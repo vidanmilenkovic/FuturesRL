@@ -137,6 +137,10 @@ futures-app/
 
 ## Quickstart
 
+> **New here?** The complete operator manual is **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)** —
+> installation, `.env`/settings reference, Databento + IBKR setup, dashboard, backtest/walk-forward
+> and live/paper runner commands, risk operations and troubleshooting.
+
 ### 1. Python environment
 
 ```bash
@@ -220,18 +224,33 @@ deterministic circuit-breaker projection before it can affect weights.
 # declarative config, offline deterministic data
 .venv/bin/python -m src.backtest.engine --strategy configs/strategies/tsmom_vol_target.yaml --offline
 
-# walk-forward validation
-.venv/bin/python -m src.backtest.engine --strategy configs/strategies/drl_ppo_llm_risk.yaml \
-  --walk-forward --output artifacts/wf_tearsheet.json
+# purged + embargoed walk-forward validation (real per-fold reports + aggregate means)
+.venv/bin/python -m src.backtest.engine --strategy configs/strategies/tsmom_vol_target.yaml \
+  --offline --walk-forward --wf-splits 5 --purge-bars 5 --embargo-bars 5 \
+  --output artifacts/wf_tsmom.json --html artifacts/wf_tsmom.html
 ```
+
+The walk-forward report contains per-fold train/test ranges + metrics, aggregate mean/std
+statistics and a compounded out-of-sample equity curve. See the
+[user guide](docs/USER_GUIDE.md#8-running-backtests) for all flags.
 
 ### Paper / live trading (IBKR)
 
 ```bash
+# deterministic end-to-end dry run: no IBKR, no Databento key, no network
+.venv/bin/python -m src.execution.runner --offline --max-states 30 \
+  --strategy configs/strategies/tsmom_vol_target.yaml
+
 # TWS or headless IB Gateway must be running and API-enabled
 FUTURESRLX_ENVIRONMENT=paper FUTURESRLX_IBKR_PORT=7497 \
-  .venv/bin/python -m src.execution.runner   # or wire via the API/dashboard
+  .venv/bin/python -m src.execution.runner --backfill-source auto
 ```
+
+Hydration source resolution: `auto` = Databento (API key) → IBKR historical (paper/live) →
+offline (only when explicitly allowed). If no source is available the CLI exits with an
+actionable message (never a raw traceback) explaining `--offline`, IBKR TWS setup and
+`FUTURESRLX_DATABENTO_API_KEY`. See the
+[user guide](docs/USER_GUIDE.md#9-running-live--paper-trading).
 
 The OMS always runs the pre-trade gate (fat finger → `whatIfOrder` margin → rate limiter) before
 transmitting; the dashboard's **EMERGENCY FLATTEN ALL** calls `flatten_all()` (cancel all, close
@@ -407,6 +426,7 @@ boundary. Detailed per-phase deliverables, gates and verification numbers are re
 | 5 | `feat/phase-5-execution` | `v0.5.0-execution` | IBKR async client, OMS pre-trade gate, BAG roller, reconciler |
 | 6 | `feat/phase-6-api-dashboard` | `v1.0.0` | FastAPI REST/WS telemetry, Next.js dashboard, Docker stack |
 | 7 | `feat/phase-7-production-hardening` | `v1.1.0` | cold-start hydration, durable risk state, open-order reconciliation, async LLM cache, FX normalisation |
+| 8 | `feat/phase-8-production-polish` | `v1.2.0` | hermetic test env, multi-source hydration + offline runner, walk-forward CLI, lazy imports, finite gym bounds, institutional dashboard redesign |
 
 ---
 

@@ -220,3 +220,70 @@ with an annotated git tag. All tests are offline and deterministic.
   6 hardening integration tests (hydration ordering, restart persistence, open-order reconciliation,
   non-blocking LLM worker).
 - Release: tag `v1.1.0` on `main` after a fast-forward merge of the phase branch.
+
+---
+
+## Phase 8 — Production polish & institutional UI (`v1.2.0`)
+
+**Branch:** `feat/phase-8-production-polish`
+
+**Backend, CLI & test-isolation fixes**
+1. **Hermetic tests** — `tests/conftest.py` gained an autouse fixture that deletes every inherited
+   `FUTURESRLX_*` variable, disables the repo `.env` file for `Settings()` and clears the settings
+   cache around each test; `scripts/quality_gate.sh` unsets all `FUTURESRLX_*` variables before
+   lint/type/test. The gate is now identical whether or not your shell exports
+   `FUTURESRLX_ENVIRONMENT=paper` / `FUTURESRLX_RISK_STATE_STORE_URI=duckdb:`.
+2. **Multi-source hydration fallback** — `src/execution/hydrator.py` composes a backfill chain:
+   `auto` = Databento (API key) → IBKR historical (`reqHistoricalDataAsync` via
+   `src/data/ibkr_data.IBKRHistoricalBarFetcher`) → `OfflineBarSource` (only when `--offline` or
+   `FUTURESRLX_HYDRATION_SOURCE=offline`); forced sources fail closed with operator hints.
+   `src/execution/runner.py` gained `--offline` and `--backfill-source {auto,databento,ibkr,offline}`
+   plus an offline streamer/`OfflineTargetBroker` dry-run stack and clean exit-2 CLI errors (no raw
+   traceback) that explain `--offline`, IBKR TWS/Gateway setup and the Databento key.
+3. **Walk-forward CLI** — `src/backtest/engine.py` CLI supports `--walk-forward`,
+   `--wf-splits`, `--purge-bars`, `--embargo-bars` with a real purged/embargoed fold runner,
+   per-fold metrics, aggregate mean/std and a compounded out-of-sample curve/tear sheet.
+4. **Zero runpy warnings** — PEP 562 lazy `__getattr__`/`__dir__` package inits for the
+   `src/backtest.engine` and `src.execution.runner` export sets (`TYPE_CHECKING` imports for mypy);
+   `python -W error::RuntimeWarning -m src.backtest.engine --help` and
+   `... -m src.execution.runner --check` run with empty stderr.
+5. **Finite Gym bounds** — `FuturesTradingEnv` observation space is
+   `Box(-1e6, 1e6, shape, float32)` and every `reset()`/`step()` observation is clipped into it;
+   `gymnasium.utils.env_checker.check_env` emits **zero** warnings (test asserts via
+   `warnings.catch_warnings(record=True)`).
+6. **Zero pytest warnings** — `StarletteDeprecationWarning` (upstream TestClient/httpx) is filtered
+   in `[tool.pytest.ini_options].filterwarnings`; the suite reports `1144 passed` with no warnings.
+
+**Frontend redesign** — `frontend/` was rebuilt from scratch as an institutional quant workstation
+(Linear / Databento Portal / TradingView Pro / Bloomberg BQuant inspiration):
+- Full-viewport docked shell (`w-screen h-screen overflow-hidden`): full-width h-12 ribbon with brand,
+  horizontal view tabs and an always-visible account ticker (NLV, Day PnL, margin vs 60% cap, gross
+  leverage, data-mode pill), compact two-step `Flatten All`, 12-col full-width main grid and an h-7
+  status bar with collapsible telemetry drawer.
+- Typography: Inter for all UI text, JetBrains Mono (tabular) strictly for numbers/tickers; exact
+  zinc/blue/emerald/rose/amber token palette; 13px Title-Case panel titles, 11px uppercase table
+  headers, 22px mono KPI values; no CRT scanlines, neon glows, hazard stripes, centered `max-w`
+  containers or static "textbook" filler cards.
+- Five rebuilt views: Command Center (dense KPIs, equity + underwater chart with timeframes and
+  crosshair, risk budget bullets, asset-class exposure, sortable positions/orders/fills/telemetry
+  tabs with `w_i` bars and roll countdowns); Pipeline & Weights (grouped long/short/net stage chart,
+  execution trace, per-root transformation heatmap matrix); Risk & LLM Monitor (`κ`/`τ`/lockout
+  cards, per-root `S_i,t` meters, news feed, macro calendar, interactive `PUT /api/risk/thresholds`
+  form); Term Structure (root strip, F1–F6 curve with price/normalized/basis, roll schedule + BAG
+  queue, multi-root matrix); Backtest Lab (compact experiment runner, run history/compare, synced
+  equity/underwater/Sharpe-attribution charts and grouped institutional metrics with winners).
+- All REST/WebSocket bindings preserved; deterministic DEMO DATA fallback with a visible mode pill;
+  working-orders/fills render honest empty states where the API does not expose them.
+
+**User guide** — new `docs/USER_GUIDE.md` (installation, full settings reference, Databento and IBKR
+setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, troubleshooting).
+
+**Verification (as merged)**
+- `FUTURESRLX_ENVIRONMENT=paper FUTURESRLX_RISK_STATE_STORE_URI=duckdb: ./scripts/quality_gate.sh --cov`
+  → ruff/format/mypy clean, **1144 passed, 0 warnings**, coverage `src/core`+`src/risk` **93.97%**.
+- `python -W error::RuntimeWarning -m src.backtest.engine --help` and
+  `... -m src.execution.runner --check` → exit 0, empty stderr.
+- CLI proofs: empty-cache/no-source runner → exit 2 with actionable hints (no traceback);
+  `runner --offline --max-states 2` → exit 0 and hydrated JSON status.
+- Frontend: `npx tsc --noEmit` clean, `npm run lint` clean, `npm run build` success (8/8 pages),
+  production `npm run start` → all five routes HTTP 200, anti-slop/filler/legacy-palette greps empty.
