@@ -8,10 +8,12 @@ for an identical :class:`~src.core.types.MarketState`.
 
 Algorithm
 ---------
-1. ``TargetNotional_i = w_i * E`` where ``E`` is the supplied equity (falling back
-   to ``state.equity``).
-2. ``N_raw_i = TargetNotional_i / (P_i * M_i)`` using the point-in-time mark price
-   and the contract multiplier from the instrument master.
+1. ``TargetNotional_i = w_i * E_t^USD`` where ``E_t^USD`` is the account net
+   liquidation value converted into US dollars (see *Base-currency FX
+   normalisation* below).
+2. ``N_raw_i = TargetNotional_i / (P_i^USD * M_i)`` using the point-in-time mark
+   price converted into USD at the contract's settlement currency and the contract
+   multiplier from the instrument master.
 3. Discrete rounding (``floor`` toward zero, ``ceil`` away from zero, or ``nearest``
    with a configurable rebalance buffer) plus automatic standard/micro routing
    (``ES -> MES``, ``NQ -> MNQ``, ``CL -> MCL``, ``GC -> MGC``) that pushes the
@@ -23,12 +25,43 @@ Algorithm
    its own standard leg: a family leg pair always carries the same directional
    exposure, so commissions, slippage, basis risk and OMS/reconciler noise from a
    self-cancelling spread are avoided.
-4. A margin feasibility projection enforces ``IM_proj / E <= eta_max`` by uniformly
-   scaling the raw targets down and re-rounding, with a deterministic contract-drop
-   fallback that guarantees the returned target set never violates the ceiling.
+4. A margin feasibility projection enforces ``IM_proj / E_t^USD <= eta_max`` by
+   uniformly scaling the raw targets down and re-rounding, with a deterministic
+   contract-drop fallback that guarantees the returned target set never violates
+   the ceiling.
+
+Base-currency FX normalisation
+------------------------------
+IBKR reports the account net liquidation value in the account **base currency**,
+while CME futures are margined and settled in US dollars. Sizing therefore converts
+the local-currency equity into USD before computing notional:
+
+``E_t^USD = E_t^local * fx_rates[account_currency]``
+
+with the convention ``fx_rates["EUR"] == 1.10`` meaning *one euro buys 1.10 US
+dollars* (i.e. USD per one unit; ``USD`` is implicitly ``1.0``). Contract marks in a
+non-USD settlement currency are likewise converted for sizing only: the emitted
+:class:`~src.core.types.ContractTarget` keeps the **native** mark price, so order
+prices, tick sizes and execution semantics are unchanged.
+
+Resolution priority (highest first) for the effective account currency and the FX
+table:
+
+1. per-call ``account_currency=`` / ``fx_rates=`` arguments,
+2. translator constructor overrides,
+3. :class:`~src.core.types.MarketState` fields (``account_currency`` / ``fx_rates``),
+4. USD default (rate ``1.0``).
+
+FX tables are merged (state first, then constructor, then per-call overrides win).
+The translator **fails closed**: a non-USD currency without a usable rate raises an
+actionable :class:`KeyError` *before* any target is emitted, rather than silently
+assuming a 1.0 conversion which would mis-size every contract on a EUR/GBP/JPY
+account. A flat/zero weight vector returns the empty target set without requiring
+equity or FX data at all, and USD-account translation is numerically identical to
+the pre-FX behaviour (the rate is exactly ``1.0``).
 
 Design notes
-------------
+-----------
 * The translator is stateless and deterministic: the same inputs always produce
   the same :class:`~src.core.types.ContractTargetSet`.
 * The ``rebalance_buffer_contracts`` parameter raises the round-up threshold in
@@ -44,7 +77,8 @@ Design notes
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING
 
@@ -58,6 +92,8 @@ from src.core.types import (
     MarketState,
     RoundingMode,
     WeightVector,
+    freeze_fx_rates,
+    normalise_currency,
 )
 
 if TYPE_CHECKING:
@@ -73,11 +109,17 @@ _MAX_GREEDY_DROPS: int = 100_000
 
 @dataclass(slots=True)
 class _Leg:
-    """Internal mutable representation of one candidate contract leg."""
+    """Internal mutable representation of one candidate contract leg.
+
+    ``price`` is the native mark price (what the emitted target carries) while
+    ``price_usd`` is the same mark converted into USD for notional sizing
+    (``price * fx_rate(spec.currency)``; identical to ``price`` for USD contracts).
+    """
 
     instrument_id: InstrumentId
     spec: InstrumentSpec
     price: float
+    price_usd: float
     expiration: date | None
     raw_quantity: float
 
@@ -100,13 +142,23 @@ class ContractTranslator:
     rebalance_buffer_contracts:
         Rebalance dead-band, in contracts, applied to ``NEAREST`` rounding.
     max_margin_utilization:
-        Hard upper bound on ``IM_proj / equity`` (default ``0.60``).
+        Hard upper bound on ``IM_proj / equity_usd`` (default ``0.60``).
     enable_micro_routing:
         Whether residual fractional standard-contract exposure may be routed into
         the paired micro root.
     min_micro_notional_ratio:
         Minimum residual notional, expressed as a fraction of one micro contract's
         notional, required before the residual is routed into micro contracts.
+    account_currency:
+        Optional IBKR account base currency override (ISO-4217, e.g. ``"EUR"``).
+        When ``None`` the per-call override is used, else
+        :attr:`~src.core.types.MarketState.account_currency`; final fallback is USD.
+        The equity supplied to :meth:`translate` is interpreted in this currency.
+    fx_rates:
+        Optional ``currency -> USD per one unit`` FX table used to normalise a
+        non-USD account (and any non-USD contract settlement currency) into USD.
+        Merged over ``MarketState.fx_rates``; per-call overrides win. ``USD`` is
+        implicitly ``1.0`` and, when supplied explicitly, must equal ``1.0``.
     """
 
     instruments: InstrumentsConfig | None = None
@@ -115,6 +167,8 @@ class ContractTranslator:
     max_margin_utilization: float = 0.60
     enable_micro_routing: bool = True
     min_micro_notional_ratio: float = 0.0
+    account_currency: str | None = None
+    fx_rates: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.rounding_mode, RoundingMode):
@@ -130,14 +184,31 @@ class ContractTranslator:
         ratio = float(self.min_micro_notional_ratio)
         if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
             raise ValueError("min_micro_notional_ratio must be within [0, 1]")
+        if self.account_currency is not None:
+            object.__setattr__(
+                self,
+                "account_currency",
+                normalise_currency(self.account_currency, name="account_currency"),
+            )
+        object.__setattr__(self, "fx_rates", freeze_fx_rates(self.fx_rates))
 
     # -- public API ------------------------------------------------------------
 
     @classmethod
     def from_config(
-        cls, config: TranslatorConfig, *, instruments: InstrumentsConfig | None = None
+        cls,
+        config: TranslatorConfig,
+        *,
+        instruments: InstrumentsConfig | None = None,
+        account_currency: str | None = None,
+        fx_rates: Mapping[str, float] | None = None,
     ) -> ContractTranslator:
-        """Build a translator from a declarative :class:`TranslatorConfig`."""
+        """Build a translator from a declarative :class:`TranslatorConfig`.
+
+        FX overrides are account/run specific (not part of the strategy YAML),
+        so callers wire the live/paper account's base currency and FX table
+        explicitly here or per :meth:`translate` call.
+        """
         return cls(
             instruments=instruments,
             rounding_mode=config.rounding_mode,
@@ -145,10 +216,18 @@ class ContractTranslator:
             max_margin_utilization=config.max_margin_utilization,
             enable_micro_routing=config.enable_micro_routing,
             min_micro_notional_ratio=config.min_micro_notional_ratio,
+            account_currency=account_currency,
+            fx_rates=fx_rates or {},
         )
 
     def translate(
-        self, weights: WeightVector, state: MarketState, *, equity: float | None = None
+        self,
+        weights: WeightVector,
+        state: MarketState,
+        *,
+        equity: float | None = None,
+        account_currency: str | None = None,
+        fx_rates: Mapping[str, float] | None = None,
     ) -> ContractTargetSet:
         """Convert ``weights`` into discrete contract targets.
 
@@ -157,34 +236,197 @@ class ContractTranslator:
         weights:
             Signed notional target weights. Negative values are shorts.
         state:
-            Point-in-time market state providing mark prices, expirations and the
-            default equity.
+            Point-in-time market state providing mark prices, expirations, the
+            default equity, the default account currency and the base FX table.
         equity:
-            Explicit net liquidation value. When omitted, ``state.equity`` is used;
-            when neither is available a :class:`ValueError` is raised.
+            Explicit net liquidation value **in the effective account currency**.
+            When omitted, ``state.equity`` is used; when neither is available a
+            :class:`ValueError` is raised.
+        account_currency:
+            Optional per-call account base currency override (highest priority).
+            ``None`` falls back to the constructor override, then
+            ``state.account_currency``, then USD.
+        fx_rates:
+            Optional per-call ``currency -> USD per unit`` overrides. Merged over
+            ``state.fx_rates`` and the constructor table; per-call values win.
 
         Returns
         -------
         ContractTargetSet
             Non-zero integer contract targets. A flat/zero weight vector yields the
-            empty target set.
+            empty target set (and requires neither equity nor FX data).
+
+        Raises
+        ------
+        KeyError
+            If a non-USD account base currency or non-USD contract settlement
+            currency has no usable FX rate. The translation fails closed before any
+            target is emitted.
         """
         master = self._instrument_master()
         active = self._normalise_weights(weights, master)
         if not active:
             return ContractTargetSet.empty()
         resolved_equity = self._resolve_equity(equity, state)
+        rates = self.effective_fx_rates(state, fx_rates=fx_rates)
+        currency = self.effective_account_currency(state, account_currency=account_currency)
+        equity_usd = resolved_equity * self._usd_rate(currency, rates)
         specs = self._resolve_specs(active, master)
-        legs = self._build_legs(active, specs, master, state, resolved_equity)
-        quantities = self._resolve_quantities(legs, resolved_equity)
+        # Fail closed on unresolvable contract settlement currencies *before* any
+        # leg is built or any target can be emitted.
+        self._validate_contract_currencies(active, specs, master, rates)
+        legs = self._build_legs(active, specs, master, state, equity_usd, rates)
+        quantities = self._resolve_quantities(legs, equity_usd)
         return self._materialise(legs, quantities)
 
-    def margin_utilization(self, targets: ContractTargetSet, equity: float) -> float:
-        """Projected initial-margin utilisation of ``targets`` at ``equity``."""
+    def margin_utilization(
+        self,
+        targets: ContractTargetSet,
+        equity: float,
+        *,
+        account_currency: str | None = None,
+        fx_rates: Mapping[str, float] | None = None,
+    ) -> float:
+        """Projected initial-margin utilisation of ``targets`` at ``equity``.
+
+        ``equity`` is expressed in the effective account currency and is converted
+        into USD (initial margins are USD-denominated) before the ratio is taken:
+
+        ``IM_proj / (equity * usd_per_unit(account_currency))``.
+
+        Without a market state the effective currency is resolved from the per-call
+        override, then the constructor override, then USD; the FX table merges the
+        constructor table with the per-call overrides. A missing non-USD rate raises
+        an actionable :class:`KeyError`.
+        """
         value = float(equity)
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError("equity must be a finite strictly positive number")
-        return targets.total_initial_margin / value
+        currency = self._stateless_account_currency(account_currency)
+        rates = self._stateless_fx_rates(fx_rates)
+        return targets.total_initial_margin / (value * self._usd_rate(currency, rates))
+
+    # -- FX resolution helpers -------------------------------------------------
+
+    def effective_account_currency(
+        self, state: MarketState, *, account_currency: str | None = None
+    ) -> str:
+        """Effective account base currency: per-call > constructor > state > USD."""
+        if account_currency is not None:
+            return normalise_currency(account_currency, name="account_currency")
+        if self.account_currency is not None:
+            return self.account_currency
+        return normalise_currency(state.account_currency, name="account_currency")
+
+    def effective_fx_rates(
+        self, state: MarketState, *, fx_rates: Mapping[str, float] | None = None
+    ) -> Mapping[str, float]:
+        """Merged, validated FX table: state < constructor < per-call overrides."""
+        merged: dict[str, float] = dict(state.fx_rates)
+        if self.fx_rates:
+            merged.update(self.fx_rates)
+        if fx_rates:
+            merged.update(fx_rates)
+        return freeze_fx_rates(merged)
+
+    def resolve_account_equity(
+        self,
+        state: MarketState,
+        *,
+        equity: float | None = None,
+        account_currency: str | None = None,
+        fx_rates: Mapping[str, float] | None = None,
+    ) -> tuple[str, float, float]:
+        """Resolve the equity normalisation used by :meth:`translate`.
+
+        Returns ``(account_currency, usd_per_unit, equity_usd)``: the effective base
+        currency, the USD value of one unit of that currency, and the equity
+        converted into USD exactly as the sizing stage consumes it. Useful for
+        execution audits and margin telemetry.
+        """
+        resolved_equity = self._resolve_equity(equity, state)
+        rates = self.effective_fx_rates(state, fx_rates=fx_rates)
+        currency = self.effective_account_currency(state, account_currency=account_currency)
+        usd_per_unit = self._usd_rate(currency, rates)
+        return currency, usd_per_unit, resolved_equity * usd_per_unit
+
+    def _stateless_account_currency(self, account_currency: str | None) -> str:
+        """Account currency for calls without a state (per-call > constructor > USD)."""
+        if account_currency is not None:
+            return normalise_currency(account_currency, name="account_currency")
+        if self.account_currency is not None:
+            return self.account_currency
+        return "USD"
+
+    def _stateless_fx_rates(self, fx_rates: Mapping[str, float] | None) -> Mapping[str, float]:
+        """FX table for calls without a state (constructor < per-call overrides)."""
+        merged: dict[str, float] = dict(self.fx_rates)
+        if fx_rates:
+            merged.update(fx_rates)
+        return freeze_fx_rates(merged)
+
+    @staticmethod
+    def _usd_rate(currency: str, rates: Mapping[str, float]) -> float:
+        """USD value of one unit of ``currency`` (``1.0`` for USD).
+
+        Fails closed for a non-USD currency with no configured rate: an implicit
+        ``1.0`` would mis-size every contract on a EUR/GBP/JPY account.
+        """
+        code = normalise_currency(currency, name="currency")
+        if code == "USD":
+            return 1.0
+        try:
+            rate = rates[code]
+        except KeyError:
+            raise KeyError(
+                f"no FX rate for currency {code!r}: set fx_rates[{code!r}] = USD per 1 "
+                f"{code} (available: {sorted(rates)!r}); refusing to size futures "
+                "contracts with an implicit 1.0 conversion"
+            ) from None
+        return float(rate)
+
+    @staticmethod
+    def _usd_price(price: float, spec: InstrumentSpec, rates: Mapping[str, float]) -> float:
+        """Convert a native contract mark into USD for notional sizing.
+
+        For USD-settled contracts the rate is exactly ``1.0``, so the returned value
+        is bit-identical to ``price`` and USD translations are unchanged.
+        """
+        return price * ContractTranslator._usd_rate(spec.currency, rates)
+
+    def _validate_contract_currencies(
+        self,
+        active: Mapping[InstrumentId, float],
+        specs: Mapping[InstrumentId, InstrumentSpec],
+        master: InstrumentsConfig,
+        rates: Mapping[str, float],
+    ) -> None:
+        """Fail closed on any unresolvable contract settlement currency.
+
+        Covers both the explicitly requested roots and the paired micro roots that
+        auto-routing could emit, so a missing rate can never be discovered after a
+        partial target set has been produced.
+        """
+        checked: set[str] = set()
+        for root in active:
+            spec = specs[root]
+            candidates = [spec]
+            paired_micro = self._paired_micro_spec(spec, master)
+            if paired_micro is not None:
+                candidates.append(paired_micro)
+            for candidate in candidates:
+                if candidate.currency in checked:
+                    continue
+                self._usd_rate(candidate.currency, rates)
+                checked.add(candidate.currency)
+
+    def _paired_micro_spec(
+        self, spec: InstrumentSpec, master: InstrumentsConfig
+    ) -> InstrumentSpec | None:
+        """Micro spec that auto-routing could pair with ``spec``, if any."""
+        if not self.enable_micro_routing or spec.micro_root is None:
+            return None
+        return master.instruments.get(spec.micro_root)
 
     # -- normalisation / validation -------------------------------------------
 
@@ -236,7 +478,8 @@ class ContractTranslator:
         specs: dict[InstrumentId, InstrumentSpec],
         master: InstrumentsConfig,
         state: MarketState,
-        equity: float,
+        equity_usd: float,
+        rates: Mapping[str, float],
     ) -> list[_Leg]:
         """Build raw (rounding-aware) contract legs, including micro routing."""
         family_order: list[InstrumentId] = []
@@ -253,7 +496,9 @@ class ContractTranslator:
         for family_key in family_order:
             family_weights = families[family_key]
             legs.extend(
-                self._build_family_legs(family_key, family_weights, specs, master, state, equity)
+                self._build_family_legs(
+                    family_key, family_weights, specs, master, state, equity_usd, rates
+                )
             )
         return legs
 
@@ -264,7 +509,8 @@ class ContractTranslator:
         specs: dict[InstrumentId, InstrumentSpec],
         master: InstrumentsConfig,
         state: MarketState,
-        equity: float,
+        equity_usd: float,
+        rates: Mapping[str, float],
     ) -> list[_Leg]:
         standard_spec = self._family_standard_spec(family_key, master)
         micro_root = standard_spec.micro_root
@@ -275,13 +521,14 @@ class ContractTranslator:
             # round each explicitly requested root independently. Micro-only
             # requests are honoured as micro contracts and never upsampled.
             return [
-                self._plain_leg(root, weight, specs[root], state, equity)
+                self._plain_leg(root, weight, specs[root], state, equity_usd, rates)
                 for root, weight in family_weights.items()
             ]
 
         standard_price, standard_expiration = self._price_and_expiration(
             state, family_key, standard_spec
         )
+        standard_price_usd = self._usd_price(standard_price, standard_spec, rates)
         micro_spec = master.instruments.get(micro_root)
         if micro_spec is None:  # pragma: no cover - validated by InstrumentsConfig
             raise ValueError(f"instrument master is missing the micro root {micro_root!r}")
@@ -295,17 +542,20 @@ class ContractTranslator:
         else:
             micro_price = standard_price
             micro_expiration = standard_expiration
+        micro_price_usd = self._usd_price(micro_price, micro_spec, rates)
 
-        family_notional = sum(family_weights.values()) * equity
+        family_notional = sum(family_weights.values()) * equity_usd
         candidates = self._family_candidates(
             family_key,
             family_notional,
             micro_root,
             standard_spec,
             standard_price,
+            standard_price_usd,
             standard_expiration,
             micro_spec,
             micro_price,
+            micro_price_usd,
             micro_expiration,
         )
         return self._select_family_candidate(family_notional, candidates)
@@ -316,11 +566,20 @@ class ContractTranslator:
         weight: float,
         spec: InstrumentSpec,
         state: MarketState,
-        equity: float,
+        equity_usd: float,
+        rates: Mapping[str, float],
     ) -> _Leg:
         price, expiration = self._price_and_expiration(state, root, spec)
-        raw = weight * equity / (price * spec.multiplier)
-        return _Leg(root, spec, price, expiration, float(self._round_quantity(raw)))
+        price_usd = self._usd_price(price, spec, rates)
+        raw = weight * equity_usd / (price_usd * spec.multiplier)
+        return _Leg(
+            root,
+            spec,
+            price,
+            price_usd,
+            expiration,
+            float(self._round_quantity(raw)),
+        )
 
     def _family_candidates(
         self,
@@ -329,9 +588,11 @@ class ContractTranslator:
         micro_root: InstrumentId,
         standard_spec: InstrumentSpec,
         standard_price: float,
+        standard_price_usd: float,
         standard_expiration: date | None,
         micro_spec: InstrumentSpec,
         micro_price: float,
+        micro_price_usd: float,
         micro_expiration: date | None,
     ) -> list[list[_Leg]]:
         """Enumerate deterministic same-direction decompositions of one family.
@@ -350,9 +611,10 @@ class ContractTranslator:
 
         ``_select_family_candidate`` then picks the decomposition with the
         smallest absolute notional tracking error, preferring fewer legs on ties.
+        All notional comparisons are in USD (margins and notional are USD).
         """
-        standard_notional = standard_price * standard_spec.multiplier
-        micro_notional = micro_price * micro_spec.multiplier
+        standard_notional = standard_price_usd * standard_spec.multiplier
+        micro_notional = micro_price_usd * micro_spec.multiplier
         if family_notional == 0.0 or micro_notional <= 0.0:
             return [[]]
         standard_raw = family_notional / standard_notional
@@ -365,6 +627,7 @@ class ContractTranslator:
                         family_key,
                         standard_spec,
                         standard_price,
+                        standard_price_usd,
                         standard_expiration,
                         float(standard_quantity),
                     )
@@ -374,6 +637,7 @@ class ContractTranslator:
                 micro_root,
                 micro_spec,
                 micro_price,
+                micro_price_usd,
                 micro_expiration,
                 residual,
                 family_notional,
@@ -399,6 +663,7 @@ class ContractTranslator:
                             micro_root,
                             micro_spec,
                             micro_price,
+                            micro_price_usd,
                             micro_expiration,
                             float(micro_quantity),
                         )
@@ -414,7 +679,7 @@ class ContractTranslator:
         best: list[_Leg] = []
         best_key: tuple[float, int] | None = None
         for legs in candidates:
-            achieved = sum(leg.raw_quantity * leg.price * leg.spec.multiplier for leg in legs)
+            achieved = sum(leg.raw_quantity * leg.price_usd * leg.spec.multiplier for leg in legs)
             key = (abs(family_notional - achieved), len(legs))
             if best_key is None or key < best_key:
                 best = legs
@@ -426,6 +691,7 @@ class ContractTranslator:
         micro_root: InstrumentId,
         micro_spec: InstrumentSpec,
         micro_price: float,
+        micro_price_usd: float,
         micro_expiration: date | None,
         residual_notional: float,
         family_notional: float,
@@ -448,7 +714,14 @@ class ContractTranslator:
             return None
         if (quantity > 0) != (family_notional > 0.0):  # pragma: no cover - sign preserving
             return None
-        return _Leg(micro_root, micro_spec, micro_price, micro_expiration, float(quantity))
+        return _Leg(
+            micro_root,
+            micro_spec,
+            micro_price,
+            micro_price_usd,
+            micro_expiration,
+            float(quantity),
+        )
 
     @staticmethod
     def _truncate_quantity(raw: float) -> int:
@@ -511,14 +784,18 @@ class ContractTranslator:
 
     # -- margin feasibility ----------------------------------------------------
 
-    def _resolve_quantities(self, legs: list[_Leg], equity: float) -> dict[InstrumentId, int]:
-        """Round legs and enforce the hard initial-margin utilisation ceiling."""
+    def _resolve_quantities(self, legs: list[_Leg], equity_usd: float) -> dict[InstrumentId, int]:
+        """Round legs and enforce the hard initial-margin utilisation ceiling.
+
+        The budget is ``eta_max * equity_usd`` because initial margins are
+        USD-denominated, even when the account base currency is not USD.
+        """
         quantities: dict[InstrumentId, int] = {}
         for leg in legs:
             quantities[leg.instrument_id] = self._round_quantity(leg.raw_quantity)
         if not legs:
             return quantities
-        budget = self.max_margin_utilization * equity
+        budget = self.max_margin_utilization * equity_usd
         margin_by_root = {leg.instrument_id: leg.initial_margin for leg in legs}
         projected = self._projected_initial_margin(quantities, margin_by_root)
         if projected <= budget:

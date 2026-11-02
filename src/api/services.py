@@ -794,13 +794,18 @@ class IBKRExecutionService:
 
 
 def _build_translator(
-    config: StrategyConfig, master: InstrumentsConfig
+    config: StrategyConfig, master: InstrumentsConfig, settings: Settings | None = None
 ) -> ContractTranslatorProtocol:
     from src.risk.contract_translator import ContractTranslator
 
     return cast(
         ContractTranslatorProtocol,
-        ContractTranslator.from_config(config.translator, instruments=master),
+        ContractTranslator.from_config(
+            config.translator,
+            instruments=master,
+            account_currency=settings.account_currency if settings is not None else None,
+            fx_rates=settings.fx_rates if settings is not None else None,
+        ),
     )
 
 
@@ -891,7 +896,7 @@ def build_pipeline_parts(
     """
     from src.strategies import build_pipeline
 
-    translator = _build_translator(config, master)
+    translator = _build_translator(config, master, settings)
     overlays: list[RiskOverlay] = []
     try:
         from src.risk.quant_risk_overlay import QuantRiskOverlay

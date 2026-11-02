@@ -1095,11 +1095,20 @@ class EventBacktester:
                 pipeline_result = self._strategy.run(targeted_state)
                 _record_weights(weight_rows, pipeline_result)
                 try:
-                    targets = self._translator.translate(
-                        pipeline_result.final_weights,
-                        targeted_state,
-                        equity=equity_before_rebalance,
-                    )
+                    if targeted_state.account_currency == "USD" and not targeted_state.fx_rates:
+                        targets = self._translator.translate(
+                            pipeline_result.final_weights,
+                            targeted_state,
+                            equity=equity_before_rebalance,
+                        )
+                    else:
+                        targets = self._translator.translate(
+                            pipeline_result.final_weights,
+                            targeted_state,
+                            equity=equity_before_rebalance,
+                            account_currency=targeted_state.account_currency,
+                            fx_rates=targeted_state.fx_rates,
+                        )
                 except Exception as exc:  # pragma: no cover - defensive translator guard
                     warnings.append(f"translator failed at {timestamp.isoformat()}: {exc}")
                     targets = ContractTargetSet.empty()
@@ -2264,10 +2273,24 @@ class SimpleContractTranslator:
         state: MarketState,
         *,
         equity: float | None = None,
+        account_currency: str | None = None,
+        fx_rates: Mapping[str, float] | None = None,
     ) -> ContractTargetSet:
         """Round ``w * equity`` notional to the nearest whole contract."""
         capital = equity if equity is not None else state.equity
-        if capital is None or capital <= 0.0:
+        if capital is None:
+            raise ValueError("equity must be available for contract translation")
+        currency = (account_currency or state.account_currency).strip().upper()
+        if currency != "USD":
+            merged = dict(state.fx_rates)
+            if fx_rates:
+                merged.update(fx_rates)
+            if currency not in merged:
+                raise KeyError(
+                    f"no FX rate for currency {currency!r} (fx_rates[{currency!r}] needed)"
+                )
+            capital *= merged[currency]
+        if capital <= 0.0:
             raise ValueError("equity must be available for contract translation")
         targets: list[ContractTarget] = []
         for root, weight in weights.weights.items():

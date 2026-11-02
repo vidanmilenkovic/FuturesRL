@@ -112,9 +112,19 @@ class ContractTranslatorProtocol(Protocol):
     """Deterministic ``w_t -> N_i,t`` translator contract."""
 
     def translate(
-        self, weights: WeightVector, state: MarketState, *, equity: float | None = None
+        self,
+        weights: WeightVector,
+        state: MarketState,
+        *,
+        equity: float | None = None,
+        account_currency: str | None = None,
+        fx_rates: Mapping[str, float] | None = None,
     ) -> ContractTargetSet:
-        """Convert approved weights into discrete contract targets."""
+        """Convert approved weights into discrete contract targets.
+
+        ``account_currency`` / ``fx_rates`` let a USD-denominated contract
+        translator consume a non-USD account's ``equity`` (Phase 7).
+        """
         ...
 
 

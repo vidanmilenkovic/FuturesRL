@@ -315,7 +315,16 @@ class ComposablePipeline:
             sanitised = len(risk_weights) - len(final_weights)
 
         if self._translator is not None:
-            targets = self._translator.translate(final_weights, state, equity=state.equity)
+            if state.account_currency == "USD" and not state.fx_rates:
+                targets = self._translator.translate(final_weights, state, equity=state.equity)
+            else:
+                targets = self._translator.translate(
+                    final_weights,
+                    state,
+                    equity=state.equity,
+                    account_currency=state.account_currency,
+                    fx_rates=state.fx_rates,
+                )
 
         diagnostics: dict[str, MetadataValue] = {
             "pipeline": self._name,
