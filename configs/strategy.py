@@ -104,6 +104,8 @@ class DRLSpec(BaseModel):
     seed: int = 7
     reward_risk_penalty_lambda: float = Field(default=0.5, ge=0.0)
     normalize_observations: bool = True
+    #: Optional SB3 checkpoint (.zip) trained by ``python -m src.strategies.train_drl``.
+    model_path: str | None = None
 
     @model_validator(mode="after")
     def _known_algorithm(self) -> DRLSpec:

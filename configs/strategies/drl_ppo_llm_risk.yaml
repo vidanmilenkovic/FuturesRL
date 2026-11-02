@@ -83,3 +83,5 @@ drl:
   seed: 7
   reward_risk_penalty_lambda: 0.5
   normalize_observations: true
+  # train with: python -m src.strategies.train_drl --strategy configs/strategies/drl_ppo_llm_risk.yaml --offline
+  model_path: null

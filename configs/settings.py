@@ -120,6 +120,23 @@ class Settings(BaseSettings):
     ibkr_nightly_reset_start_hour_et: int = 23
     ibkr_nightly_reset_end_hour_et: int = 0
 
+    # -- LLM risk provider (Tier-A Live inference switch) ---------------------------
+    #: "offline" = deterministic fixture assessments; other values use the real
+    #: async provider adapters in src/risk/llm_clients.py.
+    llm_provider: Literal["offline", "openai", "anthropic", "deepseek", "vllm"] = "offline"
+    llm_model: str = "gpt-4o-mini"
+    llm_api_key: SecretStr | None = None
+
+    # -- Live news / macro headline ingestion --------------------------------------
+    #: Financial RSS feed URLs (empty = IBKR news when connected, else fixtures).
+    news_rss_feeds: tuple[str, ...] = ()
+    news_max_items: int = Field(default=20, ge=1, le=200)
+    news_poll_interval_seconds: float = Field(default=300.0, gt=0.0)
+
+    # -- Live runner <-> API bridge ------------------------------------------------
+    #: When True the runner publishes snapshots to data_dir/bridge and the API reads them.
+    runner_bridge_enabled: bool = True
+
     # -- API / telemetry -----------------------------------------------------------
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8000, ge=1, le=65535)
@@ -153,6 +170,34 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(allowed)}")
         return upper
 
+    @field_validator("llm_model")
+    @classmethod
+    def _valid_llm_model(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("llm_model must be a non-empty model identifier")
+        return cleaned
+
+    @field_validator("llm_api_key", mode="before")
+    @classmethod
+    def _llm_key_or_none(cls, value: object) -> object:
+        if value in (None, "", "none", "null"):
+            return None
+        return value
+
+    @field_validator("news_rss_feeds")
+    @classmethod
+    def _valid_feed_urls(cls, feeds: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned: list[str] = []
+        for feed in feeds:
+            url = feed.strip()
+            if not url:
+                continue
+            if not (url.startswith("https://") or url.startswith("http://")):
+                raise ValueError(f"news RSS feed must be an http(s) URL, got {url!r}")
+            cleaned.append(url)
+        return tuple(dict.fromkeys(cleaned))
+
     @field_validator("account_currency")
     @classmethod
     def _valid_account_currency(cls, value: str) -> str:
@@ -184,6 +229,15 @@ class Settings(BaseSettings):
         if value in (None, "", "none", "null"):
             return None
         return value
+
+    @model_validator(mode="after")
+    def _llm_provider_requires_key(self) -> Settings:
+        if self.llm_provider != "offline" and self.llm_api_key is None:
+            raise ValueError(
+                f"llm_provider={self.llm_provider!r} requires FUTURESRLX_LLM_API_KEY "
+                "(use llm_provider=offline for deterministic fixture assessments)"
+            )
+        return self
 
     @model_validator(mode="after")
     def _ibkr_port_matches_environment(self) -> Settings:
@@ -226,6 +280,26 @@ class Settings(BaseSettings):
         return self.configs_dir / "strategies"
 
     @property
+    def llm_provider_value(self) -> str:
+        """Lower-case provider id (``offline`` = deterministic fixture mode)."""
+        return self.llm_provider
+
+    @property
+    def llm_api_key_value(self) -> str | None:
+        """Plain LLM API key when configured (never logged)."""
+        return self.llm_api_key.get_secret_value() if self.llm_api_key else None
+
+    @property
+    def runner_bridge_dir(self) -> Path:
+        """Directory where the live runner publishes bridge snapshots."""
+        return self.data_dir / "bridge"
+
+    @property
+    def backtest_artifacts_dir(self) -> Path:
+        """Directory where API-triggered backtest runs are persisted."""
+        return self.report_dir / "backtests"
+
+    @property
     def api_base_url(self) -> str:
         """Base URL for the local telemetry API."""
         host = "127.0.0.1" if self.api_host in {"0.0.0.0", "::"} else self.api_host
@@ -238,7 +312,13 @@ class Settings(BaseSettings):
 
     def ensure_directories(self) -> None:
         """Create the writable data/report directories if they are missing."""
-        for path in (self.data_dir, self.parquet_dir, self.report_dir):
+        for path in (
+            self.data_dir,
+            self.parquet_dir,
+            self.report_dir,
+            self.runner_bridge_dir,
+            self.backtest_artifacts_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
         self.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -250,6 +330,7 @@ class Settings(BaseSettings):
         """Dump settings with secrets redacted (safe for logs/telemetry)."""
         dumped = self.model_dump(mode="json")
         dumped["databento_api_key"] = "***" if self.databento_api_key else None
+        dumped["llm_api_key"] = "***" if self.llm_api_key else None
         return dumped
 
 
