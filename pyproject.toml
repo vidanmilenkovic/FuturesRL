@@ -86,6 +86,9 @@ ignore = [
 quote-style = "double"
 indent-style = "space"
 line-ending = "lf"
+# Prose documentation (Markdown) is hand-authored for readability; the Python
+# formatter must not reflow code fences inside guides/READMEs.
+exclude = ["*.md", "docs/**"]
 
 [tool.mypy]
 python_version = "3.12"
