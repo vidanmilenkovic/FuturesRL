@@ -26,12 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import math
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from typing import Any, Protocol, cast
 
+import polars as pl
 from configs.instruments import InstrumentsConfig, InstrumentSpec, load_instruments
 from configs.settings import Settings, get_settings
 
@@ -43,10 +46,13 @@ from src.core.types import (
     MetadataValue,
     ensure_utc,
 )
-from src.data.contracts import parse_contract_symbol
+from src.data import schema as s
+from src.data.contracts import next_contract_expiration, parse_contract_symbol
 from src.data.schema import validate_roots
 
-__all__ = ["IBKRMarketDataStreamer"]
+__all__ = ["IBKRHistoricalBarFetcher", "IBKRMarketDataStreamer"]
+
+logger = logging.getLogger(__name__)
 
 #: IBKR real-time bar size in seconds (a "5-second bar" feed).
 BAR_INTERVAL_SECONDS: int = 5
@@ -716,3 +722,388 @@ def _imbalance(bid_size: float, ask_size: float) -> float:
     if total <= 0:
         return 0.0
     return (bid_size - ask_size) / total
+
+
+# ---------------------------------------------------------------------------
+# Historical daily bars (Phase 8 cold-start hydration fallback)
+# ---------------------------------------------------------------------------
+
+#: IBKR bar size used for cold-start hydration history.
+HISTORICAL_BAR_SIZE: str = "1 day"
+
+#: Maximum calendar span requested per IBKR historical call (IB limits long
+#: durations); longer windows are fetched in chunks and de-duplicated.
+HISTORICAL_MAX_REQUEST_DAYS: int = 365
+
+#: ``formatDate=2`` makes IBKR return UTC epoch-based bar timestamps.
+_IBKR_FORMAT_DATE_UTC: int = 2
+
+#: Placeholder expiration for a continuous-futures series whose contract has no
+#: single expiry (the hydrator adds a neutral next leg for the term structure).
+_CONTINUOUS_PLACEHOLDER_EXPIRATION: date = date(2099, 12, 31)
+
+
+class _HistoricalIBClient(Protocol):
+    """The subset of the ``ib_async.IB`` API the historical fetcher depends on.
+
+    Method names mirror the ``ib_async`` camelCase API; they are only ever
+    reached through the injected client / a real ``ib_async.IB``.
+    """
+
+    def isConnected(self) -> bool:  # noqa: N802
+        """Whether the TWS/IB Gateway session is currently connected."""
+        ...
+
+    async def connectAsync(  # noqa: N802
+        self, host: str, port: int, client_id: int, timeout: float
+    ) -> None:
+        """Open the TWS/Gateway session."""
+        ...
+
+    def disconnect(self) -> None:
+        """Close the TWS/Gateway session."""
+        ...
+
+    async def reqHistoricalDataAsync(  # noqa: N802
+        self,
+        contract: object,
+        end_date_time: datetime,
+        duration: str,
+        bar_size: str,
+        what_to_show: str,
+        use_rth: bool,
+        format_date: int,
+        keep_up_to_date: bool,
+    ) -> Iterable[object]:
+        """Request historical bars, returning IBKR ``BarData``-like rows."""
+        ...
+
+
+def _finite_float(value: object) -> float | None:
+    """Coerce an IBKR numeric attribute to a finite ``float`` (``None`` otherwise)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(cast("Any", value))
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _positive_float(value: object) -> float | None:
+    """Coerce an IBKR price attribute to a finite strictly-positive ``float``."""
+    result = _finite_float(value)
+    return result if result is not None and result > 0.0 else None
+
+
+def _bar_timestamp(value: object) -> datetime | None:
+    """Normalise an IBKR bar date (``datetime``/``date``/epoch-ish) to UTC."""
+    if isinstance(value, datetime):
+        return ensure_utc(value) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=UTC)
+    return None
+
+
+class IBKRHistoricalBarFetcher:
+    """Fetch canonical daily historical bars from IBKR (TWS / IB Gateway).
+
+    This is the cold-start hydration fallback used when no Databento API key is
+    configured. It requests ``1 day`` TRADES bars through the lazily imported
+    ``ib_async`` SDK (``reqHistoricalDataAsync``), parsing IBKR's ``BarData``
+    rows into the canonical :mod:`src.data.schema` bar frame and stamping a
+    contract expiration so the feature processor can derive term structure.
+
+    Design rules
+    ------------
+    * **No network in tests**: the client and the contract resolution are both
+      injectable (``ib_factory`` / ``contract_factory``); the SDK is only
+      imported when the default factory is actually invoked.
+    * **Sync bridge**: :meth:`fetch_bars_sync` is a :data:`BackfillFn`-compatible
+      entry point. Because hydration is called synchronously *inside* the async
+      runner loop, it executes the async fetch on a dedicated worker thread with
+      its own event loop instead of nesting ``asyncio.run``.
+    * **Chunked windows**: long lookbacks (e.g. 400 days) are split into
+      ``HISTORICAL_MAX_REQUEST_DAYS`` windows because IBKR limits the duration of
+      a single historical request.
+    * **Fail closed**: connection failures and empty responses raise an
+      actionable ``RuntimeError`` naming TWS/IB Gateway, ``FUTURESRLX_ENVIRONMENT``
+      and ``FUTURESRLX_IBKR_PORT`` so the hydration chain can fall back cleanly.
+    """
+
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        instrument_master: InstrumentsConfig | None = None,
+        ib_factory: Callable[[], object] | None = None,
+        contract_factory: Callable[[InstrumentId], object] | None = None,
+        clock: Callable[[], datetime] | None = None,
+        bar_size: str = HISTORICAL_BAR_SIZE,
+        what_to_show: str = "TRADES",
+        use_rth: bool = False,
+        max_request_days: int = HISTORICAL_MAX_REQUEST_DAYS,
+    ) -> None:
+        if not bar_size:
+            raise ValueError("bar_size must be a non-empty string")
+        if not what_to_show:
+            raise ValueError("what_to_show must be a non-empty string")
+        if max_request_days < 1:
+            raise ValueError("max_request_days must be >= 1")
+        self._settings = settings if settings is not None else get_settings()
+        self._master = instrument_master
+        self._ib_factory = ib_factory
+        self._contract_factory = contract_factory
+        self._clock: Callable[[], datetime] = (
+            clock if clock is not None else lambda: datetime.now(UTC)
+        )
+        self._bar_size = bar_size
+        self._what_to_show = what_to_show
+        self._use_rth = use_rth
+        self._max_request_days = max_request_days
+
+    # -- introspection ---------------------------------------------------------
+
+    @property
+    def settings(self) -> Settings:
+        """Runtime settings (IBKR host/port/client id and credentials)."""
+        return self._settings
+
+    @property
+    def instrument_master(self) -> InstrumentsConfig:
+        """Instrument master used for exchange/currency and roll resolution."""
+        if self._master is None:
+            self._master = load_instruments(self._settings.instruments_path)
+        return self._master
+
+    def _spec_or_none(self, root: InstrumentId) -> InstrumentSpec | None:
+        master = self.instrument_master
+        return master.get(root) if master.has(root) else None
+
+    # -- client / contract resolution -----------------------------------------
+
+    def _create_client(self) -> _HistoricalIBClient:
+        """Create the injected/real IB client (SDK import happens here, lazily)."""
+        factory = self._ib_factory
+        if factory is not None:
+            return cast("_HistoricalIBClient", factory())
+        try:
+            import ib_async
+        except ImportError as exc:  # pragma: no cover - SDK installed in CI
+            raise RuntimeError(
+                "The ib_async SDK is not installed; install the optional live extra "
+                "(`pip install 'futuresrl-x[live]'` or `pip install ib_async`) before "
+                "fetching IBKR historical data."
+            ) from exc
+        return cast("_HistoricalIBClient", ib_async.IB())
+
+    def _contract_for(self, root: InstrumentId) -> object:
+        """Resolve the IBKR contract for ``root`` (injected or continuous future)."""
+        factory = self._contract_factory
+        if factory is not None:
+            return factory(root)
+        try:
+            import ib_async
+        except ImportError as exc:  # pragma: no cover - SDK installed in CI
+            raise RuntimeError(
+                "The ib_async SDK is not installed; install the optional live extra "
+                "(`pip install 'futuresrl-x[live]'`) or inject a contract_factory."
+            ) from exc
+        spec = self._spec_or_none(root)
+        exchange = spec.ibkr_exchange if spec is not None else "CME"
+        currency = spec.currency if spec is not None else "USD"
+        return ib_async.ContFuture(symbol=root, exchange=exchange, currency=currency)
+
+    async def _qualify(self, client: _HistoricalIBClient, contract: object) -> object:
+        """Qualify the contract when the client supports it (best effort)."""
+        qualify = getattr(client, "qualifyContractsAsync", None)
+        if not callable(qualify):
+            return contract
+        try:
+            result = await cast("Callable[[object], Awaitable[object]]", qualify)(contract)
+        except Exception as exc:  # pragma: no cover - fake clients never raise here
+            logger.warning("IBKR contract qualification failed for history request: %s", exc)
+            return contract
+        try:
+            items = list(cast("Iterable[object]", result))
+        except TypeError:
+            return contract
+        valid = [item for item in items if item is not None]
+        return valid[0] if valid else contract
+
+    def _expiration_for(self, root: InstrumentId, start: datetime) -> date:
+        """Representative contract expiration used to key the historical bars."""
+        spec = self._spec_or_none(root)
+        if spec is None:
+            return _CONTINUOUS_PLACEHOLDER_EXPIRATION
+        try:
+            return next_contract_expiration(spec.roll.contract_months, start)
+        except Exception:  # pragma: no cover - defensive against bad roll config
+            return _CONTINUOUS_PLACEHOLDER_EXPIRATION
+
+    # -- windows / parsing -----------------------------------------------------
+
+    def _windows(self, start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
+        """Split ``[start, end)`` into IBKR-sized historical request windows."""
+        windows: list[tuple[datetime, datetime]] = []
+        cursor = end
+        while cursor > start:
+            window_start = max(start, cursor - timedelta(days=self._max_request_days))
+            windows.append((window_start, cursor))
+            cursor = window_start
+        return windows
+
+    @staticmethod
+    def _duration_days(window: tuple[datetime, datetime]) -> int:
+        window_start, window_end = window
+        seconds = max((window_end - window_start).total_seconds(), 1.0)
+        return max(1, math.ceil(seconds / 86_400.0))
+
+    def _row(self, root: InstrumentId, expiration: date, bar: object) -> dict[str, object] | None:
+        """Parse one IBKR ``BarData`` row into a canonical bar dict."""
+        timestamp = _bar_timestamp(getattr(bar, "date", None))
+        if timestamp is None:
+            return None
+        open_price = _positive_float(getattr(bar, "open", None))
+        high_price = _positive_float(getattr(bar, "high", None))
+        low_price = _positive_float(getattr(bar, "low", None))
+        close_price = _positive_float(getattr(bar, "close", None))
+        if None in (open_price, high_price, low_price, close_price):
+            return None
+        assert open_price is not None
+        assert high_price is not None
+        assert low_price is not None
+        assert close_price is not None
+        if not (
+            low_price <= min(open_price, close_price) <= max(open_price, close_price) <= high_price
+        ):
+            logger.debug("ignoring inconsistent IBKR OHLC bar for %s at %s", root, timestamp)
+            return None
+        volume = _finite_float(getattr(bar, "volume", None)) or 0.0
+        settlement = _positive_float(getattr(bar, "average", None))
+        return {
+            s.TIMESTAMP_COLUMN: timestamp,
+            s.INSTRUMENT_ID_COLUMN: root,
+            s.ROOT_SYMBOL_COLUMN: root,
+            s.EXPIRATION_COLUMN: expiration,
+            s.OPEN_COLUMN: open_price,
+            s.HIGH_COLUMN: high_price,
+            s.LOW_COLUMN: low_price,
+            s.CLOSE_COLUMN: close_price,
+            s.VOLUME_COLUMN: max(volume, 0.0),
+            s.OPEN_INTEREST_COLUMN: 0.0,
+            s.SETTLEMENT_COLUMN: settlement,
+        }
+
+    # -- fetching --------------------------------------------------------------
+
+    async def fetch_bars(
+        self,
+        roots: Sequence[InstrumentId],
+        start: datetime,
+        end: datetime,
+    ) -> pl.DataFrame:
+        """Fetch canonical daily bars for ``roots`` in ``[start, end]`` from IBKR.
+
+        Raises
+        ------
+        RuntimeError
+            When TWS/IB Gateway is unreachable or IBKR returns no bars; the
+            message names the environment/port configuration so an operator can
+            fix it (and the hydration chain can fall back).
+        """
+        normalised = validate_roots(tuple(roots))
+        if end <= start:
+            raise ValueError(
+                f"IBKR historical window must be increasing, got [{start.isoformat()}, "
+                f"{end.isoformat()}]"
+            )
+        client = self._create_client()
+        connected_here = False
+        rows: list[dict[str, object]] = []
+        try:
+            if not client.isConnected():
+                try:
+                    await client.connectAsync(
+                        self._settings.ibkr_host,
+                        self._settings.ibkr_port,
+                        self._settings.ibkr_client_id,
+                        self._settings.ibkr_connect_timeout_seconds,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "IBKR historical data unavailable: cannot connect to TWS/IB Gateway at "
+                        f"{self._settings.ibkr_host}:{self._settings.ibkr_port} "
+                        f"({type(exc).__name__}: {exc}). Start TWS or IB Gateway and set "
+                        "FUTURESRLX_ENVIRONMENT=paper|live plus FUTURESRLX_IBKR_PORT "
+                        "(paper 7497/4002, live 7496/4001)."
+                    ) from exc
+                connected_here = True
+            for root in normalised:
+                contract = await self._qualify(client, self._contract_for(root))
+                expiration = self._expiration_for(root, start)
+                for window in self._windows(start, end):
+                    bars = await client.reqHistoricalDataAsync(
+                        contract,
+                        window[1],
+                        f"{self._duration_days(window)} D",
+                        self._bar_size,
+                        self._what_to_show,
+                        self._use_rth,
+                        _IBKR_FORMAT_DATE_UTC,
+                        False,
+                    )
+                    for bar in bars:
+                        row = self._row(root, expiration, bar)
+                        if row is not None:
+                            rows.append(row)
+        finally:
+            if connected_here:
+                with contextlib.suppress(Exception):
+                    client.disconnect()
+        if not rows:
+            raise RuntimeError(
+                "IBKR returned no daily historical bars for roots "
+                f"{list(normalised)!r} between {start.isoformat()} and {end.isoformat()}; "
+                "check that TWS/IB Gateway is running, FUTURESRLX_ENVIRONMENT is paper|live and "
+                "FUTURESRLX_IBKR_PORT matches it, and that the account is entitled to the "
+                "requested futures history"
+            )
+        frame = pl.DataFrame(rows)
+        validated = s.ensure_bars_schema(frame, context="ibkr-historical")
+        return s.dedupe_frame(validated, s.BAR_KEY_COLUMNS, keep="last")
+
+    def fetch_bars_sync(
+        self,
+        roots: Sequence[InstrumentId],
+        start: datetime,
+        end: datetime,
+    ) -> pl.DataFrame:
+        """Synchronous :data:`BackfillFn` wrapper around :meth:`fetch_bars`.
+
+        Runs the async fetch directly when no event loop is active, otherwise
+        bridges it through a dedicated worker thread (hydration is invoked
+        synchronously from inside the async runner loop, where nesting
+        ``asyncio.run`` is not allowed).
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.fetch_bars(roots, start, end))
+        outcome: list[pl.DataFrame] = []
+        failures: list[BaseException] = []
+
+        def _worker() -> None:
+            try:
+                outcome.append(asyncio.run(self.fetch_bars(roots, start, end)))
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = threading.Thread(target=_worker, name="futuresrlx-ibkr-history", daemon=True)
+        worker.start()
+        worker.join()
+        if failures:
+            raise failures[0]
+        if not outcome:  # pragma: no cover - the worker always appends or fails
+            raise RuntimeError("IBKR historical fetch produced no result")
+        return outcome[0]

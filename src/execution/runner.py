@@ -28,6 +28,14 @@ failures can never abort a rebalance: the bus already isolates them and the
 runner awaits :meth:`src.core.event_bus.EventBus.publish` for deterministic
 ordering.
 
+Cold-start history is sourced through a multi-vendor fallback chain (Phase 8):
+``auto`` = Databento (API key) -> IBKR historical daily bars (paper/live) ->
+synthetic offline history only when explicitly allowed; ``--backfill-source`` can
+force one vendor. ``--offline`` runs the whole loop end-to-end against the
+deterministic :class:`~src.data.databento_loader.OfflineBarSource` and an
+:class:`OfflineTargetBroker` wrapping the simulated venue, so the runner can be
+exercised with no IBKR/Databento connectivity at all.
+
 Production wiring lives in :func:`main`: ``ib_async``/Databento are imported
 *lazily* only on the trading path, and ``--check`` validates settings, the
 instrument master, the strategy YAML and the hydration configuration without
@@ -43,11 +51,12 @@ import json
 import logging
 import math
 import sys
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
-from typing import Protocol, cast, runtime_checkable
+from datetime import UTC, date, datetime, timedelta
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+import polars as pl
 from configs.instruments import InstrumentsConfig, load_instruments
 from configs.settings import Settings, get_settings
 
@@ -65,21 +74,44 @@ from src.core.types import (
     ScalarValue,
     ensure_utc,
 )
+from src.data import schema as s
+from src.data.feature_processor import FeatureProcessor
+from src.data.market_state_builder import MarketStateBuilder
+from src.data.storage import ParquetRepository
 from src.execution.hydrator import (
     CALENDAR_SAFETY_DAYS,
+    HYDRATION_SOURCE_HINTS,
+    HYDRATION_SOURCES,
     MIN_REQUIRED_BARS,
+    BackfillFn,
     ColdStartHydrator,
     HydrationError,
     HydrationResult,
+    MultiSourceBackfill,
+    add_neutral_term_structure,
+    build_backfill_chain,
+    offline_backfill,
 )
 from src.risk.state_store import PersistedRiskState, RiskStateStore
 
+if TYPE_CHECKING:
+    from configs.strategy import StrategyConfig
+
 __all__ = [
+    "DEFAULT_TELEMETRY_TOPIC",
+    "OFFLINE_DEFAULT_ROOTS",
+    "OFFLINE_INITIAL_CASH",
+    "OFFLINE_REPLAY_STATES",
+    "OFFLINE_SIMULATION_END",
+    "OfflineMarketStateStreamer",
+    "OfflineTargetBroker",
     "RunnerConfigError",
     "RunnerNotHydratedError",
     "RunnerStatus",
     "TargetBroker",
     "TradingRunner",
+    "build_hydration_chain",
+    "describe_hydration_sources",
     "main",
 ]
 
@@ -99,6 +131,20 @@ DEFAULT_TELEMETRY_TOPIC: str = "telemetry"
 
 #: Default strategy config used by the CLI when ``--strategy`` is omitted.
 DEFAULT_STRATEGY_FILE: str = "tsmom_vol_target.yaml"
+
+#: Fixed decision timestamp of the deterministic ``--offline`` simulation. A
+#: constant (not "now") keeps the offline CLI reproducible across machines/days.
+OFFLINE_SIMULATION_END: datetime = datetime(2025, 6, 30, 21, 0, tzinfo=UTC)
+
+#: Starting cash of the offline simulated account.
+OFFLINE_INITIAL_CASH: float = 1_000_000.0
+
+#: Number of replay states the offline streamer emits (live-loop window after the
+#: hydrated warm-up).
+OFFLINE_REPLAY_STATES: int = 30
+
+#: Default futures roots replayed by ``--offline`` (kept small for a fast demo).
+OFFLINE_DEFAULT_ROOTS: tuple[InstrumentId, ...] = ("ES", "NQ", "CL", "GC", "ZN")
 
 
 class RunnerNotHydratedError(RuntimeError):
@@ -886,6 +932,325 @@ class TradingRunner:
             logger.exception("telemetry publish failed on topic %r", self._telemetry_topic)
 
 
+# ---------------------------------------------------------------------------
+# Offline execution stack (``--offline`` determinism, Phase 8)
+# ---------------------------------------------------------------------------
+
+
+class _SimulatedBrokerLike(Protocol):
+    """Subset of :class:`src.backtest.simulated_broker.SimulatedBroker` used offline."""
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the simulated session is connected."""
+        ...
+
+    async def connect(self) -> None:
+        """Mark the simulated session connected."""
+        ...
+
+    async def disconnect(self) -> None:
+        """Tear the simulated session down."""
+        ...
+
+    def get_positions_sync(self) -> Mapping[InstrumentId, Position]:
+        """Current simulated positions keyed by futures root."""
+        ...
+
+    def get_account_sync(self, timestamp: datetime | None = None) -> AccountSnapshot:
+        """Simulated account/valuation snapshot."""
+        ...
+
+    def set_market(
+        self,
+        timestamp: datetime,
+        quotes: Any,
+    ) -> None:
+        """Install the bar quotes used by the matching engine."""
+        ...
+
+    def place_order(self, order: OrderEvent) -> OrderReceipt:
+        """Match one order against the current bar."""
+        ...
+
+    async def cancel_all(self) -> list[OrderReceipt]:
+        """Cancel every working order."""
+        ...
+
+    async def flatten_all(self) -> list[OrderReceipt]:
+        """Flatten the book and cancel working orders."""
+        ...
+
+
+class OfflineMarketStateStreamer:
+    """Deterministic offline ``MarketDataStreamer`` for ``--offline`` runs.
+
+    Replays the seeded :class:`~src.data.databento_loader.OfflineBarSource`
+    history through the canonical feature processor and the point-in-time state
+    builder: the last ``replay_states`` timestamps of the history window are
+    emitted as live-loop states (all earlier history is used to warm the
+    features/covariance, exactly like a real session). Every state carries the
+    canonical bar rows of its timestamp so an injected broker can mark the book.
+
+    No network, no credentials, no wall clock: the simulation window is a fixed
+    constant, so the whole offline loop is reproducible across machines and days.
+    """
+
+    def __init__(
+        self,
+        *,
+        roots: Sequence[InstrumentId],
+        start: datetime,
+        end: datetime,
+        equity: float,
+        instrument_master: InstrumentsConfig,
+        replay_states: int = OFFLINE_REPLAY_STATES,
+        on_state: Callable[[MarketState, pl.DataFrame], None] | None = None,
+    ) -> None:
+        normalised = tuple(sorted({root.strip().upper() for root in roots}))
+        if not normalised or any(not root for root in normalised):
+            raise ValueError("offline streamer requires at least one non-empty futures root")
+        if end <= start:
+            raise ValueError("offline streamer requires end after start")
+        if not math.isfinite(equity) or equity <= 0.0:
+            raise ValueError("offline streamer equity must be finite and strictly positive")
+        if isinstance(replay_states, bool) or replay_states < 1:
+            raise ValueError("replay_states must be a positive int")
+        self._roots = normalised
+        self._start = ensure_utc(start)
+        self._end = ensure_utc(end)
+        self._equity = float(equity)
+        self._master = instrument_master
+        self._replay_states = replay_states
+        self._on_state = on_state
+        self._connected = False
+        self._cache: list[tuple[MarketState, pl.DataFrame]] | None = None
+
+    # -- introspection ---------------------------------------------------------
+
+    @property
+    def roots(self) -> tuple[InstrumentId, ...]:
+        """Roots replayed by this streamer."""
+        return self._roots
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the offline session is "connected" (in-memory flag only)."""
+        return self._connected
+
+    @property
+    def replay_states(self) -> int:
+        """Number of states emitted by the live loop."""
+        return self._replay_states
+
+    # -- MarketDataStreamer ----------------------------------------------------
+
+    async def connect(self) -> None:
+        """Mark the offline session connected (no I/O)."""
+        self._connected = True
+
+    async def disconnect(self) -> None:
+        """Mark the offline session disconnected (no I/O)."""
+        self._connected = False
+
+    async def stream(self) -> AsyncIterator[MarketState]:
+        """Yield the deterministic replay states in chronological order."""
+        for state, bars in self._states():
+            if self._on_state is not None:
+                self._on_state(state, bars)
+            yield state
+
+    # -- internals -------------------------------------------------------------
+
+    def _states(self) -> list[tuple[MarketState, pl.DataFrame]]:
+        """Build (and memoise) the replay states from the synthetic history."""
+        if self._cache is not None:
+            return self._cache
+        from src.data.databento_loader import OfflineBarSource
+
+        source = OfflineBarSource(self._roots, periods=2, start=self._start)
+        bars = source.load(self._roots, self._start, self._end + timedelta(microseconds=1))
+        bars = add_neutral_term_structure(bars, context="offline-replay")
+        processor = FeatureProcessor(instrument_master=self._master)
+        features = processor.compute(bars)
+        timestamps = sorted(
+            {
+                value
+                for value in features[s.TIMESTAMP_COLUMN].to_list()
+                if isinstance(value, datetime)
+            }
+        )
+        if not timestamps:
+            raise RunnerConfigError(
+                "offline replay produced no bars; check the offline simulation window"
+            )
+        decision_times = timestamps[-self._replay_states :]
+        builder = MarketStateBuilder(
+            instrument_master=self._master,
+            feature_processor=processor,
+            initial_equity=self._equity,
+        )
+        states = builder.build_series(features, decision_times)
+        frames = {
+            stamp: bars.filter(pl.col(s.TIMESTAMP_COLUMN) == pl.lit(stamp))
+            for stamp in decision_times
+        }
+        cache: list[tuple[MarketState, pl.DataFrame]] = []
+        for state in states:
+            frame = frames.get(state.timestamp)
+            if frame is None:  # pragma: no cover - timestamps are built from the frame
+                raise RunnerConfigError(
+                    f"offline replay has no bar rows for state {state.timestamp.isoformat()}"
+                )
+            cache.append((state, frame))
+        self._cache = cache
+        return cache
+
+
+class OfflineTargetBroker:
+    """``TargetBroker`` adapter over the simulated venue for ``--offline`` mode.
+
+    Combines :class:`~src.backtest.simulated_broker.SimulatedBroker` (matching,
+    accounting, margin, costs) with the Phase-5 deterministic
+    :func:`~src.execution.oms.build_orders_from_targets` delta translation and
+    exposes the async ``get_positions`` / ``get_account`` / ``submit_targets``
+    surface :class:`TradingRunner` drives. It therefore exercises the *same*
+    runner loop and order-delta logic as the live OMS, without any network.
+    """
+
+    #: Broker identifier reported by the runner telemetry.
+    name = "offline-simulated"
+
+    def __init__(
+        self,
+        *,
+        simulated_broker: _SimulatedBrokerLike,
+        instrument_master: InstrumentsConfig,
+    ) -> None:
+        self._broker = simulated_broker
+        self._master = instrument_master
+        self._last_state: MarketState | None = None
+
+    # -- introspection ---------------------------------------------------------
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the underlying simulated session is connected."""
+        return self._broker.is_connected
+
+    @property
+    def is_locked(self) -> bool:
+        """The offline adapter never latches a kill switch (the runner still checks)."""
+        return False
+
+    @property
+    def last_market_state(self) -> MarketState | None:
+        """Most recent market state installed by the offline streamer."""
+        return self._last_state
+
+    # -- BrokerAdapter lifecycle -----------------------------------------------
+
+    async def connect(self) -> None:
+        """Connect the simulated session."""
+        await self._broker.connect()
+
+    async def disconnect(self) -> None:
+        """Disconnect the simulated session."""
+        await self._broker.disconnect()
+
+    # -- account / positions ---------------------------------------------------
+
+    async def get_positions(self) -> Mapping[InstrumentId, Position]:
+        """Current simulated positions keyed by futures root."""
+        return self._broker.get_positions_sync()
+
+    async def get_account(self) -> AccountSnapshot:
+        """Simulated account valuation/margin snapshot."""
+        return self._broker.get_account_sync()
+
+    # -- market data / execution ----------------------------------------------
+
+    def update_market(self, state: MarketState, bars: pl.DataFrame) -> None:
+        """Install the bar quotes of ``state`` into the simulated matching engine."""
+        from src.backtest.simulated_broker import BarQuote
+
+        self._last_state = state
+        quotes: list[BarQuote] = []
+        for root in state.ids:
+            rows = bars.filter(
+                (pl.col(s.ROOT_SYMBOL_COLUMN) == root)
+                & (pl.col(s.TIMESTAMP_COLUMN) == pl.lit(state.timestamp))
+            ).sort(s.EXPIRATION_COLUMN)
+            if rows.is_empty():
+                continue
+            record = rows.row(0, named=True)
+            expiration = (
+                record.get(s.EXPIRATION_COLUMN)
+                if isinstance(record.get(s.EXPIRATION_COLUMN), date)
+                else None
+            )
+            snapshot = state.snapshot(root)
+            settlement = snapshot.settlement
+            for quote_root in self._quote_roots(root):
+                quotes.append(
+                    BarQuote(
+                        root=quote_root,
+                        open=float(record[s.OPEN_COLUMN]),
+                        high=float(record[s.HIGH_COLUMN]),
+                        low=float(record[s.LOW_COLUMN]),
+                        close=float(record[s.CLOSE_COLUMN]),
+                        volume=float(record[s.VOLUME_COLUMN]),
+                        bid=snapshot.bid if quote_root == root else None,
+                        ask=snapshot.ask if quote_root == root else None,
+                        expiration=expiration,
+                        settlement=(
+                            settlement
+                            if quote_root == root and settlement is not None and settlement > 0
+                            else None
+                        ),
+                    )
+                )
+        if quotes:
+            self._broker.set_market(state.timestamp, quotes)
+
+    def _quote_roots(self, root: InstrumentId) -> tuple[InstrumentId, ...]:
+        """Roots to mark for ``root``: itself plus its paired micro contract.
+
+        The translator may auto-route a standard leg's residual into the micro
+        root (``ES -> MES``) even when the market state only carries the standard
+        snapshot (the pair shares the same underlying), so the simulated venue
+        must accept order flow for the micro contract too.
+        """
+        if not self._master.has(root):
+            return (root,)
+        micro = self._master.get(root).micro_root
+        if micro is None or micro == root:
+            return (root,)
+        return (root, micro)
+
+    async def submit_targets(
+        self,
+        targets: ContractTargetSet,
+        current_positions: Mapping[InstrumentId, int],
+        timestamp: datetime,
+        *,
+        flatten: bool = False,
+    ) -> list[OrderReceipt]:
+        """Translate targets into delta orders and match them in the simulator."""
+        from src.execution.oms import build_orders_from_targets
+
+        orders = build_orders_from_targets(targets, current_positions, timestamp, flatten=flatten)
+        return [self._broker.place_order(order) for order in orders]
+
+    async def cancel_all(self) -> list[OrderReceipt]:
+        """Cancel every working simulated order."""
+        return await self._broker.cancel_all()
+
+    async def flatten_all(self) -> list[OrderReceipt]:
+        """Flatten the simulated book."""
+        return await self._broker.flatten_all()
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -900,7 +1265,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="futuresrl-runner",
         description=(
             "Cold-start hydrated live/paper trading runner. Use --check to validate the "
-            "configuration offline without opening any IBKR/Databento connection."
+            "configuration offline without opening any IBKR/Databento connection, or "
+            "--offline to run the deterministic synthetic pipeline end-to-end."
         ),
     )
     parser.add_argument(
@@ -912,6 +1278,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="validate settings/instrument master/strategy/hydration config and exit",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "run the deterministic synthetic pipeline end-to-end (no IBKR/Databento, "
+            "fixed simulation window, simulated broker)"
+        ),
+    )
+    parser.add_argument(
+        "--backfill-source",
+        choices=list(HYDRATION_SOURCES),
+        default=None,
+        help=(
+            "historical backfill source: auto = Databento -> IBKR -> offline (only when "
+            "allowed); databento/ibkr/offline force one source "
+            "(default: Settings.hydration_source)"
+        ),
     )
     parser.add_argument(
         "--roots",
@@ -946,17 +1330,173 @@ def _strategy_path(settings: Settings, raw: str | None) -> str | None:
     return str(candidate) if candidate.is_file() else None
 
 
-def _check_configuration(settings: Settings, strategy_path: str | None) -> dict[str, object]:
+# ---------------------------------------------------------------------------
+# Hydration source resolution (Phase 8 multi-vendor fallback)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_hydration_source(settings: Settings, source: str | None) -> str:
+    """Resolve ``--backfill-source`` / ``Settings.hydration_source`` to a selector."""
+    resolved = str(source or settings.hydration_source).strip().lower()
+    if resolved not in HYDRATION_SOURCES:
+        raise HydrationError(
+            f"unknown hydration source {source!r}; expected one of {list(HYDRATION_SOURCES)}. "
+            + HYDRATION_SOURCE_HINTS
+        )
+    return resolved
+
+
+def _databento_configured(settings: Settings) -> bool:
+    """Whether a Databento API key is configured (``FUTURESRLX_DATABENTO_API_KEY``)."""
+    return settings.databento_api_key_value is not None
+
+
+def _ibkr_configured(settings: Settings) -> bool:
+    """Whether IBKR historical data can be used (paper/live environment configured)."""
+    return settings.environment in {"paper", "live"}
+
+
+def describe_hydration_sources(
+    settings: Settings,
+    *,
+    source: str | None = None,
+    offline_allowed: bool = False,
+) -> dict[str, object]:
+    """Describe the resolved multi-source hydration fallback (``--check`` output).
+
+    Returns the requested selector, the ordered list of sources that would be
+    tried, per-source availability, the reasons unavailable sources are skipped
+    and the actionable operator hints. Pure configuration inspection: nothing is
+    connected and no network call is made.
+    """
+    resolved = _resolve_hydration_source(settings, source)
+    available: dict[str, bool] = {
+        "databento": _databento_configured(settings),
+        "ibkr": _ibkr_configured(settings),
+        "offline": bool(offline_allowed or resolved == "offline"),
+    }
+    reasons: dict[str, str] = {}
+    if not available["databento"]:
+        reasons["databento"] = "FUTURESRLX_DATABENTO_API_KEY is not configured"
+    if not available["ibkr"]:
+        reasons["ibkr"] = (
+            "IBKR historical data requires FUTURESRLX_ENVIRONMENT=paper|live with TWS or IB "
+            "Gateway running and FUTURESRLX_IBKR_PORT set (paper 7497/4002, live 7496/4001)"
+        )
+    if not available["offline"]:
+        reasons["offline"] = (
+            "offline synthetic history is only used with --offline or --backfill-source offline"
+        )
+    if resolved == "auto":
+        order = [name for name in ("databento", "ibkr", "offline") if available[name]]
+    else:
+        order = [resolved]
+    return {
+        "requested": resolved,
+        "order": order,
+        "available": available,
+        "unavailable_reasons": reasons,
+        "databento_api_key_configured": available["databento"],
+        "ibkr_configured": available["ibkr"],
+        "offline_allowed": available["offline"],
+        "hints": HYDRATION_SOURCE_HINTS,
+    }
+
+
+def build_hydration_chain(
+    settings: Settings,
+    *,
+    repository: ParquetRepository,
+    instrument_master: InstrumentsConfig,
+    source: str | None = None,
+    offline_allowed: bool = False,
+    databento_fetch: BackfillFn | None = None,
+    ibkr_fetch: BackfillFn | None = None,
+    offline_fetch: BackfillFn | None = None,
+) -> MultiSourceBackfill:
+    """Build the ordered multi-vendor history fallback chain for hydration.
+
+    ``auto`` order: Databento (API key configured) -> IBKR historical (paper/live
+    configured) -> offline synthetic history (only when ``offline_allowed``). A
+    forced selector fills only that vendor; when it is unavailable the chain
+    builder fails closed with :data:`HYDRATION_SOURCE_HINTS`. The vendor callables
+    are injectable so tests never construct a real Databento/IBKR client.
+    """
+    resolved = _resolve_hydration_source(settings, source)
+    description = describe_hydration_sources(
+        settings, source=resolved, offline_allowed=offline_allowed
+    )
+    order = cast("list[str]", description["order"])
+    available = cast("dict[str, bool]", description["available"])
+    databento = databento_fetch
+    if databento is None and "databento" in order and available["databento"]:
+        from src.data.databento_loader import DatabentoLoader
+
+        databento = DatabentoLoader(
+            settings, repository=repository, instrument_master=instrument_master
+        ).ingest
+    ibkr = ibkr_fetch
+    if ibkr is None and "ibkr" in order and available["ibkr"]:
+        from src.data.ibkr_data import IBKRHistoricalBarFetcher
+
+        ibkr = IBKRHistoricalBarFetcher(
+            settings, instrument_master=instrument_master
+        ).fetch_bars_sync
+    offline = offline_fetch
+    if offline is None and "offline" in order and available["offline"]:
+        offline = offline_backfill
+    chain = build_backfill_chain(
+        databento=databento,
+        ibkr=ibkr,
+        offline=offline,
+        source=resolved,
+        offline_allowed=offline_allowed,
+    )
+    logger.info("hydration backfill chain resolved: %s", chain.sources or ("(none)",))
+    return chain
+
+
+def _check_configuration(
+    settings: Settings,
+    strategy_path: str | None,
+    *,
+    offline: bool = False,
+    backfill_source: str | None = None,
+) -> dict[str, object]:
     """Validate the runtime configuration without connecting to anything."""
     from configs.strategy import load_strategy_config
 
     from src.risk.contract_translator import ContractTranslator
     from src.risk.state_store import build_risk_state_store
 
-    master = settings.instruments
+    try:
+        master = settings.instruments
+    except (OSError, ValueError) as exc:
+        raise RunnerConfigError(f"could not load the instrument master: {exc}") from exc
+    repository = ParquetRepository(settings)
+    # ``--offline`` implies the synthetic source unless the operator forced one.
+    effective_source = (
+        "offline" if offline and backfill_source in (None, "auto") else backfill_source
+    )
+    resolved_source = _resolve_hydration_source(settings, effective_source)
+    offline_allowed = bool(offline or resolved_source == "offline")
+    description = describe_hydration_sources(
+        settings, source=resolved_source, offline_allowed=offline_allowed
+    )
+    # Building the chain only constructs vendor adapters (DatabentoLoader /
+    # IBKRHistoricalBarFetcher); it never connects, so --check stays offline.
+    chain = build_hydration_chain(
+        settings,
+        repository=repository,
+        instrument_master=master,
+        source=resolved_source,
+        offline_allowed=offline_allowed,
+    )
     summary: dict[str, object] = {
         "environment": settings.environment,
         "dry_run": True,
+        "offline": bool(offline),
+        "backfill_source": resolved_source,
         "instrument_roots": list(master.roots()),
         "account_currency": settings.account_currency,
         "fx_rates": dict(settings.fx_rates),
@@ -966,13 +1506,21 @@ def _check_configuration(settings: Settings, strategy_path: str | None) -> dict[
             "backfill_enabled": settings.hydration_backfill_enabled,
             "required_bars": MIN_REQUIRED_BARS,
         },
+        "hydration_sources": description,
+        "hydration_backfill_chain": list(chain.sources),
+        "hydration_backfill_ready": bool(chain),
     }
     store = build_risk_state_store(settings.risk_state_store_uri, duckdb_path=settings.duckdb_path)
     summary["state_store"] = type(store).__name__
     persisted = store.load()
     summary["kill_switch_locked"] = bool(persisted.kill_switch_locked) if persisted else False
     if strategy_path is not None:
-        config = load_strategy_config(strategy_path)
+        try:
+            config = load_strategy_config(strategy_path)
+        except (OSError, ValueError) as exc:
+            raise RunnerConfigError(
+                f"could not load the strategy configuration ({strategy_path!r}): {exc}"
+            ) from exc
         translator = ContractTranslator.from_config(config.translator, instruments=master)
         summary["strategy"] = {
             "id": config.id,
@@ -993,11 +1541,103 @@ def _check_configuration(settings: Settings, strategy_path: str | None) -> dict[
     return summary
 
 
+# ---------------------------------------------------------------------------
+# Production wiring (lazy heavy imports) and the deterministic offline loop
+# ---------------------------------------------------------------------------
+
+
+def _load_strategy(
+    settings: Settings, strategy_path: str | None
+) -> tuple[StrategyConfig, InstrumentsConfig]:
+    """Load the strategy config + instrument master (shared by both run modes)."""
+    from configs.strategy import load_strategy_config
+
+    if strategy_path is None:
+        raise RunnerConfigError(
+            f"--strategy is required (no default strategy YAML found in {settings.strategies_dir})"
+        )
+    try:
+        return load_strategy_config(strategy_path), settings.instruments
+    except (OSError, ValueError) as exc:
+        raise RunnerConfigError(
+            f"could not load the strategy/instrument configuration ({strategy_path!r}): {exc}"
+        ) from exc
+
+
+def _run_offline(settings: Settings, args: argparse.Namespace) -> RunnerStatus:
+    """Run the full runner loop against the deterministic offline stack.
+
+    ``--offline`` must work with an empty data directory and no credentials:
+    hydration backfills the synthetic history through the offline chain source,
+    the streamer replays fixed warm states and the simulated broker fills the
+    runner's target orders. No IBKR/Databento client is constructed.
+    """
+    from src.backtest.simulated_broker import SimulatedBroker
+    from src.risk.contract_translator import ContractTranslator
+    from src.risk.state_store import build_risk_state_store
+    from src.strategies.pipeline import build_pipeline
+
+    strategy_path = _strategy_path(settings, args.strategy)
+    config, master = _load_strategy(settings, strategy_path)
+    translator = ContractTranslator.from_config(
+        config.translator,
+        instruments=master,
+        account_currency=settings.account_currency,
+        fx_rates=settings.fx_rates,
+    )
+    pipeline = build_pipeline(config, master, translator=translator)
+    repository = ParquetRepository(settings)
+    state_store = build_risk_state_store(
+        settings.risk_state_store_uri, duckdb_path=settings.duckdb_path
+    )
+    end = OFFLINE_SIMULATION_END
+    history_start = end - timedelta(days=settings.hydration_lookback_days)
+    roots = _parse_roots(args.roots) or OFFLINE_DEFAULT_ROOTS
+    chain = build_hydration_chain(
+        settings,
+        repository=repository,
+        instrument_master=master,
+        source="offline",
+        offline_allowed=True,
+    )
+    hydrator = ColdStartHydrator(
+        repository=repository,
+        instrument_master=master,
+        lookback_days=settings.hydration_lookback_days,
+        backfill=chain,
+        backfill_enabled=True,
+        clock=lambda: end,
+    )
+    simulated = SimulatedBroker(master, initial_cash=OFFLINE_INITIAL_CASH, timestamp=history_start)
+    broker = OfflineTargetBroker(simulated_broker=simulated, instrument_master=master)
+    streamer = OfflineMarketStateStreamer(
+        roots=roots,
+        start=history_start,
+        end=end,
+        equity=OFFLINE_INITIAL_CASH,
+        instrument_master=master,
+        on_state=broker.update_market,
+    )
+    runner = TradingRunner(
+        settings=settings,
+        pipeline=pipeline,
+        streamer=streamer,
+        broker=broker,
+        hydrator=hydrator,
+        instrument_master=master,
+        translator=translator,
+        event_bus=None,
+        state_store=state_store,
+        clock=lambda: end,
+        dry_run=True,
+        prime_pipeline=True,
+    )
+    return asyncio.run(runner.run(roots=roots, max_states=args.max_states))
+
+
 def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # pragma: no cover
     """Build the production IBKR/Databento wiring lazily and run until stopped."""
-    from src.data.databento_loader import DatabentoLoader
     from src.data.ibkr_data import IBKRMarketDataStreamer
-    from src.data.storage import ParquetRepository
     from src.execution.ibkr_client import IBKRConnectionManager
     from src.execution.oms import OrderManagementSystem
     from src.risk.contract_translator import ContractTranslator
@@ -1005,20 +1645,29 @@ def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # 
     from src.strategies.pipeline import build_pipeline
 
     strategy_path = _strategy_path(settings, args.strategy)
-    if strategy_path is None:
-        raise RunnerConfigError(
-            "--strategy is required for a live run (no default strategy YAML found in "
-            f"{settings.strategies_dir})"
-        )
-    from configs.strategy import load_strategy_config
-
-    master = settings.instruments
-    config = load_strategy_config(strategy_path)
+    config, master = _load_strategy(settings, strategy_path)
     repository = ParquetRepository(settings)
-    manager = IBKRConnectionManager(settings, instrument_master=master)
     state_store = build_risk_state_store(
         settings.risk_state_store_uri, duckdb_path=settings.duckdb_path
     )
+    offline_allowed = bool(
+        args.backfill_source == "offline" or settings.hydration_source == "offline"
+    )
+    chain = build_hydration_chain(
+        settings,
+        repository=repository,
+        instrument_master=master,
+        source=args.backfill_source,
+        offline_allowed=offline_allowed,
+    )
+    hydrator = ColdStartHydrator(
+        repository=repository,
+        instrument_master=master,
+        lookback_days=settings.hydration_lookback_days,
+        backfill=chain if settings.hydration_backfill_enabled else None,
+        backfill_enabled=settings.hydration_backfill_enabled,
+    )
+    manager = IBKRConnectionManager(settings, instrument_master=master)
     oms = OrderManagementSystem(
         manager=manager,
         settings=settings,
@@ -1040,14 +1689,11 @@ def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # 
         )
     except Exception as exc:  # pragma: no cover - defensive production wiring
         logger.error("quant risk overlay could not be wired into the live pipeline: %s", exc)
-    pipeline = build_pipeline(config, master, translator=translator, risk_overlays=overlays)
-    loader = DatabentoLoader(settings, repository=repository, instrument_master=master)
-    hydrator = ColdStartHydrator(
-        repository=repository,
-        instrument_master=master,
-        lookback_days=settings.hydration_lookback_days,
-        backfill=loader.ingest,
-        backfill_enabled=settings.hydration_backfill_enabled,
+    pipeline = build_pipeline(
+        config,
+        master,
+        translator=translator,
+        risk_overlays=overlays,
     )
     streamer = IBKRMarketDataStreamer(settings, instrument_master=master)
     runner = TradingRunner(
@@ -1065,8 +1711,21 @@ def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # 
     return asyncio.run(runner.run(roots=_parse_roots(args.roots), max_states=args.max_states))
 
 
+def _print_cli_failure(exc: BaseException) -> None:
+    """Print an actionable CLI error block (never a raw traceback) to stderr."""
+    message = str(exc).strip() or type(exc).__name__
+    lines = [f"futuresrl-runner: error: {message}"]
+    # Hydration failures are the ones an operator fixes by choosing a history
+    # source, so only they get the vendor-setup hints (avoid noisy duplicates when
+    # the chain message already embeds them).
+    if isinstance(exc, HydrationError) and HYDRATION_SOURCE_HINTS not in message:
+        lines.append(HYDRATION_SOURCE_HINTS)
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.stderr.flush()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point: ``--check`` validates config offline, otherwise it trades."""
+    """CLI entry point: ``--check`` validates config, ``--offline`` runs a demo."""
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     settings = get_settings()
@@ -1075,12 +1734,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    if args.check:
-        summary = _check_configuration(settings, _strategy_path(settings, args.strategy))
-        json.dump(summary, sys.stdout, indent=2, sort_keys=True, default=str)
-        sys.stdout.write("\n")
-        return 0
-    status = _run_live(settings, args)  # pragma: no cover - requires IBKR/TWS
+    try:
+        if args.max_states is not None and args.max_states < 1:
+            raise RunnerConfigError(
+                f"--max-states must be a positive integer, got {args.max_states}"
+            )
+        if args.check:
+            summary = _check_configuration(
+                settings,
+                _strategy_path(settings, args.strategy),
+                offline=args.offline,
+                backfill_source=args.backfill_source,
+            )
+            json.dump(summary, sys.stdout, indent=2, sort_keys=True, default=str)
+            sys.stdout.write("\n")
+            return 0
+        if args.offline and args.backfill_source not in (None, "auto", "offline"):
+            raise RunnerConfigError(
+                "--offline replays the deterministic synthetic stack and cannot be combined "
+                f"with --backfill-source={args.backfill_source}; use --backfill-source offline "
+                "or omit it"
+            )
+        status = _run_offline(settings, args) if args.offline else _run_live(settings, args)
+    except (HydrationError, RunnerConfigError) as exc:
+        _print_cli_failure(exc)
+        return 2
     json.dump(status.as_dict(), sys.stdout, indent=2, sort_keys=True, default=str)
     sys.stdout.write("\n")
     return 0 if not status.halted else 1

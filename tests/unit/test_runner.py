@@ -282,6 +282,7 @@ def make_runner(
     clock: FakeClock | None = None,
     halt_on_error: bool = False,
     dry_run: bool = True,
+    prime_pipeline: bool = False,
     events: list[str] | None = None,
 ) -> tuple[TradingRunner, dict[str, Any]]:
     ordered_events: list[str] = events if events is not None else []
@@ -308,6 +309,7 @@ def make_runner(
         clock=clock if clock is not None else FakeClock(FIXED_TIMESTAMP),
         halt_on_error=halt_on_error,
         dry_run=dry_run,
+        prime_pipeline=prime_pipeline,
     )
     return runner, components
 
@@ -339,6 +341,29 @@ async def test_warm_start_runs_before_the_first_streamed_state(settings: Setting
     assert targets == make_contract_targets({"ES": 1})
     assert current_positions == {}
     assert timestamp == FIXED_TIMESTAMP
+
+
+async def test_prime_pipeline_runs_warm_up_without_submitting_orders(
+    settings: Settings,
+) -> None:
+    bus, events = telemetry_bus()
+    runner, fakes = make_runner(
+        settings,
+        states=single_state_states(1),
+        event_bus=bus,
+        prime_pipeline=True,
+    )
+    status = await runner.run(roots=("ES",))
+    assert status.halted is False
+    assert status.states_processed == 1
+    # One pipeline run for the hydrated warm state + one for the live state ...
+    assert len(fakes["pipeline"].calls) == 2
+    # ... but priming must never submit orders.
+    assert len(fakes["broker"].submitted) == 1
+    warmups = [event for event in events if event.kind == "pipeline_warmup"]
+    assert len(warmups) == 1
+    assert warmups[0].values["equity"] == pytest.approx(1_000_000.0)
+    assert warmups[0].values["account_currency"] == "USD"
 
 
 async def test_hydrator_receives_the_requested_roots_and_as_of(settings: Settings) -> None:
@@ -662,6 +687,16 @@ def test_check_configuration_is_offline_and_complete(
     assert summary["hydration_required_lookback_days"] == 374
     assert summary["hydration_lookback_adequate"] is True
     assert summary["hydration"]["backfill_enabled"] is True
+    # Phase-8 multi-source hydration summary.
+    assert summary["offline"] is False
+    assert summary["backfill_source"] == "auto"
+    sources = summary["hydration_sources"]
+    assert isinstance(sources, dict)
+    assert sources["requested"] == "auto"
+    assert sources["order"] == []
+    assert sources["databento_api_key_configured"] is False
+    assert summary["hydration_backfill_chain"] == []
+    assert summary["hydration_backfill_ready"] is False
 
 
 def test_check_configuration_without_a_strategy(settings: Settings) -> None:

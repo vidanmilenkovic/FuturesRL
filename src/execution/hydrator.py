@@ -44,6 +44,20 @@ holidays and the occasional short week.) The effective window is
 default :data:`src.data.schema.DEFAULT_BAR_SCHEMA`), which is the hydration
 frequency the live strategies decide on.
 
+Multi-source backfill (Phase 8)
+-------------------------------
+A cold start should not depend on one vendor. :class:`MultiSourceBackfill` is a
+:data:`BackfillFn` that tries an ordered chain of history providers and returns
+the first canonical frame covering each root:
+``auto`` = Databento (API key) -> IBKR historical (paper/live) -> offline
+synthetic history (only when the operator explicitly allows it, e.g.
+``--offline``); a forced ``--backfill-source databento|ibkr|offline`` fails
+closed with :data:`HYDRATION_SOURCE_HINTS` when that source is unavailable.
+Sources that only expose a single series per root (IBKR continuous futures, the
+seeded offline source) are given a neutrally-priced second expiration
+(:func:`add_neutral_term_structure`) so ``term_slope``/``carry_annualized`` are
+``0.0`` instead of ``NaN``; the assumption is logged as a warning.
+
 Determinism
 -----------
 Hydration is pure given the repository contents, ``as_of`` and the injected
@@ -75,11 +89,19 @@ from src.data.storage import ParquetRepository, StorageError
 __all__ = [
     "CALENDAR_SAFETY_DAYS",
     "DEFAULT_MAX_WARMUP_STATES",
+    "HYDRATION_SOURCES",
+    "HYDRATION_SOURCE_HINTS",
     "MIN_REQUIRED_BARS",
+    "NEUTRAL_TERM_STRUCTURE_DAYS",
     "BackfillFn",
+    "BackfillSource",
     "ColdStartHydrator",
     "HydrationError",
     "HydrationResult",
+    "MultiSourceBackfill",
+    "add_neutral_term_structure",
+    "build_backfill_chain",
+    "offline_backfill",
 ]
 
 logger = logging.getLogger(__name__)
@@ -795,3 +817,358 @@ def _utc_now() -> datetime:
 def _is_finite(value: float | None) -> bool:
     """Whether ``value`` is a finite real number."""
     return value is not None and math.isfinite(float(value))
+
+
+# ---------------------------------------------------------------------------
+# Multi-source backfill chain (Phase 8)
+# ---------------------------------------------------------------------------
+#
+# A production cold start should not depend on a single vendor. The chain below
+# tries sources in a configured order and returns the first canonical frame that
+# covers each requested root:
+#
+#     auto:     Databento (API key configured) -> IBKR historical (paper/live
+#               environment reachable) -> OfflineBarSource (only when the
+#               operator explicitly allows offline history, e.g. ``--offline``)
+#     databento/ibkr/offline: force that single source (fail closed when it is
+#               not configured instead of silently trading on another vendor).
+#
+# The chain itself is dependency-free: the concrete vendors are injected as
+# :data:`BackfillFn` callables, so production wiring (and tests) stay offline.
+
+#: Supported hydration backfill source selectors (mirrors ``Settings.hydration_source``).
+HYDRATION_SOURCES: tuple[str, ...] = ("auto", "databento", "ibkr", "offline")
+
+#: Calendar days between a real expiration and the neutrally-priced synthetic
+#: next expiration added when a source only exposes a single series per root.
+NEUTRAL_TERM_STRUCTURE_DAYS: int = 90
+
+#: Actionable guidance appended to every source-availability failure. The CLI
+#: also prints this block so an operator never sees a bare traceback.
+HYDRATION_SOURCE_HINTS: str = (
+    "Options: (1) rerun with --offline for deterministic synthetic history; "
+    "(2) start IBKR TWS or IB Gateway and export FUTURESRLX_ENVIRONMENT=paper|live plus "
+    "FUTURESRLX_IBKR_PORT (paper 7497/4002, live 7496/4001); "
+    "(3) set FUTURESRLX_DATABENTO_API_KEY for Databento GLBX.MDP3 history."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillSource:
+    """One named history provider in a :class:`MultiSourceBackfill` chain."""
+
+    name: str
+    fetch: BackfillFn
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("BackfillSource.name must be a non-empty string")
+        if not callable(self.fetch):
+            raise TypeError("BackfillSource.fetch must be a callable")
+
+
+def _normalise_backfill_frame(frame: object, *, source: str) -> pl.DataFrame:
+    """Validate one source response and neutralise a missing term structure.
+
+    Every source must return canonical bars; a source that exposes only one
+    series per root (continuous/front-month history such as IBKR's continuous
+    futures or the synthetic offline source) cannot provide ``term_slope`` /
+    ``carry_annualized``. Rather than allowing ``NaN`` to poison the warm-up,
+    a neutrally-priced next expiration is added (flat curve, ``term_slope = 0``)
+    and the assumption is logged.
+    """
+    if not isinstance(frame, pl.DataFrame):
+        raise HydrationError(
+            f"hydration source {source!r} must return a polars DataFrame, got {type(frame)!r}"
+        )
+    validated = s.ensure_bars_schema(frame, context=f"hydration-source[{source}]")
+    if validated.is_empty():
+        return validated
+    return add_neutral_term_structure(validated, context=f"hydration-source[{source}]")
+
+
+def add_neutral_term_structure(frame: pl.DataFrame, *, context: str = "hydration") -> pl.DataFrame:
+    """Make the required term-structure features computable for single-series data.
+
+    ``FeatureProcessor`` derives ``term_slope = (F2 - F1) / F1`` and
+    ``carry_annualized`` from the front and second contract observed at the same
+    timestamp. A source that only ever returns one expiration per root therefore
+    produces ``NaN`` for two :data:`src.data.schema.REQUIRED_FEATURES` and the
+    hydrator fails closed. For every ``(root, timestamp)`` that has exactly one
+    expiration this function appends a neutrally-priced next expiration
+    (:data:`NEUTRAL_TERM_STRUCTURE_DAYS` further out, identical OHLC), so the
+    implied curve is flat and the features are ``0.0`` instead of ``NaN``.
+
+    This is an explicit *neutral assumption*, never a directional carry signal:
+    sources that provide a real second expiration (e.g. Databento ``parent``
+    symbology) are returned unchanged.
+    """
+    validated = s.ensure_bars_schema(frame, context=context)
+    if validated.is_empty():
+        return validated
+    missing_expiration = validated.filter(pl.col(s.EXPIRATION_COLUMN).is_null()).height
+    if missing_expiration:
+        raise HydrationError(
+            f"{context}: {missing_expiration} rows have no expiration_date; a canonical "
+            "history source must stamp the contract expiry so term-structure features can "
+            "be derived"
+        )
+    counts = validated.group_by([s.ROOT_SYMBOL_COLUMN, s.TIMESTAMP_COLUMN]).agg(
+        pl.col(s.EXPIRATION_COLUMN).n_unique().alias("_expirations")
+    )
+    single = counts.filter(pl.col("_expirations") == 1).select(
+        [s.ROOT_SYMBOL_COLUMN, s.TIMESTAMP_COLUMN]
+    )
+    if single.is_empty():
+        return validated
+    next_leg = (
+        validated.join(single, on=[s.ROOT_SYMBOL_COLUMN, s.TIMESTAMP_COLUMN], how="inner")
+        .with_columns(
+            pl.col(s.EXPIRATION_COLUMN)
+            .dt.offset_by(f"{NEUTRAL_TERM_STRUCTURE_DAYS}d")
+            .alias(s.EXPIRATION_COLUMN),
+            (pl.col(s.INSTRUMENT_ID_COLUMN) + "_NEXT").alias(s.INSTRUMENT_ID_COLUMN),
+            (pl.col(s.VOLUME_COLUMN) * 0.5).alias(s.VOLUME_COLUMN),
+            (pl.col(s.OPEN_INTEREST_COLUMN) * 0.5).alias(s.OPEN_INTEREST_COLUMN),
+        )
+        .select(validated.columns)
+    )
+    augmented = s.ensure_bars_schema(
+        pl.concat([validated, next_leg], how="vertical_relaxed"),
+        context=f"{context}/term-structure",
+    ).sort(list(s.BAR_KEY_COLUMNS))
+    logger.warning(
+        "%s: %d root/timestamp row(s) had a single expiration; added neutrally-priced "
+        "next-expiration rows so term_slope/carry_annualized are 0.0 instead of NaN",
+        context,
+        single.height,
+    )
+    return augmented
+
+
+def offline_backfill(roots: Sequence[InstrumentId], start: datetime, end: datetime) -> pl.DataFrame:
+    """Deterministic synthetic history for ``--offline`` mode.
+
+    Uses the seeded :class:`~src.data.databento_loader.OfflineBarSource` (clearly
+    synthetic: contract ids carry the ``_SYN`` suffix) and adds the neutral
+    second expiration required by the warm-up validation. No network access.
+    """
+    from src.data.databento_loader import OfflineBarSource
+
+    if end <= start:
+        raise HydrationError(
+            f"offline backfill needs end ({end.isoformat()}) after start ({start.isoformat()})"
+        )
+    source = OfflineBarSource(roots, periods=2, start=start)
+    frame = source.load(roots, start, end)
+    return add_neutral_term_structure(frame, context="offline-backfill")
+
+
+class MultiSourceBackfill:
+    """Ordered fallback chain of hydration history providers.
+
+    Implements the :data:`BackfillFn` signature so it can be injected directly
+    into :class:`ColdStartHydrator`. Sources are tried in order; a source that
+    errors, returns an empty/unusable frame or misses roots is logged as a
+    fallback warning and the next source is attempted. Only when every root is
+    still uncovered does the chain raise :class:`HydrationError` — with the
+    per-source failure reasons and :data:`HYDRATION_SOURCE_HINTS`.
+    """
+
+    def __init__(self, sources: Sequence[BackfillSource], *, label: str = "hydration") -> None:
+        if not isinstance(label, str) or not label:
+            raise ValueError("label must be a non-empty string")
+        self._sources = tuple(sources)
+        self._label = label
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        """Source names in fallback order."""
+        return tuple(source.name for source in self._sources)
+
+    def __bool__(self) -> bool:
+        return bool(self._sources)
+
+    def __len__(self) -> int:
+        return len(self._sources)
+
+    def __repr__(self) -> str:
+        return f"MultiSourceBackfill({self.sources!r})"
+
+    def __call__(
+        self,
+        roots: Sequence[InstrumentId],
+        start: datetime,
+        end: datetime,
+    ) -> pl.DataFrame:
+        """Fetch every requested root from the first source(s) that can supply it."""
+        requested = tuple(roots)
+        if not requested:
+            raise HydrationError("hydration backfill requires at least one root")
+        if not self._sources:
+            raise HydrationError(
+                "no hydration backfill source is available: Databento is not configured, IBKR "
+                "is not configured (paper/live only) and offline history was not allowed. "
+                + HYDRATION_SOURCE_HINTS
+            )
+        missing = requested
+        frames: list[pl.DataFrame] = []
+        failures: list[str] = []
+        for source in self._sources:
+            if not missing:
+                break
+            try:
+                raw = source.fetch(missing, start, end)
+                frame = _normalise_backfill_frame(raw, source=source.name)
+            except HydrationError as exc:
+                failures.append(f"{source.name}: {exc}")
+                logger.warning(
+                    "%s source %r could not backfill %s (%s); falling back",
+                    self._label,
+                    source.name,
+                    list(missing),
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                failures.append(f"{source.name}: {type(exc).__name__}: {exc}")
+                logger.warning(
+                    "%s source %r failed for %s (%s: %s); falling back",
+                    self._label,
+                    source.name,
+                    list(missing),
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            if frame.is_empty():
+                failures.append(f"{source.name}: returned no rows")
+                logger.warning(
+                    "%s source %r returned no rows for %s; falling back",
+                    self._label,
+                    source.name,
+                    list(missing),
+                )
+                continue
+            present = {str(root) for root in frame[s.ROOT_SYMBOL_COLUMN].unique().to_list()}
+            supplied = tuple(root for root in missing if root in present)
+            if not supplied:
+                failures.append(f"{source.name}: returned no rows for the requested roots")
+                logger.warning(
+                    "%s source %r returned no rows for any of %s; falling back",
+                    self._label,
+                    source.name,
+                    list(missing),
+                )
+                continue
+            frames.append(frame.filter(pl.col(s.ROOT_SYMBOL_COLUMN).is_in(list(supplied))))
+            missing = tuple(root for root in missing if root not in present)
+            logger.info(
+                "%s source %r supplied %d row(s) for roots %s",
+                self._label,
+                source.name,
+                frame.height,
+                list(supplied),
+            )
+            if missing:
+                logger.warning(
+                    "%s source %r returned no history for roots %s; falling back",
+                    self._label,
+                    source.name,
+                    list(missing),
+                )
+        if missing:
+            raise HydrationError(
+                "no hydration source could supply history for roots "
+                f"{list(missing)!r} between {start.isoformat()} and {end.isoformat()}: "
+                + ("; ".join(failures) if failures else "no source was configured")
+                + ". "
+                + HYDRATION_SOURCE_HINTS
+            )
+        if len(frames) == 1:
+            return frames[0]
+        return s.ensure_bars_schema(
+            pl.concat(frames, how="vertical_relaxed"), context=f"{self._label}-chain"
+        ).sort(list(s.BAR_KEY_COLUMNS))
+
+
+def build_backfill_chain(
+    *,
+    databento: BackfillFn | None = None,
+    ibkr: BackfillFn | None = None,
+    offline: BackfillFn | None = None,
+    source: str = "auto",
+    offline_allowed: bool = False,
+) -> MultiSourceBackfill:
+    """Compose the ordered fallback chain for a hydration ``source`` selector.
+
+    Parameters
+    ----------
+    databento, ibkr, offline:
+        Vendor backfill callables. ``None`` means the vendor is not configured
+        (or was intentionally not wired); it is skipped in ``auto`` mode and
+        makes that source unavailable in forced mode.
+    source:
+        ``auto`` (Databento -> IBKR -> offline-if-allowed) or a forced vendor
+        (``databento`` / ``ibkr`` / ``offline``).
+    offline_allowed:
+        Whether synthetic offline history may be used as a fallback. ``True``
+        for ``--offline`` / ``FUTURESRLX_HYDRATION_SOURCE=offline`` or when the
+        operator explicitly opts in; never silently enabled.
+
+    Raises
+    ------
+    HydrationError
+        When an explicitly forced source is not configured (fail closed with
+        :data:`HYDRATION_SOURCE_HINTS`) or the selector is unknown.
+    """
+    resolved = str(source or "auto").strip().lower()
+    if resolved not in HYDRATION_SOURCES:
+        raise HydrationError(
+            f"unknown hydration source {source!r}; expected one of {list(HYDRATION_SOURCES)}. "
+            + HYDRATION_SOURCE_HINTS
+        )
+    configured: dict[str, BackfillFn | None] = {
+        "databento": databento,
+        "ibkr": ibkr,
+        "offline": offline,
+    }
+    if resolved != "auto":
+        if configured[resolved] is None:
+            reasons = {
+                "databento": (
+                    "FUTURESRLX_DATABENTO_API_KEY is not configured (the Databento SDK/API "
+                    "key is required to fetch GLBX.MDP3 history)"
+                ),
+                "ibkr": (
+                    "IBKR historical data requires a paper/live environment with TWS or IB "
+                    "Gateway running: set FUTURESRLX_ENVIRONMENT=paper|live and "
+                    "FUTURESRLX_IBKR_PORT (paper 7497/4002, live 7496/4001)"
+                ),
+                "offline": (
+                    "no offline history provider is wired; offline history is only used with "
+                    "--offline or --backfill-source offline"
+                ),
+            }
+            raise HydrationError(
+                f"forced hydration source {resolved!r} is unavailable: {reasons[resolved]}. "
+                + HYDRATION_SOURCE_HINTS
+            )
+        order: list[str] = [resolved]
+    else:
+        order = ["databento", "ibkr"]
+        if offline_allowed:
+            order.append("offline")
+    sources = [
+        BackfillSource(name=name, fetch=fetch)
+        for name in order
+        if (fetch := configured[name]) is not None
+    ]
+    chain = MultiSourceBackfill(sources)
+    if not sources:
+        logger.warning(
+            "no hydration backfill source is configured (auto mode); a cold repository "
+            "cannot be warmed. %s",
+            HYDRATION_SOURCE_HINTS,
+        )
+    return chain
