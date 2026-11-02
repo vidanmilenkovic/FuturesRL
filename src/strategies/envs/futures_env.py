@@ -41,6 +41,28 @@ penalty is expressed in the same dimensionless units as the spec's
 ``sum_i |w_i|`` term. ``reward_scaling`` lets a trainer scale the PnL term
 without touching the risk penalty.
 
+Observation space
+-----------------
+The observation Box is **finite and bounded** (``[-1e6, +1e6]``, ``float32``)
+rather than the usual unbounded ``[-inf, +inf]`` Box:
+
+* ``gymnasium.utils.env_checker.check_env`` warns that infinite observation
+  bounds are "probably too low / too high" — an unbounded Box cannot be sampled,
+  validated or normalised meaningfully;
+* Stable-Baselines3 observation normalisation (``VecNormalize`` / the ``MlpPolicy``
+  feature extractor) expects a finite, bounded observation space; advertising
+  ``+/-inf`` asks the trainer to normalise a range that does not exist;
+* ``1e6`` is a **non-binding sentinel**, not a modelling choice: realistic futures
+  features (returns, volatilities, term slopes, carry, order-flow imbalance), held
+  weights (``|w| <= max_gross_leverage``) and the equity ratio (near ``1``) are
+  orders of magnitude below it, so clipping never changes a realistic observation.
+  Pathological inputs (data spikes, numerical overflow in a feature pipeline) are
+  clipped into the space, so a policy can never observe an out-of-space value.
+
+Every observation returned by :meth:`reset`, :meth:`step` and the internal
+:meth:`_observation` builder is clipped into those bounds and cast to ``float32``
+(the Box dtype), so ``observation_space.contains(observation)`` always holds.
+
 Determinism
 -----------
 There is no stochasticity: ``reset(seed=...)`` restarts at the first bar with a
@@ -73,8 +95,13 @@ from src.strategies._risk import (
 #: Minimum equity below which the account is treated as bankrupt (fraction).
 DEFAULT_BANKRUPTCY_THRESHOLD: float = 0.20
 
+#: Symmetric finite bound of the observation Box (see the *Observation space* notes).
+#: Non-binding for realistic futures features; exists so the Box is finite and the
+#: Gymnasium / Stable-Baselines3 warnings about +/-inf bounds disappear.
+OBSERVATION_BOUND: float = 1_000_000.0
 
-class FuturesTradingEnv(gymnasium.Env[NDArray[np.float64], NDArray[np.float32]]):
+
+class FuturesTradingEnv(gymnasium.Env[NDArray[np.float32], NDArray[np.float32]]):
     """Margin-aware continuous-action futures portfolio environment."""
 
     def __init__(
@@ -209,8 +236,15 @@ class FuturesTradingEnv(gymnasium.Env[NDArray[np.float64], NDArray[np.float32]])
         self._reward_scaling = float(reward_scaling)
 
         observation_size = observation_dimension(asset_count, self._features.shape[2])
+        # Finite, bounded observation Box: an unbounded Box makes gymnasium's
+        # check_env warn about +/-inf bounds and gives Stable-Baselines3 observation
+        # normalisation nothing to normalise against. ``OBSERVATION_BOUND`` is a
+        # non-binding sentinel for realistic futures features (see module docstring).
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(observation_size,), dtype=np.float64
+            low=-OBSERVATION_BOUND,
+            high=OBSERVATION_BOUND,
+            shape=(observation_size,),
+            dtype=np.float32,
         )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(asset_count,), dtype=np.float32)
 
@@ -286,14 +320,26 @@ class FuturesTradingEnv(gymnasium.Env[NDArray[np.float64], NDArray[np.float32]])
 
     # -- observation ----------------------------------------------------------
 
-    def _observation(self) -> NDArray[np.float64]:
+    def _clip_observation(self, observation: NDArray[np.float64]) -> NDArray[np.float32]:
+        """Clip a raw observation into the finite Box bounds and cast to its dtype."""
+        clipped = np.clip(observation, -OBSERVATION_BOUND, OBSERVATION_BOUND)
+        return np.asarray(clipped, dtype=np.float32)
+
+    def _observation(self) -> NDArray[np.float32]:
+        """Observe the current bar: features, held weights and equity ratio.
+
+        The observation is always clipped into ``observation_space`` (finite
+        ``[-1e6, +1e6]`` bounds, ``float32``) so extreme feature values or an
+        extreme equity ratio can never produce an out-of-space observation.
+        """
         index = min(self._index, self._step_count - 1)
         features = self._features[index]
-        return observation_from_components(
+        raw = observation_from_components(
             features,
             self._weights,
             equity_ratio=self._equity / self._initial_equity,
         )
+        return self._clip_observation(raw)
 
     def _info(self) -> dict[str, Any]:
         equity = self._equity
@@ -313,7 +359,7 @@ class FuturesTradingEnv(gymnasium.Env[NDArray[np.float64], NDArray[np.float32]])
         *,
         seed: int | None = None,
         options: dict[str, Any] | None = None,
-    ) -> tuple[NDArray[np.float64], dict[str, Any]]:
+    ) -> tuple[NDArray[np.float32], dict[str, Any]]:
         """Restart the episode at bar zero with a flat, fully funded book."""
         super().reset(seed=seed)
         self._index = 0
@@ -350,7 +396,7 @@ class FuturesTradingEnv(gymnasium.Env[NDArray[np.float64], NDArray[np.float32]])
         risk_assessments: Sequence[RiskAssessment]
         | Mapping[InstrumentId, RiskAssessment]
         | None = None,
-    ) -> tuple[NDArray[np.float64], float, bool, bool, dict[str, Any]]:
+    ) -> tuple[NDArray[np.float32], float, bool, bool, dict[str, Any]]:
         """Rebalance to ``action``, then mark the book to the next bar."""
         if self._finished:
             raise RuntimeError("step() called after the episode ended; call reset() first")
@@ -465,4 +511,9 @@ class FuturesTradingEnv(gymnasium.Env[NDArray[np.float64], NDArray[np.float32]])
         return self._observation(), float(reward), terminated, truncated, info
 
 
-__all__ = ["DEFAULT_BANKRUPTCY_THRESHOLD", "DEFAULT_OBSERVATION_FEATURES", "FuturesTradingEnv"]
+__all__ = [
+    "DEFAULT_BANKRUPTCY_THRESHOLD",
+    "DEFAULT_OBSERVATION_FEATURES",
+    "OBSERVATION_BOUND",
+    "FuturesTradingEnv",
+]

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 from gymnasium.utils.env_checker import check_env
 from src.core.types import RiskAssessment
 from src.strategies.envs import FuturesTradingEnv
+from src.strategies.envs.futures_env import OBSERVATION_BOUND
 
 from tests.fixtures.market import make_risk_assessment
 
@@ -58,7 +61,7 @@ def test_spaces_and_properties() -> None:
     assert env.feature_names == ("a", "b", "c")
     assert env.observation_space.shape == (2 * 3 + 2 + 1,)
     assert env.action_space.shape == (2,)
-    assert env.observation_space.dtype == np.float64
+    assert env.observation_space.dtype == np.float32
     assert env.action_space.dtype == np.float32
     assert env.action_space.low.min() == -1.0
     assert env.action_space.high.max() == 1.0
@@ -97,6 +100,86 @@ def test_observation_dimension_without_features() -> None:
     assert env.observation_space.shape == (2 + 1,)
     observation, _ = env.reset(seed=3)
     assert observation.shape == (3,)
+
+
+# ---------------------------------------------------------------------------
+# Finite observation space (no +/-inf bounds) and bound clipping
+# ---------------------------------------------------------------------------
+
+
+def test_observation_space_has_finite_float32_bounds() -> None:
+    """The Box must be finite/float32 so gymnasium and sb3 need no inf-bound warnings."""
+    env = _base_env()
+    space = env.observation_space
+    assert OBSERVATION_BOUND == 1_000_000.0
+    assert space.dtype == np.float32
+    assert space.low.dtype == np.float32
+    assert space.high.dtype == np.float32
+    assert np.all(np.isfinite(space.low))
+    assert np.all(np.isfinite(space.high))
+    assert np.all(space.low == -1_000_000.0)
+    assert np.all(space.high == 1_000_000.0)
+    observation, _ = env.reset(seed=0)
+    assert observation.dtype == np.float32
+    assert space.contains(observation)
+    observation, _, _, _, _ = env.step(_action(1.0, -1.0))
+    assert observation.dtype == np.float32
+    assert space.contains(observation)
+
+
+def test_gymnasium_check_env_emits_zero_warnings() -> None:
+    """check_env must emit no warnings (the old infinite bounds produced two).
+
+    Gymnasium warns "A Box observation space minimum value is -infinity ..." and
+    "... maximum value is infinity ..." for unbounded Box spaces; both must be gone.
+    """
+    steps = PRICES.shape[0]
+    features = np.arange(steps * 2 * 2, dtype=np.float64).reshape(steps, 2, 2)
+    for env in (_base_env(features=features, feature_names=("ret_1d", "vol_20d")), _base_env()):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            check_env(env, skip_render_check=True)
+        assert [str(warning.message) for warning in caught] == []
+
+
+def test_extreme_feature_values_are_clipped_into_bounds() -> None:
+    steps = PRICES.shape[0]
+    extreme = np.empty((steps, 2, 2), dtype=np.float64)
+    extreme[..., 0] = 1e30
+    extreme[..., 1] = -1e30
+    env = _base_env(features=extreme)
+    observation, _ = env.reset(seed=0)
+    assert env.observation_space.contains(observation)
+    assert observation[:4].tolist() == [1e6, -1e6, 1e6, -1e6]
+    observation, _, _, _, _ = env.step(_action(1.0, -1.0))
+    assert env.observation_space.contains(observation)
+    assert observation[:4].tolist() == [1e6, -1e6, 1e6, -1e6]
+
+
+def test_extreme_equity_ratio_is_clipped_into_bounds() -> None:
+    extreme_prices = np.array(
+        [[100.0, 50.0], [100.0, 50.0], [1e12, 50.0], [1e12, 50.0]], dtype=np.float64
+    )
+    env = FuturesTradingEnv(
+        prices=extreme_prices,
+        instrument_ids=IDS,
+        multipliers=(1.0, 1.0),
+        tick_sizes=(0.01, 0.01),
+        max_gross_leverage=1.0,
+        drawdown_limit=1.0,
+        bankruptcy_threshold=0.0,
+    )
+    env.reset(seed=0)
+    # The first bar is flat; the +10,000,000,000% jump happens on the second step.
+    env.step(_action(1.0, 0.0))
+    observation, _, terminated, truncated, info = env.step(_action(1.0, 0.0))
+    assert terminated is False
+    assert truncated is False
+    # The raw equity ratio is astronomically large; the observation is clipped to
+    # the finite Box upper bound so it always lies inside the observation space.
+    assert info["equity_ratio"] > OBSERVATION_BOUND
+    assert observation[-1] == np.float32(OBSERVATION_BOUND)
+    assert env.observation_space.contains(observation)
 
 
 # ---------------------------------------------------------------------------
