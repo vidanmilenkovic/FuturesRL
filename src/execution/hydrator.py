@@ -1,0 +1,797 @@
+"""Cold-start state hydration: warm every indicator before the first live bar.
+
+A live/paper trading session that starts from an empty process has **no history**.
+Every strategy feature the FinRL-X pipeline consumes (``ret_126d``, ``vol_20d``,
+the EWMA covariance used by volatility targeting, ``term_slope``, ...) needs a
+trailing window of bars; feeding the first live IBKR bar into a cold pipeline
+produces ``NaN`` features, a missing covariance matrix and therefore an
+un-sizable target book. In production that failure mode is silent: the pipeline
+either raises deep inside a strategy stage or, worse, trades a degenerate book.
+
+:class:`ColdStartHydrator` closes that gap. It rebuilds the exact point-in-time
+:class:`~src.core.types.MarketState` warm-up window the pipeline would have
+observed had the process been running for the whole lookback period:
+
+1. read canonical bars for the requested roots from the durable
+   :class:`~src.data.storage.ParquetRepository` over the lookback window,
+2. if a root's stored coverage is short, optionally invoke an injected
+   :data:`BackfillFn` (production wiring: ``DatabentoLoader.ingest`` or an IBKR
+   ``reqHistoricalData`` fetch; tests inject a deterministic fake), validate the
+   returned frame with :func:`src.data.schema.ensure_bars_schema`, persist it,
+   and re-read the window,
+3. compute the canonical features with
+   :class:`~src.data.feature_processor.FeatureProcessor`,
+4. build one :class:`~src.core.types.MarketState` per bar timestamp (plus a final
+   state at ``as_of``) with :class:`~src.data.market_state_builder.MarketStateBuilder`,
+5. validate the warm-up **on the final state**: every
+   :data:`src.data.schema.REQUIRED_FEATURES` value finite for every root, an EWMA
+   covariance matrix present with aligned instruments, and a non-empty trailing
+   return window. Anything less raises :class:`HydrationError` — the trader must
+   fail closed rather than start cold.
+
+Coverage contract
+-----------------
+At least ``max(260, min_bars_per_root)`` **observed bars per root** are required.
+Because futures data is sparse (weekends, CME holidays), a calendar-day window
+is derived from that bar count::
+
+    required_lookback = ceil(required_bars * 7 / 5) + CALENDAR_SAFETY_DAYS
+
+(``7/5`` = calendar days per trading day, ``CALENDAR_SAFETY_DAYS`` absorbs
+holidays and the occasional short week.) The effective window is
+``max(configured lookback_days, required_lookback)`` and is reported in
+:attr:`HydrationResult.lookback_days`. The formula assumes daily bars (the
+default :data:`src.data.schema.DEFAULT_BAR_SCHEMA`), which is the hydration
+frequency the live strategies decide on.
+
+Determinism
+-----------
+Hydration is pure given the repository contents, ``as_of`` and the injected
+callables: no network access happens unless a :data:`BackfillFn` is injected, the
+read window is half-open ``[as_of - lookback, as_of]`` (the ``as_of`` bar is
+included) and the persisted backfill is idempotent (the repository dedupes on the
+canonical primary key), so calling :meth:`ColdStartHydrator.hydrate` twice
+returns the same warm-up window.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
+
+import polars as pl
+from configs.instruments import InstrumentsConfig, load_instruments
+
+from src.core.types import InstrumentId, MarketState, ensure_utc
+from src.data import schema as s
+from src.data.feature_processor import FeatureProcessor
+from src.data.market_state_builder import MarketStateBuilder
+from src.data.storage import ParquetRepository, StorageError
+
+__all__ = [
+    "CALENDAR_SAFETY_DAYS",
+    "DEFAULT_MAX_WARMUP_STATES",
+    "MIN_REQUIRED_BARS",
+    "BackfillFn",
+    "ColdStartHydrator",
+    "HydrationError",
+    "HydrationResult",
+]
+
+logger = logging.getLogger(__name__)
+
+#: Absolute minimum number of observed bars per root needed to warm every
+#: canonical feature (``ret_126d`` needs 127 bars, ``vol_20d`` 21, the EWMA
+#: covariance 20 cross-sectional observations; 260 gives a full year of margin).
+MIN_REQUIRED_BARS: int = 260
+
+#: Calendar days per trading day (5 sessions per 7 calendar days).
+_CALENDAR_DAYS_PER_TRADING_DAY: float = 7.0 / 5.0
+
+#: Extra calendar days added to the derived window to absorb CME holidays,
+#: half sessions and short weeks (purely a safety margin, never a substitute for
+#: the observed-bar coverage check).
+CALENDAR_SAFETY_DAYS: int = 10
+
+#: ``read_bars`` uses a half-open ``[start, end)`` window; widen ``end`` by one
+#: microsecond so a bar stamped exactly at ``as_of`` is part of the warm-up.
+_INCLUSIVE_END: timedelta = timedelta(microseconds=1)
+
+#: Default cap on materialised warm-up states (see ``max_warmup_states``).
+DEFAULT_MAX_WARMUP_STATES: int = 64
+
+
+class HydrationError(RuntimeError):
+    """Raised when the cold-start warm-up window cannot be reconstructed.
+
+    The message always names the offending roots, the observed coverage and the
+    actionable remedy (ingest history or inject a backfill callable): a live
+    trader must never start on a cold pipeline.
+    """
+
+
+#: Function used to fetch missing history: ``(roots, start, end) -> bars``.
+#:
+#: Production wiring passes :meth:`src.data.databento_loader.DatabentoLoader.ingest`
+#: (or an IBKR ``reqHistoricalData`` adapter); tests inject a deterministic fake.
+#: ``start`` is inclusive and ``end`` is exclusive apart from a one-microsecond
+#: widening so a bar stamped exactly at ``as_of`` is included.
+type BackfillFn = Callable[[Sequence[InstrumentId], datetime, datetime], pl.DataFrame]
+
+
+@dataclass(frozen=True, slots=True)
+class HydrationResult:
+    """The reconstructed warm-up window handed to the live trading runner.
+
+    Attributes
+    ----------
+    states:
+        Chronologically ordered point-in-time market states; the last one is the
+        state observed at ``as_of``.
+    bars:
+        Canonical bar history actually used for the warm-up (validated schema).
+    roots:
+        Normalised, sorted, de-duplicated futures roots that were hydrated.
+    lookback_days:
+        Effective calendar-day lookback used for the read (``>=`` the configured
+        lookback because the observed-bar requirement may extend it).
+    coverage:
+        Number of observed bars per root in the read window.
+    required_bars:
+        Minimum observed bars per root that was enforced.
+    backfilled:
+        Whether missing history was fetched and persisted during this call.
+    warnings:
+        Non-fatal observations (lookback expansion, ignored backfill roots, ...).
+    as_of:
+        Decision timestamp the warm-up ends at (timezone-aware UTC).
+    """
+
+    states: tuple[MarketState, ...]
+    bars: pl.DataFrame
+    roots: tuple[InstrumentId, ...]
+    lookback_days: int
+    coverage: Mapping[InstrumentId, int]
+    required_bars: int
+    backfilled: bool
+    warnings: tuple[str, ...]
+    as_of: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bars, pl.DataFrame):
+            raise TypeError(f"bars must be a polars DataFrame, got {type(self.bars)!r}")
+        if not self.states:
+            raise ValueError("HydrationResult requires at least one hydrated market state")
+        moment = ensure_utc(self.as_of)
+        object.__setattr__(self, "as_of", moment)
+        roots = tuple(self.roots)
+        if not roots:
+            raise ValueError("HydrationResult requires at least one root")
+        if len(set(roots)) != len(roots):
+            raise ValueError(f"HydrationResult roots must be unique, got {roots!r}")
+        if any(not root for root in roots):
+            raise ValueError("HydrationResult roots must be non-empty strings")
+        object.__setattr__(self, "roots", roots)
+        if isinstance(self.required_bars, bool) or self.required_bars < 1:
+            raise ValueError("required_bars must be a positive int")
+        if isinstance(self.lookback_days, bool) or self.lookback_days < 1:
+            raise ValueError("lookback_days must be a positive int")
+        previous: datetime | None = None
+        for state in self.states:
+            if previous is not None and state.timestamp < previous:
+                raise ValueError(
+                    "HydrationResult states must be chronologically ordered; "
+                    f"{state.timestamp.isoformat()} follows {previous.isoformat()}"
+                )
+            previous = state.timestamp
+        if previous != moment:
+            raise ValueError(
+                "the last hydrated state must be the state observed at as_of; "
+                f"last={previous!r} as_of={moment!r}"
+            )
+        coverage = {str(root): int(count) for root, count in self.coverage.items()}
+        missing = sorted(set(roots) - set(coverage))
+        if missing:
+            raise ValueError(f"HydrationResult coverage is missing roots {missing!r}")
+        if any(count < 0 for count in coverage.values()):
+            raise ValueError("HydrationResult coverage counts must be non-negative")
+        object.__setattr__(self, "coverage", MappingProxyType(coverage))
+        object.__setattr__(self, "warnings", tuple(str(warning) for warning in self.warnings))
+        object.__setattr__(self, "backfilled", bool(self.backfilled))
+
+    # -- convenience -----------------------------------------------------------
+
+    @property
+    def final_state(self) -> MarketState:
+        """The state observed at ``as_of`` (the last warm-up state)."""
+        return self.states[-1]
+
+    @property
+    def bar_count(self) -> int:
+        """Total number of bars used for the warm-up."""
+        return self.bars.height
+
+
+class ColdStartHydrator:
+    """Rebuild the point-in-time warm-up window a live pipeline must observe.
+
+    Parameters
+    ----------
+    repository:
+        Durable bar store (:class:`~src.data.storage.ParquetRepository`).
+    instrument_master:
+        Instrument master for asset classes / margin metadata. Defaults to the
+        committed ``configs/instruments.yaml``.
+    feature_processor:
+        Feature engine. Defaults to the injected ``state_builder``'s processor,
+        else a fresh :class:`~src.data.feature_processor.FeatureProcessor`.
+    state_builder:
+        Point-in-time state builder. Defaults to
+        ``MarketStateBuilder(instrument_master=..., feature_processor=...,
+        initial_equity=equity)``. An injected builder is reused as-is with the
+        requested ``equity`` applied to every hydrated state.
+    lookback_days:
+        Configured calendar-day lookback floor (``400`` by default, i.e. a full
+        year plus holidays). :attr:`required_lookback` may extend it so the
+        observed-bar requirement is satisfied.
+    min_bars_per_root:
+        Override of the per-root observed-bar requirement (never below
+        :data:`MIN_REQUIRED_BARS`).
+    backfill:
+        Optional missing-history provider. Only invoked when stored coverage is
+        short **and** backfill is enabled (constructor flag or ``allow_backfill``
+        on :meth:`hydrate`) **and** this callable is present.
+    clock:
+        Injectable UTC clock used by :meth:`hydrate_now`.
+    backfill_enabled:
+        Operator/configuration switch mirroring
+        ``Settings.hydration_backfill_enabled``. When ``False`` a short window
+        fails closed even if a provider is configured.
+    schema:
+        Repository bar schema to read (daily bars by default).
+    max_warmup_states:
+        Cap on how many of the newest bar timestamps are materialised into
+        :attr:`HydrationResult.states` (``None`` materialises every timestamp in
+        the window). Features are always computed over the full window, so every
+        returned state is exactly what the pipeline would have observed; the cap
+        only bounds the latency/memory of the audit trail (the state builder
+        re-estimates the EWMA covariance for every state, ~10-20ms each, and the
+        live runner consumes only the final state). Defaults to
+        :data:`DEFAULT_MAX_WARMUP_STATES`.
+    """
+
+    def __init__(
+        self,
+        *,
+        repository: ParquetRepository,
+        instrument_master: InstrumentsConfig | None = None,
+        feature_processor: FeatureProcessor | None = None,
+        state_builder: MarketStateBuilder | None = None,
+        lookback_days: int = 400,
+        min_bars_per_root: int | None = None,
+        backfill: BackfillFn | None = None,
+        clock: Callable[[], datetime] | None = None,
+        backfill_enabled: bool = True,
+        schema: str = s.DEFAULT_BAR_SCHEMA,
+        max_warmup_states: int | None = DEFAULT_MAX_WARMUP_STATES,
+    ) -> None:
+        if not isinstance(repository, ParquetRepository):
+            raise TypeError(f"repository must be a ParquetRepository, got {type(repository)!r}")
+        if (
+            isinstance(lookback_days, bool)
+            or not isinstance(lookback_days, int)
+            or lookback_days < 1
+        ):
+            raise ValueError("lookback_days must be a positive int")
+        if min_bars_per_root is not None and (
+            isinstance(min_bars_per_root, bool)
+            or not isinstance(min_bars_per_root, int)
+            or min_bars_per_root < 1
+        ):
+            raise ValueError("min_bars_per_root must be a positive int or None")
+        if max_warmup_states is not None and (
+            isinstance(max_warmup_states, bool)
+            or not isinstance(max_warmup_states, int)
+            or max_warmup_states < 1
+        ):
+            raise ValueError("max_warmup_states must be a positive int or None")
+        if not s.is_bar_schema(schema):
+            raise ValueError(
+                f"schema must be one of the canonical bar schemas "
+                f"{list(s.DATABENTO_BAR_SCHEMAS)}, got {schema!r}"
+            )
+        self._repository = repository
+        self._master = instrument_master
+        self._feature_processor = feature_processor
+        self._state_builder = state_builder
+        self._lookback_days = int(lookback_days)
+        self._min_bars_per_root = min_bars_per_root
+        self._backfill = backfill
+        self._clock: Callable[[], datetime] = clock if clock is not None else _utc_now
+        self._backfill_enabled = bool(backfill_enabled)
+        self._schema = schema
+        self._max_warmup_states = max_warmup_states
+
+    # -- introspection ---------------------------------------------------------
+
+    @property
+    def repository(self) -> ParquetRepository:
+        """Durable bar store this hydrator reads from / persists backfills into."""
+        return self._repository
+
+    @property
+    def instrument_master(self) -> InstrumentsConfig:
+        """Instrument master used for asset classes and the default roots."""
+        if self._master is None:
+            self._master = load_instruments()
+        return self._master
+
+    @property
+    def feature_processor(self) -> FeatureProcessor:
+        """Feature engine used to derive the canonical warm-up features."""
+        if self._feature_processor is None:
+            builder = self._state_builder
+            self._feature_processor = (
+                builder.feature_processor
+                if builder is not None
+                else FeatureProcessor(instrument_master=self._master)
+            )
+        return self._feature_processor
+
+    @property
+    def lookback_days(self) -> int:
+        """Configured calendar-day lookback floor."""
+        return self._lookback_days
+
+    @property
+    def required_bars(self) -> int:
+        """Observed bars per root that :meth:`hydrate` enforces."""
+        floor = self._min_bars_per_root
+        return max(MIN_REQUIRED_BARS, floor if floor is not None else MIN_REQUIRED_BARS)
+
+    @property
+    def required_lookback(self) -> int:
+        """Calendar-day window needed to observe :attr:`required_bars` daily bars.
+
+        ``ceil(required_bars * 7 / 5) + CALENDAR_SAFETY_DAYS``: five trading
+        sessions per seven calendar days plus a holiday/short-week safety margin.
+        The effective read window is ``max(lookback_days, required_lookback)``.
+        """
+        derived = math.ceil(self.required_bars * _CALENDAR_DAYS_PER_TRADING_DAY)
+        return derived + CALENDAR_SAFETY_DAYS
+
+    @property
+    def backfill_enabled(self) -> bool:
+        """Whether the hydrator may fetch missing history at all."""
+        return self._backfill_enabled
+
+    @property
+    def max_warmup_states(self) -> int | None:
+        """Cap on materialised warm-up states (``None`` = every bar timestamp)."""
+        return self._max_warmup_states
+
+    def effective_lookback(self) -> int:
+        """Calendar-day window :meth:`hydrate` actually reads."""
+        return max(self._lookback_days, self.required_lookback)
+
+    # -- warm-up validation ----------------------------------------------------
+
+    def is_warm(self, state: MarketState) -> bool:
+        """Whether ``state`` is a fully warmed pipeline input.
+
+        Checks every instrument of ``state`` for finite
+        :data:`~src.data.schema.REQUIRED_FEATURES`, a non-empty returns window,
+        and a present EWMA covariance aligned with the state's instruments.
+        """
+        if not isinstance(state, MarketState):
+            raise TypeError(f"state must be a MarketState, got {type(state)!r}")
+        return not self._warm_problems(state, tuple(state.instruments))
+
+    def _warm_problems(self, state: MarketState, roots: Sequence[InstrumentId]) -> list[str]:
+        """Return the reasons ``state`` is not warm (empty list when warm)."""
+        problems: list[str] = []
+        for root in roots:
+            snapshot = state.instruments.get(root)
+            if snapshot is None:
+                problems.append(f"{root}: missing from the final state")
+                continue
+            missing = [
+                name for name in s.REQUIRED_FEATURES if not _is_finite(snapshot.features.get(name))
+            ]
+            if missing:
+                problems.append(
+                    f"{root}: required features missing or non-finite after the warm-up {missing}"
+                )
+            series = state.returns.get(root)
+            if series is None or series.size == 0:
+                problems.append(f"{root}: empty trailing returns window")
+        covariance = state.covariance
+        if covariance is None:
+            problems.append(
+                "EWMA covariance matrix is unavailable (too few cross-sectional returns "
+                "in the warm-up window)"
+            )
+        else:
+            expected = (len(state.covariance_instruments), len(state.covariance_instruments))
+            if covariance.shape != expected:
+                problems.append(
+                    f"covariance shape {covariance.shape} does not match covariance "
+                    f"instruments {state.covariance_instruments!r}"
+                )
+            aligned = set(state.covariance_instruments)
+            missing_covariance = sorted(set(roots) - aligned)
+            extra_covariance = sorted(aligned - set(roots))
+            if missing_covariance or extra_covariance:
+                problems.append(
+                    "covariance instruments are not aligned with the hydrated roots "
+                    f"(missing={missing_covariance!r}, extra={extra_covariance!r})"
+                )
+            if not bool(pl.Series(covariance.flatten().tolist()).is_finite().all()):
+                problems.append("covariance matrix contains non-finite values")
+        return problems
+
+    # -- hydration -------------------------------------------------------------
+
+    def hydrate(
+        self,
+        roots: Sequence[InstrumentId],
+        as_of: datetime,
+        *,
+        equity: float | None = None,
+        allow_backfill: bool | None = None,
+    ) -> HydrationResult:
+        """Rebuild and validate the warm-up window ending at ``as_of``.
+
+        Parameters
+        ----------
+        roots:
+            Futures roots to hydrate (normalised, sorted, de-duplicated).
+        as_of:
+            Decision timestamp; the last hydrated state is observed exactly here.
+        equity:
+            Account equity attached to every hydrated state (``None`` leaves it
+            unset so the state builder's ``initial_equity`` applies).
+        allow_backfill:
+            Per-call override of the constructor's ``backfill_enabled`` switch.
+
+        Raises
+        ------
+        HydrationError
+            When coverage is short and cannot be restored, when the backfill
+            provider fails or returns unusable data, or when the final state is
+            not warm.
+        """
+        moment = ensure_utc(as_of)
+        try:
+            normalised_roots = s.validate_roots(tuple(roots))
+        except ValueError as exc:
+            raise HydrationError(f"cold-start hydration rejected the root list: {exc}") from exc
+        lookback = self.effective_lookback()
+        window_start = moment - timedelta(days=lookback)
+        window_end = moment + _INCLUSIVE_END
+        warnings: list[str] = []
+        if lookback > self._lookback_days:
+            warnings.append(
+                f"lookback expanded from {self._lookback_days} to {lookback} calendar days so "
+                f"{self.required_bars} observed daily bars per root can be hydrated"
+            )
+        bars = self._read_window(normalised_roots, window_start, window_end)
+        coverage = self._coverage(bars, normalised_roots)
+        short = tuple(root for root in normalised_roots if coverage[root] < self.required_bars)
+        backfilled = False
+        backfill_allowed = (
+            self._backfill_enabled if allow_backfill is None else bool(allow_backfill)
+        )
+        if short:
+            if not backfill_allowed:
+                raise HydrationError(
+                    self._insufficient_message(
+                        moment,
+                        lookback,
+                        normalised_roots,
+                        coverage,
+                        short,
+                        reason=(
+                            "backfill is disabled (settings.hydration_backfill_enabled / "
+                            "allow_backfill=False)"
+                        ),
+                    )
+                )
+            if self._backfill is None:
+                raise HydrationError(
+                    self._insufficient_message(
+                        moment,
+                        lookback,
+                        normalised_roots,
+                        coverage,
+                        short,
+                        reason=(
+                            "no backfill provider is configured; inject "
+                            "ColdStartHydrator(backfill=...) wired to "
+                            "DatabentoLoader.ingest or an IBKR historical-data fetch"
+                        ),
+                    )
+                )
+            bars = self._backfill_window(
+                short,
+                normalised_roots,
+                coverage,
+                window_start,
+                window_end,
+                warnings,
+            )
+            coverage = self._coverage(bars, normalised_roots)
+            backfilled = True
+            still_short = tuple(
+                root for root in normalised_roots if coverage[root] < self.required_bars
+            )
+            if still_short:
+                raise HydrationError(
+                    self._insufficient_message(
+                        moment,
+                        lookback,
+                        normalised_roots,
+                        coverage,
+                        still_short,
+                        reason="the backfill provider returned but coverage is still short",
+                    )
+                )
+        features = self._compute_features(bars, normalised_roots, moment)
+        states = self._build_states(features, normalised_roots, moment, equity)
+        final_state = states[-1]
+        problems = self._warm_problems(final_state, normalised_roots)
+        if problems:
+            raise HydrationError(
+                "cold-start hydration refused: the warm-up window is not warm at "
+                f"{moment.isoformat()} for roots {list(normalised_roots)!r} "
+                f"({self.required_bars} bars/root required; observed coverage {dict(coverage)!r}): "
+                + "; ".join(problems)
+            )
+        logger.info(
+            "hydrated %d roots over %d calendar days (%d states, %d bars, backfilled=%s)",
+            len(normalised_roots),
+            lookback,
+            len(states),
+            bars.height,
+            backfilled,
+        )
+        return HydrationResult(
+            states=tuple(states),
+            bars=bars,
+            roots=normalised_roots,
+            lookback_days=lookback,
+            coverage=coverage,
+            required_bars=self.required_bars,
+            backfilled=backfilled,
+            warnings=tuple(warnings),
+            as_of=moment,
+        )
+
+    def hydrate_now(
+        self,
+        roots: Sequence[InstrumentId],
+        *,
+        equity: float | None = None,
+        allow_backfill: bool | None = None,
+    ) -> HydrationResult:
+        """Hydrate the warm-up window ending at the injected clock's current time."""
+        return self.hydrate(
+            roots,
+            self._clock(),
+            equity=equity,
+            allow_backfill=allow_backfill,
+        )
+
+    # -- internals -------------------------------------------------------------
+
+    def _read_window(
+        self,
+        roots: Sequence[InstrumentId],
+        start: datetime,
+        end: datetime,
+    ) -> pl.DataFrame:
+        """Read the canonical bars for the warm-up window from the repository."""
+        try:
+            bars = self._repository.read_bars(roots, start, end, schema=self._schema)
+            return s.ensure_bars_schema(bars, context="hydration-read")
+        except (StorageError, ValueError, pl.exceptions.PolarsError) as exc:
+            raise HydrationError(
+                f"cold-start hydration could not read the {self._schema!r} history for "
+                f"roots {list(roots)!r} in [{start.isoformat()}, {end.isoformat()}): {exc}"
+            ) from exc
+
+    @staticmethod
+    def _coverage(bars: pl.DataFrame, roots: Sequence[InstrumentId]) -> dict[str, int]:
+        """Observed bar count per root (``0`` for a root without stored bars)."""
+        counts: dict[str, int] = dict.fromkeys(roots, 0)
+        if bars.is_empty():
+            return counts
+        grouped = bars.group_by(s.ROOT_SYMBOL_COLUMN).len()
+        for record in grouped.iter_rows(named=True):
+            root = str(record[s.ROOT_SYMBOL_COLUMN])
+            if root in counts:
+                counts[root] = int(record["len"])
+        return counts
+
+    def _backfill_window(
+        self,
+        short_roots: Sequence[InstrumentId],
+        requested_roots: Sequence[InstrumentId],
+        coverage: Mapping[InstrumentId, int],
+        start: datetime,
+        end: datetime,
+        warnings: list[str],
+    ) -> pl.DataFrame:
+        """Fetch, validate and persist missing history, then re-read the window."""
+        provider = self._backfill
+        if provider is None:  # pragma: no cover - guarded by the caller
+            raise HydrationError("no backfill provider is configured")
+        logger.warning(
+            "cold-start hydration backfilling roots %s (%s) over %d calendar days",
+            list(short_roots),
+            dict(coverage),
+            max((end - start).days, 1),
+        )
+        try:
+            frame = provider(short_roots, start, end)
+        except HydrationError:
+            raise
+        except Exception as exc:
+            raise HydrationError(
+                "cold-start hydration backfill failed for roots "
+                f"{list(short_roots)!r} in [{start.isoformat()}, {end.isoformat()}): "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(frame, pl.DataFrame):
+            raise HydrationError(
+                f"cold-start hydration backfill must return a polars DataFrame, got {type(frame)!r}"
+            )
+        if frame.is_empty():
+            raise HydrationError(
+                "cold-start hydration backfill returned an empty frame for roots "
+                f"{list(short_roots)!r}; the vendor/IBKR request produced no history"
+            )
+        try:
+            validated = s.ensure_bars_schema(frame, context="hydration-backfill")
+        except s.SchemaError as exc:
+            raise HydrationError(
+                f"cold-start hydration backfill returned a non-canonical frame: {exc}"
+            ) from exc
+        available = {str(root) for root in validated[s.ROOT_SYMBOL_COLUMN].unique().to_list()}
+        missing = sorted(set(short_roots) - available)
+        if missing:
+            raise HydrationError(
+                "cold-start hydration backfill did not return any rows for roots "
+                f"{missing!r}; refusing to start cold"
+            )
+        extra = sorted(available - set(requested_roots))
+        if extra:
+            warnings.append(
+                f"ignored backfill rows for roots outside the requested universe {extra!r}"
+            )
+            validated = validated.filter(pl.col(s.ROOT_SYMBOL_COLUMN).is_in(list(requested_roots)))
+        try:
+            written = self._repository.write_bars(validated, schema=self._schema, mode="append")
+        except (StorageError, ValueError, TypeError) as exc:
+            raise HydrationError(
+                f"cold-start hydration could not persist the backfilled history: {exc}"
+            ) from exc
+        if written <= 0:  # pragma: no cover - the repository reports input rows
+            raise HydrationError(
+                "cold-start hydration backfill persisted zero rows; refusing to start cold"
+            )
+        warnings.append(
+            f"backfilled {written} rows for roots {list(short_roots)!r} and persisted them to "
+            f"the repository"
+        )
+        return self._read_window(requested_roots, start, end)
+
+    def _compute_features(
+        self,
+        bars: pl.DataFrame,
+        roots: Sequence[InstrumentId],
+        moment: datetime,
+    ) -> pl.DataFrame:
+        """Compute the canonical feature frame for the warm-up window."""
+        try:
+            features = self.feature_processor.compute(bars)
+        except (ValueError, s.SchemaError, TypeError, pl.exceptions.PolarsError) as exc:
+            raise HydrationError(
+                f"cold-start hydration feature computation failed for roots {list(roots)!r} "
+                f"at {moment.isoformat()}: {type(exc).__name__}: {exc}"
+            ) from exc
+        if features.is_empty():
+            raise HydrationError(
+                f"cold-start hydration produced an empty feature frame for roots "
+                f"{list(roots)!r} at {moment.isoformat()}"
+            )
+        return features
+
+    def _build_states(
+        self,
+        features: pl.DataFrame,
+        roots: Sequence[InstrumentId],
+        moment: datetime,
+        equity: float | None,
+    ) -> list[MarketState]:
+        """Build point-in-time states for the newest warm-up timestamps.
+
+        One state is built per bar timestamp (plus the ``as_of`` state) up to the
+        configured ``max_warmup_states`` cap; the final state is always the one
+        observed at ``moment``.
+        """
+        timestamps = sorted(
+            {
+                value
+                for value in features[s.TIMESTAMP_COLUMN].to_list()
+                if isinstance(value, datetime)
+            }
+        )
+        if not timestamps:
+            raise HydrationError(
+                f"cold-start hydration found no timestamps for roots {list(roots)!r} "
+                f"at {moment.isoformat()}"
+            )
+        decision_times = [ensure_utc(stamp) for stamp in timestamps if stamp <= moment]
+        if not decision_times:
+            raise HydrationError(
+                f"cold-start hydration has no bars at or before {moment.isoformat()} for roots "
+                f"{list(roots)!r}"
+            )
+        if decision_times[-1] != moment:
+            decision_times.append(moment)
+        cap = self._max_warmup_states
+        if cap is not None:
+            decision_times = decision_times[-cap:]
+        builder = self._state_builder
+        try:
+            if builder is None:
+                builder = MarketStateBuilder(
+                    instrument_master=self._master,
+                    feature_processor=self.feature_processor,
+                    initial_equity=equity,
+                )
+                return builder.build_series(features, decision_times)
+            states = builder.build_series(features, decision_times)
+            if equity is not None:
+                states = [replace(state, equity=equity) for state in states]
+            return states
+        except (ValueError, TypeError, pl.exceptions.PolarsError) as exc:
+            raise HydrationError(
+                f"cold-start hydration could not build point-in-time states for roots "
+                f"{list(roots)!r} at {moment.isoformat()}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _insufficient_message(
+        self,
+        moment: datetime,
+        lookback: int,
+        roots: Sequence[InstrumentId],
+        coverage: Mapping[InstrumentId, int],
+        short_roots: Sequence[InstrumentId],
+        *,
+        reason: str,
+    ) -> str:
+        """Actionable ``HydrationError`` message for a cold window."""
+        detail = ", ".join(f"{root}={coverage.get(root, 0)}" for root in roots)
+        return (
+            "cold-start hydration refused: insufficient stored history for roots "
+            f"{list(short_roots)!r} (need at least "
+            f"{self.required_bars} observed bars per root over a {lookback}-day lookback ending "
+            f"{moment.isoformat()}; observed coverage: {detail}). {reason}. "
+            "Ingest the missing history with DatabentoLoader.ingest(roots, start, end) / IBKR "
+            "historical data, or inject a ColdStartHydrator(backfill=...) callable."
+        )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _is_finite(value: float | None) -> bool:
+    """Whether ``value`` is a finite real number."""
+    return value is not None and math.isfinite(float(value))

@@ -37,6 +37,7 @@ from src.execution.oms import (
     build_orders_from_targets,
     deterministic_order_id,
 )
+from src.risk.state_store import InMemoryRiskStateStore, PersistedRiskState, RateLimiterState
 
 from tests.fixtures.market import (
     FIXED_TIMESTAMP,
@@ -112,6 +113,9 @@ def make_gate(
     max_order_notional: float | None = None,
     rate_capacity: float | None = None,
     what_if: Any = None,
+    rate_limiter_state: RateLimiterState | None = None,
+    wall_clock: Any = None,
+    persist_rate_limiter: Any = None,
 ) -> PreTradeRiskGate:
     impact = margin_impact or MarginImpact(
         initial_margin_after=135_000.0, maintenance_margin_after=123_600.0
@@ -133,6 +137,9 @@ def make_gate(
         monotonic=monotonic,
         max_order_notional=max_order_notional,
         rate_capacity=rate_capacity,
+        rate_limiter_state=rate_limiter_state,
+        wall_clock=wall_clock,
+        persist_rate_limiter=persist_rate_limiter,
     )
 
 
@@ -143,6 +150,8 @@ def make_oms(
     *,
     prices: dict[str, float] | None = None,
     gate: PreTradeRiskGate | None = None,
+    state_store: Any = None,
+    wall_clock: Any = None,
 ) -> tuple[OrderManagementSystem, Any]:
     price_map = prices or {"ES": 4800.0, "NQ": 16800.0, "CL": 72.5, "GC": 2050.0, "ZN": 111.5}
     manager = make_manager(settings, client, clock, price_provider=lambda root: price_map.get(root))
@@ -152,6 +161,8 @@ def make_oms(
         clock=clock,
         sleep=clock.sleep,
         gate=gate,
+        state_store=state_store,
+        wall_clock=wall_clock,
     )
     return oms, manager
 
@@ -900,3 +911,213 @@ def test_risk_settings_gate_defaults(settings: Settings) -> None:
     assert gate.rejections == ()
     gate.reset_kill_switch()
     assert not gate.is_locked
+
+
+# ---------------------------------------------------------------------------
+# Persisted rate limiter (Phase 7 upgrade 2, OMS side)
+# ---------------------------------------------------------------------------
+
+
+class FakeWallClock:
+    """Injectable wall clock in epoch seconds for token-bucket refill tests."""
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.value = start
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+def limited_settings(settings: Settings) -> Settings:
+    """Settings with a 1 order/s bucket and no duplicate window (isolates refill)."""
+    return Settings(
+        environment="backtest",
+        instruments_path=settings.instruments_path,
+        risk=RiskSettings(order_rate_limit_per_second=1.0, duplicate_order_window_seconds=0.0),
+    )
+
+
+async def test_gate_seeds_persisted_bucket_and_refills_by_wall_clock(
+    settings: Settings, clock: FakeClock
+) -> None:
+    limited = limited_settings(settings)
+    wall = FakeWallClock(1_000.0)
+    persisted_snapshots: list[RateLimiterState] = []
+    seeded = RateLimiterState(tokens=0.0, capacity=1.0, last_refill_epoch_seconds=wall.value)
+    gate = make_gate(
+        limited,
+        clock,
+        rate_capacity=1.0,
+        wall_clock=wall,
+        rate_limiter_state=seeded,
+        persist_rate_limiter=persisted_snapshots.append,
+    )
+    assert gate.persistent_rate_limiter
+    blocked = await gate.check(make_event("ES", order_id="a"))
+    assert blocked is not None and "rate limit" in blocked.message
+    wall.advance(1.0)
+    assert await gate.check(make_event("NQ", order_id="b")) is None
+    snapshot = gate.rate_limiter_state()
+    assert snapshot is not None
+    assert snapshot.tokens == pytest.approx(0.0)
+    assert snapshot.capacity == pytest.approx(1.0)
+    assert snapshot.last_refill_epoch_seconds == pytest.approx(wall.value)
+    assert len(persisted_snapshots) == 1
+    assert persisted_snapshots[0].tokens == pytest.approx(0.0)
+
+
+async def test_persisted_token_bucket_restores_throttling_after_oms_restart(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    limited = limited_settings(settings)
+    wall = FakeWallClock(1_000.0)
+    store = InMemoryRiskStateStore()
+    oms, manager = make_oms(limited, fake_client, clock, state_store=store, wall_clock=wall)
+    await manager.connect()
+    first = await oms.submit_order(make_event("ES", quantity=1, order_id="o-1"))
+    assert first.status is OrderStatus.FILLED
+    throttled = await oms.submit_order(make_event("NQ", quantity=1, order_id="o-2"))
+    assert throttled.status is OrderStatus.REJECTED
+    assert "rate limit" in throttled.message
+    persisted = store.load()
+    assert persisted is not None and persisted.rate_limiter is not None
+    assert persisted.rate_limiter.tokens == pytest.approx(0.0)
+    # Restart: a brand-new OMS with the same durable bucket must not get a full
+    # bucket back.
+    restarted, restarted_manager = make_oms(
+        limited, fake_client, clock, state_store=store, wall_clock=wall
+    )
+    await restarted_manager.connect()
+    still_throttled = await restarted.submit_order(make_event("CL", quantity=1, order_id="o-3"))
+    assert still_throttled.status is OrderStatus.REJECTED
+    assert "rate limit" in still_throttled.message
+    # After the wall clock earned exactly one token, the order passes again.
+    wall.advance(1.0)
+    accepted = await restarted.submit_order(make_event("GC", quantity=1, order_id="o-4"))
+    assert accepted.status is OrderStatus.FILLED
+    after = store.load()
+    assert after is not None and after.rate_limiter is not None
+    assert after.rate_limiter.tokens == pytest.approx(0.0)
+    assert after.rate_limiter.last_refill_epoch_seconds == pytest.approx(wall.value)
+
+
+async def test_oms_seeds_the_bucket_from_the_persisted_anchor_and_elapsed_time(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    limited = limited_settings(settings)
+    wall = FakeWallClock(1_000.0)
+    seeded = PersistedRiskState(
+        rate_limiter=RateLimiterState(
+            tokens=0.0, capacity=1.0, last_refill_epoch_seconds=wall.value - 0.5
+        )
+    )
+    store = InMemoryRiskStateStore(seeded)
+    oms, manager = make_oms(limited, fake_client, clock, state_store=store, wall_clock=wall)
+    await manager.connect()
+    # Half a second elapsed while the process was down: not yet a full token.
+    throttled = await oms.submit_order(make_event("ES", order_id="a"))
+    assert throttled.status is OrderStatus.REJECTED
+    assert "rate limit" in throttled.message
+    wall.advance(0.5)
+    assert (await oms.submit_order(make_event("NQ", order_id="b"))).status is OrderStatus.FILLED
+
+
+async def test_kill_switch_lock_persists_across_restart(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    store = InMemoryRiskStateStore()
+    oms, manager = make_oms(settings, fake_client, clock, state_store=store)
+    await manager.connect()
+    oms.lock_kill_switch("daily max loss")
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.kill_switch_locked is True
+    assert persisted.kill_switch_reason == "daily max loss"
+    # A restarted process restores the latch and refuses non-emergency orders.
+    restarted, restarted_manager = make_oms(settings, fake_client, clock, state_store=store)
+    await restarted_manager.connect()
+    assert restarted.is_locked
+    assert restarted.gate.lock_reason == "daily max loss"
+    assert restarted.persisted_state is not None
+    rejected = await restarted.submit_order(make_event("ES", order_id="after-restart"))
+    assert rejected.status is OrderStatus.REJECTED
+    assert "kill switch" in rejected.message
+    assert not fake_client.placed_orders
+
+
+async def test_flatten_all_persists_the_lock_and_preserves_other_fields(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    initial = PersistedRiskState(
+        portfolio_high_water_mark=1_200_000.0,
+        instrument_high_water_marks={"ES": 4_900.0},
+        extra={"risk_overlay": "hwm"},
+    )
+    store = InMemoryRiskStateStore(initial)
+    oms, manager = make_oms(settings, fake_client, clock, state_store=store)
+    await manager.connect()
+    fake_client.position_rows = [
+        VenuePosition(root_symbol="ES", quantity=2, avg_cost=240_000.0, multiplier=50.0)
+    ]
+    fake_client.margin_impact = MarginImpact(
+        initial_margin_after=1_000.0, maintenance_margin_after=500.0
+    )
+    receipts = await oms.flatten_all()
+    assert receipts[-1].status is OrderStatus.FILLED
+    locked = store.load()
+    assert locked is not None
+    assert locked.kill_switch_locked is True
+    assert "flatten_all" in locked.kill_switch_reason
+    assert locked.portfolio_high_water_mark == pytest.approx(1_200_000.0)
+    assert dict(locked.instrument_high_water_marks) == {"ES": 4_900.0}
+    assert dict(locked.extra) == {"risk_overlay": "hwm"}
+    # Operator reset persists the released latch, still without clobbering HWM.
+    oms.reset_kill_switch()
+    released = store.load()
+    assert released is not None
+    assert released.kill_switch_locked is False
+    assert released.kill_switch_reason == ""
+    assert released.portfolio_high_water_mark == pytest.approx(1_200_000.0)
+    assert dict(released.extra) == {"risk_overlay": "hwm"}
+
+
+async def test_state_store_none_keeps_the_legacy_in_memory_behavior(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    oms, manager = make_oms(settings, fake_client, clock)
+    assert oms.persisted_state is None
+    assert oms.gate.persistent_rate_limiter is False
+    assert oms.gate.rate_limiter_state() is None
+    await manager.connect()
+    oms.lock_kill_switch("manual")
+    assert oms.is_locked
+    oms.reset_kill_switch()
+    assert not oms.is_locked
+    first = await oms.submit_order(make_event("ES", order_id="a"))
+    assert first.status is OrderStatus.FILLED
+
+
+async def test_rate_limiter_snapshot_capacity_follows_configured_settings(
+    settings: Settings, clock: FakeClock
+) -> None:
+    limited = limited_settings(settings)
+    wall = FakeWallClock(500.0)
+    gate = make_gate(
+        limited,
+        clock,
+        rate_capacity=4.0,
+        wall_clock=wall,
+        rate_limiter_state=RateLimiterState(
+            tokens=1.0, capacity=2.0, last_refill_epoch_seconds=wall.value
+        ),
+    )
+    snapshot = gate.rate_limiter_state()
+    assert snapshot is not None
+    assert snapshot.capacity == pytest.approx(4.0)
+    assert snapshot.tokens == pytest.approx(1.0)
+    assert await gate.check(make_event("ES", order_id="a")) is None
+    assert gate.rate_limiter_state() is not None
+    assert gate.rate_limiter_state().tokens == pytest.approx(0.0)  # type: ignore[union-attr]

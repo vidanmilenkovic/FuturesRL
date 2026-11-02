@@ -1,7 +1,7 @@
 """FuturesRL-X IBKR execution engine.
 
 Public surface
---------------
+-------------
 Connection / state
     :class:`IBKRConnectionManager`, :class:`IBClientLike`, the pure ``Venue*``
     transport dataclasses and the :class:`MarginImpact` margin-model container.
@@ -14,14 +14,30 @@ Rolls
     :class:`ContractRoller`, :class:`RollPlan`, :class:`RollExecution`,
     :class:`BagOrderSpec`, :func:`select_roll_expirations`.
 Reconciliation
-    :class:`PositionReconciler`.
+    :class:`PositionReconciler`, :class:`WorkingOrderSnapshot`.
+Cold-start hydration (Phase 7)
+    :class:`ColdStartHydrator`, :class:`HydrationResult`,
+    :class:`HydrationError`, :data:`BackfillFn`.
+Live trading runner (Phase 7)
+    :class:`TradingRunner`, :class:`RunnerStatus`, :class:`TargetBroker`,
+    :class:`RunnerNotHydratedError`, :class:`RunnerConfigError`, :func:`main`.
 
 Everything imported here is SDK-free; ``ib_async`` is only imported lazily when
-the live :class:`IBKRConnectionManager` client is instantiated.
+the live :class:`IBKRConnectionManager` client is instantiated (or by the
+runner's ``main`` production wiring), so importing this package never touches the
+network.
 """
 
 from __future__ import annotations
 
+from src.execution.hydrator import (
+    DEFAULT_MAX_WARMUP_STATES,
+    MIN_REQUIRED_BARS,
+    BackfillFn,
+    ColdStartHydrator,
+    HydrationError,
+    HydrationResult,
+)
 from src.execution.ibkr_client import (
     BagLeg,
     BagOrderSpec,
@@ -64,18 +80,31 @@ from src.execution.oms import (
     build_orders_from_targets,
     deterministic_order_id,
 )
-from src.execution.reconciler import PositionReconciler
+from src.execution.reconciler import PositionReconciler, WorkingOrderSnapshot
+from src.execution.runner import (
+    DEFAULT_TELEMETRY_TOPIC,
+    RunnerConfigError,
+    RunnerNotHydratedError,
+    RunnerStatus,
+    TargetBroker,
+    TradingRunner,
+    main,
+)
 
 __all__ = [
-    # orders / risk gate
+    "DEFAULT_MAX_WARMUP_STATES",
+    "DEFAULT_TELEMETRY_TOPIC",
+    "MIN_REQUIRED_BARS",
     "ORDER_ID_NAMESPACE",
-    # connection / transport
+    "BackfillFn",
     "BagLeg",
     "BagOrderSpec",
+    "ColdStartHydrator",
     "ContractRequest",
-    # rolls
     "ContractRoller",
     "GateDecision",
+    "HydrationError",
+    "HydrationResult",
     "IBClientLike",
     "IBKRBagUnsupportedError",
     "IBKRConnectionError",
@@ -86,21 +115,27 @@ __all__ = [
     "ManagedOrder",
     "MarginImpact",
     "OrderManagementSystem",
-    # reconciliation
     "PositionReconciler",
     "PreTradeRiskGate",
     "RollExecution",
     "RollPlan",
+    "RunnerConfigError",
+    "RunnerNotHydratedError",
+    "RunnerStatus",
+    "TargetBroker",
+    "TradingRunner",
     "VenueAccountValue",
     "VenueContract",
     "VenueFill",
     "VenueOrderSnapshot",
     "VenuePosition",
     "VenueTrade",
+    "WorkingOrderSnapshot",
     "active_contract_expiration",
     "build_orders_from_targets",
     "contract_month_string",
     "deterministic_order_id",
+    "main",
     "map_order_status",
     "margin_impact_from_order_state",
     "normalize_expiration",

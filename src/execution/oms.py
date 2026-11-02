@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -62,6 +63,7 @@ from src.execution.ibkr_client import (
     PriceProvider,
     VenueTrade,
 )
+from src.risk.state_store import PersistedRiskState, RateLimiterState, RiskStateStore
 
 if TYPE_CHECKING:
     from src.execution.ibkr_client import Clock, Sleeper
@@ -77,6 +79,11 @@ _ORDER_ID_BUCKET_SECONDS: int = 1
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _wall_clock_now() -> float:
+    """Wall-clock epoch seconds (the rate-limiter's restart-safe anchor)."""
+    return time.time()
 
 
 async def _asyncio_sleep(seconds: float) -> None:
@@ -222,6 +229,18 @@ class PreTradeRiskGate:
     and only skips the lock, size and rate-limit checks (a closing order must
     never be blocked by the kill-switch it is enforcing); the margin simulation
     remains mandatory.
+
+    Persisted token bucket (Phase 7)
+    --------------------------------
+    The rapid-fire token bucket can be anchored to *wall-clock* epoch seconds
+    instead of the monotonic clock and seeded from a
+    :class:`~src.risk.state_store.RateLimiterState` snapshot. A container restart
+    then refills exactly the tokens earned while the process was down instead of
+    silently resetting the bucket to full capacity (which would let a restart
+    double the allowed order rate). Every accepted order persists the bucket
+    snapshot through ``persist_rate_limiter``. When neither a snapshot nor a
+    persistence callback is supplied, the original monotonic in-memory behaviour
+    is preserved exactly.
     """
 
     def __init__(
@@ -236,6 +255,9 @@ class PreTradeRiskGate:
         monotonic: Callable[[], float] | None = None,
         max_order_notional: float | None = None,
         rate_capacity: float | None = None,
+        rate_limiter_state: RateLimiterState | None = None,
+        wall_clock: Callable[[], float] | None = None,
+        persist_rate_limiter: Callable[[RateLimiterState], None] | None = None,
     ) -> None:
         if max_order_notional is not None and max_order_notional <= 0:
             raise ValueError("max_order_notional must be strictly positive")
@@ -246,6 +268,11 @@ class PreTradeRiskGate:
         self._instruments = instruments if instruments is not None else settings.instruments
         self._clock: Clock = clock if clock is not None else _utc_now
         self._monotonic: Callable[[], float] = monotonic if monotonic is not None else _monotonic
+        self._wall_clock: Callable[[], float] = (
+            wall_clock if wall_clock is not None else _wall_clock_now
+        )
+        self._persist_rate_limiter = persist_rate_limiter
+        self._persistent_bucket = False
         self._max_order_notional = max_order_notional
         rate = self._settings.risk.order_rate_limit_per_second
         self._rate_capacity = rate_capacity if rate_capacity is not None else max(1.0, rate)
@@ -255,6 +282,57 @@ class PreTradeRiskGate:
         self._locked = False
         self._lock_reason = ""
         self.decisions: list[GateDecision] = []
+        if rate_limiter_state is not None or persist_rate_limiter is not None:
+            self.configure_rate_limiter(
+                rate_limiter_state,
+                wall_clock=self._wall_clock,
+                persist=persist_rate_limiter,
+            )
+
+    # -- persisted rate limiter -------------------------------------------------
+
+    @property
+    def persistent_rate_limiter(self) -> bool:
+        """Whether the token bucket is wall-clock anchored and restart-safe."""
+        return self._persistent_bucket
+
+    def configure_rate_limiter(
+        self,
+        state: RateLimiterState | None = None,
+        *,
+        wall_clock: Callable[[], float] | None = None,
+        persist: Callable[[RateLimiterState], None] | None = None,
+    ) -> None:
+        """Enable the restart-safe token bucket, seeded from ``state``.
+
+        ``state`` is a snapshot persisted by a previous process; its tokens are
+        refilled from the stored wall-clock anchor by the configured
+        ``order_rate_limit_per_second``. ``None`` starts from a full bucket
+        anchored at the current wall clock. The configured ``rate_capacity`` is
+        always authoritative (a changed setting must take effect after restart).
+        """
+        if wall_clock is not None:
+            self._wall_clock = wall_clock
+        if persist is not None:
+            self._persist_rate_limiter = persist
+        self._persistent_bucket = True
+        now = self._wall_clock()
+        if state is not None:
+            self._tokens = min(float(self._rate_capacity), max(0.0, float(state.tokens)))
+            self._last_refill = float(state.last_refill_epoch_seconds)
+        else:
+            self._tokens = float(self._rate_capacity)
+            self._last_refill = now
+
+    def rate_limiter_state(self) -> RateLimiterState | None:
+        """Current token-bucket snapshot (``None`` when not persistent)."""
+        if not self._persistent_bucket or self._tokens is None:
+            return None
+        return RateLimiterState(
+            tokens=min(float(self._rate_capacity), max(0.0, self._tokens)),
+            capacity=float(self._rate_capacity),
+            last_refill_epoch_seconds=float(self._last_refill),
+        )
 
     # -- kill switch -----------------------------------------------------------
 
@@ -420,6 +498,27 @@ class PreTradeRiskGate:
                 f"{now - last_seen:.3f}s ago (window {window:.3f}s)",
             )
         rate = self._settings.risk.order_rate_limit_per_second
+        if self._persistent_bucket:
+            epoch = self._wall_clock()
+            if self._tokens is None:  # pragma: no cover - configure() seeds the bucket
+                self._tokens = float(self._rate_capacity)
+                self._last_refill = epoch
+            else:
+                elapsed = max(0.0, epoch - self._last_refill)
+                self._tokens = min(self._rate_capacity, self._tokens + elapsed * rate)
+                self._last_refill = epoch
+            if self._tokens < 1.0:
+                return self._reject(
+                    order,
+                    f"rate limit: token bucket exhausted ({rate:g} orders/s configured)",
+                )
+            self._tokens -= 1.0
+            persist = self._persist_rate_limiter
+            if persist is not None:
+                snapshot = self.rate_limiter_state()
+                if snapshot is not None:
+                    persist(snapshot)
+            return None
         if self._tokens is None:
             self._tokens = self._rate_capacity
             self._last_refill = now
@@ -564,6 +663,8 @@ class OrderManagementSystem:
         monotonic: Callable[[], float] | None = None,
         price_provider: PriceProvider | None = None,
         poll_interval_seconds: float = 0.05,
+        state_store: RiskStateStore | None = None,
+        wall_clock: Callable[[], float] | None = None,
     ) -> None:
         self._manager = manager
         self._settings = settings
@@ -573,6 +674,9 @@ class OrderManagementSystem:
         self._clock: Clock = clock if clock is not None else _utc_now
         self._sleep: Sleeper = sleep if sleep is not None else _asyncio_sleep
         self._monotonic: Callable[[], float] = monotonic if monotonic is not None else _monotonic
+        self._wall_clock: Callable[[], float] = (
+            wall_clock if wall_clock is not None else _wall_clock_now
+        )
         self._poll_interval = poll_interval_seconds
         self._orders: dict[str, ManagedOrder] = {}
         if gate is not None:
@@ -589,6 +693,70 @@ class OrderManagementSystem:
                 clock=self._clock,
                 monotonic=self._monotonic,
             )
+        self._state_store = state_store
+        self._persisted: PersistedRiskState | None = None
+        if state_store is not None:
+            # Fail closed: an unreadable risk state must abort startup rather than
+            # silently re-arm a kill switch/bucket that was already consumed.
+            persisted = state_store.load()
+            self._persisted = persisted
+            if persisted is not None and persisted.kill_switch_locked:
+                self._gate.lock(persisted.kill_switch_reason or "persisted kill switch engaged")
+            self._gate.configure_rate_limiter(
+                persisted.rate_limiter if persisted is not None else None,
+                wall_clock=self._wall_clock,
+                persist=self._persist_rate_limiter,
+            )
+
+    # -- persisted risk state ---------------------------------------------------
+
+    @property
+    def persisted_state(self) -> PersistedRiskState | None:
+        """Last durable risk state observed/persisted by the OMS."""
+        return self._persisted
+
+    def _persist_rate_limiter(self, bucket: RateLimiterState) -> None:
+        """Persist the accepted-order token bucket (fail closed on I/O errors)."""
+        self._update_persisted(lambda state: state.updated(rate_limiter=bucket))
+
+    def _update_persisted(
+        self,
+        mutator: Callable[[PersistedRiskState], PersistedRiskState],
+        *,
+        raise_on_error: bool = True,
+    ) -> PersistedRiskState | None:
+        """Load-modify-save the durable risk state, preserving unrelated fields.
+
+        Another process (the risk overlay) persists high-water marks and the
+        daily-loss latch; re-reading before writing keeps those fields intact.
+        """
+        store = self._state_store
+        if store is None:
+            return None
+        try:
+            current = store.load()
+            base = current if current is not None else PersistedRiskState()
+            updated = mutator(base).updated(updated_at=self._clock())
+            store.save(updated)
+        except Exception:
+            logger.exception("could not persist risk state")
+            if raise_on_error:
+                raise
+            return None
+        self._persisted = updated
+        return updated
+
+    def lock_kill_switch(self, reason: str = "kill switch engaged") -> None:
+        """Engage the kill-switch and persist the latch across restarts."""
+        self._gate.lock(reason)
+        if self._state_store is not None:
+            self._update_persisted(lambda state: state.locked(reason), raise_on_error=False)
+
+    def reset_kill_switch(self) -> None:
+        """Manually release the kill-switch and persist the released latch."""
+        self._gate.reset_kill_switch()
+        if self._state_store is not None:
+            self._update_persisted(lambda state: state.unlocked(), raise_on_error=False)
 
     # -- introspection ---------------------------------------------------------
 
@@ -874,7 +1042,7 @@ class OrderManagementSystem:
                     timestamp=self._clock(),
                 )
             )
-        self._gate.lock("emergency flatten_all")
+        self.lock_kill_switch("emergency flatten_all")
         timestamp = self._clock()
         try:
             positions = await self._manager.fetch_positions()
@@ -916,10 +1084,6 @@ class OrderManagementSystem:
             )
             receipts.append(await self._submit_single(order, emergency=True))
         return receipts
-
-    def reset_kill_switch(self) -> None:
-        """Manually release the kill-switch after a flatten / risk event."""
-        self._gate.reset_kill_switch()
 
     # -- internals -------------------------------------------------------------
 

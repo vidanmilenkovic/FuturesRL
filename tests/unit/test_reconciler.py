@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from src.core.interfaces import PositionReconciler as PositionReconcilerProtocol
 from src.core.types import AccountSnapshot, Position
-from src.execution.reconciler import PositionReconciler
+from src.execution.reconciler import PositionReconciler, WorkingOrderSnapshot
 
 from tests.fixtures.market import FIXED_TIMESTAMP, make_account_snapshot
 from tests.unit.test_ibkr_client import FakeClock
@@ -426,3 +426,260 @@ async def test_reconcile_uses_injected_clock_timestamp(clock: FakeClock) -> None
     await reconciler.reconcile()
     assert reconciler.last_report is not None
     assert reconciler.last_report.timestamp == datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# Open-order-aware drift (Phase 7)
+# ---------------------------------------------------------------------------
+
+
+def working_orders(
+    *snapshots: WorkingOrderSnapshot,
+) -> Callable[[], Awaitable[Sequence[WorkingOrderSnapshot]]]:
+    """Static working-order provider returning ``snapshots``."""
+
+    async def provider() -> Sequence[WorkingOrderSnapshot]:
+        return snapshots
+
+    return provider
+
+
+def order(
+    instrument_id: str,
+    signed_remaining: int,
+    *,
+    updated_at: datetime,
+    order_id: str = "wo-1",
+) -> WorkingOrderSnapshot:
+    return WorkingOrderSnapshot(
+        order_id=order_id,
+        instrument_id=instrument_id,
+        signed_remaining=signed_remaining,
+        updated_at=updated_at,
+        status="Submitted",
+    )
+
+
+async def test_open_order_exactly_explains_drift(clock: FakeClock) -> None:
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 2},
+        broker_positions=static_positions(("ES", 1)),
+        working_orders=working_orders(order("ES", 1, updated_at=clock.now)),
+    )
+    assert await reconciler.reconcile()
+    assert not reconciler.halted
+    assert reconciler.last_working_deltas == {"ES": 1}
+    assert reconciler.last_grace_active is False
+    report = reconciler.last_report
+    assert report is not None and report.ok and report.drift == {}
+    assert "agree" in report.message
+
+
+async def test_partial_fill_remaining_explains_drift(clock: FakeClock) -> None:
+    # 2 of 4 contracts already filled: broker shows 1 held, 2 still working.
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 3},
+        broker_positions=static_positions(("ES", 1)),
+        working_orders=working_orders(order("ES", 2, updated_at=clock.now, order_id="wo-partial")),
+    )
+    assert await reconciler.reconcile()
+    assert not reconciler.halted
+    assert reconciler.last_working_deltas == {"ES": 2}
+    assert reconciler.last_report is not None
+    assert reconciler.last_report.drift == {}
+
+
+async def test_multiple_working_orders_accumulate(clock: FakeClock) -> None:
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 3},
+        broker_positions=static_positions(),
+        working_orders=working_orders(
+            order("ES", 1, updated_at=clock.now, order_id="wo-a"),
+            order("ES", 2, updated_at=clock.now, order_id="wo-b"),
+        ),
+    )
+    assert await reconciler.reconcile()
+    assert reconciler.last_working_deltas == {"ES": 3}
+    assert not reconciler.halted
+
+
+async def test_zero_remaining_working_order_is_ignored(clock: FakeClock) -> None:
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 2},
+        broker_positions=static_positions(("ES", 2)),
+        working_orders=working_orders(order("ES", 0, updated_at=clock.now)),
+    )
+    assert await reconciler.reconcile()
+    assert reconciler.last_working_deltas == {}
+    assert reconciler.last_grace_active is False
+
+
+async def test_grace_window_suppresses_unexplained_drift(clock: FakeClock) -> None:
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 2},
+        broker_positions=static_positions(("ES", 1)),
+        working_orders=working_orders(order("ES", 2, updated_at=clock.now - timedelta(seconds=10))),
+        reconcile_grace_seconds=30.0,
+    )
+    assert await reconciler.reconcile()
+    assert not reconciler.halted
+    assert reconciler.last_grace_active is True
+    assert reconciler.last_working_deltas == {"ES": 2}
+    report = reconciler.last_report
+    assert report is not None
+    assert report.ok and report.drift == {}
+    assert "grace window" in report.message
+    assert reconciler.reconcile_grace_seconds == 30.0
+
+
+async def test_stale_working_order_beyond_grace_is_drift(clock: FakeClock) -> None:
+    alerts: list[object] = []
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 2},
+        broker_positions=static_positions(("ES", 1)),
+        working_orders=working_orders(order("ES", 2, updated_at=clock.now - timedelta(seconds=60))),
+        reconcile_grace_seconds=30.0,
+        alert=alerts.append,
+    )
+    assert not await reconciler.reconcile()
+    assert reconciler.halted
+    assert reconciler.last_grace_active is False
+    report = reconciler.last_report
+    assert report is not None
+    assert report.drift == {"ES": 1}
+    assert "working +2" in report.message
+    assert "effective 3" in report.message
+    assert len(alerts) == 1
+
+
+async def test_wrong_direction_working_delta_is_drift(clock: FakeClock) -> None:
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 2},
+        broker_positions=static_positions(("ES", 1)),
+        working_orders=working_orders(order("ES", -1, updated_at=clock.now)),
+        reconcile_grace_seconds=0.0,
+    )
+    assert not await reconciler.reconcile()
+    assert reconciler.halted
+    report = reconciler.last_report
+    assert report is not None
+    assert report.drift == {"ES": -2}
+    assert "working -1" in report.message
+
+
+async def test_working_orders_provider_failure_halts(clock: FakeClock) -> None:
+    alerts: list[object] = []
+
+    async def failing() -> Sequence[WorkingOrderSnapshot]:
+        raise ConnectionError("open orders unavailable")
+
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 2},
+        broker_positions=static_positions(("ES", 2)),
+        working_orders=failing,
+        alert=alerts.append,
+    )
+    assert not await reconciler.reconcile()
+    assert reconciler.halted
+    assert reconciler.last_working_deltas == {}
+    report = reconciler.last_report
+    assert report is not None
+    assert not report.ok
+    assert "reconciliation failed" in report.message
+    assert "open orders unavailable" in report.message
+    assert len(alerts) == 1
+
+
+async def test_run_forever_halts_on_working_orders_provider_failure(clock: FakeClock) -> None:
+    async def failing() -> Sequence[WorkingOrderSnapshot]:
+        raise ConnectionError("open orders unavailable")
+
+    async def stop_after_one(_seconds: float) -> None:
+        reconciler.stop()
+
+    reconciler = make_reconciler(
+        clock,
+        working_orders=failing,
+    )
+    reconciler._sleep = stop_after_one  # type: ignore[attr-defined]
+    await reconciler.run_forever(1.0)
+    assert reconciler.halted
+    assert reconciler.last_report is not None
+    assert not reconciler.last_report.ok
+
+
+async def test_approved_drift_uses_effective_positions(clock: FakeClock) -> None:
+    reconciler = make_reconciler(
+        clock,
+        expected={"ES": 2},
+        broker_positions=static_positions(("ES", 2)),
+        working_orders=working_orders(order("ES", 1, updated_at=clock.now)),
+        reconcile_grace_seconds=0.0,
+    )
+    reconciler.approve_drift({"ES": 1})
+    assert await reconciler.reconcile()
+    assert not reconciler.halted
+
+
+async def test_no_provider_preserves_legacy_semantics(clock: FakeClock) -> None:
+    reconciler = make_reconciler(
+        clock, expected={"ES": 2}, broker_positions=static_positions(("ES", 3))
+    )
+    assert not await reconciler.reconcile()
+    assert reconciler.last_working_deltas == {}
+    assert reconciler.last_grace_active is False
+    report = reconciler.last_report
+    assert report is not None
+    assert report.drift == {"ES": 1}
+    assert "actual 3" in report.message
+    assert "working" not in report.message
+
+
+def test_reconcile_grace_seconds_validation(clock: FakeClock) -> None:
+    with pytest.raises(ValueError):
+        make_reconciler(
+            clock,
+            expected={"ES": 2},
+            broker_positions=static_positions(("ES", 2)),
+            reconcile_grace_seconds=-1.0,
+        )
+
+
+def test_working_order_snapshot_validation() -> None:
+    with pytest.raises(ValueError):
+        WorkingOrderSnapshot(
+            order_id="", instrument_id="ES", signed_remaining=1, updated_at=FIXED_TIMESTAMP
+        )
+    with pytest.raises(ValueError):
+        WorkingOrderSnapshot(
+            order_id="a", instrument_id="", signed_remaining=1, updated_at=FIXED_TIMESTAMP
+        )
+    with pytest.raises(TypeError):
+        WorkingOrderSnapshot(
+            order_id="a",
+            instrument_id="ES",
+            signed_remaining=True,  # type: ignore[arg-type]
+            updated_at=FIXED_TIMESTAMP,
+        )
+    with pytest.raises(ValueError):
+        WorkingOrderSnapshot(
+            order_id="a",
+            instrument_id="ES",
+            signed_remaining=1,
+            updated_at=datetime(2024, 1, 2, 21, 0),  # naive
+        )
+    snapshot = WorkingOrderSnapshot(
+        order_id="a",
+        instrument_id="ES",
+        signed_remaining=-2,
+        updated_at=datetime(2024, 1, 2, 21, 0, tzinfo=UTC),
+    )
+    assert snapshot.updated_at.tzinfo is not None
