@@ -32,6 +32,17 @@ export function formatCurrency(value: number | null | undefined, compact = false
   return Math.abs(value) >= 10_000 ? fullCurrency.format(value) : preciseCurrency.format(value);
 }
 
+/** Compact USD for dense inline ticker slots: `$4.00M`, `$482.31K`, `$12.40`. */
+export function formatCompactUsd(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  const sign = value < 0 ? "−" : "";
+  const absolute = Math.abs(value);
+  if (absolute >= 1_000_000_000) return `${sign}$${(absolute / 1_000_000_000).toFixed(2)}B`;
+  if (absolute >= 1_000_000) return `${sign}$${(absolute / 1_000_000).toFixed(2)}M`;
+  if (absolute >= 1_000) return `${sign}$${(absolute / 1_000).toFixed(1)}K`;
+  return `${sign}$${absolute.toFixed(2)}`;
+}
+
 export function formatSignedCurrency(value: number | null | undefined, compact = false): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "—";
   const formatted = formatCurrency(Math.abs(value), compact);

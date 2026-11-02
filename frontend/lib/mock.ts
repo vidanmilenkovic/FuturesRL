@@ -628,6 +628,12 @@ export function mockPipeline(netLiquidation = ACCOUNT_STARTING_NLV): PipelineWat
       status: "warn",
     },
     {
+      stage: "Risk overlays",
+      detail: "applied: quant_risk, llm_risk",
+      value: "2 applied",
+      status: "ok",
+    },
+    {
       stage: "LLM confidence filter",
       detail: "GC signal neutralised (c = 0.58 < τ = 0.70) · variance 0.31 > 0.25",
       value: "1 neutralised",
@@ -1200,15 +1206,18 @@ export function createTelemetrySimulator(seed: TelemetrySimulatorSeed) {
       };
     }
     if (kindRoll === 2) {
+      const positions = buildPositions(nlv);
+      const grossNotional = positions.reduce((sum, position) => sum + Math.abs(position.notional), 0);
+      const netExposure = positions.reduce((sum, position) => sum + position.notional, 0);
       return {
         type: "telemetry",
         kind: "positions",
         timestamp,
         sequence: tick,
         payload: {
-          positions: buildPositions(nlv),
-          gross_leverage: 0.78,
-          net_exposure: nlv * 0.21,
+          positions,
+          gross_leverage: grossNotional / nlv,
+          net_exposure: netExposure,
         },
       };
     }

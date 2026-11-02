@@ -2,11 +2,11 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ------------------------------------------------------------------------
-   FuturesRL-X terminal theme
-   Dark, high-contrast surfaces for long trading sessions; all colour
-   semantics live in tailwind.config.ts (signal-* palette).
-   ------------------------------------------------------------------------ */
+/* -------------------------------------------------------------------------
+   FuturesRL-X workspace theme
+   Flat institutional surfaces, one accent, generous hairlines. Typography:
+   Inter for UI, JetBrains Mono (tabular) only for numeric data.
+   ------------------------------------------------------------------------- */
 
 @layer base {
   :root {
@@ -19,18 +19,25 @@
   }
 
   body {
-    @apply bg-terminal-950 text-terminal-100 antialiased;
-    font-feature-settings: "tnum" 1, "cv02" 1;
+    @apply bg-canvas font-sans text-zinc-300 antialiased;
+    font-feature-settings: "cv02" 1, "cv03" 1, "cv04" 1;
+    overflow: hidden;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply text-zinc-100;
   }
 
   ::selection {
-    @apply bg-signal-info/30 text-terminal-100;
+    @apply bg-accent/30 text-white;
   }
 
-  /* Thin terminal scrollbars */
   * {
     scrollbar-width: thin;
-    scrollbar-color: theme("colors.terminal.500") transparent;
+    scrollbar-color: #2e2e33 transparent;
   }
   *::-webkit-scrollbar {
     width: 8px;
@@ -40,10 +47,11 @@
     background: transparent;
   }
   *::-webkit-scrollbar-thumb {
-    @apply rounded-full bg-terminal-600;
+    border-radius: 9999px;
+    background-color: #2e2e33;
   }
   *::-webkit-scrollbar-thumb:hover {
-    @apply bg-terminal-500;
+    background-color: #3f3f46;
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -58,50 +66,71 @@
 }
 
 @layer components {
-  /* Dense data table used by every view. */
+  .panel {
+    @apply rounded-md border border-edge bg-panel shadow-panel;
+  }
+
+  .panel-header {
+    @apply flex h-9 shrink-0 items-center justify-between gap-2 border-b border-hairline px-3;
+  }
+
+  .panel-title {
+    @apply text-[13px] font-medium text-zinc-100;
+  }
+
+  /* Dense data table shared by every view. */
   .data-table {
-    @apply w-full border-collapse text-left font-mono text-xs;
+    @apply w-full border-collapse text-left text-[12px];
   }
+
   .data-table thead th {
-    @apply sticky top-0 z-10 whitespace-nowrap border-b border-terminal-600/70 bg-terminal-850/95 px-2.5 py-2 text-[10px] font-medium uppercase tracking-[0.12em] text-terminal-300 backdrop-blur;
+    @apply sticky top-0 z-10 h-8 whitespace-nowrap border-b border-hairline bg-panel px-3 text-[11px] font-semibold uppercase tracking-[0.04em] text-zinc-500;
   }
+
   .data-table tbody td {
-    @apply whitespace-nowrap border-b border-terminal-600/30 px-2.5 py-1.5 tabular-nums text-terminal-200;
+    @apply h-8 whitespace-nowrap border-b border-hairline/60 px-3 text-zinc-300;
   }
+
   .data-table tbody tr {
-    @apply transition-colors;
+    @apply transition-colors hover:bg-surface;
   }
-  .data-table tbody tr:hover {
-    @apply bg-terminal-700/40;
-  }
+
   .data-table tbody tr:last-child td {
     @apply border-b-0;
   }
-  .data-table .num {
-    @apply text-right;
+
+  .data-table tfoot td {
+    @apply h-8 whitespace-nowrap border-t border-hairline bg-panel px-3 text-zinc-100;
   }
 
-  .mono-label {
-    @apply font-mono text-[10px] uppercase tracking-[0.14em] text-terminal-300;
+  .num {
+    @apply font-mono tabular-nums;
   }
 
-  .terminal-scroll {
-    @apply max-h-[420px] overflow-y-auto overscroll-contain;
+  .metric-label {
+    @apply text-[11px] font-medium uppercase tracking-[0.04em] text-zinc-500;
   }
 
   .hairline {
-    @apply border-terminal-600/50;
-  }
-
-  /* Faint grid backdrop for full-bleed sections. */
-  .grid-backdrop {
-    background-image:
-      linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
-    background-size: 28px 28px;
+    @apply border-hairline;
   }
 
   .focus-ring {
-    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-signal-info/60 focus-visible:ring-offset-2 focus-visible:ring-offset-terminal-950;
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-0;
+  }
+
+  .scroll-area {
+    @apply overflow-y-auto overscroll-contain;
+  }
+}
+
+/* Utility: hide scrollbar while keeping overflow scroll (chip strips). */
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
   }
 }

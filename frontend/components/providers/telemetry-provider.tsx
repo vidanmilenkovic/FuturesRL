@@ -12,13 +12,20 @@ import {
 } from "react";
 
 import { connectTelemetry, getHealth, type TelemetryConnection } from "@/lib/api";
-import type { ConnectionState, TelemetryEnvelope, TelemetryKind } from "@/lib/types";
+import type {
+  ConnectionState,
+  HealthResponse,
+  TelemetryEnvelope,
+  TelemetryKind,
+} from "@/lib/types";
 
 interface TelemetryContextValue {
   /** Socket state (`demo` = deterministic local simulator driving the UI). */
   status: ConnectionState;
   /** REST reachability of the FastAPI backend. */
   backend: "checking" | "online" | "offline";
+  /** Last `/health` payload (environment + offline_mode drive the mode pill). */
+  health: HealthResponse | null;
   /** Latest envelope per telemetry kind. */
   latest: Partial<Record<TelemetryKind, TelemetryEnvelope>>;
   /** Rolling event log (newest first, capped at 60). */
@@ -36,6 +43,7 @@ const MAX_EVENTS = 60;
 export function TelemetryProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<ConnectionState>("connecting");
   const [backend, setBackend] = useState<"checking" | "online" | "offline">("checking");
+  const [health, setHealth] = useState<HealthResponse | null>(null);
   const [latest, setLatest] = useState<Partial<Record<TelemetryKind, TelemetryEnvelope>>>({});
   const [events, setEvents] = useState<TelemetryEnvelope[]>([]);
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
@@ -48,6 +56,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       .then((result) => {
         if (cancelled) return;
         setBackend(result.source === "live" ? "online" : "offline");
+        setHealth(result.data);
       })
       .catch(() => {
         if (!cancelled) setBackend("offline");
@@ -79,6 +88,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
     connectionRef.current?.close();
     setStatus("connecting");
     setBackend("checking");
+    setHealth(null);
     setReconnectNonce((nonce) => nonce + 1);
   }, []);
 
@@ -90,6 +100,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
     return {
       status,
       backend,
+      health,
       latest,
       events,
       lastUpdate,
@@ -97,7 +108,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       isDemo: status === "demo" || backend === "offline",
       retry,
     };
-  }, [status, backend, latest, events, lastUpdate, retry]);
+  }, [status, backend, health, latest, events, lastUpdate, retry]);
 
   return <TelemetryContext.Provider value={value}>{children}</TelemetryContext.Provider>;
 }

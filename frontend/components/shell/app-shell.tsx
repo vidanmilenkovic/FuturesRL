@@ -1,290 +1,270 @@
 "use client";
 
-import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 
-import { Badge } from "@/components/ui/badge";
-import { LiveDot } from "@/components/ui/controls";
+import { getPipeline, listStrategies } from "@/lib/api";
 import { cn } from "@/lib/cn";
-import { formatClock } from "@/lib/format";
-
-import { useTelemetry } from "../providers/telemetry-provider";
 import {
-  BacktestIcon,
-  CloseIcon,
-  CommandCenterIcon,
-  DatabaseIcon,
-  MenuIcon,
-  PipelineIcon,
-  RefreshIcon,
-  RiskIcon,
-  TermStructureIcon,
-} from "./icons";
+  formatCompactUsd,
+  formatDateTime,
+  formatInteger,
+  formatPct,
+  formatPctPlain,
+  formatSignedCurrency,
+} from "@/lib/format";
+import { useAsyncData } from "@/lib/use-async-data";
+import type { ConnectionState, HealthResponse } from "@/lib/types";
 
-interface NavItem {
-  href: string;
-  label: string;
-  short: string;
-  description: string;
-  Icon: (props: { className?: string }) => ReactNode;
-}
+import { useAccount } from "../providers/account-provider";
+import { useTelemetry } from "../providers/telemetry-provider";
+import { Button, ModePill, NavTab, StatusDot, type Tone } from "../ui/primitives";
+import { FlattenDialog } from "./flatten-dialog";
+import { PowerIcon, ChevronDownIcon, ChevronUpIcon } from "./icons";
+import { TelemetryDrawer } from "./telemetry-drawer";
 
-const NAV_ITEMS: NavItem[] = [
-  {
-    href: "/",
-    label: "Command Center",
-    short: "CMD",
-    description: "Live account, margin, positions & kill switch",
-    Icon: CommandCenterIcon,
-  },
-  {
-    href: "/pipeline",
-    label: "Pipeline Inspector",
-    short: "PIPE",
-    description: "FinRL-X waterfall S_t → w_base → w_t → N_i,t",
-    Icon: PipelineIcon,
-  },
-  {
-    href: "/risk",
-    label: "LLM Risk Monitor",
-    short: "RISK",
-    description: "Sentiment, confidence, semantic risk & lockouts",
-    Icon: RiskIcon,
-  },
-  {
-    href: "/term-structure",
-    label: "Term Structure",
-    short: "TERM",
-    description: "Curves, carry and roll calendar",
-    Icon: TermStructureIcon,
-  },
-  {
-    href: "/backtests",
-    label: "Backtest Lab",
-    short: "BTLAB",
-    description: "Runs, tear sheets and attribution",
-    Icon: BacktestIcon,
-  },
+const NAV_ITEMS: { href: string; label: string }[] = [
+  { href: "/", label: "Command Center" },
+  { href: "/pipeline", label: "Pipeline & Weights" },
+  { href: "/risk", label: "Risk & LLM" },
+  { href: "/term-structure", label: "Term Structure" },
+  { href: "/backtests", label: "Backtest Lab" },
 ];
 
-function resolveTitle(pathname: string): { title: string; description: string } {
-  const item = NAV_ITEMS.find((nav) =>
-    nav.href === "/" ? pathname === "/" : pathname.startsWith(nav.href),
-  );
-  return item
-    ? { title: item.label, description: item.description }
-    : { title: "FuturesRL-X", description: "Quantitative futures command center" };
+const MARGIN_CAP = 0.6;
+
+function isActive(pathname: string, href: string): boolean {
+  return href === "/" ? pathname === "/" : pathname.startsWith(href);
 }
 
+function modeState(
+  backend: "checking" | "online" | "offline",
+  health: HealthResponse | null,
+  isDemo: boolean,
+): { label: string; tone: Tone; title: string } {
+  if (backend === "checking") {
+    return { label: "CONNECTING", tone: "neutral", title: "Connecting to the telemetry API" };
+  }
+  if (isDemo || backend === "offline" || !health) {
+    return {
+      label: "DEMO DATA",
+      tone: "warn",
+      title: "FastAPI backend unreachable — deterministic fixtures + local telemetry simulator",
+    };
+  }
+  if (health.offline_mode) {
+    return {
+      label: "DEMO DATA",
+      tone: "warn",
+      title: "API is serving deterministic offline fixtures (no IBKR/Databento session)",
+    };
+  }
+  if (health.status === "degraded") {
+    return {
+      label: "DEGRADED",
+      tone: "warn",
+      title: "API reports degraded service — some adapters are running on fallbacks",
+    };
+  }
+  if (health.environment === "live") {
+    return { label: "LIVE · IBKR", tone: "gain", title: "Live IBKR execution session" };
+  }
+  return { label: "PAPER · IBKR", tone: "neutral", title: "IBKR paper trading session" };
+}
+
+function connectionState(status: ConnectionState): { label: string; tone: Tone } {
+  switch (status) {
+    case "live":
+      return { label: "Streaming", tone: "gain" };
+    case "demo":
+      return { label: "Demo stream", tone: "warn" };
+    case "connecting":
+      return { label: "Connecting", tone: "neutral" };
+    default:
+      return { label: "Offline", tone: "loss" };
+  }
+}
+
+/**
+ * Full-viewport docked workspace shell: ribbon (brand, view tabs, always-visible
+ * account ticker, data-mode pill, flatten-all), scrollable main surface and a
+ * compact status bar with a collapsible telemetry console.
+ */
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const { status, backend, isDemo, lastUpdate, sequence, retry } = useTelemetry();
+  const { status, backend, health, events, isDemo, latest } = useTelemetry();
+  const { account, positions, reload } = useAccount();
+  const strategies = useAsyncData(listStrategies);
+  const pipeline = useAsyncData(getPipeline);
+  const [flattenOpen, setFlattenOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [clock, setClock] = useState<string>("--:--:--");
-  const active = useMemo(() => resolveTitle(pathname), [pathname]);
 
-  useEffect(() => {
-    setDrawerOpen(false);
-  }, [pathname]);
+  const mode = useMemo(() => modeState(backend, health, isDemo), [backend, health, isDemo]);
+  const connection = connectionState(status);
 
-  useEffect(() => {
-    setClock(formatClock(new Date().toISOString()));
-    const timer = setInterval(() => setClock(formatClock(new Date().toISOString())), 1_000);
-    return () => clearInterval(timer);
-  }, []);
+  const marginUtil = account?.margin_utilization ?? 0;
+  const dayPnl = account?.day_pnl ?? 0;
+  const dayPnlPct = account?.day_pnl_pct ?? 0;
+  const dayTone: Tone = dayPnl > 0 ? "gain" : dayPnl < 0 ? "loss" : "neutral";
+  const marginTone: Tone = marginUtil >= 0.8 ? "loss" : marginUtil >= MARGIN_CAP ? "warn" : "gain";
 
-  const statusLabel =
-    status === "live" ? "BACKEND LIVE" : status === "demo" ? "SIMULATED STREAM" : status === "connecting" ? "CONNECTING" : "OFFLINE";
+  const availableStrategies = strategies.data ?? [];
+  const strategyId =
+    availableStrategies.find((strategy) => strategy.id === "tsmom_vol_target")?.id ??
+    availableStrategies[0]?.id ??
+    "—";
+  const pipelineFrame = latest.pipeline;
+  const lastRebalance =
+    pipelineFrame && "pipeline" in pipelineFrame.payload
+      ? pipelineFrame.payload.pipeline.timestamp
+      : (pipeline.data?.timestamp ?? null);
 
   return (
-    <div className="flex min-h-screen w-full">
-      {/* Desktop sidebar */}
-      <aside className="sticky top-0 hidden h-screen w-[232px] shrink-0 flex-col border-r border-terminal-600/60 bg-terminal-900/80 lg:flex">
-        <Brand />
-        <nav aria-label="Primary" className="flex-1 space-y-0.5 px-2 py-3">
+    <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-canvas">
+      {/* ---------------------------------------------------------------- ribbon */}
+      <header className="no-scrollbar flex h-12 shrink-0 items-center gap-2 overflow-x-auto border-b border-hairline bg-panel pl-3 pr-2">
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="grid h-[22px] w-[22px] place-items-center rounded-[5px] border border-edge bg-canvas">
+            <svg viewBox="0 0 20 20" className="h-3.5 w-3.5" fill="none" stroke="#3B82F6" strokeWidth={1.8} aria-hidden="true">
+              <path d="M3.5 14.5v-9l3 5 3-5 3 5 3-5v9" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </span>
+          <span className="text-[13px] font-semibold tracking-[-0.01em] text-zinc-100">FuturesRL-X</span>
+        </div>
+
+        <nav aria-label="Views" className="ml-1 flex h-12 shrink-0 items-center">
           {NAV_ITEMS.map((item) => (
-            <NavLink key={item.href} item={item} pathname={pathname} />
+            <NavTab
+              key={item.href}
+              href={item.href}
+              label={item.label}
+              active={isActive(pathname, item.href)}
+            />
           ))}
         </nav>
-        <SidebarFooter
-          environment={backend === "online" ? "PAPER · IBGW" : "DEMO FIXTURES"}
-          sequence={sequence}
-        />
-      </aside>
 
-      {/* Mobile drawer */}
-      {drawerOpen ? (
-        <div className="fixed inset-0 z-40 lg:hidden">
-          <button
-            type="button"
-            aria-label="Close navigation"
-            className="absolute inset-0 bg-terminal-950/80 backdrop-blur-sm"
-            onClick={() => setDrawerOpen(false)}
-          />
-          <aside className="relative flex h-full w-72 flex-col border-r border-terminal-600/70 bg-terminal-900">
-            <div className="flex items-center justify-between px-3 py-2">
-              <Brand compact />
-              <button
-                type="button"
-                onClick={() => setDrawerOpen(false)}
-                aria-label="Close navigation"
-                className="rounded-sm p-1.5 text-terminal-300 hover:bg-terminal-700 hover:text-terminal-100 focus-ring"
-              >
-                <CloseIcon />
-              </button>
-            </div>
-            <nav aria-label="Primary" className="flex-1 space-y-0.5 px-2 py-2">
-              {NAV_ITEMS.map((item) => (
-                <NavLink key={item.href} item={item} pathname={pathname} />
-              ))}
-            </nav>
-            <SidebarFooter environment="MOBILE" sequence={sequence} />
-          </aside>
-        </div>
-      ) : null}
-
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-30 border-b border-terminal-600/60 bg-terminal-950/85 backdrop-blur">
-          <div className="flex items-center gap-3 px-3 py-2.5 sm:px-4">
-            <button
-              type="button"
-              className="rounded-sm p-1.5 text-terminal-200 hover:bg-terminal-700 focus-ring lg:hidden"
-              onClick={() => setDrawerOpen(true)}
-              aria-label="Open navigation"
-            >
-              <MenuIcon />
-            </button>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <h1 className="truncate font-mono text-sm font-semibold uppercase tracking-[0.16em] text-terminal-100">
-                  {active.title}
-                </h1>
-                {isDemo ? (
-                  <Badge tone="warn" dot className="hidden sm:inline-flex">
-                    DEMO DATA
-                  </Badge>
-                ) : null}
-              </div>
-              <p className="hidden truncate text-[11px] text-terminal-400 sm:block">{active.description}</p>
-            </div>
-
-            <div className="flex items-center gap-2 sm:gap-3">
-              <span className="hidden items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-terminal-400 md:flex">
-                <DatabaseIcon className="h-3.5 w-3.5" />
-                CME · NYMEX · COMEX · CBOT
-              </span>
-              <span className="hidden font-mono text-[11px] tabular-nums text-terminal-200 sm:inline">
-                {clock}
-                <span className="ml-1 text-[9px] text-terminal-400">UTC</span>
-              </span>
-              <Badge tone={status === "live" ? "up" : status === "demo" ? "warn" : "neutral"} dot>
-                {statusLabel}
-              </Badge>
-              <button
-                type="button"
-                onClick={retry}
-                title="Reconnect telemetry stream"
-                aria-label="Reconnect telemetry stream"
-                className="rounded-sm border border-terminal-500/60 p-1.5 text-terminal-300 transition-colors hover:border-signal-info/50 hover:text-signal-info focus-ring"
-              >
-                <RefreshIcon className="h-3.5 w-3.5" />
-              </button>
-            </div>
+        <div className="ml-auto flex shrink-0 items-center gap-4 pl-3">
+          {/* inline account ticker */}
+          <div className="hidden items-baseline gap-1.5 sm:flex">
+            <span className="text-[10px] font-medium uppercase tracking-[0.05em] text-zinc-500">NLV</span>
+            <span className="font-mono text-[12px] font-medium tabular-nums text-zinc-100">
+              {account ? formatCompactUsd(account.net_liquidation) : "—"}
+            </span>
           </div>
 
-          {isDemo ? (
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-t border-signal-warn/25 bg-signal-warn/[0.06] px-3 py-1 font-mono text-[10px] uppercase tracking-[0.1em] text-signal-warn sm:px-4">
-              <span className="font-semibold">DEMO DATA</span>
-              <span className="text-signal-warn/80">
-                FastAPI backend unreachable — deterministic fixtures + local telemetry simulator.
-              </span>
-              <span className="ml-auto hidden text-signal-warn/60 md:inline">
-                start: uvicorn src.api.main:app --port 8000
-              </span>
-            </div>
-          ) : null}
-        </header>
+          <div className="hidden items-baseline gap-1.5 md:flex">
+            <span className="text-[10px] font-medium uppercase tracking-[0.05em] text-zinc-500">Day PnL</span>
+            <span
+              className={cn(
+                "font-mono text-[12px] font-medium tabular-nums",
+                dayPnl > 0 ? "text-gain" : dayPnl < 0 ? "text-loss" : "text-zinc-300",
+              )}
+            >
+              {formatSignedCurrency(dayPnl, true)}
+            </span>
+            <span
+              className={cn(
+                "font-mono text-[11px] tabular-nums",
+                dayTone === "gain" ? "text-gain/80" : dayTone === "loss" ? "text-loss/80" : "text-zinc-500",
+              )}
+            >
+              {formatPct(dayPnlPct)}
+            </span>
+          </div>
 
-        <main className="flex-1 px-3 py-3 sm:px-4 sm:py-4">
-          <div className="mx-auto w-full max-w-[1700px]">{children}</div>
-        </main>
+          <div className="hidden items-center gap-1.5 lg:flex" title={`Initial margin utilisation vs ${formatPctPlain(MARGIN_CAP)} policy cap`}>
+            <span className="text-[10px] font-medium uppercase tracking-[0.05em] text-zinc-500">Margin</span>
+            <span
+              className={cn(
+                "font-mono text-[12px] font-medium tabular-nums",
+                marginTone === "loss" ? "text-loss" : marginTone === "warn" ? "text-warn" : "text-zinc-100",
+              )}
+            >
+              {formatPctPlain(marginUtil)}
+            </span>
+            <span className="relative h-1 w-[60px] overflow-hidden rounded-full bg-zinc-800">
+              <span
+                className={cn(
+                  "block h-full rounded-full",
+                  marginTone === "loss" ? "bg-loss" : marginTone === "warn" ? "bg-warn" : "bg-gain",
+                )}
+                style={{ width: `${Math.min(100, (marginUtil / MARGIN_CAP) * 100)}%` }}
+              />
+            </span>
+            <span className="font-mono text-[10px] tabular-nums text-zinc-600">60%</span>
+          </div>
 
-        <footer className="mt-auto flex flex-wrap items-center justify-between gap-2 border-t border-terminal-600/50 px-3 py-2 font-mono text-[10px] uppercase tracking-[0.1em] text-terminal-400 sm:px-4">
-          <span>FuturesRL-X · FinRL-X weight-centric pipeline · v1.0.0</span>
-          <span className="flex items-center gap-2">
-            <LiveDot state={status === "live" ? "live" : status === "demo" ? "demo" : "offline"} />
-            <span>seq {sequence.toString().padStart(5, "0")}</span>
-            <span className="hidden sm:inline">last {lastUpdate ? formatClock(lastUpdate) : "--:--:--"}Z</span>
+          <div className="hidden items-baseline gap-1.5 xl:flex">
+            <span className="text-[10px] font-medium uppercase tracking-[0.05em] text-zinc-500">Gross</span>
+            <span className="font-mono text-[12px] font-medium tabular-nums text-zinc-100">
+              {account ? `${account.gross_leverage.toFixed(2)}×` : "—"}
+            </span>
+          </div>
+
+          <ModePill label={mode.label} tone={mode.tone} title={mode.title} />
+
+          <Button
+            variant="danger"
+            size="xs"
+            onClick={() => setFlattenOpen(true)}
+            title="Flatten all positions (market orders)"
+            ariaLabel="Flatten all positions"
+            className="gap-1"
+          >
+            <PowerIcon className="h-3 w-3" />
+            Flatten All
+          </Button>
+        </div>
+      </header>
+
+      {/* ------------------------------------------------------------------ main */}
+      <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden bg-canvas p-3">{children}</main>
+
+      {/* ------------------------------------------------------------ status bar */}
+      <footer className="relative z-40 flex h-7 shrink-0 items-center gap-3 border-t border-hairline bg-panel px-3 text-[11px] text-zinc-500">
+        <span className="flex items-center gap-1.5">
+          <StatusDot tone={connection.tone} pulse={status === "live"} />
+          <span className={cn(connection.tone === "gain" ? "text-emerald-300" : connection.tone === "warn" ? "text-amber-300" : "text-zinc-400")}>
+            {connection.label}
           </span>
-        </footer>
-      </div>
-    </div>
-  );
-}
-
-function Brand({ compact = false }: { compact?: boolean }) {
-  return (
-    <div className={cn("flex items-center gap-2.5 border-b border-terminal-600/60 px-3 py-3", compact && "border-b-0 py-1")}>
-      <span className="relative grid h-8 w-8 shrink-0 place-items-center rounded-sm border border-signal-info/40 bg-signal-info/10">
-        <span className="absolute inset-0 animate-pulse bg-signal-info/5" aria-hidden />
-        <svg viewBox="0 0 24 24" className="h-4 w-4 text-signal-info" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden>
-          <path d="M4 18 9 8l4 6 3-4 4 8" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-      </span>
-      <div className="min-w-0">
-        <p className="truncate font-mono text-[12px] font-bold tracking-[0.18em] text-terminal-100">
-          FUTURESRL-X
-        </p>
-        <p className="truncate font-mono text-[9px] uppercase tracking-[0.22em] text-terminal-400">
-          quant terminal
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function NavLink({ item, pathname }: { item: NavItem; pathname: string }) {
-  const selected = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
-  return (
-    <Link
-      href={item.href}
-      aria-current={selected ? "page" : undefined}
-      className={cn(
-        "group relative flex items-start gap-2.5 rounded-sm px-2 py-2 transition-colors focus-ring",
-        selected
-          ? "bg-terminal-700/70 text-terminal-100"
-          : "text-terminal-300 hover:bg-terminal-800 hover:text-terminal-100",
-      )}
-    >
-      {selected ? (
-        <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-signal-info" />
-      ) : null}
-      <item.Icon className={cn("mt-0.5 h-4 w-4 shrink-0", selected ? "text-signal-info" : "text-terminal-400 group-hover:text-terminal-200")} />
-      <span className="min-w-0">
-        <span className="block truncate text-[12px] font-medium">{item.label}</span>
-        <span className="block truncate font-mono text-[9px] uppercase tracking-[0.12em] text-terminal-500 group-hover:text-terminal-400">
-          {item.short}
         </span>
-      </span>
-    </Link>
-  );
-}
+        <span className="text-zinc-700">·</span>
+        <span className="hidden items-center gap-1 sm:flex">
+          <span className="text-zinc-600">Strategy</span>
+          <span className="font-mono text-[11px] text-zinc-400">{strategyId}</span>
+        </span>
+        <span className="hidden text-zinc-700 sm:inline">·</span>
+        <span className="hidden items-center gap-1 md:flex">
+          <span className="text-zinc-600">Last rebalance</span>
+          <span className="font-mono text-[11px] text-zinc-400">
+            {lastRebalance ? formatDateTime(lastRebalance) : "—"}
+          </span>
+        </span>
+        <span className="ml-auto flex items-center gap-2">
+          <span className={cn("hidden text-[10.5px] lg:inline", isDemo ? "text-amber-400/80" : "text-zinc-600")}>
+            {isDemo
+              ? "DEMO DATA · deterministic fixtures"
+              : `API ${health?.environment ?? "connected"} · ${formatInteger(events.length)} frames`}
+          </span>
+          <button
+            type="button"
+            onClick={() => setDrawerOpen((open) => !open)}
+            aria-expanded={drawerOpen}
+            className="focus-ring flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-zinc-400 transition-colors hover:bg-surface hover:text-zinc-200"
+          >
+            Telemetry
+            {drawerOpen ? <ChevronDownIcon className="h-3 w-3" /> : <ChevronUpIcon className="h-3 w-3" />}
+          </button>
+        </span>
+      </footer>
 
-function SidebarFooter({ environment, sequence }: { environment: string; sequence: number }) {
-  return (
-    <div className="space-y-2 border-t border-terminal-600/60 px-3 py-3">
-      <div className="flex items-center justify-between font-mono text-[9px] uppercase tracking-[0.14em] text-terminal-400">
-        <span>mode</span>
-        <span className="text-terminal-200">{environment}</span>
-      </div>
-      <div className="flex items-center justify-between font-mono text-[9px] uppercase tracking-[0.14em] text-terminal-400">
-        <span>telemetry</span>
-        <span className="tabular-nums text-terminal-200">#{sequence.toString().padStart(5, "0")}</span>
-      </div>
-      <p className="font-mono text-[9px] leading-relaxed text-terminal-500">
-        Risk-First engine · κ 4.5 · c ≥ 0.70 · η_max 60%
-      </p>
+      <TelemetryDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} />
+      <FlattenDialog
+        open={flattenOpen}
+        positions={positions}
+        onClose={() => setFlattenOpen(false)}
+        onFlattened={reload}
+      />
     </div>
   );
 }

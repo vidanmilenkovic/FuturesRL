@@ -1,348 +1,377 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, type CSSProperties } from "react";
 
-import { WaterfallChart } from "@/components/charts/svg-charts";
-import { useTelemetry } from "@/components/providers/telemetry-provider";
-import { Badge } from "@/components/ui/badge";
-import { Segmented, Skeleton } from "@/components/ui/controls";
-import { Panel } from "@/components/ui/panel";
-import { getPipeline } from "@/lib/api";
+import { StageGroupedBars, type StageBar } from "@/components/charts/plots";
+import {
+  Badge,
+  EmptyState,
+  Panel,
+  Skeleton,
+  type Tone,
+} from "@/components/ui/primitives";
+import { getPipeline, getTermStructure } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import {
-  formatDateTime,
+  formatCurrency,
   formatNumber,
-  formatSignedNumber,
   formatWeight,
-  formatSignedCurrency,
 } from "@/lib/format";
+import type { PipelineInstrumentRow, PipelineWaterfallResponse, TermRegime } from "@/lib/types";
 import { useAsyncData } from "@/lib/use-async-data";
-import type { PipelineInstrumentRow, PipelineWaterfallResponse } from "@/lib/types";
 
-type ArtifactStage = "base" | "timing" | "risk";
+const MICRO_ROOTS = new Set(["MES", "MNQ", "MCL", "MGC"]);
 
-const STAGE_TONE = {
-  universe: "neutral",
-  base: "info",
-  timing: "violet",
-  risk: "up",
-  targets: "warn",
-} as const;
+const STAGE_LABELS: Record<string, { label: string; formula: string }> = {
+  universe: { label: "S_t · Universe", formula: "selector(X≤t)" },
+  base: { label: "A_t · Allocation", formula: "allocate(candidates)" },
+  timing: { label: "T_t · Timing", formula: "adjust_timing(w_base)" },
+  risk: { label: "R_t · Risk", formula: "apply_risk(w_timing)" },
+  targets: { label: "N_i,t · Contracts", formula: "w_t·E_t / (P·M)" },
+};
 
-/**
- * View 2 — FinRL-X Pipeline Inspector.
- *
- * Renders the staged weight transformation
- * `S_t → w_base → w_timing → w_risk → N_i,t` as a waterfall, a per-instrument
- * weight-evolution table and the diagnostics emitted by every pipeline stage.
- */
+const REGIME_TONE: Record<TermRegime, Tone> = {
+  contango: "warn",
+  backwardation: "gain",
+  flat: "neutral",
+};
+
+const REGIME_LABEL: Record<TermRegime, string> = {
+  contango: "Contango",
+  backwardation: "Backwardation",
+  flat: "Flat",
+};
+
+function heatStyle(value: number, maxAbs: number, muted = false): CSSProperties {
+  if (Math.abs(value) < 1e-9) return {};
+  const alpha = Math.max(0.06, Math.min(0.32, (Math.abs(value) / Math.max(maxAbs, 1e-9)) * 0.3));
+  if (muted) return {};
+  return {
+    backgroundColor:
+      value >= 0 ? `rgba(16, 185, 129, ${alpha.toFixed(3)})` : `rgba(244, 63, 94, ${alpha.toFixed(3)})`,
+  };
+}
+
+function parseOverlays(pipeline: PipelineWaterfallResponse): string[] {
+  const diagnostic = pipeline.diagnostics.find((item) => item.stage === "Risk overlays");
+  if (!diagnostic) return [];
+  const match = /applied:\s*(.+)$/i.exec(diagnostic.detail);
+  if (!match || !match[1]) return [];
+  return match[1]
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
+function parseTranslator(pipeline: PipelineWaterfallResponse): string {
+  const diagnostic = pipeline.diagnostics.find((item) => item.stage === "Contract translator");
+  return diagnostic?.detail ?? "not reported";
+}
+
+function parseMargin(pipeline: PipelineWaterfallResponse): string {
+  const diagnostic = pipeline.diagnostics.find((item) => item.stage === "Margin feasibility");
+  return diagnostic?.value ?? "—";
+}
+
+/** View 2 — FinRL-X pipeline & weights inspector. */
 export function PipelineView() {
   const pipeline = useAsyncData(getPipeline);
-  const { latest } = useTelemetry();
-  const [data, setData] = useState<PipelineWaterfallResponse | null>(null);
-  const [focus, setFocus] = useState<ArtifactStage>("risk");
+  const terms = useAsyncData(getTermStructure);
 
-  useEffect(() => {
-    if (pipeline.data) setData(pipeline.data);
-  }, [pipeline.data]);
+  const data = pipeline.data;
+  const regimes = useMemo(() => {
+    const map = new Map<string, TermRegime>();
+    for (const curve of terms.data?.curves ?? []) map.set(curve.root, curve.regime);
+    return map;
+  }, [terms.data]);
 
-  useEffect(() => {
-    const frame = latest.pipeline;
-    if (frame && "pipeline" in frame.payload) {
-      setData(frame.payload.pipeline);
-    }
-  }, [latest.pipeline]);
+  const stages: StageBar[] = useMemo(() => {
+    if (!data) return [];
+    return data.stages.map((stage) => {
+      const meta = STAGE_LABELS[stage.key];
+      return {
+        key: stage.key,
+        label: meta?.label ?? stage.label,
+        formula: stage.formula,
+        gross: stage.gross,
+        net: stage.net,
+        count: stage.instrument_count,
+        countLabel: stage.key === "targets" ? "lots" : "roots",
+      };
+    });
+  }, [data]);
 
-  const selected = useMemo(
-    () => (data ? data.instruments.filter((row) => row.selected) : []),
+  const maxAbs = useMemo(() => {
+    const rows = data?.instruments ?? [];
+    return Math.max(
+      ...rows.map((row) =>
+        Math.max(
+          Math.abs(row.weight_base),
+          Math.abs(row.weight_timing),
+          Math.abs(row.weight_risk),
+          Math.abs(row.weight_final),
+        ),
+      ),
+      0.0001,
+    );
+  }, [data]);
+
+  const microTargets = useMemo(
+    () =>
+      (data?.instruments ?? [])
+        .filter((row) => row.target_contracts !== null && MICRO_ROOTS.has(row.instrument_id))
+        .map((row) => row.instrument_id),
     [data],
   );
 
   if (pipeline.loading && !data) {
     return (
-      <div className="space-y-3">
-        <Skeleton className="h-24" />
-        <div className="grid gap-3 xl:grid-cols-3">
-          <Skeleton className="h-[300px] xl:col-span-2" />
-          <Skeleton className="h-[300px]" />
-        </div>
-        <Skeleton className="h-[360px]" />
+      <div className="grid min-h-full grid-rows-[minmax(0,1fr)] grid-cols-12 gap-3">
+        <Skeleton className="col-span-7 h-72" />
+        <Skeleton className="col-span-5 h-72" />
+        <Skeleton className="col-span-7 h-56" />
+        <Skeleton className="col-span-5 h-56" />
       </div>
     );
   }
 
   if (!data) {
     return (
-      <Panel title="pipeline inspector">
-        <p className="py-10 text-center font-mono text-xs uppercase tracking-[0.12em] text-signal-down">
-          pipeline trace unavailable
-        </p>
+      <Panel title="Pipeline & weights">
+        <EmptyState
+          title="Pipeline trace unavailable"
+          description="The API did not return a FinRL-X rebalance trace and the deterministic fixture fallback could not be built."
+        />
       </Panel>
     );
   }
 
-  const artifactValue = (row: PipelineInstrumentRow, stage: ArtifactStage): number => {
-    if (stage === "base") return row.weight_base;
-    if (stage === "timing") return row.weight_timing;
-    return row.weight_risk;
-  };
-
-  const maxAbsWeight = Math.max(
-    ...selected.map((row) => Math.max(Math.abs(row.weight_base), Math.abs(row.weight_timing), Math.abs(row.weight_risk))),
-    0.0001,
-  );
+  const overlays = parseOverlays(data);
+  const translator = parseTranslator(data);
+  const selectedCount = data.instruments.filter((row) => row.selected).length;
 
   return (
-    <div className="space-y-3">
-      {/* Header strip */}
-      <div className="flex flex-wrap items-center gap-2 rounded-md border border-terminal-600/60 bg-terminal-850/70 px-3 py-2">
-        <Badge tone="info">{data.cycle_id}</Badge>
-        <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-terminal-300">
-          w_t = R_t(T_t(A_t(S_t(X≤t))))
-        </span>
-        <span className="hidden font-mono text-[10px] uppercase tracking-[0.1em] text-terminal-500 sm:inline">
-          {formatDateTime(data.timestamp)} · {data.elapsed_ms.toFixed(1)} ms · {data.universe.length} roots
-        </span>
-        <div className="ml-auto flex items-center gap-2">
-          <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-terminal-400">instrument artifact</span>
-          <Segmented
-            size="sm"
-            ariaLabel="Weight artifact to inspect"
-            value={focus}
-            onChange={setFocus}
-            options={[
-              { value: "base", label: "w_base", hint: "Allocator output before overlays" },
-              { value: "timing", label: "w_timing", hint: "After TSMOM/KAMA/carry overlay" },
-              { value: "risk", label: "w_risk", hint: "After vol target + LLM risk projection" },
-            ]}
-          />
-        </div>
-      </div>
-
-      {/* Stage cards */}
-      <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
-        {data.stages.map((stage) => (
-          <div
-            key={stage.key}
-            className="relative overflow-hidden rounded-md border border-terminal-600/60 bg-terminal-850/70 px-2.5 py-2"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <p className="truncate font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-terminal-200">
-                {stage.label}
-              </p>
-              <Badge tone={STAGE_TONE[stage.key]}>{stage.key === "targets" ? "N" : stage.key.slice(0, 3)}</Badge>
-            </div>
-            <p className="mt-1 font-mono text-lg font-semibold tabular-nums text-terminal-100">
-              {stage.gross.toFixed(3)}
-              <span className="ml-1 text-[10px] font-normal text-terminal-400">gross</span>
-            </p>
-            <div className="flex items-center justify-between font-mono text-[9px] uppercase tracking-[0.08em] text-terminal-500">
-              <span>net {formatSignedNumber(stage.net, 3)}</span>
-              <span>{stage.instrument_count} {stage.key === "targets" ? "lots" : "roots"}</span>
-            </div>
-            <p className="mt-1 truncate font-mono text-[9px] text-terminal-500" title={stage.note}>
-              {stage.formula}
-            </p>
-          </div>
-        ))}
-      </div>
-
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+    <div className="grid min-h-full grid-rows-[minmax(0,1fr)] grid-cols-12 gap-3">
+      {/* ------------------------------------------------------- left column */}
+      <div className="col-span-12 flex min-h-0 flex-col gap-3 xl:col-span-7">
         <Panel
-          title="weight transformation waterfall"
-          subtitle="gross exposure by stage · dot = net exposure"
-          className="xl:col-span-2"
-          actions={<Badge tone="violet">R(T(A(S)))</Badge>}
+          title="Stage exposure · long / short / net"
+          actions={
+            <div className="flex items-center gap-2">
+              <Badge tone={data.data_source === "engine" ? "gain" : "warn"}>
+                {data.data_source === "engine" ? "Engine" : "Fixture"}
+              </Badge>
+              <span className="font-mono text-[11px] text-zinc-600">{data.cycle_id}</span>
+            </div>
+          }
         >
-          <WaterfallChart
-            stages={data.stages.map((stage) => ({
-              key: stage.key,
-              label: stage.label,
-              gross: stage.gross,
-              net: stage.net,
-              note: stage.formula,
-            }))}
-          />
-          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 border-t border-terminal-600/40 pt-2 font-mono text-[9px] uppercase tracking-[0.1em] text-terminal-400">
-            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-sm bg-signal-info/40 ring-1 ring-signal-info" /> gross Σ|w|</span>
-            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-signal-up" /> net long exposure</span>
-            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-signal-down" /> net short exposure</span>
-            <span className="ml-auto text-terminal-500">Δ vs previous stage shown per row</span>
+          <StageGroupedBars stages={stages} />
+          <div className="mt-3 border-t border-hairline pt-2">
+            <div className="grid grid-cols-4 gap-3">
+              <TraceStat label="Gross (targets)" value={`${(data.stages.at(-1)?.gross ?? 0).toFixed(3)}×`} />
+              <TraceStat label="Net (targets)" value={`${(data.stages.at(-1)?.net ?? 0).toFixed(3)}×`} />
+              <TraceStat label="Universe" value={`${selectedCount} / ${data.instruments.length}`} />
+              <TraceStat label="Elapsed" value={`${formatNumber(data.elapsed_ms, 2)} ms`} />
+            </div>
           </div>
         </Panel>
 
-        <Panel title="stage diagnostics" subtitle="guardrails & filters" actions={<Badge tone="neutral">{data.diagnostics.length}</Badge>}>
-          <div className="divide-y divide-terminal-600/30">
-            {data.diagnostics.map((diagnostic) => (
-              <div key={diagnostic.stage} className="py-2">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="font-mono text-[10px] uppercase tracking-[0.1em] text-terminal-200">{diagnostic.stage}</p>
-                  <Badge tone={diagnostic.status === "ok" ? "up" : diagnostic.status}>{diagnostic.value}</Badge>
+        <Panel title="Execution trace" className="min-h-0 flex-1">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-2.5">
+            <TraceRow label="Latency" value={`${formatNumber(data.elapsed_ms, 2)} ms`} />
+            <TraceRow label="Modules" value={`5 stages · ${overlays.length} risk overlays`} />
+            <TraceRow
+              label="Risk overlays"
+              value={overlays.length > 0 ? overlays.join(", ") : "none applied"}
+              tone={overlays.length > 0 ? "text-zinc-200" : "text-warn"}
+            />
+            <TraceRow
+              label="Tracking error"
+              value="n/a · not reported by API"
+              tone="text-zinc-500"
+              title="The pipeline API does not expose realised tracking error; it is computed by the backtest analytics layer."
+            />
+            <TraceRow
+              label="Micro routing"
+              value={microTargets.length > 0 ? `Active · ${microTargets.join(", ")}` : "Idle · no micro legs"}
+              tone={microTargets.length > 0 ? "text-zinc-200" : "text-zinc-500"}
+            />
+            <TraceRow label="Margin feasibility" value={parseMargin(data)} />
+            <TraceRow label="Translator" value={translator} />
+          </div>
+
+          <div className="mt-3 border-t border-hairline pt-2">
+            <div className="metric-label mb-1.5">Diagnostics</div>
+            <div className="space-y-1.5">
+              {data.diagnostics.map((diagnostic) => (
+                <div key={`${diagnostic.stage}-${diagnostic.value}`} className="flex items-start gap-2">
+                  <Badge
+                    tone={
+                      diagnostic.status === "critical"
+                        ? "loss"
+                        : diagnostic.status === "warn"
+                          ? "warn"
+                          : diagnostic.status === "ok"
+                            ? "gain"
+                            : "neutral"
+                    }
+                  >
+                    {diagnostic.stage}
+                  </Badge>
+                  <span className="min-w-0 flex-1 text-[11.5px] leading-5 text-zinc-500" title={diagnostic.detail}>
+                    {diagnostic.value}
+                    <span className="text-zinc-700"> · </span>
+                    {diagnostic.detail}
+                  </span>
                 </div>
-                <p className="mt-0.5 font-mono text-[10px] leading-relaxed text-terminal-400">{diagnostic.detail}</p>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
         </Panel>
       </div>
 
-      {/* Instrument table */}
+      {/* ------------------------------------------------------ right column */}
       <Panel
-        title="per-instrument transformation"
-        subtitle={`S_t → w_base → w_timing → w_risk → N_i,t · highlighting ${focus}`}
-        contentClassName="px-3 pt-2 pb-0"
+        className="col-span-12 min-h-0 xl:col-span-5"
+        title="Weight matrix"
+        actions={
+          <div className="flex items-center gap-2 text-[11px] text-zinc-600">
+            <span className="flex items-center gap-1">
+              <span className="h-2 w-2 rounded-sm bg-gain/50" /> long
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="h-2 w-2 rounded-sm bg-loss/50" /> short
+            </span>
+          </div>
+        }
+        bodyClassName="min-h-0 p-0"
+        flush
       >
-        <div className="-mx-3 overflow-x-auto">
-          <table className="data-table min-w-[1080px]">
+        <div className="min-h-0 flex-1 overflow-auto">
+          <table className="data-table">
             <thead>
               <tr>
-                <th>root</th>
-                <th>class</th>
-                <th className="num">S_t</th>
-                <th className="num">w_base</th>
-                <th className="num">w_timing</th>
-                <th className="num">w_risk</th>
-                <th className="num">Δ timing</th>
-                <th className="num">Δ risk</th>
-                <th>weight evolution</th>
-                <th className="num">target N</th>
-                <th className="num">notional</th>
-                <th>adjustment driver</th>
+                <th className="sticky left-0 z-20 bg-panel">Root</th>
+                <th>Regime</th>
+                <th className="text-right">w_base</th>
+                <th className="text-right">w_timing</th>
+                <th className="text-right">Timing Δ</th>
+                <th className="text-right">w_risk</th>
+                <th className="text-right">Risk Δ</th>
+                <th className="text-right">N_i,t</th>
+                <th className="text-right">Notional</th>
+                <th>Driver</th>
               </tr>
             </thead>
             <tbody>
-              {data.instruments.map((row) => (
-                <tr key={row.instrument_id} className={row.selected ? "" : "opacity-45"}>
-                  <td className="font-semibold text-terminal-100">{row.instrument_id}</td>
-                  <td>
-                    <Badge tone="neutral">{row.asset_class.replace("_index", "")}</Badge>
-                  </td>
-                  <td className="num">
-                    {row.selected ? <Badge tone="up" dot>in</Badge> : <Badge tone="neutral">filtered</Badge>}
-                  </td>
-                  {(["base", "timing", "risk"] as const).map((stage) => (
-                    <td
-                      key={stage}
-                      className={cn(
-                        "num",
-                        focus === stage ? "bg-signal-info/[0.06] font-semibold text-terminal-100" : "text-terminal-300",
-                      )}
-                    >
-                      {formatWeight(artifactValue(row, stage))}
-                    </td>
-                  ))}
-                  <td className={cn("num", row.delta_timing >= 0 ? "text-signal-up" : "text-signal-down")}>
-                    {formatSignedNumber(row.delta_timing, 4)}
-                  </td>
-                  <td className={cn("num", row.delta_risk >= 0 ? "text-signal-up" : "text-signal-down")}>
-                    {formatSignedNumber(row.delta_risk, 4)}
-                  </td>
-                  <td>
-                    <div className="flex h-4 w-40 items-center gap-0.5" aria-hidden>
-                      {(["base", "timing", "risk"] as const).map((stage) => {
-                        const value = artifactValue(row, stage);
-                        const width = Math.max(2, (Math.abs(value) / maxAbsWeight) * 100);
-                        return (
-                          <span key={stage} className="flex h-3 flex-1 items-center rounded-sm bg-terminal-700/60">
-                            <span
-                              className={cn(
-                                "h-2 rounded-sm",
-                                value >= 0 ? "bg-signal-up/80" : "bg-signal-down/80",
-                                focus === stage ? "opacity-100" : "opacity-45",
-                              )}
-                              style={{ width: `${width}%` }}
-                            />
-                          </span>
-                        );
-                      })}
-                    </div>
-                  </td>
-                  <td className="num font-semibold text-terminal-100">
-                    {row.target_contracts === null ? "—" : row.target_contracts > 0 ? `+${row.target_contracts}` : row.target_contracts}
-                  </td>
-                  <td className="num text-terminal-300">
-                    {row.notional === null ? "—" : formatSignedCurrency(row.notional, true)}
-                  </td>
-                  <td className="max-w-[280px] truncate text-[10px] text-terminal-400" title={row.reason}>
-                    {row.reason}
-                  </td>
-                </tr>
-              ))}
+              {data.instruments.map((row) => {
+                const regime = regimes.get(row.instrument_id);
+                return (
+                  <MatrixRow
+                    key={row.instrument_id}
+                    row={row}
+                    regime={regime}
+                    maxAbs={maxAbs}
+                  />
+                );
+              })}
             </tbody>
           </table>
         </div>
+        <div className="flex items-center justify-between border-t border-hairline px-3 py-2 text-[11px] text-zinc-600">
+          <span>
+            {selectedCount} selected · {data.instruments.length - selectedCount} filtered by S_t
+          </span>
+          <span className="font-mono">{data.cycle_id}</span>
+        </div>
       </Panel>
+    </div>
+  );
+}
 
-      {/* Universe + legend */}
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
-        <Panel title="universe selector S_t" subtitle="liquidity · open interest · regime">
-          <div className="flex flex-wrap gap-1.5">
-            {data.instruments.map((row) => (
-              <span
-                key={row.instrument_id}
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded-sm border px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em]",
-                  row.selected
-                    ? "border-signal-up/40 bg-signal-up/10 text-signal-up"
-                    : "border-terminal-600/60 bg-terminal-800/50 text-terminal-500 line-through",
-                )}
-                title={row.reason}
-              >
-                {row.instrument_id}
-                <span className={row.selected ? "text-terminal-200" : "text-terminal-600"}>
-                  {row.selected ? formatWeight(row.weight_base) : "0.000"}
-                </span>
-              </span>
-            ))}
-          </div>
-          <p className="mt-3 border-t border-terminal-600/40 pt-2 font-mono text-[10px] leading-relaxed text-terminal-400">
-            Candidates are filtered on 20d ADV, open interest and term-structure regime before the allocator
-            runs. Filtered roots are kept in the waterfall for auditability but are forced to zero notional.
-          </p>
-        </Panel>
+function TraceStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="metric-label">{label}</div>
+      <div className="font-mono text-[12px] tabular-nums text-zinc-200">{value}</div>
+    </div>
+  );
+}
 
-        <Panel title="stage contract" subtitle="every stage is weight-preserving">
-          <ol className="space-y-2">
-            {[
-              ["S_t", "UniverseSelection.select(state) → instruments"],
-              ["A_t", "PortfolioAllocator.allocate(candidates, state) → w_base"],
-              ["T_t", "TimingOverlay.adjust_timing(w_base, state) → w_timing"],
-              ["R_t", "RiskOverlay.apply_risk(w_timing, state) → w_risk"],
-              ["Translator", "N_i,t = w_t·E_t / (P_i,t·M_i) → discrete contracts"],
-            ].map(([name, detail]) => (
-              <li key={name} className="flex gap-2">
-                <span className="shrink-0 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-signal-info">
-                  {name}
-                </span>
-                <span className="font-mono text-[10px] leading-relaxed text-terminal-400">{detail}</span>
-              </li>
-            ))}
-          </ol>
-        </Panel>
-
-        <Panel title="gross leverage budget" subtitle="Σ|w_i| vs L_max">
-          <div className="space-y-2">
-            {data.stages.slice(1).map((stage) => (
-              <div key={stage.key}>
-                <div className="mb-1 flex justify-between font-mono text-[10px] uppercase tracking-[0.08em]">
-                  <span className="text-terminal-300">{stage.key}</span>
-                  <span className="tabular-nums text-terminal-200">{stage.gross.toFixed(3)}×</span>
-                </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-terminal-700">
-                  <div
-                    className="h-full rounded-full bg-signal-info/70"
-                    style={{ width: `${Math.min(100, (stage.gross / 3) * 100)}%` }}
-                  />
-                </div>
-              </div>
-            ))}
-            <p className="border-t border-terminal-600/40 pt-2 font-mono text-[10px] text-terminal-400">
-              L_max = 3.0× · margin ceiling η_max = 60% · translator rounds to{" "}
-              {formatNumber(data.stages[data.stages.length - 1]?.instrument_count ?? 0, 0)} contracts.
-            </p>
-          </div>
-        </Panel>
+function TraceRow({
+  label,
+  value,
+  tone = "text-zinc-200",
+  title,
+}: {
+  label: string;
+  value: string;
+  tone?: string;
+  title?: string;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="metric-label">{label}</div>
+      <div className={`truncate text-[12px] ${tone}`} title={title ?? value}>
+        {value}
       </div>
     </div>
+  );
+}
+
+function MatrixRow({
+  row,
+  regime,
+  maxAbs,
+}: {
+  row: PipelineInstrumentRow;
+  regime: TermRegime | undefined;
+  maxAbs: number;
+}) {
+  const quantity = row.target_contracts;
+  return (
+    <tr className={row.selected ? "" : "opacity-50"}>
+      <td className="sticky left-0 z-10 bg-panel font-medium text-zinc-100">
+        <span className="flex items-center gap-1.5">
+          {row.selected ? <span className="h-1.5 w-1.5 rounded-full bg-accent" /> : null}
+          {row.instrument_id}
+        </span>
+      </td>
+      <td>
+        {regime ? (
+          <Badge tone={REGIME_TONE[regime]}>{REGIME_LABEL[regime]}</Badge>
+        ) : (
+          <span className="text-[11px] text-zinc-600">—</span>
+        )}
+      </td>
+      <td className="num text-right" style={heatStyle(row.weight_base, maxAbs)}>
+        {formatWeight(row.weight_base)}
+      </td>
+      <td className="num text-right" style={heatStyle(row.weight_timing, maxAbs)}>
+        {formatWeight(row.weight_timing)}
+      </td>
+      <td
+        className={cn("num text-right", row.delta_timing >= 0 ? "text-gain/90" : "text-loss/90")}
+      >
+        {row.delta_timing >= 0 ? "+" : "−"}
+        {Math.abs(row.delta_timing).toFixed(3)}
+      </td>
+      <td className="num text-right" style={heatStyle(row.weight_risk, maxAbs)}>
+        {formatWeight(row.weight_risk)}
+      </td>
+      <td className={cn("num text-right", row.delta_risk >= 0 ? "text-gain/90" : "text-loss/90")}>
+        {row.delta_risk >= 0 ? "+" : "−"}
+        {Math.abs(row.delta_risk).toFixed(3)}
+      </td>
+      <td className={cn("num text-right font-medium", quantity === null ? "text-zinc-600" : "text-zinc-100")}>
+        {quantity === null ? "—" : quantity > 0 ? `+${quantity}` : quantity}
+      </td>
+      <td className="num text-right text-zinc-400">
+        {row.notional === null ? "—" : formatCurrency(row.notional, true)}
+      </td>
+      <td className="max-w-[220px] truncate text-[11.5px] text-zinc-500" title={row.reason}>
+        {row.reason}
+      </td>
+    </tr>
   );
 }

@@ -1,0 +1,309 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+
+export interface SeriesPoint {
+  time: string;
+  value: number;
+}
+
+export interface TimeSeriesChartProps {
+  data: SeriesPoint[];
+  kind?: "area" | "line" | "baseline";
+  height: number;
+  color?: string;
+  fillColor?: string;
+  /** Optional dashed comparison series rendered on the same scale. */
+  comparison?: SeriesPoint[];
+  comparisonColor?: string;
+  formatValue?: (value: number) => string;
+  formatTime?: (iso: string) => string;
+  showTimeAxis?: boolean;
+  showPriceAxis?: boolean;
+  precision?: number;
+  ariaLabel: string;
+  className?: string;
+}
+
+const DEFAULT_FORMAT = (value: number): string =>
+  value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+
+function defaultFormatTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return date.toLocaleString("en-US", {
+    month: "short",
+    day: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+  });
+}
+
+/**
+ * TradingView Lightweight Charts wrapper: area/line/baseline series with a
+ * custom crosshair tooltip rendered in the DOM. The library is imported lazily
+ * inside the effect so it never executes during SSR/pre-render.
+ */
+export function TimeSeriesChart({
+  data,
+  kind = "area",
+  height,
+  color = "#3B82F6",
+  fillColor = "rgba(59,130,246,0.16)",
+  comparison,
+  comparisonColor = "#A1A1AA",
+  formatValue = DEFAULT_FORMAT,
+  formatTime = defaultFormatTime,
+  showTimeAxis = true,
+  showPriceAxis = true,
+  precision = 2,
+  ariaLabel,
+  className,
+}: TimeSeriesChartProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<import("lightweight-charts").IChartApi | null>(null);
+  const seriesRef = useRef<import("lightweight-charts").ISeriesApi<
+    "Area" | "Line" | "Baseline"
+  > | null>(null);
+  const comparisonRef = useRef<import("lightweight-charts").ISeriesApi<"Line"> | null>(null);
+  const [tooltip, setTooltip] = useState<{
+    left: number;
+    top: number;
+    time: number;
+    value: number;
+    comparison?: number;
+  } | null>(null);
+  const dataRef = useRef(data);
+  dataRef.current = data;
+  const comparisonDataRef = useRef(comparison);
+  comparisonDataRef.current = comparison;
+
+  // Create the chart once per series kind; data updates use setData.
+  useEffect(() => {
+    let disposed = false;
+    const container = containerRef.current;
+
+    setTooltip(null);
+    void (async () => {
+      const lw = await import("lightweight-charts");
+      if (!container || disposed) return;
+      const monoFamily =
+        getComputedStyle(document.body).getPropertyValue("--font-jetbrains").trim() ||
+        "ui-monospace, monospace";
+      const chart = lw.createChart(container, {
+        height,
+        autoSize: true,
+        layout: {
+          background: { color: "transparent" },
+          textColor: "#71717A",
+          fontSize: 10,
+          fontFamily: `"${monoFamily.replace(/"/g, "")}", ui-monospace, monospace`,
+          attributionLogo: false,
+        },
+        grid: {
+          vertLines: { color: "#1E1E22" },
+          horzLines: { color: "#1E1E22" },
+        },
+        rightPriceScale: {
+          visible: showPriceAxis,
+          borderVisible: false,
+          scaleMargins: { top: 0.12, bottom: 0.08 },
+        },
+        timeScale: {
+          visible: showTimeAxis,
+          borderVisible: false,
+          timeVisible: true,
+          secondsVisible: false,
+          rightOffset: 2,
+          fixLeftEdge: true,
+        },
+        crosshair: {
+          mode: lw.CrosshairMode.Normal,
+          vertLine: { color: "#3F3F46", width: 1, labelBackgroundColor: "#27272A" },
+          horzLine: { color: "#3F3F46", width: 1, labelBackgroundColor: "#27272A" },
+        },
+        localization: {
+          locale: "en-US",
+          priceFormatter: (price: number) => formatValue(price),
+        },
+        handleScale: { axisPressedMouseMove: { time: true, price: false } },
+      });
+      chartRef.current = chart;
+
+      if (kind === "line") {
+        seriesRef.current = chart.addSeries(lw.LineSeries, {
+          color,
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerRadius: 3,
+        });
+      } else if (kind === "baseline") {
+        seriesRef.current = chart.addSeries(lw.BaselineSeries, {
+          baseValue: { type: "price", price: 0 },
+          topLineColor: "rgba(244,63,94,0)",
+          topFillColor1: "rgba(244,63,94,0)",
+          topFillColor2: "rgba(244,63,94,0)",
+          bottomLineColor: "#F43F5E",
+          bottomFillColor1: "rgba(244,63,94,0.02)",
+          bottomFillColor2: "rgba(244,63,94,0.18)",
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerRadius: 3,
+        });
+      } else {
+        seriesRef.current = chart.addSeries(lw.AreaSeries, {
+          lineColor: color,
+          topColor: fillColor,
+          bottomColor: "rgba(9,9,11,0)",
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerRadius: 3,
+        });
+      }
+
+      if (comparison && comparison.length > 0) {
+        comparisonRef.current = chart.addSeries(lw.LineSeries, {
+          color: comparisonColor,
+          lineWidth: 1,
+          lineStyle: lw.LineStyle.Dashed,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        });
+      }
+
+      const formatTooltipValue = (value: unknown): string =>
+        typeof value === "number" ? formatValue(value) : "—";
+
+      chart.subscribeCrosshairMove((param) => {
+        const series = seriesRef.current;
+        if (!series || !param.point || param.time === undefined) {
+          setTooltip(null);
+          return;
+        }
+        const datum = param.seriesData.get(series) as { value?: number } | undefined;
+        const value = datum?.value;
+        if (typeof value !== "number") {
+          setTooltip(null);
+          return;
+        }
+        const comparisonSerie = comparisonRef.current;
+        const comparisonValue = comparisonSerie
+          ? (param.seriesData.get(comparisonSerie) as { value?: number } | undefined)?.value
+          : undefined;
+        setTooltip({
+          left: param.point.x,
+          top: param.point.y,
+          time: typeof param.time === "number" ? param.time : Number(param.time),
+          value,
+          comparison: typeof comparisonValue === "number" ? comparisonValue : undefined,
+        });
+        void formatTooltipValue;
+      });
+
+      // Seed the freshly created chart with the current series (a chart can be
+      // re-created on height/layout changes while the data prop is unchanged).
+      const seedData = dataRef.current;
+      if (seriesRef.current && seedData.length > 0) {
+        const seen = new Set<number>();
+        seriesRef.current.setData(
+          seedData
+            .map((point) => ({
+              time: Math.floor(new Date(point.time).getTime() / 1000) as import("lightweight-charts").UTCTimestamp,
+              value: point.value,
+            }))
+            .filter((row) => Number.isFinite(row.time) && !seen.has(row.time) && seen.add(row.time))
+            .sort((a, b) => a.time - b.time),
+        );
+        chart.timeScale().fitContent();
+      }
+      const seedComparison = comparisonDataRef.current;
+      if (comparisonRef.current && seedComparison && seedComparison.length > 0) {
+        const seen = new Set<number>();
+        comparisonRef.current.setData(
+          seedComparison
+            .map((point) => ({
+              time: Math.floor(new Date(point.time).getTime() / 1000) as import("lightweight-charts").UTCTimestamp,
+              value: point.value,
+            }))
+            .filter((row) => Number.isFinite(row.time) && !seen.has(row.time) && seen.add(row.time))
+            .sort((a, b) => a.time - b.time),
+        );
+      }
+
+      if (disposed) chart.remove();
+    })();
+
+    return () => {
+      disposed = true;
+      seriesRef.current = null;
+      comparisonRef.current = null;
+      chartRef.current?.remove();
+      chartRef.current = null;
+    };
+    // Chart is re-created only when the series shape/axis layout changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind, height, showTimeAxis, showPriceAxis, precision]);
+
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series || data.length === 0) return;
+    const seen = new Set<number>();
+    const rows = data
+      .map((point) => ({
+        time: Math.floor(new Date(point.time).getTime() / 1000) as import("lightweight-charts").UTCTimestamp,
+        value: point.value,
+      }))
+      .filter((row) => Number.isFinite(row.time) && !seen.has(row.time) && seen.add(row.time))
+      .sort((a, b) => a.time - b.time);
+    series.setData(rows);
+    chartRef.current?.timeScale().fitContent();
+  }, [data]);
+
+  useEffect(() => {
+    const series = comparisonRef.current;
+    if (!series || !comparison || comparison.length === 0) return;
+    const seen = new Set<number>();
+    series.setData(
+      comparison
+        .map((point) => ({
+          time: Math.floor(new Date(point.time).getTime() / 1000) as import("lightweight-charts").UTCTimestamp,
+          value: point.value,
+        }))
+        .filter((row) => Number.isFinite(row.time) && !seen.has(row.time) && seen.add(row.time))
+        .sort((a, b) => a.time - b.time),
+    );
+  }, [comparison]);
+
+  return (
+    <div className={`relative ${className ?? ""}`} style={{ height }}>
+      <div ref={containerRef} role="img" aria-label={ariaLabel} className="h-full w-full" />
+      {tooltip && tooltip.time ? (
+        <div
+          className="pointer-events-none absolute z-10 min-w-[104px] rounded-md border border-edge bg-surface px-2 py-1.5 shadow-popover"
+          style={{
+            left: Math.min(Math.max(tooltip.left + 12, 8), 520),
+            top: Math.max(tooltip.top - 44, 4),
+          }}
+        >
+          <div className="text-[10.5px] leading-4 text-zinc-500">
+            {formatTime(new Date(tooltip.time * 1000).toISOString())}
+          </div>
+          <div className="font-mono text-[12px] font-medium tabular-nums text-zinc-100">
+            {formatValue(tooltip.value)}
+          </div>
+          {tooltip.comparison !== undefined ? (
+            <div className="font-mono text-[11px] tabular-nums text-zinc-400">
+              {formatValue(tooltip.comparison)}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
