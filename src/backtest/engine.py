@@ -39,6 +39,7 @@ import argparse
 import inspect
 import json
 import math
+import statistics
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -47,7 +48,7 @@ from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import polars as pl
@@ -63,6 +64,7 @@ from src.backtest.simulated_broker import (
     SimulatedBroker,
     TradeKind,
 )
+from src.backtest.walk_forward import PurgedWalkForwardSplit, WalkForwardFold
 from src.core.interfaces import ContractTranslatorProtocol, StrategyPipeline
 from src.core.types import (
     TRADING_DAYS_PER_YEAR,
@@ -93,6 +95,9 @@ from src.data.schema import (
     VOLUME_COLUMN,
     ensure_bars_schema,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids importing analytics eagerly
+    from src.analytics.metrics import PerformanceMetrics
 
 #: Callable contract for building a ``MarketState`` from a bar frame.
 type StateBuilder = Callable[[pl.DataFrame, datetime, float], MarketState]
@@ -2448,6 +2453,479 @@ def _default_report_path(config: StrategyConfig, mode: BacktestMode) -> Path:
     return Path("reports") / f"{config.id}_{mode.value}_tearsheet.json"
 
 
+# ---------------------------------------------------------------------------
+# Walk-forward CLI
+# ---------------------------------------------------------------------------
+
+#: Version of the walk-forward JSON report schema emitted by the CLI.
+WALK_FORWARD_REPORT_VERSION: int = 1
+
+#: Aggregate statistics reported for every fold metric.
+WALK_FORWARD_AGGREGATE_FIELDS: tuple[str, ...] = (
+    "cagr",
+    "annual_volatility",
+    "sharpe",
+    "sortino",
+    "calmar",
+    "max_drawdown",
+    "return_on_max_initial_margin",
+    "roll_yield_annualized",
+)
+
+
+def _arg_at_least_two(value: str) -> int:
+    """Argparse type: integer >= 2 (walk-forward fold count)."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer >= 2") from exc
+    if parsed < 2:
+        raise argparse.ArgumentTypeError("must be >= 2 walk-forward folds")
+    return parsed
+
+
+def _arg_non_negative_int(value: str) -> int:
+    """Argparse type: integer >= 0 (purge / embargo bar counts)."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
+def _default_walk_forward_path(config: StrategyConfig) -> Path:
+    """Default JSON report path for a walk-forward CLI run."""
+    return Path("artifacts") / f"{config.id}_walk_forward.json"
+
+
+def _runnable_timestamps(bars: pl.DataFrame) -> tuple[datetime, ...]:
+    """Sorted, unique decision timestamps of the runnable window."""
+    if TIMESTAMP_COLUMN not in bars.columns:
+        raise ValueError(f"walk-forward bars must contain a {TIMESTAMP_COLUMN!r} column")
+    raw = bars.get_column(TIMESTAMP_COLUMN).unique().sort().to_list()
+    timestamps = tuple(ensure_utc(cast(datetime, value)) for value in raw)
+    if len(timestamps) < 2:
+        raise ValueError(
+            f"walk-forward requires at least two bars in the runnable window, got {len(timestamps)}"
+        )
+    return timestamps
+
+
+def _build_walk_forward_folds(
+    *,
+    n_samples: int,
+    splits: int,
+    purge_bars: int,
+    embargo_bars: int,
+) -> tuple[PurgedWalkForwardSplit, list[WalkForwardFold]]:
+    """Derive exactly ``splits`` purged/embargoed folds from the runnable window.
+
+    The walk-forward geometry is derived from the window length so that the CLI's
+    ``--wf-splits`` always yields that many folds: ``test_days`` is sized so the
+    first training block plus ``splits`` back-to-back test blocks fill the window,
+    ``train_days`` is the remainder, and the splitter enforces the purge gap and
+    post-test embargo. Test windows are strictly increasing and non-overlapping.
+    """
+    if splits < 2:
+        raise ValueError("walk-forward requires at least 2 folds")
+    if purge_bars < 0 or embargo_bars < 0:
+        raise ValueError("purge and embargo bar counts must be non-negative")
+    if n_samples < 2:
+        raise ValueError("walk-forward requires at least two observations")
+    test_days = max(embargo_bars + 1, (n_samples - purge_bars) // (splits + 1))
+    if test_days < 1:
+        raise ValueError("unable to derive a positive walk-forward test window")
+    train_days = n_samples - purge_bars - splits * test_days
+    if train_days < 1 or train_days <= purge_bars:
+        raise ValueError(
+            f"insufficient bars for {splits} walk-forward folds with "
+            f"purge={purge_bars} and embargo={embargo_bars}: "
+            f"resolved train_days={train_days}, test_days={test_days} from "
+            f"{n_samples} observations"
+        )
+    splitter = PurgedWalkForwardSplit(
+        train_days=train_days,
+        test_days=test_days,
+        purge_days=purge_bars,
+        embargo_days=embargo_bars,
+        step_days=test_days,
+        expanding=True,
+    )
+    folds = splitter.split(n_samples)
+    if len(folds) != splits:
+        raise ValueError(f"walk-forward splitter produced {len(folds)} folds, expected {splits}")
+    return splitter, folds
+
+
+def _walk_forward_metric_payload(metrics: PerformanceMetrics) -> dict[str, float]:
+    """The per-fold metric subset embedded in the walk-forward JSON report."""
+    return {
+        "cagr": metrics.cagr,
+        "annual_volatility": metrics.annualized_volatility,
+        "annualized_volatility": metrics.annualized_volatility,
+        "sharpe": metrics.sharpe,
+        "sortino": metrics.sortino,
+        "calmar": metrics.calmar,
+        "omega": metrics.omega,
+        "max_drawdown": metrics.max_drawdown,
+        "max_drawdown_duration_days": metrics.max_drawdown_duration_days,
+        "var_95_historical": metrics.var_95_historical,
+        "var_99_historical": metrics.var_99_historical,
+        "cvar_95": metrics.cvar_95,
+        "cvar_99": metrics.cvar_99,
+        "rachev_ratio_05": metrics.rachev_ratio_05,
+        "return_on_max_initial_margin": metrics.return_on_max_initial_margin,
+        "average_margin_utilization": metrics.average_margin_utilization,
+        "peak_margin_utilization": metrics.peak_margin_utilization,
+        "implementation_shortfall_ticks": metrics.implementation_shortfall_ticks,
+        "turnover": metrics.turnover,
+        "commission_to_gross_pnl_ratio": metrics.commission_to_gross_pnl_ratio,
+        "roll_yield_annualized": metrics.roll_yield_annualized,
+    }
+
+
+def _aggregate_stats(values: Sequence[float]) -> dict[str, float]:
+    """Mean and population standard deviation of a fold-metric series."""
+    if not values:
+        return {"mean": 0.0, "std": 0.0}
+    mean = float(statistics.fmean(values))
+    std = float(statistics.pstdev(values)) if len(values) > 1 else 0.0
+    return {"mean": mean, "std": std}
+
+
+def _walk_forward_aggregate(
+    *,
+    fold_metrics: Sequence[PerformanceMetrics],
+    fold_results: Sequence[BacktestResult],
+) -> dict[str, object]:
+    """Aggregate ``{mean, std}`` statistics across folds."""
+    getters: dict[str, Callable[[PerformanceMetrics], float]] = {
+        "cagr": lambda metric: metric.cagr,
+        "annual_volatility": lambda metric: metric.annualized_volatility,
+        "sharpe": lambda metric: metric.sharpe,
+        "sortino": lambda metric: metric.sortino,
+        "calmar": lambda metric: metric.calmar,
+        "max_drawdown": lambda metric: metric.max_drawdown,
+        "return_on_max_initial_margin": lambda metric: metric.return_on_max_initial_margin,
+        "roll_yield_annualized": lambda metric: metric.roll_yield_annualized,
+    }
+    aggregate: dict[str, object] = {"n_folds": len(fold_metrics)}
+    for field_name in WALK_FORWARD_AGGREGATE_FIELDS:
+        aggregate[field_name] = _aggregate_stats(
+            [getters[field_name](metric) for metric in fold_metrics]
+        )
+    aggregate["return"] = _aggregate_stats([result.total_return for result in fold_results])
+    aggregate["ending_equity"] = _aggregate_stats([result.ending_equity for result in fold_results])
+    aggregate["n_trades"] = _aggregate_stats([float(result.n_trades) for result in fold_results])
+    return aggregate
+
+
+#: Equity-curve columns that are denominated in account currency (scaled when
+#: chaining independent fold curves into one walk-forward equity path).
+_WALK_FORWARD_SCALED_COLUMNS: tuple[str, ...] = (
+    "equity",
+    "cash",
+    "unrealized_pnl",
+    "price_pnl",
+    "roll_pnl",
+    "commissions",
+    "fees",
+    "slippage",
+    "funding",
+    "margin_used",
+    "gross_exposure",
+    "net_exposure",
+    "turnover",
+)
+
+
+def _combined_walk_forward_result(
+    *,
+    run_id: str,
+    strategy_id: str,
+    mode: BacktestMode,
+    initial_equity: float,
+    fold_results: Sequence[tuple[WalkForwardFold, BacktestResult]],
+    metadata: Mapping[str, ScalarValue],
+) -> BacktestResult:
+    """Chain the independent fold curves into one compounding walk-forward result.
+
+    Each fold is backtested independently (fresh capital, flat start) so no test
+    outcome can leak between folds. For the reported path the fold returns are
+    compounded: fold ``k`` starts at fold ``k-1``'s ending equity. The combined
+    result is made accounting-consistent before being returned, so the regular
+    tearsheet / identity checks apply to it as well.
+    """
+    rows: list[dict[str, object]] = []
+    running_equity = initial_equity
+    for _fold, result in fold_results:
+        frame = result.equity_curve
+        if frame.height == 0:
+            continue
+        factor = running_equity / result.initial_equity if result.initial_equity > 0.0 else 1.0
+        timestamps = [
+            ensure_utc(cast(datetime, value))
+            for value in frame.get_column(TIMESTAMP_COLUMN).to_list()
+        ]
+        scaled = {
+            column: frame.get_column(column).to_numpy().astype(np.float64) * factor
+            for column in _WALK_FORWARD_SCALED_COLUMNS
+        }
+        utilizations = frame.get_column("margin_utilization").to_numpy().astype(np.float64)
+        position_counts = frame.get_column("n_positions").to_list()
+        for index, timestamp in enumerate(timestamps):
+            row: dict[str, object] = {TIMESTAMP_COLUMN: timestamp}
+            for column in _WALK_FORWARD_SCALED_COLUMNS:
+                row[column] = float(scaled[column][index])
+            row["margin_utilization"] = float(utilizations[index])
+            row["n_positions"] = int(position_counts[index])
+            row["drawdown"] = 0.0
+            rows.append(row)
+        running_equity = float(frame.get_column("equity")[-1]) * factor
+    if not rows:
+        raise ValueError("walk-forward produced no test observations")
+    frame = _curve_frame(rows)
+    equities = frame.get_column("equity").to_numpy().astype(np.float64)
+    peaks = np.maximum.accumulate(equities)
+    frame = frame.with_columns(
+        pl.Series("drawdown", (equities / peaks - 1.0).tolist(), dtype=pl.Float64)
+    )
+    trades = tuple(trade for _fold, result in fold_results for trade in result.trades)
+    roll_events = tuple(event for _fold, result in fold_results for event in result.roll_events)
+    liquidations = tuple(
+        event for _fold, result in fold_results for event in result.forced_liquidations
+    )
+    weight_frames = [
+        result.weight_history for _fold, result in fold_results if result.weight_history.height
+    ]
+    weight_history = (
+        pl.concat(weight_frames, how="vertical_relaxed")
+        if weight_frames
+        else _empty_weight_history()
+    )
+    commissions = float(frame.get_column("commissions").sum())
+    fees = float(frame.get_column("fees").sum())
+    slippage = float(frame.get_column("slippage").sum())
+    funding = float(frame.get_column("funding").sum())
+    turnover = float(frame.get_column("turnover").sum())
+    roll_pnl = float(frame.get_column("roll_pnl").sum())
+    ending_equity = float(equities[-1])
+    # Keep the accounting identity exact for the compounded curve.
+    price_pnl = (
+        ending_equity - initial_equity + (commissions + fees + slippage + funding) - roll_pnl
+    )
+    utilizations = frame.get_column("margin_utilization").to_numpy().astype(np.float64)
+    result = BacktestResult(
+        run_id=run_id,
+        strategy_id=strategy_id,
+        mode=mode,
+        start=ensure_utc(cast(datetime, frame.get_column(TIMESTAMP_COLUMN)[0])),
+        end=ensure_utc(cast(datetime, frame.get_column(TIMESTAMP_COLUMN)[-1])),
+        initial_equity=initial_equity,
+        ending_equity=ending_equity,
+        equity_curve=frame,
+        weight_history=weight_history,
+        trades=trades,
+        fills=(),
+        roll_events=roll_events,
+        forced_liquidations=liquidations,
+        price_pnl=price_pnl,
+        roll_pnl=roll_pnl,
+        commissions=commissions,
+        fees=fees,
+        slippage=slippage,
+        funding=funding,
+        turnover=turnover,
+        margin_used_max=float(np.max(frame.get_column("margin_used").to_numpy())),
+        margin_utilization_avg=float(np.mean(utilizations)) if utilizations.size else 0.0,
+        margin_utilization_peak=float(np.max(utilizations)) if utilizations.size else 0.0,
+        metadata=metadata,
+    )
+    result.check_accounting_identity()
+    return result
+
+
+def _run_walk_forward(
+    *,
+    config: StrategyConfig,
+    bars: pl.DataFrame,
+    mode: BacktestMode,
+    initial_equity: float,
+    splits: int,
+    purge_bars: int | None,
+    embargo_bars: int | None,
+    engine_factory: Callable[[], BacktestEngine],
+    state_builder: StateBuilder | None,
+    output: Path | None,
+    html_output: Path | None,
+) -> dict[str, object]:
+    """Run the real purged/embargoed walk-forward validation and build its report.
+
+    The point-in-time market states are built exactly once over the full runnable
+    window and then sliced to each fold's test segment, so the walk-forward run
+    stays O(window) in data-layer work instead of O(folds x window). The fold
+    indices still refer to bar timestamps, so every fold trades only its own
+    out-of-sample segment (the training segment is reserved for feature warm-up
+    and is never replayed as an outcome).
+    """
+    from src.analytics.metrics import compute_metrics_from_result
+
+    spec = config.backtest
+    wf_config = spec.walk_forward if spec is not None else None
+    resolved_purge = (
+        purge_bars
+        if purge_bars is not None
+        else (wf_config.purge_days if wf_config is not None else 5)
+    )
+    resolved_embargo = (
+        embargo_bars
+        if embargo_bars is not None
+        else (wf_config.embargo_days if wf_config is not None else 5)
+    )
+    timestamps = _runnable_timestamps(bars)
+    splitter, folds = _build_walk_forward_folds(
+        n_samples=len(timestamps),
+        splits=splits,
+        purge_bars=resolved_purge,
+        embargo_bars=resolved_embargo,
+    )
+    run_id = f"{config.id}-walk-forward-{timestamps[0]:%Y%m%d}-{timestamps[-1]:%Y%m%d}"
+    # Build the full point-in-time state path exactly once (features use only
+    # past bars, so this is leak-free); each fold consumes only its own test
+    # slice, keeping walk-forward cost O(window) rather than O(folds x window).
+    all_states = _resolve_states(
+        bars,
+        None,
+        state_builder,
+        initial_equity,
+        start=None,
+        end=None,
+    )
+    state_by_timestamp = {state.timestamp: state for state in all_states}
+    fold_results: list[tuple[WalkForwardFold, BacktestResult]] = []
+    fold_metrics: list[PerformanceMetrics] = []
+    fold_payloads: list[dict[str, object]] = []
+    for fold in folds:
+        test_start = timestamps[fold.test_start]
+        test_end = timestamps[fold.test_end - 1]
+        fold_states = [
+            state
+            for timestamp in timestamps[fold.test_start : fold.test_end]
+            if (state := state_by_timestamp.get(timestamp)) is not None
+        ]
+        if not fold_states:
+            raise ValueError(
+                f"walk-forward fold {fold.fold_index} has no market states in its test window"
+            )
+        fold_engine = engine_factory()
+        fold_result = fold_engine.run(
+            bars=bars,
+            states=fold_states,
+            run_id=f"{run_id}-fold-{fold.fold_index}",
+        )
+        fold_metric = compute_metrics_from_result(fold_result)
+        fold_results.append((fold, fold_result))
+        fold_metrics.append(fold_metric)
+        fold_payloads.append(
+            {
+                "fold": fold.fold_index,
+                "train_start": fold.train_start,
+                "train_end": fold.train_end,
+                "test_start": fold.test_start,
+                "test_end": fold.test_end,
+                "train_start_time": timestamps[fold.train_start].isoformat(),
+                "train_end_time": (
+                    timestamps[fold.train_end - 1].isoformat()
+                    if fold.train_end > fold.train_start
+                    else None
+                ),
+                "test_start_time": test_start.isoformat(),
+                "test_end_time": test_end.isoformat(),
+                "purge_gap": fold.purge_gap,
+                "train_size": fold.train_size,
+                "test_size": fold.test_size,
+                "n_bars": fold_result.n_bars,
+                "return": fold_result.total_return,
+                "ending_equity": fold_result.ending_equity,
+                "n_trades": fold_result.n_trades,
+                "metrics": _walk_forward_metric_payload(fold_metric),
+            }
+        )
+    combined = _combined_walk_forward_result(
+        run_id=run_id,
+        strategy_id=config.id,
+        mode=mode,
+        initial_equity=initial_equity,
+        fold_results=fold_results,
+        metadata={
+            "strategy": config.id,
+            "walk_forward": True,
+            "folds": len(folds),
+            "purge_bars": resolved_purge,
+            "embargo_bars": resolved_embargo,
+        },
+    )
+    combined_metrics = compute_metrics_from_result(combined)
+    tearsheet_path: str | None = None
+    if output is not None:
+        from src.analytics.tearsheet import build_tearsheet, write_tearsheet
+
+        tearsheet = build_tearsheet(
+            combined,
+            combined_metrics,
+            title=f"Walk-forward — {config.id}",
+            generated_at=combined.end,
+        )
+        tearsheet_file = output.with_name(f"{output.stem}_tearsheet.json")
+        write_tearsheet(tearsheet, tearsheet_file, fmt="json")
+        tearsheet_path = str(tearsheet_file)
+        if html_output is not None:
+            write_tearsheet(tearsheet, html_output, fmt="html")
+    combined_curve = combined.equity_curve
+    concatenated_curve: dict[str, object] = {
+        "timestamps": [
+            ensure_utc(cast(datetime, value)).isoformat()
+            for value in combined_curve.get_column(TIMESTAMP_COLUMN).to_list()
+        ],
+        "equity": [float(value) for value in combined_curve.get_column("equity").to_list()],
+        "drawdown": [float(value) for value in combined_curve.get_column("drawdown").to_list()],
+    }
+    return {
+        "report": "walk_forward",
+        "schema_version": WALK_FORWARD_REPORT_VERSION,
+        "run": {
+            "run_id": run_id,
+            "strategy": config.id,
+            "mode": mode.value,
+            "initial_equity": initial_equity,
+            "generated_at": combined.end.isoformat(),
+            "window_start": timestamps[0].isoformat(),
+            "window_end": timestamps[-1].isoformat(),
+            "n_bars": len(timestamps),
+        },
+        "walk_forward": {
+            "requested_splits": splits,
+            "fold_count": len(folds),
+            "purge_bars": resolved_purge,
+            "embargo_bars": resolved_embargo,
+            "train_days": splitter.train_days,
+            "test_days": splitter.test_days,
+            "step_days": splitter.step_days,
+            "expanding": splitter.expanding,
+        },
+        "folds": fold_payloads,
+        "aggregate": _walk_forward_aggregate(
+            fold_metrics=fold_metrics,
+            fold_results=[result for _fold, result in fold_results],
+        ),
+        "combined_metrics": combined_metrics.to_dict(),
+        "concatenated_equity_curve": concatenated_curve,
+        "tearsheet_path": tearsheet_path,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point: run a declarative strategy offline and write a tear sheet."""
     parser = argparse.ArgumentParser(
@@ -2494,6 +2972,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Override the backtest initial equity",
     )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Run purged + embargoed walk-forward validation over the runnable window",
+    )
+    parser.add_argument(
+        "--wf-splits",
+        type=_arg_at_least_two,
+        default=5,
+        metavar="N",
+        help="Number of walk-forward folds (default: 5)",
+    )
+    parser.add_argument(
+        "--purge-bars",
+        type=_arg_non_negative_int,
+        default=None,
+        metavar="N",
+        help="Bars purged before each test window (default: config walk_forward or 5)",
+    )
+    parser.add_argument(
+        "--embargo-bars",
+        type=_arg_non_negative_int,
+        default=None,
+        metavar="N",
+        help="Bars embargoed after each test window (default: config walk_forward or 5)",
+    )
     args = parser.parse_args(argv)
     try:
         config = load_strategy_config(args.strategy)
@@ -2521,17 +3025,69 @@ def main(argv: Sequence[str] | None = None) -> int:
             else RebalanceSchedule.daily()
         )
         state_builder = _resolve_cli_state_builder(instrument_master)
+        initial_equity = (
+            args.initial_equity
+            if args.initial_equity is not None
+            else (spec.initial_equity if spec is not None else 1_000_000.0)
+        )
+        if args.walk_forward:
+
+            def _fresh_engine() -> BacktestEngine:
+                """Build a fresh engine per fold: no state can leak across folds."""
+                return BacktestEngine(
+                    _resolve_cli_pipeline(config, instrument_master, offline=args.offline),
+                    _resolve_cli_translator(instrument_master, offline=args.offline),
+                    mode=mode,
+                    instrument_master=instrument_master,
+                    cost_model=cost_model,
+                    initial_equity=initial_equity,
+                    rebalance_schedule=schedule,
+                    state_builder=None,
+                )
+
+            walk_forward_output = args.output or _default_walk_forward_path(config)
+            report = _run_walk_forward(
+                config=config,
+                bars=bars,
+                mode=mode,
+                initial_equity=initial_equity,
+                splits=args.wf_splits,
+                purge_bars=args.purge_bars,
+                embargo_bars=args.embargo_bars,
+                engine_factory=_fresh_engine,
+                state_builder=state_builder,
+                output=walk_forward_output,
+                html_output=args.html,
+            )
+            walk_forward_output.parent.mkdir(parents=True, exist_ok=True)
+            walk_forward_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            folds_payload = report.get("folds")
+            fold_count = len(folds_payload) if isinstance(folds_payload, list) else 0
+            run_section = report.get("run")
+            run_id = run_section.get("run_id") if isinstance(run_section, dict) else None
+            print(
+                json.dumps(
+                    {
+                        "strategy": config.id,
+                        "mode": mode.value,
+                        "report": "walk_forward",
+                        "folds": fold_count,
+                        "run_id": run_id,
+                        "output": str(walk_forward_output),
+                        "tearsheet_path": report.get("tearsheet_path"),
+                        "aggregate": report.get("aggregate"),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         engine = BacktestEngine(
             pipeline,
             translator,
             mode=mode,
             instrument_master=instrument_master,
             cost_model=cost_model,
-            initial_equity=(
-                args.initial_equity
-                if args.initial_equity is not None
-                else (spec.initial_equity if spec is not None else 1_000_000.0)
-            ),
+            initial_equity=initial_equity,
             rebalance_schedule=schedule,
             state_builder=state_builder,
         )
