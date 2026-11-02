@@ -118,6 +118,7 @@ markers = [
     "integration: exercises multiple modules together",
     "slow: long-running (still offline and deterministic)",
     "network: would require live/paid APIs (never enabled in unit CI)",
+    "parity: cross-engine deployment-parity tests (backtest vs live execution)",
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
