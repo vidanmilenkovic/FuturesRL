@@ -60,6 +60,12 @@ class RiskSettings(BaseModel):
     order_rate_limit_per_second: float = Field(default=5.0, gt=0.0)
     duplicate_order_window_seconds: float = Field(default=1.0, ge=0.0)
     reconciliation_interval_seconds: float = Field(default=30.0, gt=0.0)
+    #: Grace window during which in-flight working orders may explain position drift.
+    reconcile_grace_seconds: float = Field(default=30.0, ge=0.0)
+
+    # -- LLM Risk-First async cache ---------------------------------------------------
+    #: Time-to-live of cached LLM assessments (sync pipeline never blocks on LLM I/O).
+    llm_cache_ttl_seconds: float = Field(default=60.0, gt=0.0)
 
     @model_validator(mode="after")
     def _thresholds_ordered(self) -> RiskSettings:
@@ -120,6 +126,18 @@ class Settings(BaseSettings):
     api_cors_origins: tuple[str, ...] = ("http://localhost:3000", "http://127.0.0.1:3000")
     telemetry_interval_seconds: float = Field(default=1.0, gt=0.0)
 
+    # -- Phase-7 production hardening -------------------------------------------------
+    #: IBKR account base currency; ``MarketState.equity`` is denominated in it.
+    account_currency: str = "USD"
+    #: ``currency -> USD per one unit`` rates for non-USD base accounts.
+    fx_rates: dict[str, float] = Field(default_factory=dict)
+    #: Durable risk/kill-switch state backend: "" / "memory:" / file path / "duckdb:" / "redis:".
+    risk_state_store_uri: str = ""
+    #: Historical lookback window used to warm indicators before the first live bar.
+    hydration_lookback_days: int = Field(default=400, ge=260)
+    #: Allow the cold-start hydrator to backfill missing history (Databento/IBKR).
+    hydration_backfill_enabled: bool = True
+
     # -- risk ------------------------------------------------------------------------
     risk: RiskSettings = Field(default_factory=RiskSettings)
 
@@ -131,6 +149,31 @@ class Settings(BaseSettings):
         if upper not in allowed:
             raise ValueError(f"log_level must be one of {sorted(allowed)}")
         return upper
+
+    @field_validator("account_currency")
+    @classmethod
+    def _valid_account_currency(cls, value: str) -> str:
+        cleaned = value.strip().upper()
+        if len(cleaned) != 3 or not cleaned.isalpha():
+            raise ValueError(f"account_currency must be a 3-letter ISO-4217 code, got {value!r}")
+        return cleaned
+
+    @field_validator("fx_rates")
+    @classmethod
+    def _valid_fx_rates(cls, rates: dict[str, float]) -> dict[str, float]:
+        checked: dict[str, float] = {}
+        for currency, rate in rates.items():
+            code = currency.strip().upper()
+            if len(code) != 3 or not code.isalpha():
+                raise ValueError(f"fx_rates key must be a 3-letter code, got {currency!r}")
+            if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+                raise ValueError(f"fx_rates[{code!r}] must be a number")
+            if not (rate == rate) or rate <= 0.0 or rate == float("inf"):
+                raise ValueError(f"fx_rates[{code!r}] must be finite and strictly positive")
+            if code == "USD" and float(rate) != 1.0:
+                raise ValueError("fx_rates['USD'] must be exactly 1.0")
+            checked[code] = float(rate)
+        return checked
 
     @field_validator("databento_api_key", mode="before")
     @classmethod

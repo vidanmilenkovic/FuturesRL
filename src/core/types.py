@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -92,6 +92,35 @@ def _readonly_array(values: NDArray[np.float64]) -> NDArray[np.float64]:
     array = np.array(values, dtype=np.float64, copy=True)
     array.setflags(write=False)
     return array
+
+
+def normalise_currency(code: str, *, name: str = "currency") -> str:
+    """Validate an ISO-4217-style 3-letter currency code and upper-case it."""
+    if not isinstance(code, str):
+        raise TypeError(f"{name} must be a string, got {type(code)!r}")
+    cleaned = code.strip().upper()
+    if len(cleaned) != 3 or not cleaned.isalpha():
+        raise ValueError(f"{name} must be a 3-letter ISO-4217 code, got {code!r}")
+    return cleaned
+
+
+def freeze_fx_rates(rates: Mapping[str, float]) -> Mapping[str, float]:
+    """Validate, copy and freeze ``currency -> USD per unit`` FX rates.
+
+    Convention: ``fx_rates["EUR"] == 1.10`` means one euro buys 1.10 US dollars,
+    i.e. the value is the USD amount per one unit of the quoted currency. USD is
+    implicitly 1.0 and, if supplied explicitly, must equal 1.0.
+    """
+    cleaned: dict[str, float] = {}
+    for currency, rate in rates.items():
+        code = normalise_currency(currency, name="fx_rates currency")
+        value = _validate_finite(f"fx_rates[{code!r}]", rate, allow_zero=False)
+        if value <= 0.0:
+            raise ValueError(f"fx_rates[{code!r}] must be strictly positive, got {value!r}")
+        if code == "USD" and value != 1.0:
+            raise ValueError("fx_rates['USD'] must be exactly 1.0 (USD is the base currency)")
+        cleaned[code] = value
+    return MappingProxyType(cleaned)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +305,10 @@ class MarketState:
     returns: Mapping[InstrumentId, NDArray[np.float64]] = field(default_factory=dict)
     regime: str | None = None
     metadata: Mapping[str, MetadataValue] = field(default_factory=dict)
+    #: IBKR account base currency; ``equity`` is denominated in this currency.
+    account_currency: str = "USD"
+    #: ``currency -> USD per one unit`` rates used to normalise non-USD accounts.
+    fx_rates: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamp", ensure_utc(self.timestamp))
@@ -318,6 +351,12 @@ class MarketState:
             frozen_returns[instrument_id] = _readonly_array(array)
         object.__setattr__(self, "returns", MappingProxyType(frozen_returns))
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(
+            self,
+            "account_currency",
+            normalise_currency(self.account_currency, name="account_currency"),
+        )
+        object.__setattr__(self, "fx_rates", freeze_fx_rates(self.fx_rates))
 
     # -- convenience accessors -------------------------------------------------
 
@@ -354,6 +393,70 @@ class MarketState:
         """Whether the state covers ``instrument_id``."""
         return instrument_id in self.instruments
 
+    # -- base-currency normalisation ------------------------------------------
+
+    def fx_rate_to_usd(self, currency: str | None = None) -> float:
+        """USD value of one unit of ``currency`` (defaults to the account currency).
+
+        USD itself is always 1.0. A non-USD currency without a configured rate
+        raises a ``KeyError`` with actionable guidance: silently assuming a rate
+        of 1.0 would mis-size every contract on a EUR/GBP/JPY account.
+        """
+        code = normalise_currency(
+            currency if currency is not None else self.account_currency, name="currency"
+        )
+        if code == "USD":
+            return 1.0
+        try:
+            return self.fx_rates[code]
+        except KeyError:
+            raise KeyError(
+                f"no FX rate for account/contract currency {code!r}; provide "
+                f"fx_rates[{code!r}] = USD per 1 {code} (available: {sorted(self.fx_rates)!r})"
+            ) from None
+
+    @property
+    def equity_in_usd(self) -> float | None:
+        """``equity`` converted into USD using the configured account FX rate."""
+        if self.equity is None:
+            return None
+        return self.equity * self.fx_rate_to_usd()
+
+    def converted_to_currency(
+        self,
+        account_currency: str,
+        *,
+        fx_rates: Mapping[str, float] | None = None,
+    ) -> MarketState:
+        """Return a copy denominated in ``account_currency`` (equity converted).
+
+        The stored ``equity`` is first interpreted in the current account
+        currency, converted through USD, then re-expressed in the target
+        currency. Used when the runner's IBKR base currency differs from the
+        state's recorded account currency.
+        """
+        target = normalise_currency(account_currency, name="account_currency")
+        merged_rates: dict[str, float] = dict(self.fx_rates)
+        if fx_rates:
+            merged_rates.update(fx_rates)
+        equity_usd = self.equity_in_usd
+        new_equity: float | None = None
+        if equity_usd is not None:
+            if target == "USD":
+                new_equity = equity_usd
+            else:
+                if target not in merged_rates:
+                    raise KeyError(
+                        f"cannot convert equity into {target!r}: no fx_rates[{target!r}]"
+                    )
+                new_equity = equity_usd / merged_rates[target]
+        return replace(
+            self,
+            equity=new_equity,
+            account_currency=target,
+            fx_rates=merged_rates,
+        )
+
     def subset(self, instrument_ids: Sequence[InstrumentId]) -> MarketState:
         """Return a new state restricted to ``instrument_ids`` (order preserved)."""
         unknown = [i for i in instrument_ids if i not in self.instruments]
@@ -381,6 +484,8 @@ class MarketState:
             returns=returns,
             regime=self.regime,
             metadata=self.metadata,
+            account_currency=self.account_currency,
+            fx_rates=self.fx_rates,
         )
 
     def covariance_submatrix(
@@ -416,6 +521,8 @@ class MarketState:
         equity: float | None = None,
         regime: str | None = None,
         metadata: Mapping[str, MetadataValue] | None = None,
+        account_currency: str = "USD",
+        fx_rates: Mapping[str, float] | None = None,
     ) -> MarketState:
         """Build a state from a snapshot sequence."""
         if not snapshots:
@@ -426,6 +533,8 @@ class MarketState:
             equity=equity,
             regime=regime,
             metadata=metadata or {},
+            account_currency=account_currency,
+            fx_rates=fx_rates or {},
         )
 
 

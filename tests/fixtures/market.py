@@ -214,6 +214,8 @@ def make_market_state(
     seed: int = 7,
     regime: str | None = "neutral",
     metadata: dict[str, object] | None = None,
+    account_currency: str = "USD",
+    fx_rates: dict[str, float] | None = None,
 ) -> MarketState:
     """Build a complete synthetic :class:`MarketState` for tests."""
     master = _master(instrument_master)
@@ -260,6 +262,8 @@ def make_market_state(
         returns=returns_map if with_returns else {},
         regime=regime,
         metadata=state_metadata,  # type: ignore[arg-type]
+        account_currency=account_currency,
+        fx_rates=fx_rates or {},
     )
 
 

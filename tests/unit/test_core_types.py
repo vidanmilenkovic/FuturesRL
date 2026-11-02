@@ -547,3 +547,99 @@ def test_reconcile_report_is_immutable() -> None:
 def test_rounding_mode_enum() -> None:
     assert RoundingMode.FLOOR.value == "floor"
     assert AssetClass.EQUITY_INDEX.value == "equity_index"
+
+
+# ---------------------------------------------------------------------------
+# Base-currency FX normalisation (Phase 7)
+# ---------------------------------------------------------------------------
+
+
+def test_market_state_defaults_to_usd_account() -> None:
+    state = make_market_state(roots=("ES",), equity=1_000_000.0)
+    assert state.account_currency == "USD"
+    assert state.fx_rates == {}
+    assert state.fx_rate_to_usd() == pytest.approx(1.0)
+    assert state.equity_in_usd == pytest.approx(1_000_000.0)
+
+
+def test_market_state_converts_non_usd_equity() -> None:
+    state = make_market_state(
+        roots=("ES",), equity=100_000.0, account_currency="eur", fx_rates={"EUR": 1.1}
+    )
+    assert state.account_currency == "EUR"
+    assert state.fx_rate_to_usd() == pytest.approx(1.1)
+    assert state.fx_rate_to_usd("eur") == pytest.approx(1.1)
+    assert state.fx_rate_to_usd("USD") == pytest.approx(1.0)
+    assert state.equity_in_usd == pytest.approx(110_000.0)
+
+
+def test_market_state_missing_fx_rate_is_actionable() -> None:
+    state = make_market_state(roots=("ES",), equity=100_000.0, account_currency="GBP")
+    assert state.equity and state.equity > 0
+    with pytest.raises(KeyError, match="no FX rate"):
+        state.fx_rate_to_usd()
+    with pytest.raises(KeyError, match="no FX rate"):
+        _ = state.equity_in_usd
+
+
+def test_market_state_rejects_invalid_currency_and_rates() -> None:
+    snapshot = make_snapshot("ES")
+    with pytest.raises(ValueError, match="3-letter"):
+        MarketState(
+            timestamp=FIXED_TIMESTAMP, instruments={"ES": snapshot}, account_currency="EURO"
+        )
+    with pytest.raises(ValueError, match="strictly positive"):
+        MarketState(
+            timestamp=FIXED_TIMESTAMP,
+            instruments={"ES": snapshot},
+            account_currency="EUR",
+            fx_rates={"EUR": -1.0},
+        )
+    with pytest.raises(ValueError, match="USD"):
+        MarketState(
+            timestamp=FIXED_TIMESTAMP,
+            instruments={"ES": snapshot},
+            fx_rates={"USD": 1.2},
+        )
+
+
+def test_market_state_fx_rates_are_frozen() -> None:
+    state = make_market_state(
+        roots=("ES",), equity=100_000.0, account_currency="EUR", fx_rates={"EUR": 1.1}
+    )
+    with pytest.raises(TypeError):
+        state.fx_rates["EUR"] = 1.2  # type: ignore[index]
+
+
+def test_market_state_subset_and_from_snapshots_propagate_fx() -> None:
+    state = make_market_state(
+        roots=("ES", "CL"),
+        equity=100_000.0,
+        account_currency="EUR",
+        fx_rates={"EUR": 1.1, "GBP": 1.25},
+    )
+    subset = state.subset(("CL",))
+    assert subset.account_currency == "EUR"
+    assert dict(subset.fx_rates) == {"EUR": 1.1, "GBP": 1.25}
+    rebuilt = MarketState.from_snapshots(
+        FIXED_TIMESTAMP,
+        [make_snapshot("ES")],
+        equity=50_000.0,
+        account_currency="GBP",
+        fx_rates={"GBP": 1.25},
+    )
+    assert rebuilt.equity_in_usd == pytest.approx(62_500.0)
+
+
+def test_market_state_converted_to_currency_round_trips() -> None:
+    eur_state = make_market_state(
+        roots=("ES",), equity=100_000.0, account_currency="EUR", fx_rates={"EUR": 1.1}
+    )
+    usd_state = eur_state.converted_to_currency("USD")
+    assert usd_state.account_currency == "USD"
+    assert usd_state.equity == pytest.approx(110_000.0)
+    assert usd_state.equity_in_usd == pytest.approx(110_000.0)
+    back = usd_state.converted_to_currency("EUR")
+    assert back.equity == pytest.approx(100_000.0)
+    with pytest.raises(KeyError, match="no fx_rates"):
+        eur_state.converted_to_currency("JPY")
