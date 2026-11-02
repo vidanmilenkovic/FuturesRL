@@ -1,0 +1,279 @@
+version: 1
+# ---------------------------------------------------------------------------
+# FuturesRL-X instrument master
+#
+# Every futures root traded by the platform is declared here with its CME/IBKR
+# metadata: contract multiplier, tick size, roll methodology, margin estimator
+# and the standard <-> micro routing pair used by the ContractTranslator.
+#
+# Margins are conservative CME SPAN / IBKR initial & maintenance *estimates*.
+# They are configuration, not truth: the live Pre-Trade Risk Gate always
+# confirms the real margin requirement with IBKR `whatIfOrder` before transmit.
+# ---------------------------------------------------------------------------
+
+defaults:
+  currency: USD
+  price_precision: 2
+  rounding_mode: nearest
+  rebalance_buffer_contracts: 2
+  max_margin_utilization: 0.60
+  max_order_contracts: 200
+
+instruments:
+  ES:
+    name: E-mini S&P 500
+    asset_class: equity_index
+    sector: equity
+    exchange: CME
+    multiplier: 50.0
+    tick_size: 0.25
+    databento_symbol: ES.FUT
+    ibkr_exchange: CME
+    micro_root: MES
+    margins:
+      initial: 15000.0
+      maintenance: 13600.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  MES:
+    name: Micro E-mini S&P 500
+    asset_class: equity_index
+    sector: equity
+    exchange: CME
+    multiplier: 5.0
+    tick_size: 0.25
+    databento_symbol: MES.FUT
+    ibkr_exchange: CME
+    standard_root: ES
+    margins:
+      initial: 1500.0
+      maintenance: 1360.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  NQ:
+    name: E-mini Nasdaq-100
+    asset_class: equity_index
+    sector: equity
+    exchange: CME
+    multiplier: 20.0
+    tick_size: 0.25
+    databento_symbol: NQ.FUT
+    ibkr_exchange: CME
+    micro_root: MNQ
+    margins:
+      initial: 20000.0
+      maintenance: 18100.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  MNQ:
+    name: Micro E-mini Nasdaq-100
+    asset_class: equity_index
+    sector: equity
+    exchange: CME
+    multiplier: 2.0
+    tick_size: 0.25
+    databento_symbol: MNQ.FUT
+    ibkr_exchange: CME
+    standard_root: NQ
+    margins:
+      initial: 2000.0
+      maintenance: 1810.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  YM:
+    name: E-mini Dow Jones Industrial Average
+    asset_class: equity_index
+    sector: equity
+    exchange: CBOT
+    multiplier: 5.0
+    tick_size: 1.0
+    databento_symbol: YM.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 15000.0
+      maintenance: 13600.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  RTY:
+    name: E-mini Russell 2000
+    asset_class: equity_index
+    sector: equity
+    exchange: CME
+    multiplier: 50.0
+    tick_size: 0.10
+    databento_symbol: RTY.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 8000.0
+      maintenance: 7300.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  CL:
+    name: WTI Crude Oil
+    asset_class: energy
+    sector: energy
+    exchange: NYMEX
+    multiplier: 1000.0
+    tick_size: 0.01
+    databento_symbol: CL.FUT
+    ibkr_exchange: NYMEX
+    micro_root: MCL
+    margins:
+      initial: 6500.0
+      maintenance: 5900.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      physical_delivery: true
+
+  MCL:
+    name: Micro WTI Crude Oil
+    asset_class: energy
+    sector: energy
+    exchange: NYMEX
+    multiplier: 100.0
+    tick_size: 0.01
+    databento_symbol: MCL.FUT
+    ibkr_exchange: NYMEX
+    standard_root: CL
+    margins:
+      initial: 650.0
+      maintenance: 590.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      physical_delivery: true
+
+  GC:
+    name: Gold
+    asset_class: metals
+    sector: metals
+    exchange: COMEX
+    multiplier: 100.0
+    tick_size: 0.10
+    databento_symbol: GC.FUT
+    ibkr_exchange: COMEX
+    micro_root: MGC
+    margins:
+      initial: 10000.0
+      maintenance: 9100.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [2, 4, 6, 8, 10, 12]
+      physical_delivery: true
+
+  MGC:
+    name: Micro Gold
+    asset_class: metals
+    sector: metals
+    exchange: COMEX
+    multiplier: 10.0
+    tick_size: 0.10
+    databento_symbol: MGC.FUT
+    ibkr_exchange: COMEX
+    standard_root: GC
+    margins:
+      initial: 1000.0
+      maintenance: 910.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [2, 4, 6, 8, 10, 12]
+      physical_delivery: true
+
+  ZN:
+    name: 10-Year T-Note
+    asset_class: rates
+    sector: rates
+    exchange: CBOT
+    multiplier: 1000.0
+    tick_size: 0.015625
+    price_precision: 6
+    databento_symbol: ZN.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 2200.0
+      maintenance: 2000.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 10
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  ZT:
+    name: 2-Year T-Note
+    asset_class: rates
+    sector: rates
+    exchange: CBOT
+    multiplier: 2000.0
+    tick_size: 0.0078125
+    price_precision: 6
+    databento_symbol: ZT.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 1500.0
+      maintenance: 1360.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 10
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  6E:
+    name: Euro FX
+    asset_class: fx
+    sector: fx
+    exchange: CME
+    multiplier: 125000.0
+    tick_size: 0.00005
+    price_precision: 5
+    databento_symbol: 6E.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 2500.0
+      maintenance: 2300.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false

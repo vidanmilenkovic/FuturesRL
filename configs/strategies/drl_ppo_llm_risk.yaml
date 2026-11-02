@@ -1,0 +1,85 @@
+# ---------------------------------------------------------------------------
+# FuturesRL-X declarative strategy pipeline
+#
+# DRL allocator (PPO) with the FinRL Risk-First LLM overlay enabled, so the
+# comparison against tsmom_vol_target isolates the value added by the RL policy
+# and the semantic risk circuit breaker.
+# ---------------------------------------------------------------------------
+id: drl_ppo_llm_risk
+description: >-
+  PPO allocator over the full futures universe, TSMOM timing overlay and the
+  LLM Risk-First constraint engine plus quantitative vol targeting.
+tags: [drl, ppo, llm-risk, vol-target]
+
+universe:
+  selector: liquidity
+  params:
+    min_avg_dollar_volume: 50000000
+    min_open_interest: 5000
+    top_n: 10
+    min_history_days: 252
+
+allocator:
+  name: drl
+  params:
+    algorithm: PPO
+    policy: MlpPolicy
+    total_timesteps: 100000
+    learning_rate: 0.0003
+    gamma: 0.99
+    seed: 7
+
+timing:
+  - name: tsmom
+    params:
+      lookback_fast: 21
+      lookback_slow: 126
+      vol_lookback: 20
+
+risk:
+  - name: quant_risk
+    params:
+      vol_target: 0.12
+      ewma_halflife_days: 20
+      max_single_instrument_weight: 0.35
+      max_sector_weight: 0.40
+      drawdown_limit_pct: 0.20
+      daily_max_loss_pct: 0.03
+  - name: llm_risk
+    params:
+      confidence_threshold: 0.70
+      safe_score: 1.5
+      critical_score: 4.5
+      risk_penalty_lambda: 0.5
+
+translator:
+  rounding_mode: nearest
+  rebalance_buffer_contracts: 2
+  max_margin_utilization: 0.60
+  enable_micro_routing: true
+  min_micro_notional_ratio: 0.0
+
+backtest:
+  start: 2018-01-01
+  end: 2024-12-31
+  initial_equity: 1000000.0
+  base_currency: USD
+  rebalance_frequency: W-FRI
+  commission_bps: 3.0
+  slippage_ticks: 1.0
+  random_seed: 7
+  walk_forward:
+    train_days: 252
+    test_days: 63
+    purge_days: 5
+    embargo_days: 5
+
+drl:
+  algorithm: PPO
+  policy: MlpPolicy
+  total_timesteps: 100000
+  learning_rate: 0.0003
+  gamma: 0.99
+  seed: 7
+  reward_risk_penalty_lambda: 0.5
+  normalize_observations: true
