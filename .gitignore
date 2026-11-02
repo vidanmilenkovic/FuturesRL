@@ -22,12 +22,12 @@ coverage.xml
 *.pem
 
 # Market data & caches (never commit)
-data/
+/data/
 *.parquet
 *.duckdb
 *.duckdb.wal
 *.db
-logs/
+/logs/
 
 # Frontend
 frontend/node_modules/
@@ -42,6 +42,6 @@ frontend/.turbo/
 .DS_Store
 
 # Local artefacts
-artifacts/
-reports/*.html
+/artifacts/
+/reports/*.html
 !reports/.gitkeep
