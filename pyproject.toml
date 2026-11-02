@@ -95,7 +95,7 @@ mypy_path = "."
 files = ["src", "configs"]
 show_error_codes = true
 pretty = true
-exclude = ["frontend/", "data/"]
+exclude = ["^frontend/", "^data/"]
 
 [[tool.mypy.overrides]]
 module = [
