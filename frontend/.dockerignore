@@ -1,0 +1,13 @@
+# Docker build context exclusions for the Next.js image (context = frontend/).
+node_modules
+.next
+out
+.turbo
+coverage
+*.log
+.git
+.env
+.env.local
+.env*.local
+.DS_Store
+README.md

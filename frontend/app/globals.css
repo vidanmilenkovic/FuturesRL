@@ -1,0 +1,107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------------
+   FuturesRL-X terminal theme
+   Dark, high-contrast surfaces for long trading sessions; all colour
+   semantics live in tailwind.config.ts (signal-* palette).
+   ------------------------------------------------------------------------ */
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-terminal-950 text-terminal-100 antialiased;
+    font-feature-settings: "tnum" 1, "cv02" 1;
+  }
+
+  ::selection {
+    @apply bg-signal-info/30 text-terminal-100;
+  }
+
+  /* Thin terminal scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: theme("colors.terminal.500") transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-terminal-600;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    @apply bg-terminal-500;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* Dense data table used by every view. */
+  .data-table {
+    @apply w-full border-collapse text-left font-mono text-xs;
+  }
+  .data-table thead th {
+    @apply sticky top-0 z-10 whitespace-nowrap border-b border-terminal-600/70 bg-terminal-850/95 px-2.5 py-2 text-[10px] font-medium uppercase tracking-[0.12em] text-terminal-300 backdrop-blur;
+  }
+  .data-table tbody td {
+    @apply whitespace-nowrap border-b border-terminal-600/30 px-2.5 py-1.5 tabular-nums text-terminal-200;
+  }
+  .data-table tbody tr {
+    @apply transition-colors;
+  }
+  .data-table tbody tr:hover {
+    @apply bg-terminal-700/40;
+  }
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+  .data-table .num {
+    @apply text-right;
+  }
+
+  .mono-label {
+    @apply font-mono text-[10px] uppercase tracking-[0.14em] text-terminal-300;
+  }
+
+  .terminal-scroll {
+    @apply max-h-[420px] overflow-y-auto overscroll-contain;
+  }
+
+  .hairline {
+    @apply border-terminal-600/50;
+  }
+
+  /* Faint grid backdrop for full-bleed sections. */
+  .grid-backdrop {
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-signal-info/60 focus-visible:ring-offset-2 focus-visible:ring-offset-terminal-950;
+  }
+}

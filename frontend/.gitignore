@@ -1,0 +1,7 @@
+# Frontend-local ignore rules (root .gitignore already covers most of these).
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.env*.local
+.DS_Store

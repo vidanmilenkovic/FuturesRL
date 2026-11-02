@@ -1,0 +1,31 @@
+{
+  "name": "futuresrl-x-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FuturesRL-X quantitative command center: Next.js 15 dashboard for the FinRL-X futures pipeline.",
+  "scripts": {
+    "dev": "next dev -p 3100",
+    "build": "next build",
+    "start": "next start -p 3100",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lightweight-charts": "5.2.1",
+    "next": "15.5.28",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "3.3.3",
+    "@types/node": "22.19.1",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "autoprefixer": "10.6.2",
+    "eslint": "9.39.5",
+    "eslint-config-next": "15.5.28",
+    "postcss": "8.5.32",
+    "tailwindcss": "3.4.19",
+    "typescript": "5.9.3"
+  }
+}
