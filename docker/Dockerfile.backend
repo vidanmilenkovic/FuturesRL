@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1.7
+# ---------------------------------------------------------------------------
+# FuturesRL-X FastAPI backend
+#
+# Build (from the repository root — this Dockerfile needs `src/` + `configs/`):
+#   docker build -f docker/Dockerfile.backend -t futuresrlx/backend:1.0.0 .
+# or simply:
+#   docker compose -f docker/docker-compose.yml build backend
+#
+# The image installs *only* the runtime dependencies declared in pyproject.toml
+# (no dev tooling, no Databento/IBKR SDKs) and runs the API with a non-root user.
+# ---------------------------------------------------------------------------
+
+# --- Stage 1: dependency resolver / wheel cache ----------------------------
+FROM python:3.12-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /build
+
+# Only the project metadata is required to read the runtime dependency list.
+# (We deliberately do not `pip install .` so the image never depends on
+# pyproject's readme/package-data quirks; the application runs from /app.)
+COPY pyproject.toml ./
+RUN python - <<'PY'
+import tomllib
+from pathlib import Path
+
+metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+dependencies = metadata["project"]["dependencies"]
+Path("/build/requirements.txt").write_text("\n".join(dependencies) + "\n", encoding="utf-8")
+print(f"resolved {len(dependencies)} runtime dependencies")
+PY
+
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install -r /build/requirements.txt
+
+# --- Stage 2: runtime ------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    FUTURESRLX_ENVIRONMENT=paper \
+    FUTURESRLX_API_HOST=0.0.0.0 \
+    FUTURESRLX_API_PORT=8000 \
+    FUTURESRLX_LOG_LEVEL=INFO \
+    FUTURESRLX_DATA_DIR=/app/data \
+    FUTURESRLX_REPORT_DIR=/app/artifacts
+
+# `curl` powers the container healthcheck; LibreSSL/curl are the only extras.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1000 futuresrlx \
+    && useradd --system --uid 1000 --gid futuresrlx --create-home futuresrlx
+
+WORKDIR /app
+
+# Application code: `src` + `configs` are needed at runtime because the
+# instrument master and strategy YAMLs are loaded from disk (not packaged).
+COPY --chown=futuresrlx:futuresrlx src ./src
+COPY --chown=futuresrlx:futuresrlx configs ./configs
+COPY --chown=futuresrlx:futuresrlx docker/entrypoint.backend.sh ./entrypoint.sh
+COPY --from=builder /opt/venv /opt/venv
+
+RUN chmod +x /app/entrypoint.sh \
+    && mkdir -p /app/data/parquet /app/artifacts \
+    && chown -R futuresrlx:futuresrlx /app
+
+USER futuresrlx
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=4 \
+    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

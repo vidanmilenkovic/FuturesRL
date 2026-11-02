@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# docker/.dockerignore
+#
+# Canonical ignore list for the FuturesRL-X backend image. The backend build
+# needs the repository root as context (pyproject.toml + src/ + configs/), so
+# BuildKit only honours a `.dockerignore` located at the *context root*. Use it
+# explicitly when the root file is unavailable:
+#
+#   docker buildx build \
+#     --ignorefile docker/.dockerignore \
+#     -f docker/Dockerfile.backend \
+#     -t futuresrlx/backend:1.0.0 .
+#
+# If you add a root `.dockerignore`, mirror this list there. None of these paths
+# are required by the backend runtime image.
+# ---------------------------------------------------------------------------
+
+# VCS / editor
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Python virtualenvs, caches, tooling
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.hypothesis
+.coverage
+.coverage.*
+htmlcov
+coverage.xml
+
+# Local market data / generated artefacts (never baked into images)
+data
+artifacts
+reports
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.db
+logs
+.env
+.env.*
+
+# Frontend (built by docker/Dockerfile.frontend instead)
+frontend
+node_modules
+.next
+
+# Docker/compose sources not needed inside the backend image
+docker/docker-compose.yml
+docker/Dockerfile.frontend
+docker/.env
+docker/.env.*
+
+# Docs / local scripts
+*.md
+!README.md
+scripts
+AGENTS.md
+Instructions.md

@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1.7
+# ---------------------------------------------------------------------------
+# FuturesRL-X dashboard (Next.js 15 + TypeScript + Tailwind)
+#
+# Built from the `frontend/` directory:
+#   docker build -f ../docker/Dockerfile.frontend -t futuresrlx/frontend:1.0.0 .
+# or through compose:
+#   docker compose -f docker/docker-compose.yml build frontend
+#
+# NEXT_PUBLIC_API_BASE_URL is baked into the client bundle at build time: the
+# browser must be able to reach the FastAPI backend on that exact origin.
+# ---------------------------------------------------------------------------
+
+# --- Stage 1: deterministic dependency install -----------------------------
+FROM node:22-alpine AS deps
+
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+# --- Stage 2: production build ---------------------------------------------
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    NEXT_OUTPUT=standalone
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+ARG NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+ARG NEXT_PUBLIC_WS_URL=
+ENV NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL} \
+    NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL}
+
+RUN npm run build
+
+# --- Stage 3: minimal runner -----------------------------------------------
+FROM node:22-alpine AS runner
+
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+RUN addgroup --system --gid 1001 nodejs \
+    && adduser --system --uid 1001 nextjs \
+    && apk add --no-cache wget
+
+WORKDIR /app
+
+# `output: "standalone"` (enabled via NEXT_OUTPUT) emits a self-contained
+# server bundle; only static assets + public files need copying on top.
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=4 \
+    CMD wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1
+
+CMD ["node", "server.js"]
