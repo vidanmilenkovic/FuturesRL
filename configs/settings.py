@@ -137,6 +137,9 @@ class Settings(BaseSettings):
     hydration_lookback_days: int = Field(default=400, ge=260)
     #: Allow the cold-start hydrator to backfill missing history (Databento/IBKR).
     hydration_backfill_enabled: bool = True
+    #: Historical backfill source order: auto (Databento -> IBKR -> offline when
+    #: explicitly allowed), or force one source: databento / ibkr / offline.
+    hydration_source: Literal["auto", "databento", "ibkr", "offline"] = "auto"
 
     # -- risk ------------------------------------------------------------------------
     risk: RiskSettings = Field(default_factory=RiskSettings)
