@@ -108,6 +108,7 @@ futures-app/
 │   ├── settings.py                  # Pydantic BaseSettings + .env loader
 │   ├── instruments.py(.yaml)        # futures master: multipliers, ticks, margins, roll/micro rules
 │   ├── strategy.py                  # typed declarative strategy config models
+│   ├── macro_calendar.yaml          # Tier-1 macro event lockout calendar (editable template)
 │   └── strategies/                  # YAML pipelines (tsmom_vol_target, drl_ppo_llm_risk)
 ├── src/
 │   ├── core/                        # immutable contracts, Protocols, async event bus
@@ -124,7 +125,10 @@ futures-app/
 │   ├── unit/                        # offline deterministic unit tests
 │   ├── integration/                 # cross-module end-to-end tests
 │   └── parity/                      # backtest vs live ContractTarget parity proofs
+├── docs/PHASE_COMPLETION.md         # per-phase deliverables, gates and release commits
+├── .github/workflows/ci.yml         # CI: quality gate, frontend build, docker images
 ├── scripts/quality_gate.sh          # lint + format + strict mypy + pytest (+ coverage gate)
+├── Makefile                         # developer entry points (make gate, make backtest, ...)
 ├── pyproject.toml
 └── README.md
 ```
@@ -193,6 +197,12 @@ estimates; live orders are always confirmed against IBKR `whatIfOrder` before tr
 Declarative strategy pipelines live in `configs/strategies/*.yaml` and describe the pipeline
 stages by name + parameters — no executable code, so runs are reproducible and sweepable.
 
+`configs/macro_calendar.yaml` is the editable Tier-1 macro release calendar used by the LLM
+Risk-First engine's lockout windows (FOMC/CPI/NFP/EIA/WASDE/OPEC, UTC timestamps). The async LLM
+adapters support OpenAI, Anthropic, DeepSeek and local vLLM endpoints; they are only used when
+explicitly configured, and every LLM signal passes through the confidence/variance filter and the
+deterministic circuit-breaker projection before it can affect weights.
+
 ---
 
 ## Running the platform
@@ -229,6 +239,14 @@ all, lock).
 # frontend
 cd frontend && npm install && npm run dev     # http://localhost:3000
 ```
+
+REST surface: `/health`, `/api/positions`, `/api/pipeline/latest`, `/api/risk/state`,
+`PUT /api/risk/thresholds`, `POST /api/risk/flatten-all`, `/api/term-structure`,
+`/api/strategies[/{id}]`, `/api/backtests[ POST, /{id}, /{id}/tearsheet]`, `/api/telemetry/status`,
+plus `WS /ws/telemetry`. The backend runs **offline by default** (`/health.offline_mode=true`,
+deterministic fixtures, `data_source` recorded on every pipeline/backtest payload); set
+`FUTURESRLX_API_ENABLE_IBKR=1` to attach a real IBKR paper/live session. The dashboard shows a
+visible `DEMO DATA` indicator whenever it is not talking to a live backend.
 
 ### Docker stack
 
@@ -322,7 +340,8 @@ both engines produce identical targets and deltas for identical market states.
 ## Development workflow & release history
 
 Conventional Commits, atomic commits, one feature branch per phase, a release tag at each phase
-boundary:
+boundary. Detailed per-phase deliverables, gates and verification numbers are recorded in
+[docs/PHASE_COMPLETION.md](docs/PHASE_COMPLETION.md):
 
 | Phase | Branch | Release | Scope |
 | --- | --- | --- | --- |
@@ -346,3 +365,9 @@ boundary:
   rebalancing until an explicit reset.
 - LLM outputs are untrusted data: they are schema-validated, confidence-filtered, and only ever
   applied through bounded deterministic projections.
+- The Databento SDK and live IBKR socket paths are lazy, opt-in adapters: unit/CI tests exercise
+  them through injected fakes and never contact vendors. Real-feed smoke tests belong in a
+  credentialed paper environment.
+- Docker images were validated statically on this build host (no Docker daemon available); the
+  compose stack, healthchecks, ports and environment contracts are committed and CI builds both
+  images.
