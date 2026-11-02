@@ -166,3 +166,57 @@ with an annotated git tag. All tests are offline and deterministic.
 - `next build` succeeds (8/8 pages), `tsc --noEmit` + ESLint clean.
 - Docker binaries are not available on this build host; compose YAML, services, ports and env
   contracts were validated statically (documented limitation).
+
+---
+
+## Phase 7 — Production hardening (`v1.1.0`)
+
+**Branch:** `feat/phase-7-production-hardening`
+
+**Deliverables**
+1. **Cold-start state hydration** — `src/execution/hydrator.py` (`ColdStartHydrator`,
+   `HydrationResult`, `HydrationError`): reads the lookback window from the partitioned Parquet
+   cache, optionally backfills missing history through an injected provider (Databento
+   `ingest` / IBKR historical data), computes FinRL-X features and PIT `MarketState`s, and
+   validates a fully warm state (required features finite, aligned EWMA covariance, non-empty
+   return windows) before trading. `src/execution/runner.py` (`TradingRunner`) hydrates *before*
+   the first streamed bar (`RunnerNotHydratedError` otherwise), enriches live states with the
+   broker account NLV/base currency, primes the pipeline on the warm state, honours the durable
+   kill switch, runs `pipeline -> translator -> OMS.submit_targets`, publishes telemetry and shuts
+   down cleanly; `--check` validates the whole live configuration offline.
+2. **Persistent risk & kill-switch state** — `src/risk/state_store.py` (`PersistedRiskState`,
+   `RateLimiterState`, `RiskStateStore`, atomic JSON / DuckDB / Redis / in-memory backends,
+   `build_risk_state_store`). `QuantRiskOverlay(state_store=...)` restores/re-persists daily NLV,
+   portfolio & instrument high-water marks, kill-switch/daily-loss latches and trading day;
+   day rolls keep HWM + stops while resetting daily counters. `OrderManagementSystem(state_store=...)`
+   restores the kill-switch latch and OMS token bucket across restarts and persists lock/unlock/
+   flatten via load-modify-save (preserving other writers' fields).
+3. **Open-order-aware reconciliation** — `PositionReconciler` now consumes an injectable
+   `working_orders` provider (`WorkingOrderSnapshot` with signed remaining quantity + `updated_at`)
+   and a configurable `reconcile_grace_seconds`: drift is only flagged/halted when
+   `broker_position + Σ working_deltas != expected` and the newest in-flight order is older than
+   the grace window. Partial fills are explicitly handled; provider failures remain fail-closed;
+   the no-provider path is byte-identical to Phase 5.
+4. **Async cached LLM risk worker** — `LLMRiskOverlay` now has a TTL cache
+   (`cache_ttl_seconds`, `valid_until_utc`, `is_cache_fresh`), a non-blocking fire-and-forget
+   refresh from the synchronous `apply_risk` projection, and `AsyncLLMRiskCacheWorker` (single
+   flight, TTL interval, capped exponential backoff, last-known-good assessments, cancellation-safe
+   start/stop). Slow K-sample multi-provider calls can never stall the rebalance pipeline or the
+   WebSocket event loop.
+5. **Base-currency FX normalisation** — `MarketState` gained `account_currency` + `fx_rates`
+   (USD-per-unit convention, `fx_rate_to_usd`, `equity_in_usd`, `converted_to_currency`);
+   `ContractTranslator` converts `E_t` into USD for notional sizing and margin feasibility,
+   converts non-USD contract prices for sizing only (target marks stay native), resolves overrides
+   per-call > constructor > state, fails closed on missing rates, and leaves the USD path
+   numerically identical. Pipeline/backtest/API/live-runner call sites pass the state's account
+   FX so non-USD IBKR base accounts are sized correctly end-to-end.
+
+**Verification (as merged)**
+- `ruff check .` / `ruff format --check .` clean; `mypy src configs` strict clean.
+- Full gate `./scripts/quality_gate.sh --cov`: **1082 passed**, coverage on `src/core` + `src/risk`
+  = **93.97%** (translator 100%, quant overlay 100%, LLM overlay 99%, state store 82%).
+- New tests: 19 hydrator, 23 runner, 12 reconciler, 7 OMS persistence; 18 durable-state store;
+  18 quant persistence + 17 async LLM cache; 51 FX translator + 5 FX end-to-end integration;
+  6 hardening integration tests (hydration ordering, restart persistence, open-order reconciliation,
+  non-blocking LLM worker).
+- Release: tag `v1.1.0` on `main` after a fast-forward merge of the phase branch.

@@ -188,6 +188,13 @@ logs and telemetry (`Settings.model_dump_redacted()`).
 | `FUTURESRLX_RISK__LLM_CRITICAL_SCORE` | `4.5` | `κ` circuit-breaker threshold |
 | `FUTURESRLX_RISK__DAILY_MAX_LOSS_PCT` | `0.03` | intraday kill switch |
 | `FUTURESRLX_API_HOST` / `PORT` | `0.0.0.0:8000` | FastAPI telemetry backend |
+| `FUTURESRLX_ACCOUNT_CURRENCY` | `USD` | IBKR account base currency (NLV denomination) |
+| `FUTURESRLX_FX_RATES` | `{}` | JSON map `{"EUR": 1.10}` = USD per 1 unit |
+| `FUTURESRLX_RISK_STATE_STORE_URI` | `""` | durable risk state: `""`/`memory:`/file path/`duckdb:`/`redis:` |
+| `FUTURESRLX_HYDRATION_LOOKBACK_DAYS` | `400` | cold-start history window before live trading |
+| `FUTURESRLX_HYDRATION_BACKFILL_ENABLED` | `true` | allow Databento/IBKR history backfill while hydrating |
+| `FUTURESRLX_RISK__RECONCILE_GRACE_SECONDS` | `30` | in-flight-order grace window before flagging drift |
+| `FUTURESRLX_RISK__LLM_CACHE_TTL_SECONDS` | `60` | TTL of the async LLM risk-assessment cache |
 
 The futures instrument master (`configs/instruments.yaml`) is the single source of truth for
 multipliers, tick sizes, margin estimates, roll rules and standard↔micro pairs (ES↔MES, NQ↔MNQ,
@@ -320,6 +327,50 @@ both engines produce identical targets and deltas for identical market states.
 
 ---
 
+## Production hardening (Phase 7)
+
+The live deployment surface is hardened for real capital; all five upgrades are
+offline-tested and wired into the production paths:
+
+1. **Cold-start state hydration** (`src/execution/hydrator.py` + `runner.py`) — the
+   runner loads the historical lookback window from the Parquet cache (optional Databento /
+   IBKR backfill), computes features and EWMA covariance, validates that every required feature is
+   warm, and only then connects the live feed. `TradingRunner.warm_start()` runs before the first
+   bar; `prime_pipeline=True` additionally exercises the full `S→A→T→R→N` chain on the hydrated
+   state. Live market-data states that carry no NLV are enriched from the broker account
+   (base currency + FX table) before sizing.
+2. **Durable risk & kill-switch state** (`src/risk/state_store.py`) — atomic JSON, DuckDB and Redis
+   backends persist `starting_daily_nlv`, portfolio/instrument high-water marks, the
+   `kill_switch_locked` latch and the OMS token-bucket state. A container restart or IBKR nightly
+   reset no longer re-arms intraday drawdown tracking; day rolls clear daily counters but keep HWM
+   and latched stops.
+3. **Open-order-aware reconciliation** (`src/execution/reconciler.py`) — the 30-second reconciler
+   adds `broker_position + Σ in-flight working-order remaining` and only halts on drift that is not
+   explained by a fresh open order (configurable `reconcile_grace_seconds`); partial fills and
+   stale orders are handled explicitly.
+4. **Async cached LLM risk worker** (`src/risk/llm_risk_overlay.py`) — assessments are cached with
+   `valid_until_utc` and a configurable `cache_ttl_seconds`; the synchronous risk projection never
+   awaits LLM I/O (single-flight fire-and-forget refresh on a running loop), and
+   `AsyncLLMRiskCacheWorker` keeps the cache warm with last-known-good fallback and capped backoff,
+   so slow multi-provider K-sample calls cannot stall the pipeline or the WebSocket loop.
+5. **Base-currency FX normalisation** (`src/core/types.py` + `src/risk/contract_translator.py`) —
+   `MarketState` carries `account_currency` + `fx_rates`; the translator converts `E_t` into USD
+   before notional sizing and margin-utilisation checks, fails closed when a rate is missing, and
+   keeps the USD path numerically identical. Non-USD accounts are simply real-sized instead of
+   being silently mis-sized.
+
+Run the hardened live/paper runner:
+
+```bash
+# offline configuration validation (no socket opened)
+.venv/bin/python -m src.execution.runner --check --strategy configs/strategies/tsmom_vol_target.yaml
+
+# live/paper (requires TWS / IB Gateway, credentials and a configured state store)
+FUTURESRLX_ENVIRONMENT=paper FUTURESRLX_RISK_STATE_STORE_URI=duckdb:   .venv/bin/python -m src.execution.runner --strategy configs/strategies/tsmom_vol_target.yaml
+```
+
+---
+
 ## Testing philosophy
 
 - **Offline & deterministic** — seeded synthetic fixtures in `tests/fixtures/market.py`; adapters
@@ -332,6 +383,10 @@ both engines produce identical targets and deltas for identical market states.
   changes in the past.
 - **Parity** — identical `MarketState` ⇒ identical `ContractTarget`s (and OMS deltas) from the
   backtest and IBKR paths.
+- **Hardening** — hydrate-before-first-bar ordering, restart-safe risk latches, open-order
+  reconciliation grace windows, non-blocking TTL LLM cache, and EUR↔USD sizing parity are covered
+  by Phase-7 unit tests plus `tests/integration/test_phase7_hardening.py` /
+  `test_phase7_fx.py`.
 - **Ablation** — LLM hallucination fixtures (low confidence) are ignored, while high-confidence
   critical alerts deterministically zero exposure.
 
@@ -351,6 +406,7 @@ boundary. Detailed per-phase deliverables, gates and verification numbers are re
 | 4 | `feat/phase-4-backtest-analytics` | `v0.4.0-backtest` | backtester, margin/cost simulators, walk-forward, metrics, tearsheets |
 | 5 | `feat/phase-5-execution` | `v0.5.0-execution` | IBKR async client, OMS pre-trade gate, BAG roller, reconciler |
 | 6 | `feat/phase-6-api-dashboard` | `v1.0.0` | FastAPI REST/WS telemetry, Next.js dashboard, Docker stack |
+| 7 | `feat/phase-7-production-hardening` | `v1.1.0` | cold-start hydration, durable risk state, open-order reconciliation, async LLM cache, FX normalisation |
 
 ---
 
