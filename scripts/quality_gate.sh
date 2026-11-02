@@ -9,6 +9,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PY="${PYTHON:-.venv/bin/python}"
 
+# Hermetic gate: the developer's shell (e.g. FUTURESRLX_ENVIRONMENT=paper when
+# running live/paper trading) must never change lint/type/test behaviour.
+if compgen -e >/dev/null 2>&1; then
+  for variable in $(compgen -e | grep -E '^FUTURESRLX_' || true); do
+    unset "$variable"
+  done
+fi
+
 echo "==> ruff check"
 "$PY" -m ruff check .
 

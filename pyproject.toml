@@ -122,6 +122,11 @@ markers = [
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # Upstream starlette TestClient emits a deprecation warning about httpx on
+    # import; it is not actionable for this project (no httpx2 dependency cycle).
+    "ignore::starlette.exceptions.StarletteDeprecationWarning",
+]
 
 [tool.coverage.run]
 source = ["src"]

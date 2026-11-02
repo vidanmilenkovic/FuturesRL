@@ -6,6 +6,8 @@ network access, no Databento credentials and no IBKR/TWS connection.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +27,33 @@ from tests.fixtures.market import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def isolate_futuresrlx_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Hermetic tests: the developer's shell must never configure the suite.
+
+    Exported ``FUTURESRLX_*`` variables (e.g. ``FUTURESRLX_ENVIRONMENT=paper``
+    or a ``duckdb:`` risk-state URI used for live trading) would otherwise leak
+    into ``Settings()`` constructions and change test behaviour depending on the
+    machine. This autouse fixture strips every ``FUTURESRLX_*`` variable and
+    disables the repo ``.env`` file before each test; a test that *wants* a
+    variable can still set it explicitly via its own ``monkeypatch.setenv``.
+
+    The settings singleton is cleared on entry and exit so cached settings from
+    a previous test can never observe a different environment.
+    """
+    from configs.settings import get_settings
+
+    for variable in list(os.environ):
+        if variable.startswith("FUTURESRLX_"):
+            monkeypatch.delenv(variable, raising=False)
+    # Ignore the developer's committed/untracked ``.env`` file too, unless a
+    # test deliberately opts back in (none currently do).
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture(scope="session")
