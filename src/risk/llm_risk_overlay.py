@@ -29,18 +29,31 @@ protocol; concrete HTTP adapters for OpenAI, Anthropic, DeepSeek and a local
 vLLM server use ``httpx`` (imported lazily, never at module import time) with
 robust JSON extraction, request retry and exponential backoff. Unit tests inject
 a deterministic fake client and never touch the network.
+
+Phase-7 async cache
+-------------------
+``apply_risk`` is synchronous and never awaits LLM I/O. The assessment set is a
+TTL-managed :class:`LLMRiskCacheEntry` (``cache_ttl_seconds``); when it goes
+stale the synchronous path schedules a fire-and-forget refresh on the running
+event loop and immediately projects with the last-known-good cache.
+:class:`AsyncLLMRiskCacheWorker` is the production mechanism that keeps that
+cache warm off the trading/WebSocket loops (single-flight, exponential backoff,
+last-known-good cache retained on failure, clean cancellation).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from configs.instruments import InstrumentsConfig, load_instruments
@@ -58,15 +71,19 @@ from src.core.types import (
 if TYPE_CHECKING:
     from configs.settings import RiskSettings
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "ANTHROPIC_VERSION",
     "DEFAULT_LLM_SYSTEM_PROMPT",
     "AnthropicClient",
     "AsyncLLMClient",
+    "AsyncLLMRiskCacheWorker",
     "DeepSeekClient",
     "LLMClientError",
     "LLMResponseError",
     "LLMRiskAssessmentBatch",
+    "LLMRiskCacheEntry",
     "LLMRiskConfig",
     "LLMRiskOverlay",
     "LLMRiskResponse",
@@ -84,6 +101,9 @@ ANTHROPIC_VERSION: str = "2023-06-01"
 
 #: Maximum number of characters of an LLM response embedded in error messages.
 _MAX_ERROR_SNIPPET: int = 200
+
+#: Upper bound for the async worker's exponential failure backoff (seconds).
+_MAX_WORKER_BACKOFF_SECONDS: float = 300.0
 
 #: Default system prompt: strict JSON contract tailored to futures macro catalysts.
 DEFAULT_LLM_SYSTEM_PROMPT = (
@@ -864,6 +884,9 @@ class LLMRiskConfig(BaseModel):
     macro_lockout_action: Literal["flatten", "cap_leverage"] = "flatten"
     macro_lockout_leverage_cap: float = Field(default=0.25, gt=0.0)
     sampling_temperature: float = Field(default=0.7, ge=0.0)
+    #: Time-to-live of the cached assessment set (seconds). The synchronous
+    #: pipeline never awaits LLM I/O: stale caches are refreshed in the background.
+    cache_ttl_seconds: float = Field(default=60.0, gt=0.0)
 
     @model_validator(mode="after")
     def _thresholds_ordered(self) -> LLMRiskConfig:
@@ -883,6 +906,7 @@ class LLMRiskConfig(BaseModel):
             penalty_lambda=settings.llm_risk_penalty_lambda,
             macro_lockout_minutes_before=settings.macro_lockout_minutes_before,
             macro_lockout_minutes_after=settings.macro_lockout_minutes_after,
+            cache_ttl_seconds=settings.llm_cache_ttl_seconds,
         )
 
 
@@ -926,6 +950,33 @@ def semantic_risk_penalty(
 
 
 # ---------------------------------------------------------------------------
+# TTL-managed assessment cache
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LLMRiskCacheEntry:
+    """One cached assessment set with the wall-clock window it is valid for.
+
+    The synchronous risk projection (:meth:`LLMRiskOverlay.apply_risk`) always
+    reads this last-known-good entry and never awaits LLM I/O. Background workers
+    replace the whole entry atomically only after a successful sample/filter run,
+    so a failed or slow completion can never degrade the cached signal.
+    """
+
+    assessments: Mapping[InstrumentId, RiskAssessment]
+    refreshed_at_utc: datetime
+    valid_until_utc: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "assessments", MappingProxyType(dict(self.assessments)))
+        object.__setattr__(self, "refreshed_at_utc", ensure_utc(self.refreshed_at_utc))
+        object.__setattr__(self, "valid_until_utc", ensure_utc(self.valid_until_utc))
+        if self.valid_until_utc <= self.refreshed_at_utc:
+            raise ValueError("valid_until_utc must be after refreshed_at_utc")
+
+
+# ---------------------------------------------------------------------------
 # LLM Risk-First overlay (Modules 1 & 3)
 # ---------------------------------------------------------------------------
 
@@ -947,6 +998,9 @@ class LLMRiskOverlay:
         ``configs/instruments.yaml``.
     source:
         ``RiskAssessment.source`` label recorded on the produced assessments.
+    clock:
+        Injectable wall clock (timezone-aware) used for cache TTL bookkeeping.
+        Production keeps the default; tests inject a deterministic fake.
     """
 
     def __init__(
@@ -957,14 +1011,25 @@ class LLMRiskOverlay:
         calendar: MacroEventCalendar | None = None,
         instruments: InstrumentsConfig | None = None,
         source: str = "llm",
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._client = client
         self._config = self._coerce_config(config)
         self._calendar = calendar
         self._instruments = instruments
         self._source = source
-        self._cache: dict[InstrumentId, RiskAssessment] = {}
+        self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
+        self._cache_entry: LLMRiskCacheEntry | None = None
         self._last_refresh: datetime | None = None
+
+        # -- async cache-refresh bookkeeping (fire-and-forget, never blocking) ---
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
+        self._refresh_in_flight: int = 0
+        self._refresh_errors: int = 0
+        self._last_refresh_error: str | None = None
+        self._staleness_count: int = 0
+        self._last_stale_at: datetime | None = None
 
     # -- public API ------------------------------------------------------------
 
@@ -986,23 +1051,101 @@ class LLMRiskOverlay:
     @property
     def latest_assessments(self) -> Mapping[InstrumentId, RiskAssessment]:
         """Latest cached (already filtered) assessments keyed by futures root."""
-        return dict(self._cache)
+        entry = self._cache_entry
+        return dict(entry.assessments) if entry is not None else {}
+
+    @property
+    def cache_entry(self) -> LLMRiskCacheEntry | None:
+        """The current TTL-managed cache entry, if anything has been cached yet."""
+        return self._cache_entry
+
+    @property
+    def refreshed_at_utc(self) -> datetime | None:
+        """Wall-clock timestamp of the last successful cache update."""
+        entry = self._cache_entry
+        return entry.refreshed_at_utc if entry is not None else None
+
+    @property
+    def valid_until_utc(self) -> datetime | None:
+        """Wall-clock expiry of the cached assessment set (``None`` when empty)."""
+        entry = self._cache_entry
+        return entry.valid_until_utc if entry is not None else None
 
     @property
     def last_refresh(self) -> datetime | None:
         """Timestamp of the last successful :meth:`refresh` call."""
         return self._last_refresh
 
+    @property
+    def pending_refresh_count(self) -> int:
+        """Number of in-flight fire-and-forget cache refresh tasks."""
+        return sum(1 for task in self._background_tasks if not task.done())
+
+    @property
+    def refresh_in_flight(self) -> int:
+        """Number of :meth:`refresh` calls currently awaiting LLM I/O."""
+        return self._refresh_in_flight
+
+    @property
+    def refresh_errors(self) -> int:
+        """Total failed background/direct refreshes observed since construction."""
+        return self._refresh_errors
+
+    @property
+    def last_refresh_error(self) -> str | None:
+        """Description of the most recent refresh failure, if any."""
+        return self._last_refresh_error
+
+    @property
+    def staleness_count(self) -> int:
+        """How many times the synchronous path observed a stale/absent cache."""
+        return self._staleness_count
+
+    @property
+    def last_stale_at(self) -> datetime | None:
+        """Wall-clock time of the most recent stale-cache observation."""
+        return self._last_stale_at
+
+    def is_cache_fresh(self, now: datetime | None = None) -> bool:
+        """Whether the cached assessment set is still inside its TTL window."""
+        entry = self._cache_entry
+        if entry is None:
+            return False
+        moment = ensure_utc(now) if now is not None else self._now()
+        return moment < entry.valid_until_utc
+
+    def cache_age_seconds(self, now: datetime | None = None) -> float:
+        """Age of the cached assessment set in seconds (``inf`` when empty)."""
+        entry = self._cache_entry
+        if entry is None:
+            return math.inf
+        moment = ensure_utc(now) if now is not None else self._now()
+        return max(0.0, (moment - entry.refreshed_at_utc).total_seconds())
+
     def set_cached_assessments(self, assessments: Sequence[RiskAssessment]) -> None:
-        """Seed the assessment cache (deterministic replay / tests)."""
-        self._cache = {assessment.instrument_id: assessment for assessment in assessments}
+        """Seed the assessment cache (deterministic replay / tests).
+
+        The seeded set gets a fresh TTL window from the overlay clock, so the
+        synchronous path does not immediately schedule a background refresh.
+        """
+        self._store_cache(assessments, self._now())
 
     async def refresh(
         self, state: MarketState, candidates: Sequence[InstrumentId]
     ) -> tuple[RiskAssessment, ...]:
         """Sample the LLM ``K`` times, run Module 1 filtering and refresh the cache."""
-        filtered = await self.sample_assessments(state, candidates)
-        self._cache = {assessment.instrument_id: assessment for assessment in filtered}
+        self._refresh_in_flight += 1
+        try:
+            filtered = await self.sample_assessments(state, candidates)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._refresh_errors += 1
+            self._last_refresh_error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            self._refresh_in_flight -= 1
+        self._store_cache(filtered, self._now())
         self._last_refresh = state.timestamp
         return filtered
 
@@ -1041,15 +1184,24 @@ class LLMRiskOverlay:
         return tuple(self._filter_samples(root, samples[root], state.timestamp) for root in roots)
 
     def apply_risk(self, weights: WeightVector, state: MarketState) -> WeightVector:
-        """Deterministic post-hoc circuit breaker / macro lockout projection."""
+        """Deterministic post-hoc circuit breaker / macro lockout projection.
+
+        This method is strictly synchronous and NEVER awaits LLM I/O. When the
+        cached assessment set is stale/absent and an asyncio event loop is
+        running, a fire-and-forget background refresh is scheduled and the
+        projection immediately proceeds with the last-known-good cache (or the
+        existing pass-through behaviour when nothing has been cached yet).
+        """
         keys: tuple[InstrumentId, ...] = tuple(weights)
         if not weights.weights or weights.is_flat():
             return WeightVector(dict.fromkeys(keys, 0.0))
+        self._maybe_schedule_refresh(state, tuple(weights))
         if self._macro_lockout_active(state.timestamp):
             if self._config.macro_lockout_action == "flatten":
                 return WeightVector(dict.fromkeys(keys, 0.0))
             return self._cap_leverage(weights)
 
+        entry = self._cache_entry
         master = self._instrument_master()
         tau = self._config.confidence_threshold
         safe = self._config.safe_score
@@ -1062,7 +1214,7 @@ class LLMRiskOverlay:
                 raise ValueError(
                     f"unknown futures root {root!r}: not declared in the instrument master"
                 ) from exc
-            assessment = self._cache.get(canonical)
+            assessment = entry.assessments.get(canonical) if entry is not None else None
             if assessment is None or assessment.confidence < tau:
                 output[canonical] = value
                 continue
@@ -1082,7 +1234,7 @@ class LLMRiskOverlay:
         assessments: Sequence[RiskAssessment] | Mapping[InstrumentId, RiskAssessment] | None = None,
     ) -> float:
         """Apply :func:`semantic_risk_penalty` with the overlay's configured parameters."""
-        selected = self._cache if assessments is None else assessments
+        selected = self.latest_assessments if assessments is None else assessments
         return semantic_risk_penalty(
             weights,
             selected,
@@ -1091,7 +1243,104 @@ class LLMRiskOverlay:
             tau=self._config.confidence_threshold,
         )
 
+    # -- async cache refresh ---------------------------------------------------
+
+    async def drain_pending_refresh(self, timeout: float | None = None) -> None:
+        """Await in-flight fire-and-forget cache refreshes (clean shutdown helper).
+
+        A ``TimeoutError``/deadline expiry leaves the refreshes running (the next
+        tick, a worker or :meth:`stop_background_cache` will finish them).
+        """
+        if timeout is not None and timeout < 0.0:
+            raise ValueError("timeout must be non-negative")
+        tasks = [task for task in self._background_tasks if not task.done()]
+        if not tasks:
+            return
+        if timeout is None:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return
+        try:
+            # ``shield`` keeps the refresh tasks alive when the caller's deadline
+            # expires; a drain timeout must not corrupt the cache or cancel work.
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(*tasks, return_exceptions=True)), timeout
+            )
+        except TimeoutError:
+            return
+
+    async def stop_background_cache(self) -> None:
+        """Cancel every in-flight fire-and-forget refresh and wait for cancellation."""
+        tasks = [task for task in self._background_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self._refresh_task = None
+
     # -- internals -------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        return ensure_utc(self._clock())
+
+    def _store_cache(
+        self, assessments: Sequence[RiskAssessment], refreshed_at_utc: datetime
+    ) -> None:
+        moment = ensure_utc(refreshed_at_utc)
+        self._cache_entry = LLMRiskCacheEntry(
+            assessments={assessment.instrument_id: assessment for assessment in assessments},
+            refreshed_at_utc=moment,
+            valid_until_utc=moment + timedelta(seconds=self._config.cache_ttl_seconds),
+        )
+
+    def _maybe_schedule_refresh(
+        self, state: MarketState, candidates: Sequence[InstrumentId]
+    ) -> bool:
+        """Schedule a non-blocking cache refresh when stale; return whether scheduled.
+
+        With no running event loop (synchronous backtest runner) this records the
+        staleness and returns ``False`` instead of raising -- the synchronous
+        pipeline simply keeps using the cache it has.
+        """
+        moment = self._now()
+        if self.is_cache_fresh(moment):
+            return False
+        self._staleness_count += 1
+        self._last_stale_at = moment
+        if not candidates:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        if self._refresh_in_flight > 0:
+            return False
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return False
+        task = loop.create_task(self._background_refresh(state, tuple(candidates)))
+        self._refresh_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_background_refresh_done)
+        return True
+
+    async def _background_refresh(
+        self, state: MarketState, candidates: tuple[InstrumentId, ...]
+    ) -> None:
+        try:
+            await self.refresh(state, candidates)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+
+    def _on_background_refresh_done(self, task: asyncio.Task[None]) -> None:
+        self._background_tasks.discard(task)
+        if task is self._refresh_task:
+            self._refresh_task = None
+        if not task.cancelled():
+            # Retrieve the exception (if any) so asyncio never warns about it;
+            # refresh() has already counted the failure.
+            task.exception()
 
     @staticmethod
     def _coerce_config(config: LLMRiskConfig | RiskSettings | None) -> LLMRiskConfig:
@@ -1186,3 +1435,210 @@ class LLMRiskOverlay:
             source=self._source,
             metadata=metadata,
         )
+
+
+# ---------------------------------------------------------------------------
+# Background TTL cache worker (production mechanism)
+# ---------------------------------------------------------------------------
+
+
+class AsyncLLMRiskCacheWorker:
+    """Single-flight background refresher that keeps the LLM cache warm.
+
+    The synchronous :meth:`LLMRiskOverlay.apply_risk` projection must never wait
+    on a slow K-sample multi-provider LLM completion (a 3-sample call can take
+    seconds and would stall the WebSocket event loop / rebalance tick). This
+    worker refreshes the overlay's TTL-managed cache on an interval derived from
+    the configured cache TTL and keeps the last-known-good assessments on failure,
+    backing off exponentially (capped) instead of hammering the provider.
+
+    Parameters
+    ----------
+    overlay:
+        The :class:`LLMRiskOverlay` whose cache is refreshed.
+    state_provider:
+        Callable returning the latest :class:`MarketState` (or ``None`` when no
+        state is available yet; the tick is skipped).
+    candidates_provider:
+        Callable deriving the roots to assess from the current state.
+    interval_seconds:
+        Optional refresh cadence. The effective cadence is
+        ``min(cache_ttl_seconds, interval_seconds)`` (TTL-based when omitted).
+    sleep, clock:
+        Injectable async sleep / wall clock for deterministic tests.
+    max_failures:
+        Optional consecutive-failure threshold after which the loop stops.
+    stop_event:
+        Optional external stop signal; :meth:`stop` also sets it.
+    """
+
+    def __init__(
+        self,
+        overlay: LLMRiskOverlay,
+        *,
+        state_provider: Callable[[], MarketState | None],
+        candidates_provider: Callable[[MarketState], Sequence[InstrumentId]],
+        interval_seconds: float | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        clock: Callable[[], datetime] | None = None,
+        max_failures: int | None = None,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
+        if not isinstance(overlay, LLMRiskOverlay):
+            raise TypeError(f"overlay must be an LLMRiskOverlay, got {type(overlay)!r}")
+        if not callable(state_provider):
+            raise TypeError("state_provider must be callable")
+        if not callable(candidates_provider):
+            raise TypeError("candidates_provider must be callable")
+        ttl = overlay.config.cache_ttl_seconds
+        if interval_seconds is None:
+            interval = ttl
+        else:
+            if not math.isfinite(interval_seconds) or interval_seconds <= 0.0:
+                raise ValueError("interval_seconds must be a finite positive number")
+            interval = min(ttl, float(interval_seconds))
+        if max_failures is not None and (
+            isinstance(max_failures, bool) or not isinstance(max_failures, int) or max_failures < 1
+        ):
+            raise ValueError("max_failures must be a positive int or None")
+        self._overlay = overlay
+        self._state_provider = state_provider
+        self._candidates_provider = candidates_provider
+        self._interval = interval
+        self._sleep: Callable[[float], Awaitable[None]] = sleep or asyncio.sleep
+        self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
+        self._max_failures = max_failures
+        self._stop_event = stop_event if stop_event is not None else asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._running_once = False
+        self._refreshes = 0
+        self._failures = 0
+        self._consecutive_failures = 0
+        self._last_error: str | None = None
+        self._last_run_at: datetime | None = None
+
+    # -- lifecycle -------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the background loop (requires a running asyncio event loop)."""
+        if self.is_running:
+            return
+        loop = asyncio.get_running_loop()
+        self._stop_event.clear()
+        self._task = loop.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        """Stop the loop, cancel any in-flight refresh and await clean teardown."""
+        self._stop_event.set()
+        task = self._task
+        self._task = None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await self._overlay.stop_background_cache()
+
+    async def run_once(self) -> bool:
+        """Run exactly one cache refresh; ``False`` when skipped or failed.
+
+        Single-flight: concurrent callers get ``False`` instead of stacking
+        overlapping LLM completion batches.
+        """
+        if self._running_once:
+            return False
+        self._running_once = True
+        try:
+            try:
+                state = self._state_provider()
+            except Exception as exc:
+                self._record_failure(exc)
+                return False
+            if state is None:
+                return False
+            try:
+                candidates = tuple(self._candidates_provider(state))
+            except Exception as exc:
+                self._record_failure(exc)
+                return False
+            if not candidates:
+                return False
+            if self._overlay.refresh_in_flight > 0:
+                return False
+            try:
+                await self._overlay.refresh(state, candidates)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._record_failure(exc)
+                return False
+            self._refreshes += 1
+            self._consecutive_failures = 0
+            self._last_run_at = self._clock()
+            return True
+        finally:
+            self._running_once = False
+
+    # -- observability ---------------------------------------------------------
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the background loop task is alive."""
+        return self._task is not None and not self._task.done()
+
+    @property
+    def interval_seconds(self) -> float:
+        """Effective refresh cadence (``min(ttl, configured interval)``)."""
+        return self._interval
+
+    @property
+    def refreshes(self) -> int:
+        """Number of successful cache refreshes performed by this worker."""
+        return self._refreshes
+
+    @property
+    def failures(self) -> int:
+        """Number of failed refresh attempts (provider/LLM/transport errors)."""
+        return self._failures
+
+    @property
+    def consecutive_failures(self) -> int:
+        """Current run of consecutive failures (drives the exponential backoff)."""
+        return self._consecutive_failures
+
+    @property
+    def last_error(self) -> str | None:
+        """Description of the most recent worker failure, if any."""
+        return self._last_error
+
+    @property
+    def last_run_at(self) -> datetime | None:
+        """Wall-clock time of the last successful worker refresh."""
+        return self._last_run_at
+
+    @property
+    def stop_event(self) -> asyncio.Event:
+        """The stop event; ``set()`` it to request an orderly loop exit."""
+        return self._stop_event
+
+    # -- internals -------------------------------------------------------------
+
+    async def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            await self.run_once()
+            if self._stop_event.is_set():
+                break
+            if self._max_failures is not None and self._consecutive_failures >= self._max_failures:
+                break
+            await self._sleep(self._next_delay())
+
+    def _next_delay(self) -> float:
+        if self._consecutive_failures <= 0:
+            return self._interval
+        exponent = min(self._consecutive_failures, 16)
+        return min(_MAX_WORKER_BACKOFF_SECONDS, self._interval * (2.0**exponent))
+
+    def _record_failure(self, exc: BaseException) -> None:
+        self._failures += 1
+        self._consecutive_failures += 1
+        self._last_error = f"{type(exc).__name__}: {exc}"

@@ -21,6 +21,12 @@ The overlay implements the ``R_t`` statistical side of the FinRL-X risk stage:
   session.
 * **Drawdown limit** - a portfolio drawdown from the equity high-water mark of
   ``drawdown_limit_pct`` flattens the book while the breach persists.
+* **Durable state (Phase 7)** - an optional
+  :class:`~src.risk.state_store.RiskStateStore` restores the starting daily NLV,
+  portfolio/instrument high-water marks and kill-switch latches on construction
+  and auto-persists every material mutation (load-modify-save, so OMS-owned
+  fields survive). A persisted locked kill switch keeps flattening weights across
+  a container restart or IBKR nightly reset until an explicit operator reset.
 
 Everything is deterministic, stateful and driven exclusively by the immutable
 :class:`~src.core.types.MarketState` plus injected equity updates. A clock can
@@ -29,6 +35,7 @@ be injected for reproducible reset/day-roll timestamps.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime
@@ -40,14 +47,23 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.core.types import TRADING_DAYS_PER_YEAR, InstrumentId, MarketState, WeightVector
+from src.risk.state_store import PersistedRiskState, RiskStateStore
 
 if TYPE_CHECKING:
     from configs.settings import RiskSettings
 
 __all__ = ["QuantRiskConfig", "QuantRiskOverlay"]
 
+logger = logging.getLogger(__name__)
+
 #: Weight magnitudes below this threshold are treated as flat.
 _WEIGHT_EPSILON: float = 1e-12
+
+#: ``PersistedRiskState.extra`` key prefix holding the per-instrument HWM direction.
+_HWM_DIRECTION_PREFIX: str = "quant_overlay.hwm_direction:"
+
+#: ``PersistedRiskState.extra`` key holding the comma-separated stopped roots.
+_STOPPED_ROOTS_KEY: str = "quant_overlay.stopped_roots"
 
 
 class QuantRiskConfig(BaseModel):
@@ -103,6 +119,14 @@ class QuantRiskOverlay:
     clock:
         Injectable clock returning a timezone-aware ``datetime`` (used only when
         :meth:`update_equity` / :meth:`reset_day` are called without a timestamp).
+    state_store:
+        Optional durable :class:`~src.risk.state_store.RiskStateStore`. When
+        supplied the overlay restores ``starting_daily_nlv``, the portfolio /
+        instrument high-water marks and the kill-switch latches on construction,
+        and auto-persists every material state mutation. This keeps an intraday
+        risk budget consumed before a container restart or IBKR nightly reset
+        from being silently re-armed. Store failures are logged, counted in
+        :attr:`state_store_errors` and never crash the trading loop.
     """
 
     def __init__(
@@ -121,7 +145,10 @@ class QuantRiskOverlay:
         daily_loss_kill_switch_enabled: bool | None = None,
         instruments: InstrumentsConfig | None = None,
         clock: Callable[[], datetime] | None = None,
+        state_store: RiskStateStore | None = None,
     ) -> None:
+        if state_store is not None and not isinstance(state_store, RiskStateStore):
+            raise TypeError("state_store must implement RiskStateStore (load/save/clear)")
         base = self._coerce_config(config)
         overrides: dict[str, float | bool] = {}
         for name, value in (
@@ -142,6 +169,12 @@ class QuantRiskOverlay:
         self._instruments = instruments
         self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
 
+        # -- durable state -------------------------------------------------------
+        self._state_store: RiskStateStore | None = state_store
+        self._state_store_errors: int = 0
+        self._last_state_store_error: str | None = None
+        self._store_snapshot: PersistedRiskState | None = None
+
         # -- mutable session / equity state --------------------------------------
         self._equity: float | None = None
         self._starting_daily_equity: float | None = None
@@ -152,6 +185,12 @@ class QuantRiskOverlay:
         self._stopped_roots: set[InstrumentId] = set()
         self._instrument_hwm: dict[InstrumentId, tuple[float, int]] = {}
         self._last_directions: dict[InstrumentId, int] = {}
+        #: Operator / OMS kill switch latch restored from (and persisted to) the store.
+        self._kill_switch_locked: bool = False
+        self._kill_switch_reason: str = ""
+
+        if self._state_store is not None:
+            self.restore_from_store()
 
     # -- public API ------------------------------------------------------------
 
@@ -167,32 +206,74 @@ class QuantRiskOverlay:
 
     @property
     def kill_switch_active(self) -> bool:
-        """Whether the intraday daily max-loss kill switch is latched."""
+        """Whether the daily max-loss or the operator/OMS kill switch is latched."""
+        return self._daily_loss_latched or self._kill_switch_locked
+
+    @property
+    def daily_loss_latched(self) -> bool:
+        """Whether the intraday daily max-loss breaker latched (session-scoped)."""
         return self._daily_loss_latched
+
+    @property
+    def kill_switch_reason(self) -> str:
+        """Reason recorded for the operator/OMS kill switch latch (empty when clear)."""
+        return self._kill_switch_reason
+
+    @property
+    def state_store(self) -> RiskStateStore | None:
+        """Durable state backend, if one was supplied."""
+        return self._state_store
+
+    @property
+    def state_store_errors(self) -> int:
+        """Number of store I/O failures observed (never raises into the trading loop)."""
+        return self._state_store_errors
+
+    @property
+    def last_state_store_error(self) -> str | None:
+        """Human-readable description of the most recent store I/O failure."""
+        return self._last_state_store_error
+
+    @property
+    def persisted_state(self) -> PersistedRiskState:
+        """Durable representation of the current in-memory risk state.
+
+        This is the state :meth:`persist` writes (minus a fresh store read); it
+        never performs store I/O by itself.
+        """
+        return self._build_persisted_state(refresh_store=False)
 
     def apply_risk(self, weights: WeightVector, state: MarketState) -> WeightVector:
         """Project ``weights`` onto the quantitative risk constraints."""
-        self._observe(state)
+        changed = self._observe(state)
         keys: tuple[InstrumentId, ...] = tuple(weights)
         if not weights.weights or weights.is_flat():
+            if changed:
+                self.persist()
             return WeightVector(dict.fromkeys(keys, 0.0))
-        if self._daily_loss_latched or self._portfolio_risk_breached():
+        if self._daily_loss_latched or self._kill_switch_locked or self._portfolio_risk_breached():
+            if changed:
+                self.persist()
             return WeightVector(dict.fromkeys(keys, 0.0))
 
         normalised, specs = self._normalise(weights)
-        current = self._apply_instrument_stops(normalised, state)
+        current, stops_changed = self._apply_instrument_stops(normalised, state)
         scaled = self._apply_volatility_target(current, state)
         scaled = self._apply_single_instrument_cap(scaled)
         scaled = self._apply_sector_cap(scaled, specs)
         scaled = self._apply_gross_leverage_cap(scaled)
+        if changed or stops_changed:
+            self.persist()
         return WeightVector(scaled)
 
     def update_equity(self, equity: float, timestamp: datetime | None = None) -> None:
         """Mark the account equity to market and evaluate the daily loss limit."""
         value = self._validate_equity(equity)
         moment = self._timestamp(timestamp)
-        self._roll_session(moment, value)
-        self._set_equity(value, moment)
+        changed = self._roll_session(moment, value)
+        changed = self._set_equity(value, moment) or changed
+        if changed:
+            self.persist()
 
     def reset_day(self, equity: float | None = None, timestamp: datetime | None = None) -> None:
         """Reset the daily loss baseline, kill switch and instrument stops.
@@ -200,7 +281,10 @@ class QuantRiskOverlay:
         This models the next trading session roll: the daily max-loss latch is
         cleared, the starting daily NLV is re-based and trailing-stopped
         instruments may be re-entered. The portfolio high-water mark is preserved
-        so the portfolio drawdown limit keeps its history.
+        so the portfolio drawdown limit keeps its history, and a latched
+        operator/OMS kill switch survives the day roll (it only clears on an
+        explicit :meth:`reset_kill_switch`) -- exactly like
+        :meth:`PersistedRiskState.rolled_to_day`.
         """
         value = self._validate_equity(equity if equity is not None else self._equity)
         moment = self._timestamp(timestamp)
@@ -211,10 +295,23 @@ class QuantRiskOverlay:
         self._daily_loss_latched = False
         self._stopped_roots.clear()
         self._last_timestamp = moment
+        self.persist()
 
     def reset_kill_switch(self) -> None:
-        """Manually clear the latched daily max-loss kill switch."""
+        """Manually clear the latched daily max-loss and operator/OMS kill switches."""
         self._daily_loss_latched = False
+        self._kill_switch_locked = False
+        self._kill_switch_reason = ""
+        self.persist()
+
+    def engage_kill_switch(self, reason: str = "operator kill switch engaged") -> None:
+        """Latches the operator kill switch and persists it (flatten until reset)."""
+        cleaned = reason.strip()
+        if not cleaned:
+            raise ValueError("kill switch reason must be non-empty")
+        self._kill_switch_locked = True
+        self._kill_switch_reason = cleaned
+        self.persist()
 
     def reset(self) -> None:
         """Clear every piece of mutable overlay state (test / new-session helper)."""
@@ -227,6 +324,49 @@ class QuantRiskOverlay:
         self._stopped_roots.clear()
         self._instrument_hwm.clear()
         self._last_directions.clear()
+        self._kill_switch_locked = False
+        self._kill_switch_reason = ""
+        self.persist()
+
+    def persist(self) -> PersistedRiskState:
+        """Persist the current risk state through the configured store.
+
+        Uses load-modify-save so fields written by other components (for example
+        the OMS ``rate_limiter`` token bucket) are preserved. Store failures are
+        counted in :attr:`state_store_errors`, logged, and never raised: the
+        in-memory state stays authoritative for the rest of the process lifetime.
+        """
+        state = self._build_persisted_state(refresh_store=True)
+        self._store_snapshot = state
+        if self._state_store is None:
+            return state
+        try:
+            self._state_store.save(state)
+        except Exception as exc:
+            self._record_store_error("save", exc)
+        return state
+
+    def restore_from_store(self) -> bool:
+        """Restore the durable risk state, if the store has one.
+
+        Returns ``True`` when a persisted state was applied, ``False`` when the
+        store is absent/empty or unreadable. A locked kill switch, the daily loss
+        latch, trading day and the high-water marks are all restored so a
+        restart cannot re-arm an already consumed risk budget.
+        """
+        store = self._state_store
+        if store is None:
+            return False
+        try:
+            state = store.load()
+        except Exception as exc:
+            self._record_store_error("load", exc)
+            return False
+        if state is None:
+            return False
+        self._store_snapshot = state
+        self._apply_persisted_state(state)
+        return True
 
     def snapshot_state(self) -> dict[str, object]:
         """JSON-serialisable snapshot of the overlay's risk state."""
@@ -244,13 +384,106 @@ class QuantRiskOverlay:
             "portfolio_high_water_mark": self._portfolio_hwm,
             "daily_pnl_pct": daily_pnl,
             "drawdown_pct": drawdown,
-            "kill_switch_active": self._daily_loss_latched,
+            "kill_switch_active": self.kill_switch_active,
             "stopped_roots": sorted(self._stopped_roots),
             "instrument_high_water_marks": {
                 root: {"price": hwm, "direction": direction}
                 for root, (hwm, direction) in sorted(self._instrument_hwm.items())
             },
         }
+
+    # -- durable state ---------------------------------------------------------
+
+    def _apply_persisted_state(self, state: PersistedRiskState) -> None:
+        """Copy a persisted payload into the in-memory session state."""
+        self._starting_daily_equity = state.starting_daily_nlv
+        self._portfolio_hwm = state.portfolio_high_water_mark
+        self._session_date = state.trading_day
+        self._last_timestamp = state.updated_at
+        self._daily_loss_latched = state.daily_loss_locked
+        self._kill_switch_locked = state.kill_switch_locked
+        self._kill_switch_reason = state.kill_switch_reason
+        self._instrument_hwm = {}
+        self._last_directions = {}
+        for root, price in state.instrument_high_water_marks.items():
+            direction = self._persisted_direction(state, root)
+            self._instrument_hwm[root] = (price, direction)
+            self._last_directions[root] = direction
+        raw_stopped = state.extra.get(_STOPPED_ROOTS_KEY)
+        if isinstance(raw_stopped, str) and raw_stopped.strip():
+            self._stopped_roots = {root.strip() for root in raw_stopped.split(",") if root.strip()}
+        else:
+            self._stopped_roots = set()
+
+    @staticmethod
+    def _persisted_direction(state: PersistedRiskState, root: str) -> int:
+        raw = state.extra.get(f"{_HWM_DIRECTION_PREFIX}{root}")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            # Legacy payload without direction metadata: assume a long position.
+            return 1
+        return -1 if float(raw) < 0.0 else 1
+
+    def _build_persisted_state(self, *, refresh_store: bool) -> PersistedRiskState:
+        """Merge the in-memory state over the store's current document.
+
+        ``refresh_store`` performs the ``store.load()`` half of the
+        load-modify-save cycle so non-risk fields (e.g. the OMS rate limiter) are
+        preserved; ``persisted_state`` reads the cached view only.
+        """
+        base = self._store_snapshot if self._store_snapshot is not None else PersistedRiskState()
+        if refresh_store and self._state_store is not None:
+            try:
+                loaded = self._state_store.load()
+            except Exception as exc:
+                self._record_store_error("load", exc)
+            else:
+                if loaded is not None:
+                    base = loaded
+        if (
+            self._session_date is not None
+            and base.trading_day is not None
+            and base.trading_day != self._session_date
+        ):
+            # A session roll also resets the persisted daily counters while the
+            # high-water marks and kill-switch latch deliberately survive.
+            base = base.rolled_to_day(self._session_date)
+        extra = dict(base.extra)
+        for key in tuple(extra):
+            if key == _STOPPED_ROOTS_KEY or key.startswith(_HWM_DIRECTION_PREFIX):
+                del extra[key]
+        marks: dict[str, float] = {}
+        for root, (price, direction) in self._instrument_hwm.items():
+            value = float(price)
+            if not math.isfinite(value) or value <= 0.0:  # pragma: no cover - contract-validated
+                continue
+            marks[root] = value
+            extra[f"{_HWM_DIRECTION_PREFIX}{root}"] = direction
+        if self._stopped_roots:
+            extra[_STOPPED_ROOTS_KEY] = ",".join(sorted(self._stopped_roots))
+        reason = self._kill_switch_reason if self._kill_switch_locked else ""
+        if self._kill_switch_locked and not reason:  # pragma: no cover - defensive
+            # A locked kill switch must always carry a reason (store contract).
+            reason = "kill switch engaged"
+        return base.updated(
+            starting_daily_nlv=self._starting_daily_equity,
+            portfolio_high_water_mark=self._portfolio_hwm,
+            instrument_high_water_marks=marks,
+            kill_switch_locked=self._kill_switch_locked,
+            kill_switch_reason=reason,
+            daily_loss_locked=self._daily_loss_latched,
+            trading_day=self._session_date,
+            updated_at=self._timestamp(None),
+            extra=extra,
+        )
+
+    def _record_store_error(self, operation: str, exc: BaseException) -> None:
+        self._state_store_errors += 1
+        self._last_state_store_error = f"{operation}: {exc!r}"
+        logger.warning(
+            "risk-state store %s failed (%r); continuing with in-memory risk state",
+            operation,
+            exc,
+        )
 
     # -- configuration / normalisation ----------------------------------------
 
@@ -309,21 +542,29 @@ class QuantRiskOverlay:
             raise ValueError("timestamp must be timezone-aware")
         return moment.astimezone(UTC)
 
-    def _observe(self, state: MarketState) -> None:
+    def _observe(self, state: MarketState) -> bool:
+        """Fold the point-in-time state into the session tracker; return "changed"."""
         moment = state.timestamp
         equity = state.equity
-        self._roll_session(moment, equity)
+        changed = self._roll_session(moment, equity)
         if equity is not None:
-            self._set_equity(self._validate_equity(equity), moment)
+            changed = self._set_equity(self._validate_equity(equity), moment) or changed
         self._last_timestamp = moment
+        return changed
 
-    def _roll_session(self, moment: datetime, equity: float | None) -> None:
+    def _roll_session(self, moment: datetime, equity: float | None) -> bool:
+        """Roll the daily counters when ``moment`` starts a new trading session.
+
+        Mirrors :meth:`PersistedRiskState.rolled_to_day`: the daily loss latch and
+        instrument stops are cleared, while the portfolio high-water mark and the
+        operator/OMS kill-switch latch survive.
+        """
         session = moment.astimezone(UTC).date()
         if self._session_date is None:
             self._session_date = session
-            return
+            return True
         if session == self._session_date:
-            return
+            return False
         # New trading session: clear daily counters/stops but keep the portfolio HWM.
         self._session_date = session
         self._daily_loss_latched = False
@@ -334,8 +575,14 @@ class QuantRiskOverlay:
             self._starting_daily_equity = value
             self._equity = value
             self._portfolio_hwm = max(self._portfolio_hwm or value, value)
+        return True
 
-    def _set_equity(self, equity: float, moment: datetime) -> None:
+    def _set_equity(self, equity: float, moment: datetime) -> bool:
+        """Mark equity to market; return whether any persisted field changed."""
+        previous_equity = self._equity
+        previous_starting = self._starting_daily_equity
+        previous_hwm = self._portfolio_hwm
+        previous_latched = self._daily_loss_latched
         self._equity = equity
         if self._starting_daily_equity is None:
             self._starting_daily_equity = equity
@@ -347,6 +594,12 @@ class QuantRiskOverlay:
             starting = self._starting_daily_equity
             if starting and (starting - equity) / starting >= self._config.daily_max_loss_pct:
                 self._daily_loss_latched = True
+        return (
+            previous_equity != self._equity
+            or previous_starting != self._starting_daily_equity
+            or previous_hwm != self._portfolio_hwm
+            or previous_latched != self._daily_loss_latched
+        )
 
     def _portfolio_risk_breached(self) -> bool:
         equity = self._equity
@@ -362,8 +615,10 @@ class QuantRiskOverlay:
 
     def _apply_instrument_stops(
         self, weights: dict[InstrumentId, float], state: MarketState
-    ) -> dict[InstrumentId, float]:
+    ) -> tuple[dict[InstrumentId, float], bool]:
+        """Apply per-instrument trailing stops; return weights and "persisted change"."""
         output = dict(weights)
+        changed = False
         threshold = self._config.trailing_stop_pct
         for root, value in weights.items():
             direction = 1 if value > 0.0 else (-1 if value < 0.0 else 0)
@@ -382,8 +637,10 @@ class QuantRiskOverlay:
             previous_direction = self._last_directions.get(root, 0)
             if previous_direction != direction:
                 self._instrument_hwm[root] = (price, direction)
+                changed = True
             else:
-                hwm = self._instrument_hwm.get(root, (price, direction))[0]
+                previous_hwm = self._instrument_hwm.get(root, (price, direction))[0]
+                hwm = previous_hwm
                 if direction > 0:
                     hwm = max(hwm, price)
                     triggered = (hwm - price) / hwm >= threshold
@@ -391,11 +648,14 @@ class QuantRiskOverlay:
                     hwm = min(hwm, price)
                     triggered = (price - hwm) / hwm >= threshold
                 self._instrument_hwm[root] = (hwm, direction)
+                if hwm != previous_hwm:
+                    changed = True
                 if triggered:
                     self._stopped_roots.add(root)
+                    changed = True
                     output[root] = 0.0
             self._last_directions[root] = direction
-        return output
+        return output, changed
 
     # -- volatility targeting --------------------------------------------------
 
