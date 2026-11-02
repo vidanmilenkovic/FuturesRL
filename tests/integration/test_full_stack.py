@@ -18,7 +18,6 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
-
 from configs.instruments import InstrumentsConfig, load_instruments
 from configs.settings import Settings
 from configs.strategy import StageConfig, load_strategy_config
@@ -27,6 +26,7 @@ from src.backtest.engine import BacktestResult, EventBacktester
 from src.data import FeatureProcessor, MarketStateBuilder, OfflineBarSource
 from src.risk import ContractTranslator, LLMRiskOverlay, MacroEventCalendar, QuantRiskOverlay
 from src.strategies import build_pipeline
+
 from tests.fixtures.market import make_risk_assessment
 
 pytestmark = pytest.mark.integration

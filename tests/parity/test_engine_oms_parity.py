@@ -23,7 +23,6 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from configs.instruments import InstrumentsConfig
 from src.backtest.engine import BacktestResult, EventBacktester
 from src.core.types import (
@@ -35,6 +34,7 @@ from src.core.types import (
 )
 from src.execution.oms import build_orders_from_targets
 from src.risk.contract_translator import ContractTranslator
+
 from tests.fixtures.market import make_market_state
 
 pytestmark = pytest.mark.parity
