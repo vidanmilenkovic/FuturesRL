@@ -120,6 +120,11 @@ export interface AccountSnapshotResponse {
   stale?: boolean;
   stale_reason?: string | null;
   source?: string;
+  /** v1.5.1 live-book attribution (task-38). */
+  equity_curve_source?: "ibkr-live" | "simulated-backfill" | "fixture" | string;
+  equity_curve_live_points?: number;
+  portfolio_volatility?: number | null;
+  portfolio_volatility_source?: string | null;
 }
 
 export interface EquityPoint {
@@ -387,6 +392,11 @@ export interface StudioParameter {
   options?: StudioParamOption[];
   unit?: string | null;
   optuna_tunable: boolean;
+  /** Curated Optuna default selection (v1.5.1, optuna_default_selected). */
+  optuna_default_selected?: boolean;
+  /** Structural / data-hygiene flag from the v1.5.1 catalog. */
+  hygiene?: boolean;
+  structural?: boolean;
   /** Catalog hints (Phase 10): log-scaled sliders and YAML encodings. */
   log_scale?: boolean;
   yaml_encoding?: string | null;

@@ -154,10 +154,13 @@ export function StageGroupedBars({ stages }: { stages: StageBar[] }) {
 
 export interface BulletRow {
   label: string;
-  value: number;
+  /** `null` renders an honest `—` (e.g. ex-ante covariance unavailable). */
+  value: number | null;
   cap: number;
   format: (value: number) => string;
   hint?: string;
+  /** Tooltip for the row (defaults to the hint). */
+  tooltip?: string;
   /** Optional explicit tone; otherwise derived from value/cap. */
   tone?: "gain" | "warn" | "loss" | "accent";
 }
@@ -166,15 +169,24 @@ export function BulletBars({ rows }: { rows: BulletRow[] }) {
   return (
     <div className="space-y-3.5">
       {rows.map((row) => {
-        const ratio = row.cap > 0 ? row.value / row.cap : 0;
-        const tone = row.tone ?? (ratio >= 1 ? "loss" : ratio >= 0.8 ? "warn" : "gain");
-        const fill = tone === "loss" ? "bg-loss" : tone === "warn" ? "bg-warn" : tone === "accent" ? "bg-accent" : "bg-gain";
+        const unavailable = row.value === null;
+        const ratio = !unavailable && row.cap > 0 ? (row.value ?? 0) / row.cap : 0;
+        const tone = row.tone ?? (unavailable ? "accent" : ratio >= 1 ? "loss" : ratio >= 0.8 ? "warn" : "gain");
+        const fill = unavailable
+          ? "bg-zinc-600"
+          : tone === "loss"
+            ? "bg-loss"
+            : tone === "warn"
+              ? "bg-warn"
+              : tone === "accent"
+                ? "bg-accent"
+                : "bg-gain";
         return (
-          <div key={row.label}>
+          <div key={row.label} data-unavailable={unavailable ? "true" : "false"} title={row.tooltip ?? row.hint}>
             <div className="mb-1.5 flex items-baseline justify-between gap-2">
               <span className="text-[12px] text-zinc-400">{row.label}</span>
               <span className="font-mono text-[11.5px] tabular-nums text-zinc-300">
-                {row.format(row.value)}
+                {unavailable ? "—" : row.format(row.value as number)}
                 <span className="text-zinc-600"> / {row.format(row.cap)}</span>
               </span>
             </div>

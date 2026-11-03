@@ -17,11 +17,14 @@ import { applyOptimization, getOptimization, listOptimizations, runOptimization 
 import { cn } from "@/lib/cn";
 import { formatInteger, formatNumber, formatPct } from "@/lib/format";
 import {
+  activeTunableParameters,
   buildSearchSpace,
-  defaultTunableBounds,
+  defaultOptunaBounds,
+  defaultOptunaSelection,
   formatObjectiveMetric,
   formatParamPath,
   importancePercent,
+  structuralParametersForStrategy,
 } from "@/lib/studio";
 import type {
   OptimizationObjective,
@@ -64,26 +67,55 @@ export function OptimizerPanel({
   const [nTrials, setNTrials] = useState(25);
   const [wfSplits, setWfSplits] = useState(5);
   const [drawdownPenalty, setDrawdownPenalty] = useState(0.2);
-  const [bounds, setBounds] = useState(() => defaultTunableBounds(catalog.parameters));
+  const [bounds, setBounds] = useState<Record<string, { enabled: boolean; low: number; high: number }>>({});
   const [study, setStudy] = useState<OptimizationStudy | null>(null);
   const [running, setRunning] = useState(false);
   const [applying, setApplying] = useState(false);
   const [message, setMessage] = useState<{ text: string; tone: Tone } | null>(null);
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "value", dir: "desc" });
 
-  const tunables = useMemo(
-    () =>
-      catalog.parameters.filter(
-        (parameter) =>
-          parameter.optuna_tunable &&
-          (parameter.type === "int" || parameter.type === "float" || parameter.type === "select" || parameter.type === "bool"),
-      ),
-    [catalog.parameters],
+  const baseStrategy = useMemo(
+    () => strategies.find((strategy) => strategy.id === baseId) ?? null,
+    [strategies, baseId],
   );
+  // v1.5.1: only parameters active in the selected base strategy are tunable.
+  const activeParams = useMemo(
+    () => (baseStrategy ? activeTunableParameters(baseStrategy, catalog) : []),
+    [baseStrategy, catalog],
+  );
+  const structuralParams = useMemo(
+    () => (baseStrategy ? structuralParametersForStrategy(baseStrategy, catalog) : []),
+    [baseStrategy, catalog],
+  );
+  const activeKey = activeParams.map((parameter) => parameter.path).join("|");
+  const tunables = activeParams;
 
   useEffect(() => {
-    if (!baseId && strategies.length > 0) setBaseId(strategies[0]?.id ?? "");
+    if (!baseId && strategies.length > 0) {
+      // Prefer the canonical TSMOM strategy as the initial study base.
+      const preferred =
+        strategies.find((strategy) => strategy.id === "tsmom_vol_target") ?? strategies[0];
+      setBaseId(preferred?.id ?? "");
+    }
   }, [baseId, strategies]);
+
+  // Recompute the active list and curated default checks whenever the base
+  // strategy changes (or the catalog's active parameter set changes).
+  useEffect(() => {
+    if (!baseStrategy) {
+      setBounds({});
+      return;
+    }
+    const defaults = defaultOptunaSelection(activeParams);
+    setBounds(defaultOptunaBounds(activeParams, defaults));
+    setMessage(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseId, activeKey, baseStrategy]);
+
+  const checkedCount = useMemo(
+    () => activeParams.filter((parameter) => bounds[parameter.path]?.enabled).length,
+    [activeParams, bounds],
+  );
 
   useEffect(() => {
     if (study === null && studies.data && studies.data.studies.length > 0) {
@@ -116,7 +148,7 @@ export function OptimizerPanel({
       purge_bars: 5,
       embargo_bars: 5,
       drawdown_penalty_threshold: drawdownPenalty,
-      search_space: buildSearchSpace(catalog.parameters, bounds),
+      search_space: buildSearchSpace(activeParams, bounds),
       seed: 7,
     };
     const result = await runOptimization(request);
@@ -283,11 +315,33 @@ export function OptimizerPanel({
         <Panel
           title="Tunable bounds"
           className="max-h-[356px] shrink-0"
-          actions={<span className="text-[10.5px] text-zinc-600">{Object.values(bounds).filter((entry) => entry.enabled).length} active</span>}
+          actions={
+            <span className="flex items-center gap-2">
+              {checkedCount > 8 ? (
+                <Badge tone="warn" title="Recommended: tune 3–6 parameters per study to prevent overfitting">
+                  overfitting risk
+                </Badge>
+              ) : null}
+              <span className="text-[10.5px] text-zinc-600" data-testid="optuna-selected-count">
+                {checkedCount} checked
+              </span>
+            </span>
+          }
         >
+          {checkedCount > 8 ? (
+            <div
+              className="mb-2 shrink-0 rounded border border-warn/30 bg-warn-soft/40 px-2 py-1.5 text-[10px] leading-4 text-amber-300"
+              data-testid="optuna-overfit-warning"
+            >
+              Recommended: tune 3–6 parameters per study to prevent overfitting.
+            </div>
+          ) : null}
           <div className="scroll-area -mx-1 min-h-0 flex-1 overflow-y-auto px-1">
             {tunables.length === 0 ? (
-              <EmptyState title="No tunable parameters" description="The strategy schema catalog did not mark any parameters as Optuna-tunable." />
+              <EmptyState
+                title="No active tunable parameters"
+                description={`No numeric Optuna parameters are active for ${baseId || "this strategy"}. Inactive selector/overlay parameters and structural hygiene params are excluded.`}
+              />
             ) : (
               <div className="space-y-1">
                 {tunables.map((parameter) => {
@@ -308,6 +362,29 @@ export function OptimizerPanel({
               </div>
             )}
           </div>
+          {structuralParams.length > 0 ? (
+            <details className="mt-1 shrink-0 border-t border-hairline pt-1.5" data-testid="optuna-structural-params">
+              <summary className="cursor-pointer select-none text-[10px] font-medium text-zinc-500 hover:text-zinc-300" title="Structural / data-hygiene parameters are read-only and never tuned">
+                Structural parameters excluded ({structuralParams.length}) — not optimized
+              </summary>
+              <div className="mt-1 max-h-24 space-y-0.5 overflow-y-auto">
+                {structuralParams.map((parameter) => (
+                  <div
+                    key={parameter.path}
+                    className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[10px] text-zinc-600"
+                    data-testid="optuna-structural-row"
+                    title="Structural / data-hygiene parameter — excluded from Optuna to prevent data-snooping"
+                  >
+                    <span className="h-1 w-1 rounded-full bg-zinc-600" />
+                    <span className="truncate">{parameter.label}</span>
+                    <span className="ml-auto shrink-0 font-mono text-[9px] text-zinc-700">
+                      {parameter.path.split(".").pop()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          ) : null}
           <div className="mt-2 flex items-center gap-2 border-t border-hairline pt-2">
             <Button variant="primary" onClick={() => void run()} disabled={running || !baseId}>
               {running ? "Optimizing…" : "Run optimization"}
@@ -540,12 +617,17 @@ function TunableRow({
   onChange: (entry: { enabled: boolean; low: number; high: number }) => void;
 }) {
   return (
-    <div className="flex items-center gap-2 rounded border border-transparent px-1 py-1 text-[10.5px] hover:border-hairline">
+    <div
+      className="flex items-center gap-2 rounded border border-transparent px-1 py-1 text-[10.5px] hover:border-hairline"
+      data-testid="optuna-tunable-row"
+      data-optuna-path={parameter.path}
+    >
       <input
         type="checkbox"
         checked={entry.enabled}
         onChange={(event) => onChange({ ...entry, enabled: event.target.checked })}
         aria-label={`Tune ${parameter.label}`}
+        data-testid={`optuna-check-${parameter.path.split(".").pop() ?? parameter.path}`}
         className="h-3 w-3 rounded border border-zinc-600 bg-canvas accent-blue-500"
       />
       <span className="min-w-0 flex-1 truncate text-zinc-400" title={parameter.path}>

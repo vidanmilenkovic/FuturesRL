@@ -906,6 +906,9 @@ function normaliseParameter(raw: unknown): StudioParameter | null {
     options: normaliseOptions(raw.choices ?? raw.options),
     unit: asString(raw.unit ?? "", "") || null,
     optuna_tunable: asBoolean(raw.optuna_tunable ?? raw.tunable, false),
+    optuna_default_selected: asBoolean(raw.optuna_default_selected, false),
+    hygiene: asBoolean(raw.hygiene ?? raw.data_hygiene, false),
+    structural: asBoolean(raw.structural ?? raw.structural_parameter, false),
     log_scale: asBoolean(raw.log_scale, false),
     yaml_encoding: asString(raw.yaml_encoding ?? "", "") || null,
     location: asString(raw.location ?? "", "") || null,
@@ -1536,6 +1539,162 @@ export function defaultTunableBounds(
     const defaultNumber = typeof parameter.default === "number" ? parameter.default : 0;
     bounds[parameter.path] = {
       enabled: true,
+      low: parameter.min ?? Math.min(defaultNumber * 0.5, 0),
+      high: parameter.max ?? Math.max(defaultNumber * 1.5, 1),
+    };
+  }
+  return bounds;
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.1 Optuna active-strategy filtering + curated default selection
+// ---------------------------------------------------------------------------
+
+/** Curated Optuna default keys from strategy-eng task-36. */
+export const OPTUNA_DEFAULT_KEYS = new Set<string>([
+  "timing.tsmom.lookback_fast",
+  "timing.tsmom.lookback_slow",
+  "timing.kama.window",
+  "timing.carry_filter.min_carry_bps",
+  "allocator.volatility_target.target_annual_volatility",
+  "risk.quant_risk.trailing_stop_pct",
+]);
+
+/** Structural / data-hygiene keys that must never be tuned. */
+const OPTUNA_HYGIENE_KEYS = new Set<string>([
+  "universe.liquidity.min_avg_dollar_volume",
+  "universe.liquidity.min_open_interest",
+  "universe.liquidity.min_history_days",
+  "universe.liquidity.top_n",
+  "universe.regime.top_n",
+  "risk.llm_risk.sample_count",
+  "risk.llm_risk.cache_ttl_seconds",
+  "risk.llm_risk.macro_lockout_minutes_before",
+  "risk.llm_risk.macro_lockout_minutes_after",
+  "risk.llm_risk.macro_lockout_action",
+  "risk.llm_risk.macro_lockout_leverage_cap",
+]);
+
+const HYGIENE_PATTERN =
+  /(min_avg_dollar_volume|min_open_interest|min_history_days|top_n|sample_count|cache_ttl|macro_lockout|risk_off_roots|risk_off_sectors)/i;
+
+function parameterKeyCandidates(parameter: StudioParameter): string[] {
+  return [parameter.key ?? "", parameter.path].filter((value) => value.length > 0);
+}
+
+/** True for data-hygiene / structural params (not selectable in Optuna). */
+export function isStructuralParameter(parameter: StudioParameter): boolean {
+  if (parameter.hygiene || parameter.structural) return true;
+  if (!parameter.optuna_tunable) return true;
+  const candidates = parameterKeyCandidates(parameter);
+  if (candidates.some((key) => OPTUNA_HYGIENE_KEYS.has(key))) return true;
+  return candidates.some((key) => HYGIENE_PATTERN.test(key));
+}
+
+function stageComponentNames(stages: { name: string; params: Record<string, StudioParamValue> }[]): Set<string> {
+  const names = new Set<string>();
+  for (const stage of stages) {
+    names.add(stage.name);
+    if (stage.name === "composite") {
+      const components = stage.params.components;
+      const values = Array.isArray(components)
+        ? components.map(String)
+        : typeof components === "string" && components.length > 0
+          ? components.split(",").map((entry) => entry.trim())
+          : [];
+      for (const value of values) names.add(value);
+    }
+  }
+  return names;
+}
+
+/** Stage choices active in the selected base strategy. */
+export function activeStageChoices(strategy: StrategyConfig): {
+  universe: Set<string>;
+  allocator: Set<string>;
+  timing: Set<string>;
+  risk: Set<string>;
+} {
+  return {
+    universe: stageComponentNames([strategy.universe]),
+    allocator: stageComponentNames([strategy.allocator]),
+    timing: stageComponentNames(strategy.timing),
+    risk: stageComponentNames(strategy.risk),
+  };
+}
+
+/** A parameter is active when its stage component/overlay is present in the strategy. */
+export function isParameterActiveForStrategy(
+  parameter: StudioParameter,
+  strategy: StrategyConfig,
+  choices?: ReturnType<typeof activeStageChoices>,
+): boolean {
+  const active = choices ?? activeStageChoices(strategy);
+  const stageName = parameter.stage_name ?? "";
+  if (parameter.stage === "translator") return true;
+  if (stageName.length === 0) return true;
+  if (parameter.stage === "universe") return active.universe.has(stageName);
+  if (parameter.stage === "allocator") return active.allocator.has(stageName);
+  if (parameter.stage === "timing") return active.timing.has(stageName);
+  if (parameter.stage === "risk") return active.risk.has(stageName);
+  return true;
+}
+
+/** Numeric tunable parameters active in the selected base strategy (no hygiene). */
+export function activeTunableParameters(
+  strategy: StrategyConfig,
+  catalog: StudioCatalogResponse,
+): StudioParameter[] {
+  const choices = activeStageChoices(strategy);
+  return catalog.parameters.filter(
+    (parameter) =>
+      (parameter.type === "int" || parameter.type === "float") &&
+      parameter.optuna_tunable &&
+      isParameterActiveForStrategy(parameter, strategy, choices) &&
+      !isStructuralParameter(parameter),
+  );
+}
+
+/** Active structural/hygiene params for the "excluded" explainer. */
+export function structuralParametersForStrategy(
+  strategy: StrategyConfig,
+  catalog: StudioCatalogResponse,
+): StudioParameter[] {
+  const choices = activeStageChoices(strategy);
+  return catalog.parameters.filter(
+    (parameter) =>
+      isParameterActiveForStrategy(parameter, strategy, choices) &&
+      isStructuralParameter(parameter),
+  );
+}
+
+/**
+ * Pre-check only curated/default-selected active params: catalog
+ * `optuna_default_selected` when available, otherwise the frozen curated keys.
+ */
+export function defaultOptunaSelection(parameters: StudioParameter[]): string[] {
+  const flagged = parameters
+    .filter((parameter) => parameter.optuna_default_selected)
+    .map((parameter) => parameter.path);
+  if (flagged.length > 0) return flagged;
+  return parameters
+    .filter((parameter) =>
+      parameterKeyCandidates(parameter).some((key) => OPTUNA_DEFAULT_KEYS.has(key)),
+    )
+    .map((parameter) => parameter.path);
+}
+
+export function defaultOptunaBounds(
+  parameters: StudioParameter[],
+  selectedPaths: string[],
+): Record<string, { enabled: boolean; low: number; high: number }> {
+  const selected = new Set(selectedPaths);
+  const bounds: Record<string, { enabled: boolean; low: number; high: number }> = {};
+  for (const parameter of parameters) {
+    if (parameter.type !== "int" && parameter.type !== "float") continue;
+    const defaultNumber = typeof parameter.default === "number" ? parameter.default : 0;
+    bounds[parameter.path] = {
+      enabled: selected.has(parameter.path),
       low: parameter.min ?? Math.min(defaultNumber * 0.5, 0),
       high: parameter.max ?? Math.max(defaultNumber * 1.5, 1),
     };

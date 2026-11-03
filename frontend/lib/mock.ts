@@ -259,6 +259,10 @@ export function buildAccount(netLiquidation = ACCOUNT_STARTING_NLV): AccountSnap
     net_exposure: netExposure,
     equity_curve: generateEquityCurve(20260101, 0.0082, 0.00055, netLiquidation).points,
     positions,
+    equity_curve_source: "fixture",
+    equity_curve_live_points: 0,
+    portfolio_volatility: null,
+    portfolio_volatility_source: "unavailable",
   };
 }
 
@@ -1373,6 +1377,9 @@ function param(
     options: extra.options,
     unit: extra.unit ?? null,
     optuna_tunable: extra.optuna_tunable ?? false,
+    optuna_default_selected: extra.optuna_default_selected ?? false,
+    hygiene: extra.hygiene ?? false,
+    structural: extra.structural ?? false,
     log_scale: extra.log_scale ?? false,
     yaml_encoding: extra.yaml_encoding ?? null,
     location: extra.location ?? null,
@@ -1397,16 +1404,16 @@ export function mockStudioCatalog(): StudioCatalogResponse {
       min: 2, max: 16, step: 1, yaml_encoding: "comma_strings",
     }),
     param("universe.params.min_avg_dollar_volume", "universe", "Min ADV (USD)", "Roots below this average daily dollar volume are excluded before allocation.", "float", 50_000_000, {
-      min: 10_000_000, max: 200_000_000, step: 5_000_000, unit: "$", optuna_tunable: true,
+      min: 10_000_000, max: 200_000_000, step: 5_000_000, unit: "$", optuna_tunable: false, hygiene: true,
     }),
     param("universe.params.min_open_interest", "universe", "Min open interest", "Reject thin contracts that would be costly to roll or exit.", "int", 5_000, {
-      min: 1_000, max: 20_000, step: 500, optuna_tunable: true,
+      min: 1_000, max: 20_000, step: 500, optuna_tunable: false, hygiene: true,
     }),
     param("universe.params.top_n", "universe", "Max roots", "Hard cap on the number of roots admitted after ranking.", "int", 10, {
-      min: 3, max: 15, step: 1, optuna_tunable: true,
+      min: 3, max: 15, step: 1, optuna_tunable: false, hygiene: true,
     }),
     param("universe.params.min_history_days", "universe", "Min history (days)", "Warm-up requirement so trend and covariance features are available.", "int", 252, {
-      min: 60, max: 504, step: 21,
+      min: 60, max: 504, step: 21, optuna_tunable: false, hygiene: true,
     }),
 
     param("allocator.name", "allocator", "Allocator", "Base portfolio construction before timing and risk overlays.", "select", "risk_parity", {
@@ -1419,7 +1426,7 @@ export function mockStudioCatalog(): StudioCatalogResponse {
       ],
     }),
     param("allocator.params.target_annual_volatility", "allocator", "Target annual vol", "Portfolio volatility the allocator aims for before overlays.", "float", 0.12, {
-      min: 0.05, max: 0.3, step: 0.005, unit: "%", optuna_tunable: true,
+      min: 0.05, max: 0.3, step: 0.005, unit: "%", optuna_tunable: true, optuna_default_selected: true,
     }),
     param("allocator.params.covariance_lookback_days", "allocator", "Covariance lookback (days)", "EWMA window used to estimate the risk model.", "int", 60, {
       min: 20, max: 120, step: 5, optuna_tunable: true,
@@ -1433,21 +1440,21 @@ export function mockStudioCatalog(): StudioCatalogResponse {
 
     param("timing.tsmom.enabled", "timing", "Time-series momentum", "Trade with the 21/126-day trend, sized by volatility.", "bool", true, { group: "TSMOM" }),
     param("timing.tsmom.params.lookback_fast", "timing", "Fast lookback (days)", "Short trend window; shorter reacts faster but churns more.", "int", 21, {
-      min: 5, max: 63, step: 1, group: "TSMOM", optuna_tunable: true,
+      min: 5, max: 63, step: 1, group: "TSMOM", optuna_tunable: true, optuna_default_selected: true,
     }),
     param("timing.tsmom.params.lookback_slow", "timing", "Slow lookback (days)", "Long trend window; defines the structural trend regime.", "int", 126, {
-      min: 63, max: 252, step: 7, group: "TSMOM", optuna_tunable: true,
+      min: 63, max: 252, step: 7, group: "TSMOM", optuna_tunable: true, optuna_default_selected: true,
     }),
     param("timing.tsmom.params.vol_lookback", "timing", "Volatility lookback", "Realised volatility window used to size the momentum signal.", "int", 20, {
       min: 10, max: 60, step: 5, group: "TSMOM",
     }),
     param("timing.kama.enabled", "timing", "KAMA trend filter", "Adaptive moving average confirmation to avoid whipsaw entries.", "bool", true, { group: "KAMA" }),
     param("timing.kama.params.window", "timing", "KAMA efficiency window", "Window for the Kaufman efficiency ratio.", "int", 10, {
-      min: 5, max: 30, step: 1, group: "KAMA", optuna_tunable: true,
+      min: 5, max: 30, step: 1, group: "KAMA", optuna_tunable: true, optuna_default_selected: true,
     }),
     param("timing.carry_filter.enabled", "timing", "Carry / term-structure filter", "Tilt towards backwardated roots and penalise expensive contango.", "bool", true, { group: "Carry" }),
     param("timing.carry_filter.params.min_carry_bps", "timing", "Min carry (bps)", "Minimum annualised roll yield required to keep a long position.", "float", 0, {
-      min: -50, max: 50, step: 5, group: "Carry", optuna_tunable: true,
+      min: -50, max: 50, step: 5, group: "Carry", optuna_tunable: true, optuna_default_selected: true,
     }),
     param("timing.mean_reversion.enabled", "timing", "Mean reversion (RSI + Bollinger)", "Fade panic sell-offs when RSI or the lower Bollinger band is breached and turbulence is calm.", "bool", false, { group: "Mean reversion" }),
     param("timing.mean_reversion.params.rsi_period", "timing", "RSI period", "RSI window for oversold / overbought detection.", "int", 14, {
@@ -1507,6 +1514,9 @@ export function mockStudioCatalog(): StudioCatalogResponse {
     }),
     param("risk.quant_risk.params.drawdown_limit_pct", "risk", "Drawdown limit", "Trailing drawdown that forces de-risking.", "float", 0.2, {
       min: 0.05, max: 0.5, step: 0.01, unit: "%", group: "Quant risk", optuna_tunable: true,
+    }),
+    param("risk.quant_risk.params.trailing_stop_pct", "risk", "Trailing stop", "High-water-mark trailing stop distance per position.", "float", 0.1, {
+      min: 0.01, max: 0.5, step: 0.01, unit: "%", group: "Quant risk", optuna_tunable: true, optuna_default_selected: true,
     }),
     param("risk.quant_risk.params.daily_max_loss_pct", "risk", "Daily max loss", "Intraday loss that trips the kill-switch and flattens the book.", "float", 0.03, {
       min: 0.005, max: 0.1, step: 0.001, unit: "%", group: "Quant risk", optuna_tunable: true,

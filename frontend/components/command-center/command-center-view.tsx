@@ -96,7 +96,7 @@ const BOOK_TABS: { value: BookTab; label: string }[] = [
 
 export function CommandCenterView() {
   const { account, positions, loading, source, dataMode, stale, staleReason } = useAccount();
-  const { events, latest } = useTelemetry();
+  const { events, latest, health } = useTelemetry();
   const risk = useAsyncData(getRiskState);
   const thresholds = risk.data?.thresholds ?? FALLBACK_THRESHOLDS;
 
@@ -160,6 +160,22 @@ export function CommandCenterView() {
     return { first, last, change, high, low, annualizedVol, maxDrawdown };
   }, [windowPoints, drawdownSeries]);
 
+  // v1.5.1 live-book attribution: when IBKR is connected, volatility must come
+  // from the ex-ante live book (account.portfolio_volatility), never the
+  // synthetic equity-curve vol.
+  const ibkrConnected = health?.ibkr_connected === true;
+  const equitySource = account?.equity_curve_source ?? null;
+  const equityLivePoints = account?.equity_curve_live_points ?? 0;
+  const liveVolFraction =
+    ibkrConnected && typeof account?.portfolio_volatility === "number"
+      ? account.portfolio_volatility
+      : null;
+  const volUnavailable = ibkrConnected && liveVolFraction === null;
+  const displayVolFraction: number | null = ibkrConnected ? liveVolFraction : period.annualizedVol;
+  const volSource = account?.portfolio_volatility_source ?? null;
+  const showSimulatedBackfillBadge = ibkrConnected && equitySource === "simulated-backfill";
+  const showLiveEquityBadge = ibkrConnected && equitySource === "ibkr-live";
+
   const totals = useMemo(() => {
     const unrealized = positions.reduce((sum, position) => sum + position.unrealized_pnl, 0);
     const margin = positions.reduce(
@@ -191,13 +207,23 @@ export function CommandCenterView() {
       },
       {
         label: "Portfolio volatility",
-        value: period.annualizedVol * 100,
+        value: displayVolFraction === null ? null : displayVolFraction * 100,
         cap: thresholds.target_annual_volatility * 100,
         format: (value) => `${value.toFixed(1)}%`,
-        hint: `Annualised ${timeframe} return volatility vs ${(thresholds.target_annual_volatility * 100).toFixed(0)}% target`,
+        hint: !ibkrConnected
+          ? `Annualised ${timeframe} return volatility vs ${(thresholds.target_annual_volatility * 100).toFixed(0)}% target`
+          : displayVolFraction === null
+            ? "Ex-ante covariance unavailable for the live IBKR book — shown as —"
+            : `Live IBKR book ex-ante volatility${volSource ? ` (${volSource})` : ""} vs ${(thresholds.target_annual_volatility * 100).toFixed(0)}% target`,
+        tooltip: !ibkrConnected
+          ? undefined
+          : displayVolFraction === null
+            ? "ex-ante covariance unavailable"
+            : `Live book ex-ante vol${volSource ? ` · source ${volSource}` : ""}`,
+        tone: !ibkrConnected ? undefined : displayVolFraction === null ? "accent" : "gain",
       },
     ];
-  }, [account, thresholds, period.annualizedVol, timeframe]);
+  }, [account, thresholds, timeframe, displayVolFraction, ibkrConnected, volSource]);
 
   const exposureRows = useMemo(() => {
     const byClass = new Map<string, { long: number; short: number }>();
@@ -400,9 +426,35 @@ export function CommandCenterView() {
             <span className={cn("font-mono text-[12px] tabular-nums", signedColor(period.change))}>
               {formatPct(period.change)}
             </span>
-            <span className="text-[11px] text-zinc-600">
-              {timeframe} · {source === "demo" ? "fixture curve" : "mark-to-market"}
-            </span>
+            <span className="text-[11px] text-zinc-600">{timeframe} ·</span>
+            {showSimulatedBackfillBadge ? (
+              <span
+                data-testid="equity-source-badge"
+                data-source="simulated-backfill"
+                data-live-points={equityLivePoints}
+                data-ibkr="true"
+                className="inline-flex items-center gap-1 rounded bg-warn-soft px-1.5 py-0.5 text-[10.5px] font-medium text-amber-300"
+                title="Synthetic equity backfill while live IBKR NLV history is being recorded — not live data"
+              >
+                Simulated Backfill · Recording Live Paper NLV
+              </span>
+            ) : showLiveEquityBadge ? (
+              <span
+                data-testid="equity-source-badge"
+                data-source="ibkr-live"
+                data-live-points={equityLivePoints}
+                data-ibkr="true"
+                className="inline-flex items-center gap-1 rounded bg-gain-soft px-1.5 py-0.5 text-[10.5px] font-medium text-emerald-300"
+                title={`${equityLivePoints} persisted live IBKR NLV points`}
+              >
+                Live IBKR NLV
+                <span className="font-mono text-[9.5px] text-emerald-400/80">{equityLivePoints} pts</span>
+              </span>
+            ) : (
+              <span className="text-[11px] text-zinc-600">
+                {source === "demo" ? "fixture curve" : "mark-to-market"}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-3 text-[11px] text-zinc-500">
             <span>
@@ -423,6 +475,10 @@ export function CommandCenterView() {
           data-last-time={windowPoints[windowPoints.length - 1]?.time ?? ""}
           data-last-value={windowPoints[windowPoints.length - 1]?.value ?? ""}
           data-intraday={timeframe === "1D" ? "true" : "false"}
+          data-equity-source={equitySource ?? "unknown"}
+          data-equity-live-points={equityLivePoints}
+          data-ibkr-connected={ibkrConnected ? "true" : "false"}
+          data-portfolio-vol={displayVolFraction ?? ""}
         />
         <TimeSeriesChart
           data={windowPoints}
@@ -455,12 +511,21 @@ export function CommandCenterView() {
 
         <div className="mt-2 grid grid-cols-2 gap-3 border-t border-hairline pt-2 sm:grid-cols-4">
           {[
-            { label: "Period change", value: formatPct(period.change), tone: signedColor(period.change) },
-            { label: "Max drawdown", value: formatPctPlain(period.maxDrawdown), tone: "text-loss" },
-            { label: "Annualised vol", value: formatPctPlain(period.annualizedVol), tone: "text-zinc-200" },
-            { label: "Gross notional", value: formatCompactUsd(totals.notional), tone: "text-zinc-200" },
+            { label: "Period change", value: formatPct(period.change), tone: signedColor(period.change), title: undefined },
+            { label: "Max drawdown", value: formatPctPlain(period.maxDrawdown), tone: "text-loss", title: undefined },
+            {
+              label: "Annualised vol",
+              value: formatPctPlain(displayVolFraction),
+              tone: "text-zinc-200",
+              title: volUnavailable
+                ? "ex-ante covariance unavailable"
+                : ibkrConnected
+                  ? `Live IBKR book ex-ante volatility${volSource ? ` (${volSource})` : ""}`
+                  : undefined,
+            },
+            { label: "Gross notional", value: formatCompactUsd(totals.notional), tone: "text-zinc-200", title: undefined },
           ].map((item) => (
-            <div key={item.label}>
+            <div key={item.label} title={item.title}>
               <div className="metric-label">{item.label}</div>
               <div className={cn("font-mono text-[12.5px] tabular-nums", item.tone)}>{item.value}</div>
             </div>
