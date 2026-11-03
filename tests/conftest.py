@@ -28,6 +28,14 @@ from tests.fixtures.market import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Hermetic *at import time* as well: module/session-scoped fixtures and test
+# modules can construct ``Settings()`` before the function-scoped autouse
+# fixture below runs. Strip the developer's exported FUTURESRLX_* variables and
+# disable the repo ``.env`` before any test fixture is instantiated.
+for _variable in [name for name in os.environ if name.startswith("FUTURESRLX_")]:
+    os.environ.pop(_variable, None)
+Settings.model_config["env_file"] = None
+
 
 @pytest.fixture(autouse=True)
 def isolate_futuresrlx_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
