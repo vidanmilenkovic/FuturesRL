@@ -19,8 +19,9 @@ Real wiring
   real ``flatten_all_sync`` path and locks execution.
 * :class:`IBKRExecutionService` — opt-in real ``IBKRConnectionManager`` +
   ``OrderManagementSystem`` wiring (``FUTURESRLX_API_ENABLE_IBKR=1``); connects in
-  the lifespan and transparently uses the offline simulated broker while the
-  session is unavailable.
+  the lifespan, keeps a background liveness/reconnect probe running and serves the
+  last-known-good IBKR book (marked ``stale``) while TWS is unavailable -- it never
+  silently substitutes simulated positions.
 * :class:`EngineRiskService` — real ``RiskSettings`` + deterministic Risk-First
   assessment/projection (same Module-3 formulas as the LLM overlay).
 * Backtests — see :mod:`src.api.backtests_service` (real ``BacktestEngine``).
@@ -29,10 +30,13 @@ Real wiring
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import math
 import os
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -105,6 +109,7 @@ __all__ = [
     "EngineRiskService",
     "FixtureExecutionService",
     "FixtureMarketService",
+    "IBKRBookUnavailableError",
     "IBKRExecutionService",
     "InMemoryStrategyCatalog",
     "SimulatedExecutionService",
@@ -226,6 +231,7 @@ class InMemoryStrategyCatalog:
         self._clock = clock
         self._configs: dict[str, StrategyConfig] = {}
         self._updated_at: dict[str, datetime] = {}
+        self._lock = threading.RLock()
         directory = settings.strategies_dir
         if directory.is_dir():
             for strategy_id, config in discover_strategy_configs(directory).items():
@@ -240,36 +246,68 @@ class InMemoryStrategyCatalog:
 
     def list_configs(self) -> list[StrategyConfigView]:
         """Every config, sorted by strategy id."""
-        return [self._view(self._configs[key]) for key in sorted(self._configs)]
+        with self._lock:
+            return [self._view(self._configs[key]) for key in sorted(self._configs)]
 
     def get(self, strategy_id: str) -> StrategyConfigView | None:
         """One strategy view or ``None``."""
-        config = self._configs.get(strategy_id.strip().lower())
-        return self._view(config) if config is not None else None
+        with self._lock:
+            config = self._configs.get(strategy_id.strip().lower())
+            return self._view(config) if config is not None else None
 
     def update(self, strategy_id: str, update: StrategyConfigUpdate) -> StrategyConfigView | None:
         """Merge, validate and store an edited config (in memory)."""
         key = strategy_id.strip().lower()
-        current = self._configs.get(key)
-        if current is None:
-            return None
-        payload = current.model_dump()
-        changes = update.model_dump(exclude_none=True)
-        for name, value in changes.items():
-            payload[name] = value
-        payload["id"] = current.id
-        validated = parse_strategy_config(payload)
-        self._configs[key] = validated
-        self._updated_at[key] = self._clock()
-        return self._view(validated)
+        with self._lock:
+            current = self._configs.get(key)
+            if current is None:
+                return None
+            payload = current.model_dump()
+            changes = update.model_dump(exclude_none=True)
+            for name, value in changes.items():
+                payload[name] = value
+            payload["id"] = current.id
+            validated = parse_strategy_config(payload)
+            self._configs[key] = validated
+            self._updated_at[key] = self._clock()
+            return self._view(validated)
+
+    def upsert(self, config: StrategyConfig) -> StrategyConfigView:
+        """Register a validated config in memory so it is immediately runnable.
+
+        This is the runtime bridge used by the Strategy Studio / optimizer apply
+        flow: a strategy created or tuned through the API becomes available to the
+        backtest service without a process restart. It never touches disk (the
+        committed YAML stays immutable; Studio writes are handled elsewhere).
+        """
+        if not isinstance(config, StrategyConfig):
+            raise TypeError(f"config must be a StrategyConfig, got {type(config)!r}")
+        with self._lock:
+            self._configs[config.id] = config
+            self._updated_at[config.id] = self._clock()
+            return self._view(config)
+
+    def reload(self) -> tuple[str, ...]:
+        """Re-discover the committed strategy directory (additive refresh hook)."""
+        directory = self._settings.strategies_dir
+        discovered = discover_strategy_configs(directory) if directory.is_dir() else {}
+        with self._lock:
+            for strategy_id, config in discovered.items():
+                self._configs[strategy_id] = config
+                self._updated_at[strategy_id] = datetime.fromtimestamp(
+                    (directory / f"{strategy_id}.yaml").stat().st_mtime, tz=UTC
+                )
+            return tuple(sorted(self._configs))
 
     def core_config(self, strategy_id: str) -> StrategyConfig | None:
         """Validated core config used by the backtest engine."""
-        return self._configs.get(strategy_id.strip().lower())
+        with self._lock:
+            return self._configs.get(strategy_id.strip().lower())
 
     def available_ids(self) -> list[str]:
         """All strategy ids, sorted."""
-        return sorted(self._configs)
+        with self._lock:
+            return sorted(self._configs)
 
     def _view(self, config: StrategyConfig) -> StrategyConfigView:
         return StrategyConfigView(
@@ -709,15 +747,31 @@ class FixtureExecutionService:
         )
 
 
-class IBKRExecutionService:
-    """Opt-in real IBKR wiring with a transparent offline fallback.
+class IBKRBookUnavailableError(RuntimeError):
+    """No IBKR account book is available (and simulated data must never be used)."""
 
-    Enabled with ``FUTURESRLX_API_ENABLE_IBKR=1``. The lifespan calls
-    :meth:`connect`, which uses the production ``IBKRConnectionManager`` with a
-    bounded timeout; while the session is unavailable every call falls through
-    to the deterministic simulated broker, and ``/health`` reports
-    ``offline_mode=true``.
+
+class IBKRExecutionService:
+    """Opt-in real IBKR wiring that never substitutes a simulated book.
+
+    Enabled with ``FUTURESRLX_API_ENABLE_IBKR=1`` (or ``settings.api_enable_ibkr``).
+    The lifespan calls :meth:`connect` once, then :meth:`start_background` starts a
+    throttled liveness probe, so a TWS restart (or the IBKR nightly server reset)
+    is recovered automatically without restarting the API process.
+
+    Degradation is honest:
+
+    * while the session is down the service serves the **last-known-good IBKR
+      book** with ``stale=True`` / ``stale_reason`` -- never the deterministic
+      simulated broker;
+    * before the first successful fetch it raises
+      :class:`IBKRBookUnavailableError`, mapped by the routes to a clear 503;
+    * :meth:`account` / :meth:`positions` invalidate a dead socket on request-path
+      failure and schedule a bounded background reconnect.
     """
+
+    #: Minimum seconds between background/request-path reconnect attempts.
+    _MIN_PROBE_INTERVAL_SECONDS: float = 2.0
 
     def __init__(
         self,
@@ -725,6 +779,7 @@ class IBKRExecutionService:
         settings: Settings,
         market: fixtures.OfflineMarket,
         clock: fixtures.Clock = fixtures.utc_now,
+        connection_manager: IBKRConnectionManager | None = None,
     ) -> None:
         from src.execution.ibkr_client import IBKRConnectionManager
         from src.execution.oms import OrderManagementSystem
@@ -732,27 +787,78 @@ class IBKRExecutionService:
         self._settings = settings
         self._market = market
         self._clock = clock
-        self._fallback = SimulatedExecutionService(market=market, settings=settings, clock=clock)
-        self._manager: IBKRConnectionManager = IBKRConnectionManager(
-            settings, instrument_master=market.instrument_master, clock=clock
+        manager = (
+            connection_manager
+            if connection_manager is not None
+            else IBKRConnectionManager(
+                settings, instrument_master=market.instrument_master, clock=clock
+            )
         )
+        self._manager: IBKRConnectionManager = manager
         self._oms: OrderManagementSystem = OrderManagementSystem(
-            manager=self._manager,
+            manager=manager,
             settings=settings,
             instrument_master=market.instrument_master,
             clock=clock,
         )
         self._connect_error: str | None = None
+        self._ever_connected: bool = False
+        self._last_good_account: AccountSnapshotResponse | None = None
+        self._last_good_positions: dict[InstrumentId, Position] | None = None
+        self._last_good_at: datetime | None = None
+        self._liveness_task: asyncio.Task[None] | None = None
+        self._ensure_task: asyncio.Task[bool] | None = None
+        self._last_ensure_at: float | None = None
+        self._probe_interval: float = max(
+            self._MIN_PROBE_INTERVAL_SECONDS,
+            float(settings.ibkr_heartbeat_interval_seconds),
+        )
+
+    # -- introspection ---------------------------------------------------------
+
+    @property
+    def ibkr_enabled(self) -> bool:
+        """Whether this adapter is the real IBKR execution engine."""
+        return True
 
     @property
     def connected(self) -> bool:
-        """Whether the IBKR session is established."""
-        return self._manager.is_connected
+        """Whether the IBKR session is currently established."""
+        return bool(self._manager.is_connected)
+
+    @property
+    def reconnecting(self) -> bool:
+        """Whether a reconnect attempt (heartbeat, liveness or request) is in flight."""
+        task = self._ensure_task
+        return bool(self._manager.is_reconnecting or (task is not None and not task.done()))
+
+    @property
+    def last_error(self) -> str | None:
+        """Most recent connection/fetch failure (``None`` while healthy)."""
+        if self._connect_error is not None:
+            return self._connect_error
+        manager_error = getattr(self._manager, "last_error", None)
+        return manager_error if isinstance(manager_error, str) else None
+
+    @property
+    def last_book_at(self) -> datetime | None:
+        """Timestamp of the last successful live account/position fetch."""
+        return self._last_good_at
+
+    @property
+    def has_last_good_book(self) -> bool:
+        """Whether at least one live IBKR account snapshot has been cached."""
+        return self._last_good_account is not None
 
     @property
     def source_name(self) -> str:
-        """Provenance reported by the API for this execution adapter."""
-        return "engine" if self._manager.is_connected else "simulated"
+        """Provenance reported by the API (the IBKR book is always ``engine``)."""
+        return "engine"
+
+    @property
+    def connection_error(self) -> str | None:
+        """Last connection error (``None`` when healthy)."""
+        return self.last_error
 
     def working_orders_snapshot(self) -> list[dict[str, object]]:
         """Working OMS orders as plain rows for ``GET /api/orders/working``."""
@@ -794,10 +900,7 @@ class IBKRExecutionService:
             for fill in fills
         ]
 
-    @property
-    def connection_error(self) -> str | None:
-        """Last connection error (``None`` when connected)."""
-        return self._connect_error
+    # -- lifecycle / reconnect -------------------------------------------------
 
     async def connect(self) -> bool:
         """Attempt the IBKR connection within the configured timeout."""
@@ -805,61 +908,222 @@ class IBKRExecutionService:
             await asyncio.wait_for(
                 self._manager.connect(), timeout=self._settings.ibkr_connect_timeout_seconds
             )
-        except (TimeoutError, Exception) as exc:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
             self._connect_error = f"{type(exc).__name__}: {exc}"
             logger.warning(
-                "IBKR session unavailable, using offline fallback: %s", self._connect_error
+                "IBKR session unavailable; background reconnect active: %s", self._connect_error
             )
             return False
         self._connect_error = None
-        return self._manager.is_connected
+        self._ever_connected = True
+        logger.info("IBKR execution session established")
+        return bool(self._manager.is_connected)
+
+    async def ensure_connected(self) -> bool:
+        """Throttled, bounded reconnect probe; never raises into the caller."""
+        if self._manager.is_connected:
+            return True
+        now = time.monotonic()
+        last = self._last_ensure_at
+        if last is not None and (now - last) < self._probe_interval:
+            return False
+        self._last_ensure_at = now
+        timeout = max(0.1, float(self._settings.ibkr_connect_timeout_seconds))
+        try:
+            connected = await asyncio.wait_for(
+                self._manager.ensure_connected(max_attempts=1), timeout=timeout
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._connect_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("IBKR reconnect probe failed: %s", self._connect_error)
+            return False
+        if connected:
+            self._connect_error = None
+            self._ever_connected = True
+            return True
+        manager_error = getattr(self._manager, "last_error", None)
+        if isinstance(manager_error, str):
+            self._connect_error = manager_error
+        return False
+
+    async def start_background(self) -> None:
+        """Start the throttled liveness probe that reconnects after a TWS restart."""
+        task = self._liveness_task
+        if task is not None and not task.done():
+            return
+        self._liveness_task = asyncio.create_task(self._liveness_loop(), name="ibkr-liveness")
+
+    async def stop_background(self) -> None:
+        """Cancel the liveness probe and any in-flight request-path reconnect."""
+        tasks = [self._liveness_task, self._ensure_task]
+        self._liveness_task = None
+        self._ensure_task = None
+        for task in tasks:
+            if task is None or task.done():
+                continue
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def disconnect(self) -> None:
-        """Close the IBKR session if one was established."""
+        """Stop background probes and close the IBKR session if established."""
+        await self.stop_background()
         try:
             await self._manager.disconnect()
         except Exception:
             logger.exception("error while disconnecting IBKR session")
 
-    async def account(self) -> AccountSnapshotResponse:
-        """Live IBKR account when connected, offline simulated account otherwise."""
+    async def _liveness_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    if self._manager.is_connected:
+                        self._manager.ensure_heartbeat()
+                    elif not self._manager.is_reconnecting:
+                        await self.ensure_connected()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("IBKR liveness probe failed")
+                await asyncio.sleep(self._probe_interval)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._liveness_task = None
+
+    async def _attempt_connect_now(self) -> bool:
+        """Operator-intent reconnect (bypasses the liveness throttle)."""
+        self._last_ensure_at = None
+        return await self.ensure_connected()
+
+    def _schedule_ensure(self) -> None:
+        """Trigger one bounded background reconnect from a failed request path."""
+        task = self._ensure_task
+        if task is not None and not task.done():
+            return
+        if self._manager.is_connected or self._manager.is_reconnecting:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - synchronous caller (tests/CLI)
+            return
+        scheduled = loop.create_task(self.ensure_connected(), name="ibkr-request-ensure")
+        self._ensure_task = scheduled
+        scheduled.add_done_callback(self._clear_ensure_task)
+
+    def _clear_ensure_task(self, task: asyncio.Task[bool]) -> None:
+        if task is self._ensure_task:
+            self._ensure_task = None
+        if not task.cancelled():
+            task.exception()  # retrieved; failures are recorded on the service
+
+    # -- book fetching ---------------------------------------------------------
+
+    async def _refresh_book(self) -> bool:
+        """Fetch the live book; cache it as last-known-good. Never raises."""
         if not self._manager.is_connected:
-            return await self._fallback.account()
-        snapshot = await self._manager.fetch_account()
-        positions = await self._manager.fetch_positions()
+            return False
+        try:
+            snapshot = await self._manager.fetch_account()
+            positions = await self._manager.fetch_positions()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._connect_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "IBKR account/position fetch failed; invalidating session: %s", self._connect_error
+            )
+            self._manager.invalidate(self._connect_error)
+            self._schedule_ensure()
+            return False
+        self._connect_error = None
+        self._ever_connected = True
         curve = fixtures.equity_history(self._market, snapshot.net_liquidation, now=self._clock())
         day_pnl = curve[-1].value - curve[-2].value if len(curve) > 1 else 0.0
-        return _account_response(
+        self._last_good_account = _account_response(
             snapshot=snapshot,
             positions=positions,
             master=self._market.instrument_master,
             market=self._market,
             curve=curve,
             day_pnl=day_pnl,
+        ).model_copy(update={"source": "engine"})
+        self._last_good_positions = dict(positions)
+        self._last_good_at = self._clock()
+        return True
+
+    def _unavailable_reason(self) -> str:
+        detail = self.last_error or "IBKR session not connected"
+        return (
+            "IBKR execution is enabled but no live account book is available yet "
+            f"(no simulated fallback): {detail}"
         )
 
+    def _stale_book(self, cached: AccountSnapshotResponse) -> AccountSnapshotResponse:
+        moment = self._last_good_at.isoformat() if self._last_good_at is not None else "unknown"
+        reason = (
+            f"IBKR session unavailable ({self.last_error or 'disconnected'}); "
+            f"serving last-known-good book fetched at {moment}"
+        )
+        return cached.model_copy(update={"source": "engine", "stale": True, "stale_reason": reason})
+
+    async def account(self) -> AccountSnapshotResponse:
+        """Live IBKR account, or the last-known-good book marked stale."""
+        if await self._refresh_book():
+            cached = self._last_good_account
+            assert cached is not None
+            return cached
+        self._schedule_ensure()
+        if self._last_good_account is None:
+            raise IBKRBookUnavailableError(self._unavailable_reason())
+        return self._stale_book(self._last_good_account)
+
     async def positions(self) -> Mapping[InstrumentId, Position]:
-        """Live IBKR positions when connected, simulated otherwise."""
-        if not self._manager.is_connected:
-            return await self._fallback.positions()
-        return await self._manager.fetch_positions()
+        """Live IBKR positions, or the last-known-good book marked stale."""
+        if await self._refresh_book():
+            return dict(self._last_good_positions or {})
+        self._schedule_ensure()
+        if self._last_good_positions is not None:
+            return dict(self._last_good_positions)
+        raise IBKRBookUnavailableError(self._unavailable_reason())
 
     @property
     def is_locked(self) -> bool:
-        """Whether the OMS gate or the offline kill switch is latched."""
-        return self._oms.is_locked or self._fallback.is_locked
+        """Whether the OMS gate kill switch is latched."""
+        return self._oms.is_locked
 
     @property
     def lock_reason(self) -> str:
-        """Kill-switch reason from the active adapter."""
-        return self._oms.gate.lock_reason if self._oms.is_locked else self._fallback.lock_reason
+        """Kill-switch reason (empty when unlocked)."""
+        return self._oms.gate.lock_reason if self._oms.is_locked else ""
 
     async def flatten_all(self) -> FlattenAllResponse:
-        """Kill switch: live OMS flatten when connected, simulated otherwise."""
+        """Kill switch: live OMS flatten (never a simulated fallback)."""
         if not self._manager.is_connected:
-            return await self._fallback.flatten_all()
+            # Operator intent: attempt a bounded reconnect immediately, even if a
+            # background probe ran a moment ago.
+            await self._attempt_connect_now()
+        if not self._manager.is_connected:
+            raise IBKRBookUnavailableError(
+                "cannot flatten: IBKR session unavailable and simulated positions must never "
+                f"be used ({self.last_error or 'disconnected'})"
+            )
+        try:
+            positions = await self._manager.fetch_positions()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._connect_error = f"{type(exc).__name__}: {exc}"
+            self._manager.invalidate(self._connect_error)
+            self._schedule_ensure()
+            raise IBKRBookUnavailableError(
+                f"cannot flatten: failed to fetch IBKR positions ({self._connect_error})"
+            ) from exc
         timestamp = self._clock()
-        positions = await self._manager.fetch_positions()
         targets = [
             (root, position.quantity)
             for root, position in sorted(positions.items())
@@ -1231,6 +1495,9 @@ class EngineMarketService:
             risk = result.risk_weights.get(root, 0.0)
             final = result.final_weights.get(root, 0.0)
             target = target_rows.get(root)
+            driver = _adjustment_reason(
+                root in selected, base, timing, risk, target.quantity if target else 0
+            )
             instruments.append(
                 PipelineInstrumentRow(
                     instrument_id=root,
@@ -1245,9 +1512,9 @@ class EngineMarketService:
                     delta_risk=round(risk - timing, 8),
                     target_contracts=target.quantity if target is not None else None,
                     notional=round(final * equity, 2),
-                    reason=_adjustment_reason(
-                        root in selected, base, timing, risk, target.quantity if target else 0
-                    ),
+                    driver=driver,
+                    regime=state.regime,
+                    reason=driver,
                 )
             )
         stages = [
@@ -1535,6 +1802,8 @@ class FixtureMarketService:
                     delta_risk=risk - timing,
                     target_contracts=quantity,
                     notional=risk * INITIAL_EQUITY,
+                    driver="fixture fallback: real pipeline layer unavailable",
+                    regime=state.regime,
                     reason="fixture fallback: real pipeline layer unavailable",
                 )
             )
@@ -1756,18 +2025,33 @@ class Container:
     warnings: list[str] = field(default_factory=list)
 
     def health(self) -> HealthResponse:
-        """Liveness payload (``degraded`` when any fallback is active)."""
+        """Liveness payload with dynamically derived IBKR connectivity state.
+
+        ``offline_mode`` is recomputed on every request: for an IBKR-enabled
+        process it is ``not ibkr_connected``; for a simulated/backtest process it
+        stays ``True``. A TWS restart therefore flips the dashboard badge back to
+        online automatically once the background reconnect succeeds.
+        """
         now = self.clock()
         bridge_available = self.live.bridge_available()
+        ibkr_enabled = bool(getattr(self.execution, "ibkr_enabled", False))
+        ibkr_connected = bool(getattr(self.execution, "connected", False))
+        ibkr_reconnecting = bool(getattr(self.execution, "reconnecting", False))
+        raw_last_error = getattr(self.execution, "last_error", None)
+        ibkr_last_error = raw_last_error if isinstance(raw_last_error, str) else None
+        offline_mode = (not ibkr_connected) if ibkr_enabled else self.offline_mode
         return HealthResponse(
-            status="degraded" if self.warnings or self.offline_mode else "ok",
+            status="degraded" if self.warnings or offline_mode else "ok",
             app_name=self.settings.app_name,
             version=API_VERSION,
             environment=self.settings.environment,
-            offline_mode=self.offline_mode,
+            offline_mode=offline_mode,
             uptime_seconds=max(0.0, (now - self.started_at).total_seconds()),
             server_time=now,
-            ibkr_connected=bool(getattr(self.execution, "connected", False)),
+            ibkr_connected=ibkr_connected,
+            ibkr_enabled=ibkr_enabled,
+            ibkr_reconnecting=ibkr_reconnecting,
+            ibkr_last_error=ibkr_last_error,
             runner_bridge_available=bridge_available,
             runner_bridge_stale=self.live.bridge_stale(),
             runner_mode=self.live.runner_mode(),
@@ -1778,14 +2062,23 @@ class Container:
         return self.telemetry.status()
 
     async def start(self) -> None:
-        """Start the telemetry publisher and any live execution session."""
+        """Start the telemetry publisher, live execution session and reconnect probe."""
         connector = getattr(self.execution, "connect", None)
         if callable(connector):
             outcome = connector()
             connected = await outcome if inspect.isawaitable(outcome) else bool(outcome)
             if not connected:
-                self.warnings.append("IBKR session unavailable — offline execution fallback active")
-                self.offline_mode = True
+                # Never latch offline_mode here: /health derives it dynamically and a
+                # background liveness probe reconnects once TWS is back. No simulated
+                # book is ever served in the meantime.
+                logger.warning(
+                    "IBKR session unavailable at startup; background reconnect probe active"
+                )
+        starter = getattr(self.execution, "start_background", None)
+        if callable(starter):
+            outcome = starter()
+            if inspect.isawaitable(outcome):
+                await outcome
         await self.telemetry.start()
         await self.news.start()
         await self.live.start()
@@ -1795,6 +2088,11 @@ class Container:
         await self.telemetry.stop()
         await self.news.stop()
         await self.live.close()
+        stopper = getattr(self.execution, "stop_background", None)
+        if callable(stopper):
+            outcome = stopper()
+            if inspect.isawaitable(outcome):
+                await outcome
         disconnector = getattr(self.execution, "disconnect", None)
         if callable(disconnector):
             outcome = disconnector()

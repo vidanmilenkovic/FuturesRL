@@ -636,11 +636,13 @@ class IBKRConnectionManager:
         self._connected = False
         self._closing = False
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._stale_clients: list[IBClientLike] = []
         self._contract_cache: dict[tuple[str, str], VenueContract] = {}
         self._connection_attempts = 0
         self._reconnects = 0
         self._last_error: str | None = None
         self._last_heartbeat: datetime | None = None
+        self._reconnecting: bool = False
 
     # -- introspection ---------------------------------------------------------
 
@@ -674,6 +676,17 @@ class IBKRConnectionManager:
     def last_heartbeat_at(self) -> datetime | None:
         """Timestamp of the last successful heartbeat."""
         return self._last_heartbeat
+
+    @property
+    def is_reconnecting(self) -> bool:
+        """Whether a reconnect attempt is currently in flight."""
+        return self._reconnecting
+
+    @property
+    def heartbeat_running(self) -> bool:
+        """Whether the background heartbeat/liveness task is alive."""
+        task = self._heartbeat_task
+        return task is not None and not task.done()
 
     @property
     def instruments(self) -> InstrumentsConfig:
@@ -721,12 +734,68 @@ class IBKRConnectionManager:
         del exc_type, exc, traceback
         await self.disconnect()
 
-    async def connect(self) -> None:
-        """Connect to TWS / IB Gateway, retrying with exponential backoff."""
+    async def connect(self, *, max_attempts: int | None = None) -> None:
+        """Connect to TWS / IB Gateway, retrying with exponential backoff.
+
+        ``max_attempts`` overrides ``settings.ibkr_reconnect_max_attempts`` for a
+        single bounded probe (request-path / background liveness reconnects must
+        never block the event loop for the full production retry budget).
+        """
         if self.is_connected:
             return
         async with self._lock:
-            await self._connect_locked()
+            await self._connect_locked(max_attempts=max_attempts)
+
+    async def ensure_connected(self, *, max_attempts: int = 1) -> bool:
+        """Best-effort reconnect that never raises.
+
+        Returns ``True`` when a live session is (re)established. Inside the IBKR
+        nightly reset window the probe is skipped immediately (the venue is
+        intentionally unreachable) instead of sleeping until the window closes.
+        """
+        if self.is_connected:
+            return True
+        if self.in_nightly_reset_window():
+            self._last_error = "inside the IBKR nightly reset window"
+            return False
+        try:
+            await self.connect(max_attempts=max_attempts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            return False
+        return self.is_connected
+
+    def invalidate(self, reason: str) -> None:
+        """Mark the current transport as dead after a request-path failure.
+
+        Drops the client reference and the connected flag so the heartbeat /
+        liveness probe re-establishes a fresh session. The wedged client is queued
+        for best-effort disposal on the next reconnect/heartbeat tick: the manager
+        never blocks the caller waiting for a stuck socket teardown.
+        """
+        self._last_error = reason or "IBKR session invalidated"
+        self._connected = False
+        client = self._client
+        self._client = None
+        if client is not None:
+            self._stale_clients.append(client)
+
+    async def _dispose_stale_clients(self) -> None:
+        clients, self._stale_clients = self._stale_clients, []
+        for client in clients:
+            try:
+                await client.disconnect()
+            except Exception:  # pragma: no cover - best-effort socket teardown
+                logger.debug("failed to dispose a stale IBKR client", exc_info=True)
+
+    def ensure_heartbeat(self) -> bool:
+        """Restart the heartbeat task when a live session lost its monitor."""
+        if not self._connected or self._closing or self.heartbeat_running:
+            return False
+        self._start_heartbeat()
+        return self.heartbeat_running
 
     async def disconnect(self) -> None:
         """Cancel the heartbeat and tear down the gateway session."""
@@ -745,6 +814,7 @@ class IBKRConnectionManager:
         self._client = None
         self._connected = False
         self._contract_cache.clear()
+        await self._dispose_stale_clients()
         if client is not None:
             try:
                 await client.disconnect()
@@ -758,58 +828,70 @@ class IBKRConnectionManager:
             return factory()
         return _IbAsyncIBClient()
 
-    async def _connect_locked(self) -> None:
+    async def _connect_locked(self, *, max_attempts: int | None = None) -> None:
         if self.is_connected:
             return
         self._closing = False
-        settings = self._settings
-        max_attempts = max(1, settings.ibkr_reconnect_max_attempts)
-        last_exc: BaseException | None = None
-        for attempt in range(1, max_attempts + 1):
-            if self.in_nightly_reset_window():
-                await self._wait_for_reset_window()
-            self._connection_attempts += 1
-            client = self._client if self._client is not None else self._make_client()
-            try:
-                await client.connect(
-                    host=settings.ibkr_host,
-                    port=settings.ibkr_port,
-                    client_id=settings.ibkr_client_id,
-                    timeout=settings.ibkr_connect_timeout_seconds,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                last_exc = exc
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                self._client = None
-                self._connected = False
-                logger.warning(
-                    "IBKR connection attempt %d/%d failed: %s",
-                    attempt,
-                    max_attempts,
-                    self._last_error,
-                )
-                if attempt >= max_attempts:
-                    break
-                await self._sleep(self._backoff_delay(attempt))
-                continue
-            self._client = client
-            self._connected = True
-            self._last_error = None
-            self._last_heartbeat = self._clock()
-            self._start_heartbeat()
-            logger.info(
-                "connected to IBKR at %s:%d (clientId=%d)",
-                settings.ibkr_host,
-                settings.ibkr_port,
-                settings.ibkr_client_id,
+        self._reconnecting = True
+        await self._dispose_stale_clients()
+        try:
+            settings = self._settings
+            attempts = max(
+                1,
+                settings.ibkr_reconnect_max_attempts if max_attempts is None else max_attempts,
             )
-            return
-        raise IBKRConnectionError(
-            f"could not connect to IBKR at {settings.ibkr_host}:{settings.ibkr_port} after "
-            f"{max_attempts} attempts (last error: {self._last_error})"
-        ) from last_exc
+            last_exc: BaseException | None = None
+            for attempt in range(1, attempts + 1):
+                if self.in_nightly_reset_window():
+                    await self._wait_for_reset_window()
+                self._connection_attempts += 1
+                client = self._client if self._client is not None else self._make_client()
+                try:
+                    await client.connect(
+                        host=settings.ibkr_host,
+                        port=settings.ibkr_port,
+                        client_id=settings.ibkr_client_id,
+                        timeout=settings.ibkr_connect_timeout_seconds,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    self._client = None
+                    self._connected = False
+                    try:
+                        await client.disconnect()
+                    except Exception:  # pragma: no cover - best-effort teardown
+                        logger.debug("failed to dispose a failed IBKR client", exc_info=True)
+                    logger.warning(
+                        "IBKR connection attempt %d/%d failed: %s",
+                        attempt,
+                        attempts,
+                        self._last_error,
+                    )
+                    if attempt >= attempts:
+                        break
+                    await self._sleep(self._backoff_delay(attempt))
+                    continue
+                self._client = client
+                self._connected = True
+                self._last_error = None
+                self._last_heartbeat = self._clock()
+                self._start_heartbeat()
+                logger.info(
+                    "connected to IBKR at %s:%d (clientId=%d)",
+                    settings.ibkr_host,
+                    settings.ibkr_port,
+                    settings.ibkr_client_id,
+                )
+                return
+            raise IBKRConnectionError(
+                f"could not connect to IBKR at {settings.ibkr_host}:{settings.ibkr_port} after "
+                f"{attempts} attempts (last error: {self._last_error})"
+            ) from last_exc
+        finally:
+            self._reconnecting = False
 
     def _backoff_delay(self, attempt: int) -> float:
         """Exponential backoff with symmetric jitter, capped by settings."""
@@ -882,8 +964,6 @@ class IBKRConnectionManager:
         try:
             while not self._closing:
                 await self._sleep(interval)
-                if self._closing or self._client is None:
-                    return
                 try:
                     await self.heartbeat_tick()
                 except asyncio.CancelledError:
@@ -897,6 +977,7 @@ class IBKRConnectionManager:
 
     async def heartbeat_tick(self) -> bool:
         """Verify liveness once, reconnecting (with backoff) when it is lost."""
+        await self._dispose_stale_clients()
         client = self._client
         if client is not None and client.is_connected:
             self._last_heartbeat = self._clock()
@@ -907,7 +988,10 @@ class IBKRConnectionManager:
                 self._last_heartbeat = self._clock()
                 return True
             self._reconnects += 1
-            await self._connect_locked()
+            # One bounded attempt per heartbeat tick: a dead TWS keeps the event
+            # loop responsive and the session is retried on the next interval
+            # instead of sleeping through the full production backoff budget.
+            await self._connect_locked(max_attempts=1)
         return self.is_connected
 
     # -- account / positions ---------------------------------------------------

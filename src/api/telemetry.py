@@ -16,6 +16,11 @@ with the pipeline waterfall every tenth frame. Values are derived from the live
 service adapters (offline simulated broker / risk engine), with a tiny
 deterministic sinusoid so an offline demo session visibly ticks; production
 wiring uses the same frame shapes and no jitter.
+
+Phase-10 guarantee: once IBKR is enabled the broadcaster consumes only the IBKR
+adapter's live or last-known-good (``stale``) book. A failed account refresh keeps
+the previous book and an absent book degrades the frame to a heartbeat -- simulated
+positions are never published into a live session.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import asyncio
 import contextlib
 import logging
 import math
+from datetime import datetime
 
 from configs.settings import Settings
 
@@ -92,6 +98,7 @@ class TelemetryBroadcaster:
         self._sequence = 0
         self._task: asyncio.Task[None] | None = None
         self._account_cache: AccountSnapshotResponse | None = None
+        self._account_refreshed_at: datetime | None = None
         self._interval = float(settings.telemetry_interval_seconds)
 
     # -- introspection ---------------------------------------------------------
@@ -169,20 +176,66 @@ class TelemetryBroadcaster:
 
     # -- frame construction ----------------------------------------------------
 
-    async def _account(self) -> AccountSnapshotResponse:
-        if self._account_cache is None:
-            self._account_cache = await self._execution.account()
-        return self._account_cache
+    async def _account(self) -> AccountSnapshotResponse | None:
+        """Latest account snapshot, or ``None`` when no honest book exists yet.
+
+        For a pure offline/simulated process the snapshot is fetched once (the
+        deterministic broker never changes its own book). For an IBKR-enabled
+        process every account-frame refreshes the adapter at a bounded cadence and
+        a fetch failure falls back to the **last-known-good IBKR book** -- the
+        telemetry stream must never replace a live book with simulated data.
+        """
+        now = self._clock()
+        if not bool(getattr(self._execution, "ibkr_enabled", False)):
+            if self._account_cache is None:
+                self._account_cache = await self._execution.account()
+                self._account_refreshed_at = now
+            return self._account_cache
+        refreshed_at = self._account_refreshed_at
+        if (
+            self._account_cache is not None
+            and refreshed_at is not None
+            and (now - refreshed_at).total_seconds() < max(self._interval, 0.5)
+        ):
+            return self._account_cache
+        try:
+            account = await self._execution.account()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "live account refresh failed; keeping last-known-good/stale book: %s", exc
+            )
+            return self._account_cache
+        self._account_cache = account
+        self._account_refreshed_at = now
+        return account
 
     def _next_sequence(self) -> int:
         self._sequence += 1
         return self._sequence
 
+    def _heartbeat_envelope(self, now: datetime, sequence: int) -> TelemetryEnvelope:
+        """Idle frame used when an account-driven frame has no honest book."""
+        return TelemetryEnvelope(
+            kind="heartbeat",
+            timestamp=now,
+            sequence=sequence,
+            payload=HeartbeatTelemetryPayload(status="ok", sequence=sequence),
+        )
+
     async def _build_envelope(self, kind: TelemetryKind) -> TelemetryEnvelope:
         now = self._clock()
         sequence = self._next_sequence()
-        if kind == "pnl":
+        account: AccountSnapshotResponse | None = None
+        if kind in {"pnl", "margin", "positions"}:
             account = await self._account()
+            if account is None:
+                # IBKR enabled but no live/last-good book yet: never fall back to
+                # simulated positions (the dashboard keeps its last REST snapshot).
+                return self._heartbeat_envelope(now, sequence)
+        if kind == "pnl":
+            assert account is not None
             jitter = _DEMO_PNL_JITTER_USD * math.sin(sequence * 0.7)
             net_liquidation = account.net_liquidation + jitter
             day_pnl = account.day_pnl + jitter
@@ -198,7 +251,7 @@ class TelemetryBroadcaster:
                 ),
             )
         if kind == "margin":
-            account = await self._account()
+            assert account is not None
             return TelemetryEnvelope(
                 kind="margin",
                 timestamp=now,
@@ -212,7 +265,7 @@ class TelemetryBroadcaster:
                 ),
             )
         if kind == "positions":
-            account = await self._account()
+            assert account is not None
             return TelemetryEnvelope(
                 kind="positions",
                 timestamp=now,

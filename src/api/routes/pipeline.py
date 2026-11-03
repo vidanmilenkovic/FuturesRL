@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from src.api.deps import ContainerDep
+from src.api.phase10_deps import BridgePipelineDep
 from src.api.schemas import PipelineWaterfallResponse
 
 router = APIRouter(tags=["pipeline"])
@@ -23,9 +24,19 @@ router = APIRouter(tags=["pipeline"])
         "(``data_source=runner-bridge``)."
     ),
 )
-def latest_pipeline(container: ContainerDep) -> PipelineWaterfallResponse:
-    """Return the most recent pipeline trace (bridge-first)."""
-    bridged = container.live.bridge_pipeline()
-    if bridged is not None:
-        return bridged
+def latest_pipeline(
+    container: ContainerDep, bridge: BridgePipelineDep
+) -> PipelineWaterfallResponse:
+    """Return the most recent pipeline trace (bridge-first).
+
+    Precedence: a fresh runner-bridge snapshot **with per-instrument rows** (full
+    Weight matrix, identical fields to the engine waterfall) → the compact bridge
+    scalar summary (Phase-9 snapshots without rows) → the engine waterfall.
+    """
+    matrix = bridge.pipeline()
+    if matrix is not None:
+        return matrix
+    compact = container.live.bridge_pipeline()
+    if compact is not None:
+        return compact
     return container.market.pipeline()

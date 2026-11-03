@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -991,3 +991,93 @@ def test_ib_async_adapter_normalises_trade_and_state() -> None:
     assert venue.commission == pytest.approx(4.5)
     assert venue.fills[0].side is OrderSide.BUY
     assert venue.is_terminal
+
+
+# ---------------------------------------------------------------------------
+# Phase-10: resilient liveness / reconnect surface (task-22)
+# ---------------------------------------------------------------------------
+
+
+async def test_ensure_connected_is_bounded_and_never_raises(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    manager = make_manager(settings, fake_client, clock)
+    fake_client.fail_connects = 1
+
+    # A single bounded probe: one transport attempt, no exception, error recorded.
+    assert await manager.ensure_connected(max_attempts=1) is False
+    assert fake_client.connect_calls == 1
+    assert manager.last_error is not None
+    assert manager.is_connected is False
+
+    # Once TWS is reachable again the next probe reconnects.
+    assert await manager.ensure_connected(max_attempts=1) is True
+    assert manager.is_connected is True
+    assert manager.last_error is None
+
+
+async def test_ensure_connected_skips_nightly_reset_window(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    # FIXED is 16:00 New York -> inside a 23:45-00:45 reset window only when the
+    # window is configured to cover it; use an explicit full-day window instead.
+    manager = make_manager(
+        settings,
+        fake_client,
+        clock,
+        nightly_reset_start=time(15, 0),
+        nightly_reset_end=time(17, 0),
+    )
+    assert manager.in_nightly_reset_window() is True
+    assert await manager.ensure_connected(max_attempts=1) is False
+    assert fake_client.connect_calls == 0
+    assert manager.last_error is not None
+    assert "nightly reset window" in manager.last_error
+
+
+async def test_invalidate_marks_session_dead_and_heartbeat_reconnects(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    manager = make_manager(settings, fake_client, clock)
+    await manager.connect()
+    assert manager.is_connected is True
+
+    # Simulated TWS restart: the SDK socket dies and a request path invalidates it.
+    fake_client.connected = False
+    manager.invalidate("connection reset by peer")
+    assert manager.is_connected is False
+    assert manager.last_error == "connection reset by peer"
+    assert manager.is_reconnecting is False
+
+    # The liveness layer re-establishes the session (heartbeat_tick path).
+    assert await manager.heartbeat_tick() is True
+    assert manager.is_connected is True
+    assert manager.is_reconnecting is False
+    assert manager.last_error is None
+    await manager.disconnect()
+
+
+async def test_ensure_heartbeat_restarts_a_dead_monitor(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    async def _yielding_sleep(seconds: float) -> None:
+        clock.advance(seconds)
+        await asyncio.sleep(0)
+
+    manager = IBKRConnectionManager(
+        settings,
+        client_factory=lambda: fake_client,
+        clock=clock,
+        sleep=_yielding_sleep,
+        heartbeat_enabled=True,
+    )
+    await manager.connect()
+    task = manager._heartbeat_task
+    assert task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert manager.heartbeat_running is False
+    assert manager.ensure_heartbeat() is True
+    assert manager.heartbeat_running is True
+    await manager.disconnect()

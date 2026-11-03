@@ -41,6 +41,10 @@ def _settings(tmp_path: Path) -> Settings:
         instruments_path=REPO_ROOT / "configs" / "instruments.yaml",
         telemetry_interval_seconds=TELEMETRY_INTERVAL,
         api_cors_origins=("http://localhost:3080", "http://127.0.0.1:3080"),
+        # Hermetic: a developer .env enabling IBKR must never leak into these
+        # offline API tests (module-scoped fixtures are built before the
+        # function-scoped environment-isolation fixture runs).
+        api_enable_ibkr=False,
     )
 
 
@@ -64,7 +68,7 @@ def test_health_reports_offline_fixture_mode(client: TestClient) -> None:
     body = response.json()
     assert body["status"] in {"ok", "degraded"}
     assert body["app_name"] == "FuturesRL-X"
-    assert body["version"] == "1.3.0"
+    assert body["version"] == "1.4.0"
     assert body["environment"] == "backtest"
     assert body["offline_mode"] is True
     assert body["uptime_seconds"] >= 0.0
@@ -80,7 +84,7 @@ def test_cors_allows_configured_dashboard_origin(client: TestClient) -> None:
 def test_openapi_metadata_and_docs(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     assert schema["info"]["title"] == "FuturesRL-X Telemetry API"
-    assert schema["info"]["version"] == "1.3.0"
+    assert schema["info"]["version"] == "1.4.0"
     paths = schema["paths"]
     for route in (
         "/health",
@@ -513,21 +517,44 @@ def test_unknown_route_returns_404(client: TestClient) -> None:
     assert client.get("/api/does-not-exist").status_code == 404
 
 
-def test_ibkr_wiring_falls_back_offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Opting into IBKR wiring without a session must degrade, not crash."""
+def test_ibkr_wiring_never_serves_simulated_book(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IBKR enabled without a session: honest unavailable state, never fake positions."""
     monkeypatch.setenv("FUTURESRLX_API_ENABLE_IBKR", "1")
     settings = _settings(tmp_path).model_copy(
-        update={"ibkr_connect_timeout_seconds": 0.1, "ibkr_reconnect_max_attempts": 1}
+        update={
+            "ibkr_connect_timeout_seconds": 0.1,
+            "ibkr_reconnect_max_attempts": 1,
+            "ibkr_heartbeat_interval_seconds": 0.1,
+        }
     )
     with TestClient(create_app(settings, clock=lambda: FIXED_TIMESTAMP)) as client:
         health = client.get("/health").json()
+        # Dynamic health: IBKR is enabled, the socket is down, a reconnect probe runs.
         assert health["offline_mode"] is True
-        assert health["status"] in {"ok", "degraded"}
-        account = client.get("/api/positions").json()
-        assert account["net_liquidation"] > 0.0
-        assert account["positions"]
+        assert health["ibkr_enabled"] is True
+        assert health["ibkr_connected"] is False
+        assert health["ibkr_last_error"]
+        assert health["status"] == "degraded"
+        # No IBKR book was ever fetched: a clear 503 instead of simulated positions.
+        positions = client.get("/api/positions")
+        assert positions.status_code == 503
+        assert "no live account book" in positions.json()["detail"]
         status = client.get("/api/telemetry/status").json()
         assert status["stream_active"] is True
+
+
+def test_health_reports_offline_ibkr_fields(client: TestClient) -> None:
+    """Pure offline processes still expose the additive Phase-10 health fields."""
+    health = client.get("/health").json()
+    assert health["ibkr_enabled"] is False
+    assert health["ibkr_reconnecting"] is False
+    assert health["ibkr_last_error"] is None
+    account = client.get("/api/positions").json()
+    assert account["source"] in {"simulated", "fixture", "engine", "runner-bridge"}
+    assert account["stale"] is False
+    assert account["stale_reason"] is None
 
 
 # ---------------------------------------------------------------------------

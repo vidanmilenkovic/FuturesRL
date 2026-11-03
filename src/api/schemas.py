@@ -33,7 +33,7 @@ type RiskAction = Literal["pass", "scale", "liquidate", "neutralized"]
 type BacktestStatus = Literal["queued", "running", "completed", "failed"]
 type DataSource = Literal["engine", "fixture", "runner-bridge"]
 #: Provenance of a live/snapshot view: fresh runner bridge vs local fallback.
-type SnapshotSource = Literal["runner-bridge", "simulated", "fixture"]
+type SnapshotSource = Literal["runner-bridge", "engine", "simulated", "fixture"]
 #: Provenance of the account/position snapshot.
 type AccountSource = Literal["engine", "simulated", "fixture", "runner-bridge"]
 type PipelineStageKey = Literal["universe", "base", "timing", "risk", "targets"]
@@ -76,6 +76,10 @@ class HealthResponse(APIModel):
     runner_bridge_available: bool = False
     runner_bridge_stale: bool = True
     runner_mode: str | None = None
+    #: Additive Phase-10 IBKR resilience fields (dynamic, recomputed per request).
+    ibkr_enabled: bool = False
+    ibkr_reconnecting: bool = False
+    ibkr_last_error: str | None = None
 
 
 class TelemetryStatusResponse(APIModel):
@@ -140,6 +144,11 @@ class AccountSnapshotResponse(APIModel):
     positions: list[PositionRow] = Field(default_factory=list)
     #: Provenance: ``runner-bridge`` wins over ``engine``/``simulated``/``fixture``.
     source: AccountSource = "fixture"
+    #: Additive Phase-10 provenance: ``True`` when this is a last-known-good book
+    #: served while the live IBKR session is unavailable (never simulated data).
+    stale: bool = False
+    #: Human-readable reason the book is stale (``None`` when fresh).
+    stale_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +184,11 @@ class PipelineInstrumentRow(APIModel):
     delta_risk: float
     target_contracts: int | None = None
     notional: float | None = None
+    #: Why the weight changed across stages (same vocabulary as the engine waterfall).
+    driver: str = ""
+    #: Per-cycle market regime (bridge rows expose it when the runner publishes one).
+    regime: str | None = None
+    #: Human-readable adjustment reason (engine waterfall uses this; equals ``driver``).
     reason: str = ""
 
 

@@ -985,7 +985,12 @@ class LiveStateService:
     # -- Protocol surface ------------------------------------------------------
 
     async def account(self) -> AccountSnapshotResponse:
-        """Bridge account when fresh, otherwise the execution adapter snapshot."""
+        """Bridge account when fresh, otherwise the execution adapter snapshot.
+
+        The adapter's additive ``stale`` / ``stale_reason`` provenance is preserved:
+        for an IBKR-enabled process this is either the live book or the last-known-good
+        IBKR book (never the simulated fixture book).
+        """
         bridged = self.bridge_account()
         if bridged is not None:
             return bridged
@@ -1088,6 +1093,9 @@ class LiveStateService:
         source = self._execution_source()
         if source == "fixture":
             return "fixture"
+        if source == "engine":
+            # Live IBKR OMS orders/fills must never be labelled as simulated data.
+            return "engine"
         return "simulated"
 
     def _execution_working_orders(self) -> tuple[list[WorkingOrderRow], SnapshotSource]:

@@ -348,6 +348,21 @@ class Settings(BaseSettings):
         return self.report_dir / "backtests"
 
     @property
+    def optimization_artifacts_dir(self) -> Path:
+        """Directory where Optuna optimization studies are persisted."""
+        return self.report_dir / "optimizations"
+
+    @property
+    def strategy_artifacts_dir(self) -> Path:
+        """Directory where user-authored strategy YAMLs are persisted."""
+        return self.report_dir / "strategies"
+
+    @property
+    def drl_models_dir(self) -> Path:
+        """Directory where trained DRL checkpoints and metadata live."""
+        return self.report_dir / "models"
+
+    @property
     def api_base_url(self) -> str:
         """Base URL for the local telemetry API."""
         host = "127.0.0.1" if self.api_host in {"0.0.0.0", "::"} else self.api_host
@@ -366,6 +381,9 @@ class Settings(BaseSettings):
             self.report_dir,
             self.runner_bridge_dir,
             self.backtest_artifacts_dir,
+            self.optimization_artifacts_dir,
+            self.strategy_artifacts_dir,
+            self.drl_models_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
