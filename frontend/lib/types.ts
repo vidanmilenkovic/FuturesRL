@@ -123,6 +123,10 @@ export interface AccountSnapshotResponse {
   /** v1.5.1 live-book attribution (task-38). */
   equity_curve_source?: "ibkr-live" | "simulated-backfill" | "fixture" | string;
   equity_curve_live_points?: number;
+  /** Distinct UTC days covered by the persisted live NLV history. */
+  equity_curve_live_days?: number;
+  /** Real intraday live NLV points for the 1D timeframe. */
+  equity_curve_intraday?: EquityPoint[];
   portfolio_volatility?: number | null;
   portfolio_volatility_source?: string | null;
 }
@@ -879,6 +883,11 @@ export interface PnlTelemetryPayload {
   day_pnl: number;
   day_pnl_pct: number;
   point: EquityPoint;
+  /** v1.5.2 additive IBKR-sourced fields (null on offline/backtest frames). */
+  portfolio_volatility?: number | null;
+  initial_margin_used?: number | null;
+  margin_utilization?: number | null;
+  open_positions?: number;
 }
 
 export interface MarginTelemetryPayload {
@@ -887,12 +896,18 @@ export interface MarginTelemetryPayload {
   margin_utilization: number;
   warning_threshold: number;
   critical_threshold: number;
+  /** v1.5.2 additive IBKR-sourced fields (absent on simulated frames). */
+  portfolio_volatility?: number | null;
+  open_positions?: number;
 }
 
 export interface PositionsTelemetryPayload {
   positions: PositionRow[];
   gross_leverage: number;
   net_exposure: number;
+  /** v1.5.2 additive IBKR-sourced fields (optional; may be absent offline). */
+  portfolio_volatility?: number | null;
+  open_positions?: number;
 }
 
 export interface RiskAlertTelemetryPayload {

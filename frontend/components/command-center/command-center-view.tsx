@@ -113,6 +113,17 @@ export function CommandCenterView() {
   });
 
   const dailyCurve = useMemo(() => account?.equity_curve ?? [], [account]);
+  const ibkrConnected = health?.ibkr_connected === true;
+  const equitySource = account?.equity_curve_source ?? null;
+  const equityLivePoints = account?.equity_curve_live_points ?? 0;
+  const equityLiveDays = account?.equity_curve_live_days ?? 0;
+  const intradayReal = useMemo(
+    () =>
+      [...(account?.equity_curve_intraday ?? [])].sort(
+        (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime(),
+      ),
+    [account],
+  );
 
   // Seed the intraday working copy only when a NEW account snapshot arrives (the
   // provider mutates the daily curve in place on every tick).
@@ -128,13 +139,24 @@ export function CommandCenterView() {
     pnlFrame && "net_liquidation" in pnlFrame.payload ? pnlFrame.payload.point : null;
 
   useEffect(() => {
-    if (timeframe !== "1D" || !pnlPoint) return;
+    // Connected IBKR 1D uses REST-recorded intraday points only; never splice
+    // synthetic/WS points into the live intraday provenance.
+    if (timeframe !== "1D" || !pnlPoint || ibkrConnected) return;
     setIntradaySeries((previous) => mergeTelemetryIntoSeries(previous, pnlPoint, "1D"));
     // Daily timeframes are handled by AccountProvider (update last bar in place).
-  }, [timeframe, pnlPoint]);
+  }, [timeframe, pnlPoint, ibkrConnected]);
 
-  const chartCurve = timeframe === "1D" ? intradaySeries : dailyCurve;
-  const windowPoints = useMemo(() => sliceTimeframe(chartCurve, timeframe), [chartCurve, timeframe]);
+  const useRestIntraday = ibkrConnected && timeframe === "1D" && intradayReal.length > 0;
+  const chartCurve = useRestIntraday
+    ? intradayReal
+    : timeframe === "1D"
+      ? intradaySeries
+      : dailyCurve;
+  const windowPoints = useMemo(() => {
+    // 1D live provenance plots the recorded intraday points, not a 2-bar slice.
+    if (useRestIntraday) return intradayReal;
+    return sliceTimeframe(chartCurve, timeframe);
+  }, [useRestIntraday, intradayReal, chartCurve, timeframe]);
   const drawdownSeries = useMemo(() => deriveUnderwaterSeries(windowPoints), [windowPoints]);
 
   const period = useMemo(() => {
@@ -160,12 +182,9 @@ export function CommandCenterView() {
     return { first, last, change, high, low, annualizedVol, maxDrawdown };
   }, [windowPoints, drawdownSeries]);
 
-  // v1.5.1 live-book attribution: when IBKR is connected, volatility must come
-  // from the ex-ante live book (account.portfolio_volatility), never the
+  // v1.5.1/v1.5.2 live-book attribution: when IBKR is connected, volatility must
+  // come from the ex-ante live book (account.portfolio_volatility), never the
   // synthetic equity-curve vol.
-  const ibkrConnected = health?.ibkr_connected === true;
-  const equitySource = account?.equity_curve_source ?? null;
-  const equityLivePoints = account?.equity_curve_live_points ?? 0;
   const liveVolFraction =
     ibkrConnected && typeof account?.portfolio_volatility === "number"
       ? account.portfolio_volatility
@@ -173,8 +192,14 @@ export function CommandCenterView() {
   const volUnavailable = ibkrConnected && liveVolFraction === null;
   const displayVolFraction: number | null = ibkrConnected ? liveVolFraction : period.annualizedVol;
   const volSource = account?.portfolio_volatility_source ?? null;
-  const showSimulatedBackfillBadge = ibkrConnected && equitySource === "simulated-backfill";
-  const showLiveEquityBadge = ibkrConnected && equitySource === "ibkr-live";
+  // 1D provenance: real recorded intraday points are live even when the
+  // multi-day history is still below the 5-distinct-day ibkr-live threshold.
+  const isIntradayLive = ibkrConnected && timeframe === "1D" && intradayReal.length > 0;
+  const showLiveEquityBadge = ibkrConnected && (isIntradayLive || equitySource === "ibkr-live");
+  const showSimulatedBackfillBadge =
+    ibkrConnected && !showLiveEquityBadge && equitySource === "simulated-backfill";
+  const equityBadgePoints = isIntradayLive ? intradayReal.length : equityLivePoints;
+  const equityBadgeSource = showLiveEquityBadge ? "ibkr-live" : "simulated-backfill";
 
   const totals = useMemo(() => {
     const unrealized = positions.reduce((sum, position) => sum + position.unrealized_pnl, 0);
@@ -432,23 +457,31 @@ export function CommandCenterView() {
                 data-testid="equity-source-badge"
                 data-source="simulated-backfill"
                 data-live-points={equityLivePoints}
+                data-live-days={equityLiveDays}
+                data-intraday={isIntradayLive ? "true" : "false"}
                 data-ibkr="true"
                 className="inline-flex items-center gap-1 rounded bg-warn-soft px-1.5 py-0.5 text-[10.5px] font-medium text-amber-300"
-                title="Synthetic equity backfill while live IBKR NLV history is being recorded — not live data"
+                title={`Synthetic equity backfill while live IBKR NLV history is being recorded (${equityLiveDays} distinct UTC days) — not live data`}
               >
                 Simulated Backfill · Recording Live Paper NLV
               </span>
             ) : showLiveEquityBadge ? (
               <span
                 data-testid="equity-source-badge"
-                data-source="ibkr-live"
+                data-source={equityBadgeSource}
                 data-live-points={equityLivePoints}
+                data-live-days={equityLiveDays}
+                data-intraday={isIntradayLive ? "true" : "false"}
                 data-ibkr="true"
                 className="inline-flex items-center gap-1 rounded bg-gain-soft px-1.5 py-0.5 text-[10.5px] font-medium text-emerald-300"
-                title={`${equityLivePoints} persisted live IBKR NLV points`}
+                title={
+                  isIntradayLive
+                    ? `${intradayReal.length} recorded intraday IBKR NLV points (current UTC day)`
+                    : `${equityLivePoints} persisted live IBKR NLV points across ${equityLiveDays} distinct UTC days`
+                }
               >
                 Live IBKR NLV
-                <span className="font-mono text-[9.5px] text-emerald-400/80">{equityLivePoints} pts</span>
+                <span className="font-mono text-[9.5px] text-emerald-400/80">{equityBadgePoints} pts</span>
               </span>
             ) : (
               <span className="text-[11px] text-zinc-600">
@@ -477,6 +510,10 @@ export function CommandCenterView() {
           data-intraday={timeframe === "1D" ? "true" : "false"}
           data-equity-source={equitySource ?? "unknown"}
           data-equity-live-points={equityLivePoints}
+          data-equity-live-days={equityLiveDays}
+          data-intraday-points={intradayReal.length}
+          data-intraday-live={isIntradayLive ? "true" : "false"}
+          data-equity-mode={showLiveEquityBadge ? "live" : showSimulatedBackfillBadge ? "simulated" : "fallback"}
           data-ibkr-connected={ibkrConnected ? "true" : "false"}
           data-portfolio-vol={displayVolFraction ?? ""}
         />

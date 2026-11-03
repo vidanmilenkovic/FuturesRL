@@ -12,7 +12,14 @@ import {
 
 import { getAccount } from "@/lib/api";
 import { mergeTelemetryIntoSeries } from "@/lib/equity-series";
-import type { AccountSnapshotResponse, DataMode, PositionRow } from "@/lib/types";
+import type {
+  AccountSnapshotResponse,
+  DataMode,
+  MarginTelemetryPayload,
+  PnlTelemetryPayload,
+  PositionRow,
+  TelemetryPayload,
+} from "@/lib/types";
 
 import { useTelemetry } from "./telemetry-provider";
 
@@ -32,6 +39,14 @@ interface AccountContextValue {
 }
 
 const AccountContext = createContext<AccountContextValue | null>(null);
+
+function isPnlPayload(payload: TelemetryPayload): payload is PnlTelemetryPayload {
+  return "net_liquidation" in payload;
+}
+
+function isMarginPayload(payload: TelemetryPayload): payload is MarginTelemetryPayload {
+  return "maintenance_margin_used" in payload;
+}
 
 /**
  * Shared account snapshot used by the workspace ribbon ticker and the Command
@@ -86,27 +101,99 @@ export function AccountProvider({ children }: { children: ReactNode }) {
     // IBKR-owned books are REST-authoritative: stream frames may refresh PnL and
     // margin, but must never replace the broker position book (stale last-good).
     const ibkrManaged = Boolean(health?.ibkr_enabled);
+    const ibkrConnected = Boolean(health?.ibkr_connected);
     setAccount((previous) => {
       if (!previous) return previous;
       const next: AccountSnapshotResponse = { ...previous };
-      if (pnl && "net_liquidation" in pnl.payload) {
-        next.net_liquidation = pnl.payload.net_liquidation;
-        next.day_pnl = pnl.payload.day_pnl;
-        next.day_pnl_pct = pnl.payload.day_pnl_pct;
-        // The provider keeps a *daily* series: live ticks update the last daily
-        // bar in place and never append intraday timestamps (chart-safe).
-        next.equity_curve = mergeTelemetryIntoSeries(
-          previous.equity_curve,
-          pnl.payload.point,
-          "1M",
-        );
+      const flatBook =
+        previous.positions.length === 0 && Math.abs(previous.initial_margin_used) < 1e-9;
+      const pnlPayload = pnl && isPnlPayload(pnl.payload) ? pnl.payload : null;
+      const marginPayload = margin && isMarginPayload(margin.payload) ? margin.payload : null;
+      const pnlSourced =
+        ibkrConnected &&
+        pnlPayload !== null &&
+        ("portfolio_volatility" in pnlPayload ||
+          "initial_margin_used" in pnlPayload ||
+          "margin_utilization" in pnlPayload ||
+          "open_positions" in pnlPayload);
+      const marginSourced =
+        ibkrConnected &&
+        marginPayload !== null &&
+        ("portfolio_volatility" in marginPayload || "open_positions" in marginPayload);
+
+      if (pnlPayload) {
+        if (!ibkrConnected) {
+          next.net_liquidation = pnlPayload.net_liquidation;
+          next.day_pnl = pnlPayload.day_pnl;
+          next.day_pnl_pct = pnlPayload.day_pnl_pct;
+          // Offline/demo streaming keeps its existing in-place daily merge.
+          next.equity_curve = mergeTelemetryIntoSeries(
+            previous.equity_curve,
+            pnlPayload.point,
+            "1M",
+          );
+        } else if (pnlSourced) {
+          // Only accept IBKR-sourced frames. Never let a synthetic WS tick
+          // overwrite the REST live book; while flat keep the REST snapshot.
+          if (!flatBook) {
+            next.net_liquidation = pnlPayload.net_liquidation;
+            next.day_pnl = pnlPayload.day_pnl;
+            next.day_pnl_pct = pnlPayload.day_pnl_pct;
+          }
+          if (typeof pnlPayload.initial_margin_used === "number" && !flatBook) {
+            next.initial_margin_used = pnlPayload.initial_margin_used;
+            next.excess_liquidity = next.net_liquidation - pnlPayload.initial_margin_used;
+          }
+          if (typeof pnlPayload.margin_utilization === "number" && !flatBook) {
+            next.margin_utilization = pnlPayload.margin_utilization;
+          }
+          if (typeof pnlPayload.portfolio_volatility === "number" && !flatBook) {
+            next.portfolio_volatility = pnlPayload.portfolio_volatility;
+            next.portfolio_volatility_source = "ws-live-book";
+          }
+        }
+        // Connected IBKR: the equity curve is REST-owned (no WS appends).
       }
-      if (margin && "margin_utilization" in margin.payload) {
-        next.initial_margin_used = margin.payload.initial_margin_used;
-        next.maintenance_margin_used = margin.payload.maintenance_margin_used;
-        next.margin_utilization = margin.payload.margin_utilization;
-        next.excess_liquidity = next.net_liquidation - margin.payload.initial_margin_used;
+
+      if (marginPayload) {
+        if (!ibkrConnected) {
+          next.initial_margin_used = marginPayload.initial_margin_used;
+          next.maintenance_margin_used = marginPayload.maintenance_margin_used;
+          next.margin_utilization = marginPayload.margin_utilization;
+          next.excess_liquidity = next.net_liquidation - marginPayload.initial_margin_used;
+        } else if (marginSourced) {
+          // IBKR-sourced margin frame: accept real values, but a flat REST book
+          // must stay 0.00 / 0.0% no matter what a synthetic tick says.
+          const frameMargin = marginPayload.initial_margin_used;
+          const frameUtil = marginPayload.margin_utilization;
+          const safeMargin =
+            !flatBook || (Math.abs(frameMargin) < 1e-9 && Math.abs(frameUtil) < 1e-9);
+          if (safeMargin) {
+            next.initial_margin_used = frameMargin;
+            next.maintenance_margin_used = marginPayload.maintenance_margin_used;
+            next.margin_utilization = frameUtil;
+            next.excess_liquidity = next.net_liquidation - frameMargin;
+          }
+          if (typeof marginPayload.portfolio_volatility === "number") {
+            const safeVol =
+              !flatBook || Math.abs(marginPayload.portfolio_volatility) < 1e-12;
+            if (safeVol && previous.portfolio_volatility === null) {
+              next.portfolio_volatility = marginPayload.portfolio_volatility;
+              next.portfolio_volatility_source = "ws-live-book";
+            }
+            if (flatBook) next.portfolio_volatility = 0;
+          }
+        }
       }
+
+      if (flatBook && ibkrConnected) {
+        // Defensive: a flat IBKR account is exactly 0 vol / 0 IM / 0 util even if
+        // an older or malformed simulated frame was published.
+        next.initial_margin_used = 0;
+        next.margin_utilization = 0;
+        next.portfolio_volatility = 0;
+      }
+
       if (positions && "positions" in positions.payload && !ibkrManaged) {
         next.positions = positions.payload.positions;
         next.gross_leverage = positions.payload.gross_leverage;
@@ -114,7 +201,7 @@ export function AccountProvider({ children }: { children: ReactNode }) {
       }
       return next;
     });
-  }, [latest.pnl, latest.margin, latest.positions, source, status, health?.ibkr_enabled]);
+  }, [latest.pnl, latest.margin, latest.positions, source, status, health?.ibkr_enabled, health?.ibkr_connected]);
 
   const reload = useCallback(() => setNonce((value) => value + 1), []);
 

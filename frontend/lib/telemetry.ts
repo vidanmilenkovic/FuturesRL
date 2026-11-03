@@ -6,7 +6,7 @@ export function summarizeTelemetry(frame: TelemetryEnvelope): string {
   if (frame.kind === "pnl" && "net_liquidation" in payload) {
     return `NLV ${payload.net_liquidation.toLocaleString("en-US", { maximumFractionDigits: 0 })} · day ${(payload.day_pnl_pct * 100).toFixed(2)}%`;
   }
-  if (frame.kind === "margin" && "margin_utilization" in payload) {
+  if (frame.kind === "margin" && "maintenance_margin_used" in payload) {
     return `Initial margin ${(payload.margin_utilization * 100).toFixed(2)}% · ${payload.initial_margin_used.toLocaleString("en-US", { maximumFractionDigits: 0 })} used`;
   }
   if (frame.kind === "positions" && "positions" in payload) {

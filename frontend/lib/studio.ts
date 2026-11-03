@@ -1702,6 +1702,67 @@ export function defaultOptunaBounds(
   return bounds;
 }
 
+/** All concrete/cat-key parameter paths that are active+tunable for a strategy. */
+export function activeOptimizationParameterPaths(
+  strategy: StrategyConfig,
+  catalog: StudioCatalogResponse,
+): Set<string> {
+  const allowed = new Set<string>();
+  const timingNames = strategy.timing.map((stage) => stage.name);
+  const riskNames = strategy.risk.map((stage) => stage.name);
+  const allocate = (parameter: StudioParameter) => {
+    const paramKey = parameter.path.split(".").pop() ?? "";
+    if (parameter.key) allowed.add(parameter.key);
+    allowed.add(parameter.path);
+    if (parameter.stage === "allocator") {
+      allowed.add(`allocator.params.${paramKey}`);
+      allowed.add(`allocator.${strategy.allocator.name}.params.${paramKey}`);
+    } else if (parameter.stage === "universe") {
+      allowed.add(`universe.params.${paramKey}`);
+      allowed.add(`universe.${strategy.universe.name}.params.${paramKey}`);
+    } else if (parameter.stage === "timing") {
+      const index = timingNames.indexOf(parameter.stage_name ?? "");
+      if (index >= 0) allowed.add(`timing.${index}.params.${paramKey}`);
+      if (parameter.stage_name) {
+        allowed.add(`timing.${parameter.stage_name}.params.${paramKey}`);
+        allowed.add(`timing.${parameter.stage_name}.${paramKey}`);
+      }
+    } else if (parameter.stage === "risk") {
+      const index = riskNames.indexOf(parameter.stage_name ?? "");
+      if (index >= 0) allowed.add(`risk.${index}.params.${paramKey}`);
+      if (parameter.stage_name) {
+        allowed.add(`risk.${parameter.stage_name}.params.${paramKey}`);
+        allowed.add(`risk.${parameter.stage_name}.${paramKey}`);
+      }
+    } else {
+      allowed.add(`translator.${paramKey}`);
+    }
+  };
+  for (const parameter of activeTunableParameters(strategy, catalog)) allocate(parameter);
+  return allowed;
+}
+
+/**
+ * Client-side legacy guard (defence-in-depth for task-44's API purge): a study
+ * is legacy when any recorded parameter path is not active+tunable for its base
+ * strategy (inactive allocator/overlay or structural/hygiene/translator path).
+ */
+export function isLegacyOptimizationStudy(
+  study: OptimizationStudy,
+  strategies: StrategyConfig[],
+  catalog: StudioCatalogResponse,
+): boolean {
+  const strategy = strategies.find((entry) => entry.id === study.base_strategy_id);
+  if (!strategy) return false;
+  const allowed = activeOptimizationParameterPaths(strategy, catalog);
+  const paths = new Set<string>([
+    ...Object.keys(study.best_params ?? {}),
+    ...study.trials.flatMap((trial) => Object.keys(trial.params ?? {})),
+  ]);
+  if (paths.size === 0) return false;
+  return [...paths].some((path) => !allowed.has(path));
+}
+
 export function drlModelMetaJson(model: DrlModel): string {
   return JSON.stringify(model.meta ?? {}, null, 2);
 }

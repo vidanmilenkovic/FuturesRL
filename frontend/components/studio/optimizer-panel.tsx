@@ -24,6 +24,7 @@ import {
   formatObjectiveMetric,
   formatParamPath,
   importancePercent,
+  isLegacyOptimizationStudy,
   structuralParametersForStrategy,
 } from "@/lib/studio";
 import type {
@@ -62,6 +63,7 @@ export function OptimizerPanel({
   onNotify: (message: string, tone: Tone) => void;
 }) {
   const studies = useAsyncData(listOptimizations);
+  const reloadStudies = studies.reload;
   const [baseId, setBaseId] = useState("");
   const [objective, setObjective] = useState<OptimizationObjective>("sharpe");
   const [nTrials, setNTrials] = useState(25);
@@ -72,6 +74,7 @@ export function OptimizerPanel({
   const [running, setRunning] = useState(false);
   const [applying, setApplying] = useState(false);
   const [message, setMessage] = useState<{ text: string; tone: Tone } | null>(null);
+  const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "value", dir: "desc" });
 
   const baseStrategy = useMemo(
@@ -117,23 +120,59 @@ export function OptimizerPanel({
     [activeParams, bounds],
   );
 
+  // v1.5.2: never auto-select a legacy study. The API quarantines legacy
+  // artifacts (task-44); this client-side guard drops any stale legacy id still
+  // in local state and prefers the newest clean study from the list.
+  const cleanStudies = useMemo(
+    () =>
+      (studies.data?.studies ?? []).filter(
+        (entry) =>
+          !archivedIds.has(entry.study_id) &&
+          !isLegacyOptimizationStudy(entry, strategies, catalog),
+      ),
+    [studies.data, strategies, catalog, archivedIds],
+  );
+  const legacyStudyCount = (studies.data?.studies.length ?? 0) - cleanStudies.length;
+
   useEffect(() => {
-    if (study === null && studies.data && studies.data.studies.length > 0) {
-      setStudy(studies.data.studies[0] ?? null);
+    if (!studies.data) return;
+    if (study && isLegacyOptimizationStudy(study, strategies, catalog)) {
+      setStudy(null);
+      return;
     }
-  }, [studies.data, study]);
+    if (study === null && cleanStudies.length > 0) {
+      setStudy(cleanStudies[0] ?? null);
+    }
+  }, [studies.data, study, cleanStudies, strategies, catalog]);
 
   // GET /api/optimize returns summaries (no trials); load the full study on demand.
   useEffect(() => {
     if (!study || study.trials.length > 0) return;
+    if (isLegacyOptimizationStudy(study, strategies, catalog)) return;
     let cancelled = false;
     void getOptimization(study.study_id).then((result) => {
-      if (!cancelled && result.data.trials.length > 0) setStudy(result.data);
+      if (cancelled) return;
+      if (!result.data) {
+        // API quarantined/archived a legacy study (404) — refresh the clean list.
+        setMessage({
+          text: "Legacy optimization run archived — pick a current study.",
+          tone: "warn",
+        });
+        setArchivedIds((current) => {
+          const next = new Set(current);
+          next.add(study.study_id);
+          return next;
+        });
+        setStudy(null);
+        reloadStudies();
+        return;
+      }
+      if (result.data.trials.length > 0) setStudy(result.data);
     });
     return () => {
       cancelled = true;
     };
-  }, [study]);
+  }, [study, strategies, catalog, reloadStudies]);
 
   const run = async () => {
     if (!baseId) return;
@@ -176,9 +215,26 @@ export function OptimizerPanel({
         ? ` · verification ${verification.status}${verification.message ? `: ${verification.message}` : ""}`
         : "";
     setMessage({
-      text: (result.data.message || `Applied best parameters as ${result.data.strategy_id}.`) + verificationNote,
-      tone: result.data.applied ? (verification && verification.status === "skipped" ? "warn" : "gain") : "warn",
+      text:
+        (result.data.message || `Applied best parameters as ${result.data.strategy_id}.`) +
+        verificationNote,
+      tone: result.data.applied
+        ? verification && verification.status === "skipped"
+          ? "warn"
+          : "gain"
+        : "warn",
     });
+    if (!result.data.applied) {
+      // Archived legacy study: refresh the clean list and do not navigate/apply.
+      setArchivedIds((current) => {
+        const next = new Set(current);
+        next.add(study.study_id);
+        return next;
+      });
+      setStudy(null);
+      studies.reload();
+      return;
+    }
     onNotify(`Applied ${study.study_id} → ${result.data.strategy_id}`, result.source === "live" ? "gain" : "warn");
     if (result.data.strategy) onApplied(result.data.strategy);
     const appliedId = result.data.strategy_id;
@@ -416,15 +472,20 @@ export function OptimizerPanel({
           }
         >
           <div className="scroll-area -mx-1 min-h-0 flex-1 overflow-y-auto px-1">
-            {(studies.data?.studies ?? []).length === 0 ? (
-              <p className="py-2 text-[11px] text-zinc-600">No persisted optimization studies yet.</p>
+            {cleanStudies.length === 0 ? (
+              <p className="py-2 text-[11px] text-zinc-600">
+                No persisted optimization studies yet.
+              </p>
             ) : (
               <div className="space-y-1">
-                {(studies.data?.studies ?? []).map((entry) => (
+                {cleanStudies.map((entry) => (
                   <button
                     key={entry.study_id}
                     type="button"
                     onClick={() => setStudy(entry)}
+                    data-testid="optimization-study-row"
+                    data-study-id={entry.study_id}
+                    data-selected={study?.study_id === entry.study_id ? "true" : "false"}
                     className={cn(
                       "focus-ring flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-[10.5px] transition-colors",
                       study?.study_id === entry.study_id
@@ -445,6 +506,11 @@ export function OptimizerPanel({
                 ))}
               </div>
             )}
+            {legacyStudyCount > 0 ? (
+              <p className="mt-1 px-1 text-[9.5px] text-amber-400/80" data-testid="legacy-studies-note">
+                {legacyStudyCount} legacy study{legacyStudyCount === 1 ? "" : "s"} hidden (quarantined by API / client guard)
+              </p>
+            ) : null}
           </div>
         </Panel>
       </div>

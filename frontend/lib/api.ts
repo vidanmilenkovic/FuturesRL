@@ -495,14 +495,29 @@ export function listOptimizations(): Promise<ApiResult<OptimizationListResponse>
   }));
 }
 
-export function getOptimization(studyId: string): Promise<ApiResult<OptimizationStudy>> {
+export function getOptimization(
+  studyId: string,
+): Promise<ApiResult<OptimizationStudy | null>> {
   return withFallback<unknown>(`/api/optimize/${encodeURIComponent(studyId)}`, () =>
     mockOptimizationStudy(),
   ).then((result) => {
+    // v1.5.2: the API quarantines legacy studies; a 404 means "archived", not
+    // "render a fake fixture study".
+    if (result.source === "demo" && /\b404\b/.test(result.error ?? "")) {
+      return {
+        data: null,
+        source: "live" as const,
+        error: "archived",
+      };
+    }
     const normalized = normalizeOptimizationStudy(result.data);
     if (normalized) return { ...result, data: normalized };
     const fallback = mockOptimizationStudy();
-    return { data: { ...fallback, study_id: studyId }, source: "demo" as const, error: "unrecognized optimization payload" };
+    return {
+      data: { ...fallback, study_id: studyId },
+      source: "demo" as const,
+      error: "unrecognized optimization payload",
+    };
   });
 }
 
@@ -529,12 +544,29 @@ export function applyOptimization(studyId: string): Promise<ApiResult<Optimizati
     () => mockOptimizationApply(studyId),
     { method: "POST", body: JSON.stringify({}) },
     60_000,
-  ).then((result) => ({
-    ...result,
-    data: result.source === "live"
-      ? normalizeOptimizationApply(result.data, studyId)
-      : (result.data as OptimizationApplyResult),
-  }));
+  ).then((result) => {
+    if (result.source === "demo" && /\b404\b/.test(result.error ?? "")) {
+      return {
+        data: {
+          study_id: studyId,
+          strategy_id: "",
+          strategy: null,
+          backtest_run_id: null,
+          applied: false,
+          message:
+            "Legacy optimization run archived — pick a current study (the API no longer serves it).",
+        },
+        source: "live" as const,
+        error: "archived",
+      };
+    }
+    return {
+      ...result,
+      data: result.source === "live"
+        ? normalizeOptimizationApply(result.data, studyId)
+        : (result.data as OptimizationApplyResult),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
