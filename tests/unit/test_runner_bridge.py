@@ -27,15 +27,18 @@ from src.core.types import (
     PipelineResult,
     Position,
 )
-from src.execution.runner import RunnerStatus
+from src.execution.runner import OfflineRunnerSession, RunnerStatus
 from src.execution.runner_bridge import (
     BRIDGE_FILENAME,
     BRIDGE_MODES,
     BRIDGE_SCHEMA_VERSION,
     DEFAULT_STALE_AFTER_SECONDS,
     MAX_BRIDGE_FILLS,
+    MAX_BRIDGE_INSTRUMENTS,
     MAX_BRIDGE_ORDERS,
     BridgeFill,
+    BridgeMicroRouting,
+    BridgePipelineRow,
     BridgePosition,
     BridgeSchemaError,
     BridgeWorkingOrder,
@@ -123,16 +126,27 @@ def make_pipeline_result(
     *,
     timestamp: datetime = FIXED_TIMESTAMP,
     diagnostics: dict[str, object] | None = None,
+    universe: tuple[str, ...] = ("ES", "NQ"),
+    base: dict[str, float] | None = None,
+    timing: dict[str, float] | None = None,
+    risk: dict[str, float] | None = None,
+    final: dict[str, float] | None = None,
+    targets: Any = None,
 ) -> PipelineResult:
-    weights = make_weight_vector({"ES": 0.5, "NQ": 0.25})
+    base_weights = make_weight_vector(base if base is not None else {"ES": 0.5, "NQ": 0.25})
+    timing_weights = make_weight_vector(
+        timing if timing is not None else dict(base_weights.weights)
+    )
+    risk_weights = make_weight_vector(risk if risk is not None else dict(timing_weights.weights))
+    final_weights = make_weight_vector(final if final is not None else dict(risk_weights.weights))
     return PipelineResult(
         timestamp=timestamp,
-        universe=("ES", "NQ"),
-        base_weights=weights,
-        timing_weights=weights,
-        risk_weights=weights,
-        final_weights=weights,
-        targets=make_contract_targets({"ES": 1}),
+        universe=universe,
+        base_weights=base_weights,
+        timing_weights=timing_weights,
+        risk_weights=risk_weights,
+        final_weights=final_weights,
+        targets=targets if targets is not None else make_contract_targets({"ES": 1}),
         diagnostics=diagnostics if diagnostics is not None else {},
         elapsed_ms=3.0,
     )
@@ -172,6 +186,11 @@ class FakeRunner:
         last_pipeline_result: PipelineResult | None = None,
         last_bridge_snapshot: RunnerBridgeSnapshot | None = None,
         mode: str | None = None,
+        instrument_master: Any = None,
+        last_regime: str | None = None,
+        last_market_state: Any = None,
+        pipeline: Any = None,
+        last_discretization_report: Any = None,
     ) -> None:
         self.settings = settings
         self.status = status if status is not None else RunnerStatus()
@@ -181,6 +200,11 @@ class FakeRunner:
         self.last_account = last_account
         self.last_pipeline_result = last_pipeline_result
         self.last_bridge_snapshot = last_bridge_snapshot
+        self.instrument_master = instrument_master
+        self.last_regime = last_regime
+        self.last_market_state = last_market_state
+        self.pipeline = pipeline
+        self.last_discretization_report = last_discretization_report
         if mode is not None:
             self.mode = mode
 
@@ -285,6 +309,36 @@ def _full_snapshot() -> RunnerBridgeSnapshot:
                 timestamp=FIXED_TIMESTAMP,
             ),
         ),
+        instruments=(
+            BridgePipelineRow(
+                instrument_id="ES",
+                root="ES",
+                asset_class="equity_index",
+                selected=True,
+                weight_base=0.50,
+                weight_timing=0.40,
+                weight_risk=0.35,
+                weight_final=0.35,
+                weight_actual=0.348,
+                delta_timing=-0.10,
+                delta_risk=-0.05,
+                target_contracts=1,
+                notional=350_000.0,
+                driver="projected by the risk overlays (vol target / LLM breaker)",
+                regime="neutral",
+            ),
+        ),
+        micro_routing=(
+            BridgeMicroRouting(
+                family="ES",
+                standard_root="ES",
+                standard_quantity=1,
+                micro_root="MES",
+                micro_quantity=2,
+            ),
+        ),
+        tracking_error_pct=1.25,
+        tracking_error_source="translator",
     )
 
 
@@ -302,6 +356,29 @@ def test_snapshot_round_trips_through_json() -> None:
     assert restored.fills[0].side == "SELL"
     assert isinstance(restored.updated_at, datetime)
     assert restored.updated_at.tzinfo is not None
+    assert len(restored.instruments) == 1
+    row = restored.instruments[0]
+    assert row.instrument_id == "ES"
+    assert row.asset_class == "equity_index"
+    assert row.weight_base == pytest.approx(0.50)
+    assert row.weight_actual == pytest.approx(0.348)
+    assert row.target_contracts == 1
+    assert row.notional == pytest.approx(350_000.0)
+    assert row.driver.startswith("projected by the risk overlays")
+    assert row.reason == row.driver
+    assert row.regime == "neutral"
+    assert restored.micro_routing == (
+        BridgeMicroRouting(
+            family="ES",
+            standard_root="ES",
+            standard_quantity=1,
+            micro_root="MES",
+            micro_quantity=2,
+        ),
+    )
+    assert restored.tracking_error_pct == pytest.approx(1.25)
+    assert restored.tracking_error_source == "translator"
+    assert payload["instruments"][0]["reason"] == payload["instruments"][0]["driver"]
 
 
 def test_snapshot_from_dict_rejects_newer_schema_and_bad_fields() -> None:
@@ -869,3 +946,398 @@ def test_bridge_exports_resolve_from_the_execution_package() -> None:
     assert OfflineRunnerSession.mode == "offline"
     assert "RunnerBridgeStore" in dir(package)
     assert "OfflineRunnerSession" in dir(package)
+
+
+# ---------------------------------------------------------------------------
+# Phase-10 pipeline weight matrix (rows / micro routing / tracking error)
+# ---------------------------------------------------------------------------
+
+
+class FakeTranslator:
+    """Duck-typed ``discretization_report`` provider."""
+
+    def __init__(self, report: object | None = None, *, error: BaseException | None = None) -> None:
+        self.report = report
+        self.error = error
+        self.calls: list[tuple[object, object, object, dict[str, object]]] = []
+
+    def discretization_report(
+        self, weights: object, targets: object, state: object, **kwargs: object
+    ) -> object:
+        self.calls.append((weights, targets, state, dict(kwargs)))
+        if self.error is not None:
+            raise self.error
+        return self.report
+
+
+def make_report(
+    *,
+    tracking_error_pct: float = 0.75,
+    achieved: dict[str, float] | None = None,
+    micro_routes: tuple[object, ...] = (),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        tracking_error_pct=tracking_error_pct,
+        achieved_weights=achieved if achieved is not None else {"ES": 0.44, "NQ": 0.2},
+        micro_routes=micro_routes,
+    )
+
+
+def test_old_v1_snapshot_without_pipeline_detail_still_loads() -> None:
+    """Snapshots written by Phase-9 runners carry no Phase-10 keys."""
+    payload = _full_snapshot().to_dict()
+    for key in ("instruments", "micro_routing", "tracking_error_pct", "tracking_error_source"):
+        payload.pop(key)
+    restored = RunnerBridgeSnapshot.from_dict(payload)
+    assert restored.instruments == ()
+    assert restored.micro_routing == ()
+    assert restored.tracking_error_pct is None
+    assert restored.tracking_error_source == "fallback"
+    # The flat scalar pipeline summary is still intact.
+    assert restored.pipeline is not None
+    assert restored.pipeline["universe"] == "ES,NQ"
+    # New snapshots serialise the additive keys again (forward compatibility).
+    assert "instruments" in restored.to_dict()
+    assert restored.to_dict()["tracking_error_source"] == "fallback"
+
+
+def test_pipeline_detail_validation() -> None:
+    row = BridgePipelineRow(
+        instrument_id="ES",
+        root="ES",
+        asset_class="equity_index",
+        selected=True,
+        weight_base=0.5,
+        weight_timing=0.4,
+        weight_risk=0.35,
+        weight_final=0.35,
+        weight_actual=None,
+        delta_timing=-0.1,
+        delta_risk=-0.05,
+        target_contracts=None,
+        notional=None,
+        driver="passed through unchanged",
+        regime=None,
+    )
+    with pytest.raises(BridgeSchemaError, match="tracking_error_source"):
+        RunnerBridgeSnapshot(
+            schema_version=BRIDGE_SCHEMA_VERSION,
+            runner_id="r",
+            mode="offline",
+            sequence=1,
+            updated_at=FIXED_TIMESTAMP,
+            stale_after_seconds=15.0,
+            instruments=(row,),
+            tracking_error_source="vendor",
+        )
+    with pytest.raises(BridgeSchemaError, match="tracking_error_pct"):
+        RunnerBridgeSnapshot(
+            schema_version=BRIDGE_SCHEMA_VERSION,
+            runner_id="r",
+            mode="offline",
+            sequence=1,
+            updated_at=FIXED_TIMESTAMP,
+            stale_after_seconds=15.0,
+            tracking_error_pct=-1.0,
+        )
+    with pytest.raises(BridgeSchemaError, match="instruments"):
+        RunnerBridgeSnapshot(
+            schema_version=BRIDGE_SCHEMA_VERSION,
+            runner_id="r",
+            mode="offline",
+            sequence=1,
+            updated_at=FIXED_TIMESTAMP,
+            stale_after_seconds=15.0,
+            instruments=tuple(
+                BridgePipelineRow(
+                    instrument_id=f"R{index}",
+                    root=f"R{index}",
+                    asset_class="unknown",
+                    selected=False,
+                    weight_base=0.0,
+                    weight_timing=0.0,
+                    weight_risk=0.0,
+                    weight_final=0.0,
+                    weight_actual=None,
+                    delta_timing=0.0,
+                    delta_risk=0.0,
+                    target_contracts=None,
+                    notional=None,
+                    driver="passed through unchanged",
+                    regime=None,
+                )
+                for index in range(MAX_BRIDGE_INSTRUMENTS + 1)
+            ),
+        )
+    bad_payload = _full_snapshot().to_dict()
+    bad_payload["instruments"] = ["not-a-mapping"]
+    with pytest.raises(BridgeSchemaError):
+        RunnerBridgeSnapshot.from_dict(bad_payload)
+    bad_route = {**_full_snapshot().to_dict(), "micro_routing": [{"micro_root": "MES"}]}
+    with pytest.raises(BridgeSchemaError):
+        RunnerBridgeSnapshot.from_dict(bad_route)
+
+
+def test_pipeline_row_and_micro_routing_from_dict_tolerance() -> None:
+    row = BridgePipelineRow.from_dict(
+        {
+            "instrument_id": "ES",
+            "weight_base": 0.5,
+            "weight_timing": 0.4,
+            "weight_risk": 0.35,
+            "weight_final": 0.35,
+            "reason": "scaled by the timing/term-structure overlay",
+        }
+    )
+    assert row.root == "ES"
+    assert row.asset_class == "unknown"
+    assert row.selected is True
+    assert row.delta_timing == pytest.approx(-0.1)
+    assert row.delta_risk == pytest.approx(-0.05)
+    assert row.driver.startswith("scaled by the timing")
+    assert row.weight_actual is None
+    route = BridgeMicroRouting.from_dict(
+        {"standard_root": "ES", "micro_root": "MES", "micro_quantity": 2}
+    )
+    assert route.family == "ES"
+    assert route.standard_quantity == 0
+    assert route.micro_quantity == 2
+
+
+def test_snapshot_from_runner_builds_full_pipeline_rows(
+    settings: Settings, instrument_master: InstrumentsConfig
+) -> None:
+    targets = make_contract_targets({"ES": 1, "GC": 1, "MGC": 2})
+    result = make_pipeline_result(
+        universe=("ES", "NQ", "CL"),
+        base={"ES": 0.6, "NQ": 0.2, "CL": 0.2},
+        timing={"ES": 0.5, "NQ": 0.2, "CL": 0.0},
+        risk={"ES": 0.45, "NQ": 0.2, "CL": 0.0},
+        final={"ES": 0.45, "NQ": 0.2, "CL": 0.0},
+        targets=targets,
+    )
+    runner = FakeRunner(
+        settings=settings,
+        instrument_master=instrument_master,
+        last_regime="risk-off",
+        last_account={"net_liquidation": 1_000_000.0},
+        last_pipeline_result=result,
+    )
+    snapshot = snapshot_from_runner(runner, broker=object(), mode="paper")
+    rows = {row.instrument_id: row for row in snapshot.instruments}
+    assert set(rows) == {"ES", "NQ", "CL", "GC", "MGC"}
+    assert [row.instrument_id for row in snapshot.instruments] == sorted(rows)
+    es = rows["ES"]
+    assert es.root == "ES"
+    assert es.asset_class == "equity_index"
+    assert es.selected is True
+    assert es.weight_base == pytest.approx(0.6)
+    assert es.weight_timing == pytest.approx(0.5)
+    assert es.weight_risk == pytest.approx(0.45)
+    assert es.weight_final == pytest.approx(0.45)
+    assert es.weight_actual == pytest.approx(240_000.0 / 1_000_000.0)
+    assert es.delta_timing == pytest.approx(-0.1)
+    assert es.delta_risk == pytest.approx(-0.05)
+    assert es.target_contracts == 1
+    assert es.notional == pytest.approx(240_000.0)
+    assert es.driver == "scaled by the timing/term-structure overlay"
+    assert es.regime == "risk-off"
+    # Selected root without a contract target: rounded flat by the translator.
+    assert rows["NQ"].target_contracts is None
+    assert rows["NQ"].notional == pytest.approx(200_000.0)
+    assert rows["NQ"].weight_actual == pytest.approx(0.0)
+    assert rows["NQ"].driver.startswith("rounded flat")
+    assert rows["CL"].asset_class == "energy"
+    # Unselected roots pulled in by the achieved book are flagged as filtered.
+    assert rows["GC"].selected is False
+    assert rows["GC"].driver.startswith("filtered out")
+    assert rows["MGC"].asset_class == "metals"
+    # Fallback discretization: GC standard + MGC residual routing pair.
+    assert snapshot.micro_routing == (
+        BridgeMicroRouting(
+            family="GC",
+            standard_root="GC",
+            standard_quantity=1,
+            micro_root="MGC",
+            micro_quantity=2,
+        ),
+    )
+    # Half-L1 tracking error from the fallback achieved weights
+    # (MGC: 2 * 2050 * 10 = 41,000 -> 4.1% of equity).
+    expected = 0.5 * (abs(0.45 - 0.24) + abs(0.2 - 0.0) + abs(0.0 - 0.205) + abs(0.0 - 0.041))
+    assert snapshot.tracking_error_pct == pytest.approx(round(expected * 100.0, 6))
+    assert snapshot.tracking_error_source == "fallback"
+    # Flat scalar summary stays available and is enriched with the detail counts.
+    assert snapshot.pipeline is not None
+    assert snapshot.pipeline["instruments"] == len(snapshot.instruments)
+    assert snapshot.pipeline["micro_routes"] == 1
+    assert snapshot.pipeline["tracking_error_source"] == "fallback"
+    assert snapshot.pipeline["tracking_error_pct"] == snapshot.tracking_error_pct
+
+
+async def test_snapshot_from_runner_uses_runner_discretization_report(
+    settings: Settings, instrument_master: InstrumentsConfig
+) -> None:
+    report = make_report(
+        tracking_error_pct=0.75,
+        achieved={"ES": 0.44, "NQ": 0.2},
+        micro_routes=(
+            SimpleNamespace(
+                family="ES",
+                standard_root="ES",
+                standard_quantity=1,
+                micro_root="MES",
+                micro_quantity=3,
+            ),
+        ),
+    )
+    runner = FakeRunner(
+        settings=settings,
+        instrument_master=instrument_master,
+        last_account={"net_liquidation": 1_000_000.0},
+        last_pipeline_result=make_pipeline_result(),
+        last_discretization_report=report,
+    )
+    snapshot = snapshot_from_runner(runner, broker=object())
+    assert snapshot.tracking_error_source == "translator"
+    assert snapshot.tracking_error_pct == pytest.approx(0.75)
+    rows = {row.instrument_id: row for row in snapshot.instruments}
+    assert rows["ES"].weight_actual == pytest.approx(0.44)
+    assert snapshot.micro_routing == (
+        BridgeMicroRouting(
+            family="ES",
+            standard_root="ES",
+            standard_quantity=1,
+            micro_root="MES",
+            micro_quantity=3,
+        ),
+    )
+
+
+def test_snapshot_from_runner_calls_pipeline_translator_report(
+    settings: Settings, instrument_master: InstrumentsConfig
+) -> None:
+    from tests.fixtures.market import make_market_state
+
+    report = make_report(tracking_error_pct=1.5)
+    translator = FakeTranslator(report)
+    state = make_market_state(roots=("ES", "NQ"))
+    runner = FakeRunner(
+        settings=settings,
+        instrument_master=instrument_master,
+        last_account={"net_liquidation": 1_000_000.0},
+        last_market_state=state,
+        pipeline=SimpleNamespace(translator=translator),
+    )
+    result = make_pipeline_result()
+    snapshot = snapshot_from_runner(runner, broker=object(), pipeline_result=result)
+    assert snapshot.tracking_error_source == "translator"
+    assert snapshot.tracking_error_pct == pytest.approx(1.5)
+    assert len(translator.calls) == 1
+    weights, targets, called_state, kwargs = translator.calls[0]
+    assert weights is result.final_weights
+    assert targets is result.targets
+    assert called_state is state
+    assert kwargs == {"equity": 1_000_000.0}
+
+
+def test_snapshot_from_runner_degrades_when_translator_report_fails(
+    settings: Settings, instrument_master: InstrumentsConfig
+) -> None:
+    from tests.fixtures.market import make_market_state
+
+    translator = FakeTranslator(error=RuntimeError("FX unavailable"))
+    runner = FakeRunner(
+        settings=settings,
+        instrument_master=instrument_master,
+        last_account={"net_liquidation": 1_000_000.0},
+        last_market_state=make_market_state(roots=("ES", "NQ")),
+        pipeline=SimpleNamespace(translator=translator),
+    )
+    snapshot = snapshot_from_runner(runner, broker=object(), pipeline_result=make_pipeline_result())
+    assert snapshot.tracking_error_source == "fallback"
+    assert snapshot.tracking_error_pct is not None
+    assert snapshot.instruments
+
+
+def test_snapshot_from_runner_without_pipeline_result_keeps_defaults(
+    settings: Settings,
+) -> None:
+    snapshot = snapshot_from_runner(FakeRunner(settings=settings), broker=object())
+    assert snapshot.instruments == ()
+    assert snapshot.micro_routing == ()
+    assert snapshot.tracking_error_pct is None
+    assert snapshot.tracking_error_source == "fallback"
+    assert snapshot.pipeline is None
+
+
+def test_pipeline_rows_validate_against_frozen_api_contract(
+    settings: Settings, instrument_master: InstrumentsConfig
+) -> None:
+    """The bridge row dicts must be directly renderable by the API schemas."""
+    from src.api.schemas import MicroRoutingEntry, PipelineInstrumentRow
+
+    runner = FakeRunner(
+        settings=settings,
+        instrument_master=instrument_master,
+        last_account={"net_liquidation": 1_000_000.0},
+        last_pipeline_result=make_pipeline_result(
+            targets=make_contract_targets({"ES": 1, "MGC": 2})
+        ),
+    )
+    snapshot = snapshot_from_runner(runner, broker=object())
+    assert snapshot.instruments
+    for row in snapshot.instruments:
+        validated = PipelineInstrumentRow.model_validate(row.to_dict())
+        assert validated.instrument_id == row.instrument_id
+        assert validated.weight_final == pytest.approx(row.weight_final)
+        assert validated.reason == row.driver
+    payload = snapshot.to_dict()
+    raw_rows = payload["instruments"]
+    assert isinstance(raw_rows, list)
+    assert (
+        PipelineInstrumentRow.model_validate(raw_rows[0]).instrument_id
+        == snapshot.instruments[0].instrument_id
+    )
+    if snapshot.micro_routing:
+        MicroRoutingEntry.model_validate(snapshot.micro_routing[0].to_dict())
+
+
+async def test_real_offline_runner_session_snapshot_contains_pipeline_rows(
+    settings: Settings,
+) -> None:
+    strategy_path = settings.strategies_dir / "tsmom_vol_target.yaml"
+    session = OfflineRunnerSession(settings, strategy_path=str(strategy_path))
+    try:
+        await session.warm_start()
+        snapshot = session.snapshot()
+        assert snapshot is not None
+        assert snapshot.instruments, "primed offline pipeline must publish weight-matrix rows"
+        assert snapshot.tracking_error_source in {"translator", "fallback"}
+        assert snapshot.tracking_error_pct is not None
+        roots = {row.instrument_id for row in snapshot.instruments}
+        assert roots  # non-empty weight matrix
+        for row in snapshot.instruments:
+            assert row.root == row.instrument_id
+            assert row.asset_class
+            assert row.driver
+            assert row.weight_base == pytest.approx(row.weight_base)
+        # Advancing the deterministic replay keeps republishing the full weight
+        # matrix (sequence increases) with rows/tracking intact.
+        for _ in range(3):
+            await session.step(1)
+            current = session.snapshot()
+            assert current is not None
+            assert current.sequence > snapshot.sequence
+            assert current.instruments
+            assert current.tracking_error_pct is not None
+            snapshot = current
+        assert snapshot.tracking_error_pct is not None
+        store = session.bridge_store
+        assert store is not None
+        loaded = store.load()
+        assert loaded is not None
+        assert loaded.to_dict() == snapshot.to_dict()
+        assert loaded.instruments == snapshot.instruments
+    finally:
+        await session.close()

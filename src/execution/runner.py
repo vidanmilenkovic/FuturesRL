@@ -347,6 +347,8 @@ class TradingRunner:
         self._last_pipeline_result: PipelineResult | None = None
         self._last_positions: Mapping[InstrumentId, Position] | None = None
         self._last_account: dict[str, float] | None = None
+        self._last_regime: str | None = None
+        self._last_discretization_report: object | None = None
         if bridge_store is not None:
             # Continue the sequence across restarts and never regress the file.
             self._last_bridge_snapshot = bridge_store.load()
@@ -434,6 +436,39 @@ class TradingRunner:
     def last_account(self) -> Mapping[str, float] | None:
         """Latest account valuation/margin scalars (bridge-ready)."""
         return self._last_account
+
+    @property
+    def last_regime(self) -> str | None:
+        """Market regime of the latest processed state (``None`` when unavailable).
+
+        Sourced from the latest :class:`~src.core.types.MarketState` regime; when
+        the state carries none, a scalar ``regime``/``market_regime`` diagnostic on
+        the latest pipeline result is used as a fallback. Read-only and consumed by
+        the Phase-10 bridge weight-matrix rows.
+        """
+        if self._last_regime is not None:
+            return self._last_regime
+        result = self._last_pipeline_result
+        if result is None:
+            return None
+        diagnostics = result.diagnostics
+        for key in ("regime", "market_regime", "macro_regime"):
+            value = diagnostics.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @property
+    def last_discretization_report(self) -> object | None:
+        """Latest duck-typed ``ContractTranslator.discretization_report`` result.
+
+        ``None`` until a state with a discrete target book has been processed by a
+        translator that exposes ``discretization_report``. Kept as ``object`` so
+        the execution package does not import the risk translator types (the
+        runner bridge reads ``tracking_error_pct`` / ``achieved_weights`` /
+        ``micro_routes`` duck-typed).
+        """
+        return self._last_discretization_report
 
     @property
     def hydrated(self) -> bool:
@@ -717,8 +752,12 @@ class TradingRunner:
         pipeline is warm on the very first live bar. It never submits orders.
         """
         state = await self._state_with_account_equity(hydration.final_state)
+        self._record_state_regime(state)
         result = self._pipeline.run(state)
         self._last_pipeline_result = result
+        report = self._compute_discretization_report(state, result, result.targets)
+        if report is not None:
+            self._last_discretization_report = report
         self._ensure_daily_anchor(state)
         self._persisted = self._persisted  # keep property semantics explicit
         await self._refresh_bridge_caches()
@@ -756,6 +795,7 @@ class TradingRunner:
         if not isinstance(state, MarketState):
             raise TypeError(f"state must be a MarketState, got {type(state)!r}")
         state = await self._state_with_account_equity(state)
+        self._record_state_regime(state)
         self._states_processed += 1
         result: PipelineResult | None = None
         receipts: list[OrderReceipt] = []
@@ -792,6 +832,9 @@ class TradingRunner:
                 targets = self._translator.translate(
                     result.final_weights, state, equity=state.equity
                 )
+            report = self._compute_discretization_report(state, result, targets)
+            if report is not None:
+                self._last_discretization_report = report
             if targets is None:
                 self._ensure_daily_anchor(state)
                 await self._refresh_bridge_caches()
@@ -907,6 +950,34 @@ class TradingRunner:
         return summary
 
     # -- bridge publishing -----------------------------------------------------
+
+    def _record_state_regime(self, state: MarketState) -> None:
+        """Remember the latest non-empty market regime for the bridge rows."""
+        regime = state.regime
+        if isinstance(regime, str) and regime.strip():
+            self._last_regime = regime.strip()
+
+    def _compute_discretization_report(
+        self, state: MarketState, result: PipelineResult, targets: ContractTargetSet | None
+    ) -> object | None:
+        """Duck-type the translator's discretization report for this cycle."""
+        reporter = getattr(self._translator, "discretization_report", None)
+        if not callable(reporter) or targets is None:
+            return None
+        call = cast("Callable[..., object]", reporter)
+        if state.equity is not None:
+            try:
+                return call(result.final_weights, targets, state, equity=state.equity)
+            except TypeError:
+                pass
+            except Exception as exc:
+                logger.warning("discretization report unavailable for the runner state: %s", exc)
+                return None
+        try:
+            return call(result.final_weights, targets, state)
+        except Exception as exc:
+            logger.warning("discretization report unavailable for the runner state: %s", exc)
+            return None
 
     async def _refresh_bridge_caches(self) -> None:
         """Refresh the cached positions/account used by the bridge snapshot."""

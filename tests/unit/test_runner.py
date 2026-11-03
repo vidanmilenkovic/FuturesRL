@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from src.core.types import (
 )
 from src.execution.hydrator import HydrationError, HydrationResult
 from src.execution.runner import (
+    OFFLINE_SIMULATION_END,
     OfflineRunnerSession,
     RunnerConfigError,
     RunnerNotHydratedError,
@@ -970,3 +972,100 @@ async def test_offline_runner_session_warm_start_step_snapshot_close(
     await session.close()  # idempotent
     assert session.runner.halted is False
     assert session.exhausted is False
+
+
+# ---------------------------------------------------------------------------
+# Phase-10 follow-up: latest regime / discretization report on the runner
+# ---------------------------------------------------------------------------
+
+
+class FakeReportTranslator:
+    """Translator double exposing ``translate`` + ``discretization_report``."""
+
+    def __init__(self, report: object) -> None:
+        self.report = report
+        self.report_calls: list[dict[str, object]] = []
+
+    def translate(self, weights: object, state: object, *, equity: float | None = None) -> object:
+        raise AssertionError("the fake pipeline already attaches contract targets")
+
+    def discretization_report(
+        self, weights: object, targets: object, state: object, **kwargs: object
+    ) -> object:
+        self.report_calls.append(dict(kwargs))
+        return self.report
+
+
+async def test_runner_exposes_last_regime_and_bridge_rows_carry_it(
+    settings: Settings,
+) -> None:
+    store = RunnerBridgeStore(settings)
+    # ``make_market_state`` fixtures carry regime="neutral" by default.
+    runner, _fakes = make_runner(settings, states=single_state_states(1), bridge_store=store)
+    await runner.run(roots=("ES",))
+    assert runner.last_regime == "neutral"
+    loaded = store.load()
+    assert loaded is not None
+    assert loaded.instruments
+    assert {row.regime for row in loaded.instruments} == {"neutral"}
+
+
+async def test_runner_last_regime_is_none_when_states_carry_no_regime(
+    settings: Settings,
+) -> None:
+    states = [make_market_state(roots=("ES",), timestamp=FIXED_TIMESTAMP, regime=None)]
+    runner, _fakes = make_runner(settings, states=states)
+    await runner.run(roots=("ES",))
+    assert runner.last_regime is None
+
+
+async def test_runner_computes_last_discretization_report_for_the_bridge(
+    settings: Settings,
+) -> None:
+    report = SimpleNamespace(
+        tracking_error_pct=2.5,
+        tracking_error=0.025,
+        achieved_weights={"ES": 0.49},
+        micro_routes=(),
+    )
+    translator = FakeReportTranslator(report)
+    store = RunnerBridgeStore(settings)
+    runner, _fakes = make_runner(
+        settings,
+        states=single_state_states(1),
+        translator=translator,
+        bridge_store=store,
+    )
+    await runner.run(roots=("ES",))
+    assert runner.last_discretization_report is report
+    assert translator.report_calls == [{"equity": 1_000_000.0}]
+    loaded = store.load()
+    assert loaded is not None
+    assert loaded.tracking_error_source == "translator"
+    assert loaded.tracking_error_pct == pytest.approx(2.5)
+    row = next(row for row in loaded.instruments if row.instrument_id == "ES")
+    assert row.weight_actual == pytest.approx(0.49)
+
+
+async def test_offline_runner_session_snapshot_carries_market_state_regime(
+    settings: Settings,
+) -> None:
+    strategy_path = settings.strategies_dir / "tsmom_vol_target.yaml"
+    session = OfflineRunnerSession(settings, strategy_path=str(strategy_path))
+    try:
+        await session.warm_start()
+        # Inject a deterministic MarketState with an explicit regime: this is
+        # exactly the real runner + real bridge path the API consumes.
+        state = make_market_state(
+            roots=tuple(session.roots),
+            timestamp=OFFLINE_SIMULATION_END,
+            regime="risk-off",
+        )
+        await session.runner.run_once(state)
+        assert session.runner.last_regime == "risk-off"
+        snapshot = session.snapshot()
+        assert snapshot is not None
+        assert snapshot.instruments
+        assert {row.regime for row in snapshot.instruments} == {"risk-off"}
+    finally:
+        await session.close()

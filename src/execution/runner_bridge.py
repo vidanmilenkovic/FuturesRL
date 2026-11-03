@@ -27,6 +27,15 @@ Design rules
 * **Bounded payload** — working orders and fills are capped at
   :data:`MAX_BRIDGE_ORDERS` / :data:`MAX_BRIDGE_FILLS` (most recent, chronological)
   so the JSON stays small enough for the dashboard to poll.
+* **Full pipeline breakdown (Phase 10)** — alongside the flat ``pipeline`` scalar
+  summary the snapshot carries ``instruments`` (one :class:`BridgePipelineRow`
+  per root: base/timing/risk/final/actual weights, target contracts, notional,
+  driver and regime), ``micro_routing`` (:class:`BridgeMicroRouting` pairs),
+  ``tracking_error_pct`` and ``tracking_error_source`` (``translator`` when the
+  :class:`~src.risk.contract_translator.ContractTranslator` discretization report
+  was available, else ``fallback``). This is purely additive: payloads written by
+  older runners still load (new fields default) and older readers ignore the new
+  keys, so :data:`BRIDGE_SCHEMA_VERSION` stays ``1``.
 * **No heavyweight imports** — this module never imports the runner, the OMS or
   the backtester, so the lazy ``src.execution.__init__`` stays runpy-warning free
   and the API can import it without pulling the IBKR stack in.
@@ -57,8 +66,12 @@ __all__ = [
     "BRIDGE_SCHEMA_VERSION",
     "DEFAULT_STALE_AFTER_SECONDS",
     "MAX_BRIDGE_FILLS",
+    "MAX_BRIDGE_INSTRUMENTS",
+    "MAX_BRIDGE_MICRO_ROUTES",
     "MAX_BRIDGE_ORDERS",
     "BridgeFill",
+    "BridgeMicroRouting",
+    "BridgePipelineRow",
     "BridgePosition",
     "BridgeSchemaError",
     "BridgeWorkingOrder",
@@ -85,6 +98,10 @@ DEFAULT_STALE_AFTER_SECONDS: float = 15.0
 #: Maximum number of in-flight orders / fills published in one snapshot.
 MAX_BRIDGE_ORDERS: int = 200
 MAX_BRIDGE_FILLS: int = 200
+
+#: Maximum per-instrument pipeline rows / micro-routing pairs published.
+MAX_BRIDGE_INSTRUMENTS: int = 200
+MAX_BRIDGE_MICRO_ROUTES: int = 200
 
 _SIDES: frozenset[str] = frozenset({"BUY", "SELL"})
 
@@ -202,6 +219,22 @@ def _as_sequence(value: object) -> tuple[object, ...] | None:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         return None
     return tuple(value)
+
+
+def _as_iterable_sequence(value: object) -> tuple[object, ...] | None:
+    """Like :func:`_as_sequence` but also accepts iterable-only containers.
+
+    ``ContractTargetSet`` is iterable/sized but deliberately not a
+    ``collections.abc.Sequence`` (it has no ``__getitem__``), so the pipeline
+    breakdown extractors use this tolerant helper.
+    """
+    if isinstance(value, (str, bytes, bytearray, Mapping)):
+        return None
+    if isinstance(value, Sequence):
+        return tuple(value)
+    if isinstance(value, Iterable):
+        return tuple(value)
+    return None
 
 
 def _coerce_scalar(value: object) -> ScalarValue:
@@ -489,6 +522,209 @@ class BridgeFill:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class BridgePipelineRow:
+    """One per-instrument weight trace from the latest pipeline cycle.
+
+    The field names intentionally mirror the frozen API waterfall contract
+    (:class:`src.api.schemas.PipelineInstrumentRow`) so the API can render the
+    Weight matrix from the bridge row dicts almost verbatim; ``root``, ``driver``
+    and ``regime`` are additive bridge-only context (``reason`` is serialised as
+    the API-compatible alias of ``driver``).
+
+    ``weight_actual`` is the weight actually achieved by the discrete contract
+    book (signed notional / equity) when a discretization report/fallback is
+    available, else ``None``. ``notional`` is the target contract notional (or
+    ``w_final * equity`` when no contract target exists).
+    """
+
+    instrument_id: str
+    root: str
+    asset_class: str
+    selected: bool
+    weight_base: float
+    weight_timing: float
+    weight_risk: float
+    weight_final: float
+    weight_actual: float | None
+    delta_timing: float
+    delta_risk: float
+    target_contracts: int | None
+    notional: float | None
+    driver: str
+    regime: str | None
+
+    def __post_init__(self) -> None:
+        for name in ("instrument_id", "root", "asset_class", "driver"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise BridgeSchemaError(f"pipeline_row.{name} must be a non-empty string")
+        if not isinstance(self.selected, bool):
+            raise BridgeSchemaError("pipeline_row.selected must be a bool")
+        for name in (
+            "weight_base",
+            "weight_timing",
+            "weight_risk",
+            "weight_final",
+            "delta_timing",
+            "delta_risk",
+        ):
+            value = _as_float(getattr(self, name))
+            if value is None:
+                raise BridgeSchemaError(f"pipeline_row.{name} must be a finite number")
+            object.__setattr__(self, name, value)
+        if self.weight_actual is not None:
+            actual = _as_float(self.weight_actual)
+            if actual is None:
+                raise BridgeSchemaError("pipeline_row.weight_actual must be finite or None")
+            object.__setattr__(self, "weight_actual", actual)
+        if self.target_contracts is not None:
+            contracts = _as_int(self.target_contracts)
+            if contracts is None:
+                raise BridgeSchemaError("pipeline_row.target_contracts must be an int or None")
+            object.__setattr__(self, "target_contracts", contracts)
+        if self.notional is not None:
+            notional = _as_float(self.notional)
+            if notional is None:
+                raise BridgeSchemaError("pipeline_row.notional must be finite or None")
+            object.__setattr__(self, "notional", notional)
+        if self.regime is not None and not isinstance(self.regime, str):
+            raise BridgeSchemaError("pipeline_row.regime must be a string or None")
+
+    @property
+    def reason(self) -> str:
+        """API-compatible alias of :attr:`driver`."""
+        return self.driver
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable representation (API-compatible keys)."""
+        return {
+            "instrument_id": self.instrument_id,
+            "root": self.root,
+            "asset_class": self.asset_class,
+            "selected": self.selected,
+            "weight_base": round(self.weight_base, 8),
+            "weight_timing": round(self.weight_timing, 8),
+            "weight_risk": round(self.weight_risk, 8),
+            "weight_final": round(self.weight_final, 8),
+            "weight_actual": (
+                round(self.weight_actual, 8) if self.weight_actual is not None else None
+            ),
+            "delta_timing": round(self.delta_timing, 8),
+            "delta_risk": round(self.delta_risk, 8),
+            "target_contracts": self.target_contracts,
+            "notional": round(self.notional, 2) if self.notional is not None else None,
+            "driver": self.driver,
+            "reason": self.driver,
+            "regime": self.regime,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> BridgePipelineRow:
+        """Parse a bridge pipeline row (missing optional fields degrade gracefully)."""
+        if not isinstance(payload, Mapping):
+            raise BridgeSchemaError("pipeline_row payload must be a mapping")
+        instrument_id = _require_str(payload, "instrument_id", context="pipeline_row")
+        weight_base = _require_float(payload, "weight_base", context="pipeline_row")
+        weight_timing = _require_float(payload, "weight_timing", context="pipeline_row")
+        weight_risk = _require_float(payload, "weight_risk", context="pipeline_row")
+        weight_final = _require_float(payload, "weight_final", context="pipeline_row")
+        raw_selected = payload.get("selected", True)
+        raw_actual = payload.get("weight_actual")
+        raw_contracts = payload.get("target_contracts")
+        raw_notional = payload.get("notional")
+        driver = _optional_str(payload.get("driver")) or _optional_str(payload.get("reason"))
+        return cls(
+            instrument_id=instrument_id,
+            root=_optional_str(payload.get("root")) or instrument_id,
+            asset_class=_optional_str(payload.get("asset_class")) or "unknown",
+            selected=bool(raw_selected),
+            weight_base=weight_base,
+            weight_timing=weight_timing,
+            weight_risk=weight_risk,
+            weight_final=weight_final,
+            weight_actual=None
+            if raw_actual is None
+            else _require_float(payload, "weight_actual", context="pipeline_row"),
+            delta_timing=(
+                _require_float(payload, "delta_timing", context="pipeline_row")
+                if payload.get("delta_timing") is not None
+                else weight_timing - weight_base
+            ),
+            delta_risk=(
+                _require_float(payload, "delta_risk", context="pipeline_row")
+                if payload.get("delta_risk") is not None
+                else weight_risk - weight_timing
+            ),
+            target_contracts=(
+                None
+                if raw_contracts is None
+                else _require_int(payload, "target_contracts", context="pipeline_row")
+            ),
+            notional=(
+                None
+                if raw_notional is None
+                else _require_float(payload, "notional", context="pipeline_row")
+            ),
+            driver=driver or "passed through unchanged",
+            regime=_optional_str(payload.get("regime")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeMicroRouting:
+    """One achieved standard/micro contract routing pair from the translator."""
+
+    family: str
+    standard_root: str
+    standard_quantity: int
+    micro_root: str
+    micro_quantity: int
+
+    def __post_init__(self) -> None:
+        for name in ("family", "standard_root", "micro_root"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise BridgeSchemaError(f"micro_routing.{name} must be a non-empty string")
+        for name in ("standard_quantity", "micro_quantity"):
+            value = _as_int(getattr(self, name))
+            if value is None:
+                raise BridgeSchemaError(f"micro_routing.{name} must be an int")
+            object.__setattr__(self, name, value)
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable representation (API ``MicroRoutingEntry`` keys)."""
+        return {
+            "family": self.family,
+            "standard_root": self.standard_root,
+            "standard_quantity": self.standard_quantity,
+            "micro_root": self.micro_root,
+            "micro_quantity": self.micro_quantity,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> BridgeMicroRouting:
+        """Parse a bridge micro-routing payload."""
+        if not isinstance(payload, Mapping):
+            raise BridgeSchemaError("micro_routing payload must be a mapping")
+        standard_root = _require_str(payload, "standard_root", context="micro_routing")
+        return cls(
+            family=_optional_str(payload.get("family")) or standard_root,
+            standard_root=standard_root,
+            standard_quantity=(
+                _require_int(payload, "standard_quantity", context="micro_routing")
+                if payload.get("standard_quantity") is not None
+                else 0
+            ),
+            micro_root=_require_str(payload, "micro_root", context="micro_routing"),
+            micro_quantity=(
+                _require_int(payload, "micro_quantity", context="micro_routing")
+                if payload.get("micro_quantity") is not None
+                else 0
+            ),
+        )
+
+
 type _PayloadParser = Callable[[Mapping[str, object]], object]
 
 
@@ -533,6 +769,15 @@ class RunnerBridgeSnapshot:
         In-flight orders (most recent :data:`MAX_BRIDGE_ORDERS`).
     fills:
         Execution reports (most recent :data:`MAX_BRIDGE_FILLS`).
+    instruments:
+        Full per-instrument pipeline weight matrix rows (Phase 10, additive).
+    micro_routing:
+        Achieved standard -> micro contract routing pairs (Phase 10, additive).
+    tracking_error_pct:
+        Discretization tracking error in percent (``None`` when unavailable).
+    tracking_error_source:
+        ``translator`` when the real discretization report was used, else
+        ``fallback`` (arithmetic estimate from the discrete book).
     """
 
     schema_version: int
@@ -547,6 +792,10 @@ class RunnerBridgeSnapshot:
     positions: tuple[BridgePosition, ...] = ()
     working_orders: tuple[BridgeWorkingOrder, ...] = ()
     fills: tuple[BridgeFill, ...] = ()
+    instruments: tuple[BridgePipelineRow, ...] = ()
+    micro_routing: tuple[BridgeMicroRouting, ...] = ()
+    tracking_error_pct: float | None = None
+    tracking_error_source: str = "fallback"
 
     def __post_init__(self) -> None:
         version = _as_int(self.schema_version)
@@ -596,11 +845,42 @@ class RunnerBridgeSnapshot:
             )
         if len(fills) > MAX_BRIDGE_FILLS:
             raise BridgeSchemaError(f"snapshot.fills exceeds the {MAX_BRIDGE_FILLS} entry cap")
+        instruments = tuple(self.instruments)
+        micro_routing = tuple(self.micro_routing)
+        for row in instruments:
+            if not isinstance(row, BridgePipelineRow):
+                raise BridgeSchemaError("snapshot.instruments entries must be BridgePipelineRow")
+        for route in micro_routing:
+            if not isinstance(route, BridgeMicroRouting):
+                raise BridgeSchemaError("snapshot.micro_routing entries must be BridgeMicroRouting")
+        if len(instruments) > MAX_BRIDGE_INSTRUMENTS:
+            raise BridgeSchemaError(
+                f"snapshot.instruments exceeds the {MAX_BRIDGE_INSTRUMENTS} entry cap"
+            )
+        if len(micro_routing) > MAX_BRIDGE_MICRO_ROUTES:
+            raise BridgeSchemaError(
+                f"snapshot.micro_routing exceeds the {MAX_BRIDGE_MICRO_ROUTES} entry cap"
+            )
+        if self.tracking_error_pct is not None:
+            tracking = _as_float(self.tracking_error_pct)
+            if tracking is None or tracking < 0.0:
+                raise BridgeSchemaError(
+                    "snapshot.tracking_error_pct must be a finite non-negative number or None"
+                )
+            object.__setattr__(self, "tracking_error_pct", tracking)
+        if self.tracking_error_source not in ("translator", "fallback"):
+            raise BridgeSchemaError(
+                "snapshot.tracking_error_source must be 'translator' or 'fallback'"
+            )
         object.__setattr__(
             self, "positions", tuple(sorted(positions, key=lambda item: item.instrument_id))
         )
         object.__setattr__(self, "working_orders", working_orders)
         object.__setattr__(self, "fills", fills)
+        object.__setattr__(
+            self, "instruments", tuple(sorted(instruments, key=lambda row: row.instrument_id))
+        )
+        object.__setattr__(self, "micro_routing", micro_routing)
 
     # -- staleness -------------------------------------------------------------
 
@@ -626,6 +906,10 @@ class RunnerBridgeSnapshot:
             "positions": [position.to_dict() for position in self.positions],
             "working_orders": [order.to_dict() for order in self.working_orders],
             "fills": [fill.to_dict() for fill in self.fills],
+            "instruments": [row.to_dict() for row in self.instruments],
+            "micro_routing": [route.to_dict() for route in self.micro_routing],
+            "tracking_error_pct": self.tracking_error_pct,
+            "tracking_error_source": self.tracking_error_source,
         }
 
     @classmethod
@@ -685,6 +969,26 @@ class RunnerBridgeSnapshot:
                     payload.get("fills", ()), name="fills", parser=BridgeFill.from_dict
                 ),
             ),
+            # Phase-10 additive fields: absent in v1 snapshots written by older
+            # runners, so they default to empty/None and keep loading.
+            instruments=cast(
+                "tuple[BridgePipelineRow, ...]",
+                _sequence_payload(
+                    payload.get("instruments", ()),
+                    name="instruments",
+                    parser=BridgePipelineRow.from_dict,
+                ),
+            ),
+            micro_routing=cast(
+                "tuple[BridgeMicroRouting, ...]",
+                _sequence_payload(
+                    payload.get("micro_routing", ()),
+                    name="micro_routing",
+                    parser=BridgeMicroRouting.from_dict,
+                ),
+            ),
+            tracking_error_pct=_optional_float(payload, "tracking_error_pct"),
+            tracking_error_source=_optional_str(payload.get("tracking_error_source")) or "fallback",
         )
 
 
@@ -1166,7 +1470,7 @@ def _pipeline_from_result(result: object | None) -> Mapping[str, ScalarValue] | 
         except TypeError:  # pragma: no cover - defensive against odd doubles
             pipeline["targets"] = None
         book: list[str] = []
-        for target in cast("Iterable[object]", targets):
+        for target in _as_iterable_sequence(targets) or ():
             instrument_id = _optional_str(getattr(target, "instrument_id", None))
             quantity = _as_int(getattr(target, "quantity", None))
             if instrument_id is not None and quantity is not None:
@@ -1196,6 +1500,374 @@ def _tracking_error_from_diagnostics(diagnostics: Mapping[object, object]) -> fl
             if number is not None:
                 return number
     return None
+
+
+# ---------------------------------------------------------------------------
+# Pipeline weight-matrix extraction (Phase 10, duck-typed)
+# ---------------------------------------------------------------------------
+
+
+def _field(value: object, name: str, default: object = None) -> object:
+    """Field access supporting both mapping- and attribute-based duck types."""
+    if isinstance(value, Mapping):
+        return cast("Mapping[str, object]", value).get(name, default)
+    return getattr(value, name, default)
+
+
+def _weight_map(vector: object) -> dict[str, float]:
+    """Finite ``instrument -> weight`` mapping from a WeightVector-like object."""
+    raw = _field(vector, "weights")
+    if not isinstance(raw, Mapping):
+        return {}
+    weights: dict[str, float] = {}
+    for key, value in raw.items():
+        number = _as_float(value)
+        if isinstance(key, str) and number is not None:
+            weights[key] = number
+    return weights
+
+
+def _targets_map(result: object) -> dict[str, object]:
+    """``instrument -> ContractTarget`` mapping from a PipelineResult-like object."""
+    sequence = _as_iterable_sequence(_field(result, "targets"))
+    if sequence is None:
+        return {}
+    targets: dict[str, object] = {}
+    for target in sequence:
+        instrument_id = _optional_str(_field(target, "instrument_id"))
+        if instrument_id is not None:
+            targets[instrument_id] = target
+    return targets
+
+
+def _universe_roots(result: object) -> set[str]:
+    sequence = _as_sequence(_field(result, "universe"))
+    if sequence is None:
+        return set()
+    return {str(root) for root in sequence if str(root)}
+
+
+def _asset_class_text(master: object, root: str) -> str:
+    """Asset-class enum value for ``root`` via the instrument master (duck-typed)."""
+    unknown = "unknown"
+    if master is None:
+        return unknown
+    try:
+        has = getattr(master, "has", None)
+        get = getattr(master, "get", None)
+        if callable(has) and callable(get) and bool(has(root)):
+            spec = get(root)
+            text = _enum_text(_field(spec, "asset_class"))
+            if text:
+                return text
+    except Exception:  # pragma: no cover - defensive against exotic masters
+        return unknown
+    return unknown
+
+
+def _adjustment_driver(
+    selected: bool, base: float, timing: float, risk: float, quantity: int
+) -> str:
+    """Per-instrument driver label (identical semantics to the API waterfall)."""
+    if not selected:
+        return "filtered out by the universe selector"
+    if timing != base:
+        return "scaled by the timing/term-structure overlay"
+    if risk != timing:
+        return "projected by the risk overlays (vol target / LLM breaker)"
+    if quantity == 0:
+        return "rounded flat by the contract translator (below buffer)"
+    return "passed through unchanged"
+
+
+def _fallback_achieved_weights(
+    targets: Mapping[str, object], equity: float | None
+) -> dict[str, float] | None:
+    """Arithmetic ``signed notional / equity`` achieved weights from the book.
+
+    An empty target set is a genuinely flat achieved book (``{}``), not "unknown":
+    the tracking error then measures the unachieved requested weights, which is
+    the information the dashboard needs after a risk overlay flattens the book.
+    """
+    if equity is None or equity <= 0.0:
+        return None
+    achieved: dict[str, float] = {}
+    for root, target in targets.items():
+        notional = _as_float(_field(target, "signed_notional"))
+        if notional is None:
+            quantity = _as_int(_field(target, "quantity"))
+            price = _as_positive(_field(target, "price"))
+            multiplier = _as_positive(_field(target, "multiplier"))
+            if quantity is None or price is None or multiplier is None:
+                continue
+            notional = float(quantity) * price * multiplier
+        achieved[root] = notional / equity
+    return achieved
+
+
+def _tracking_error_from_weights(
+    final_weights: Mapping[str, float], achieved_weights: Mapping[str, float]
+) -> float:
+    """Half-L1 notional tracking error in percent (the translator's convention)."""
+    roots = set(final_weights) | set(achieved_weights)
+    if not roots:
+        return 0.0
+    error = 0.5 * math.fsum(
+        abs(final_weights.get(root, 0.0) - achieved_weights.get(root, 0.0)) for root in roots
+    )
+    return round(max(0.0, error) * 100.0, 6)
+
+
+def _micro_routing_from_targets(
+    targets: Mapping[str, object], master: object
+) -> tuple[BridgeMicroRouting, ...]:
+    """Derive standard/micro pairs from the achieved discrete contract book."""
+    if not targets or master is None:
+        return ()
+    get = getattr(master, "get", None)
+    has = getattr(master, "has", None)
+    if not callable(get) or not callable(has):
+        return ()
+    routes: list[BridgeMicroRouting] = []
+    seen_families: set[str] = set()
+    for root in sorted(targets):
+        family = root
+        try:
+            if bool(has(root)):
+                spec = get(root)
+                standard_root = _optional_str(_field(spec, "standard_root"))
+                family = standard_root or _optional_str(_field(spec, "root")) or root
+        except Exception:  # pragma: no cover - defensive against exotic masters
+            family = root
+        if family in seen_families:
+            continue
+        seen_families.add(family)
+        try:
+            if not bool(has(family)):
+                continue
+            micro_root = _optional_str(_field(get(family), "micro_root"))
+            micro_quantity = _as_int(_field(targets.get(micro_root or ""), "quantity")) or 0
+            standard_quantity = _as_int(_field(targets.get(family), "quantity")) or 0
+        except Exception:  # pragma: no cover - defensive against exotic masters
+            continue
+        if micro_root is None or micro_quantity == 0:
+            continue
+        routes.append(
+            BridgeMicroRouting(
+                family=family,
+                standard_root=family,
+                standard_quantity=standard_quantity,
+                micro_root=micro_root,
+                micro_quantity=micro_quantity,
+            )
+        )
+    return tuple(routes)
+
+
+def _micro_routing_from_report(report: object) -> tuple[BridgeMicroRouting, ...]:
+    """Read ``micro_routes`` (or ``routes``) from a duck-typed discretization report."""
+    raw = _field(report, "micro_routes")
+    if raw is None:
+        raw = _field(report, "routes")
+    sequence = _as_sequence(raw)
+    if sequence is None:
+        return ()
+    routes: list[BridgeMicroRouting] = []
+    for entry in sequence:
+        standard_root = _optional_str(_field(entry, "standard_root"))
+        micro_root = _optional_str(_field(entry, "micro_root"))
+        if standard_root is None or micro_root is None:
+            continue
+        routes.append(
+            BridgeMicroRouting(
+                family=_optional_str(_field(entry, "family")) or standard_root,
+                standard_root=standard_root,
+                standard_quantity=_as_int(_field(entry, "standard_quantity")) or 0,
+                micro_root=micro_root,
+                micro_quantity=_as_int(_field(entry, "micro_quantity")) or 0,
+            )
+        )
+    return tuple(routes)
+
+
+def _achieved_from_report(report: object) -> dict[str, float] | None:
+    raw = _field(report, "achieved_weights")
+    if not isinstance(raw, Mapping):
+        return None
+    achieved: dict[str, float] = {}
+    for key, value in raw.items():
+        number = _as_float(value)
+        if isinstance(key, str) and number is not None:
+            achieved[key] = number
+    return achieved or None
+
+
+def _translator_report(
+    runner: object, result: object | None, equity: float | None
+) -> object | None:
+    """Duck-type the runner's latest translator/discretization report.
+
+    Preferred sources, in order:
+
+    1. ``runner.last_discretization_report`` / ``runner.translator_report``
+       (a runner that already computed the report once per state);
+    2. ``runner.pipeline.translator.discretization_report(...)`` invoked against
+       ``runner.last_market_state`` / the pipeline result (tolerant: the runner,
+       pipeline and state are all duck-typed, and any failure degrades to the
+       arithmetic ``fallback`` rather than failing the snapshot).
+    """
+    for attribute in ("last_discretization_report", "translator_report"):
+        candidate = getattr(runner, attribute, None)
+        if candidate is not None and not callable(candidate):
+            return cast("object", candidate)
+    if result is None:
+        return None
+    pipeline = getattr(runner, "pipeline", None)
+    translator = getattr(pipeline, "translator", None)
+    reporter = getattr(translator, "discretization_report", None)
+    state = getattr(runner, "last_market_state", None)
+    weights = _field(result, "final_weights")
+    targets = _field(result, "targets")
+    if not callable(reporter) or state is None or targets is None or weights is None:
+        return None
+    call = cast("Callable[..., object]", reporter)
+    kwargs: dict[str, object] = {"equity": equity} if equity is not None else {}
+    try:
+        return call(weights, targets, state, **kwargs)
+    except TypeError:
+        try:
+            return call(weights, targets, state)
+        except Exception as exc:  # pragma: no cover - defensive vendor-free fallback
+            logger.warning("translator discretization report unavailable: %s", exc)
+            return None
+    except Exception as exc:  # pragma: no cover - defensive vendor-free fallback
+        logger.warning("translator discretization report failed: %s", exc)
+        return None
+
+
+def _runner_equity(runner: object, account: Mapping[str, float] | None) -> float | None:
+    if account is not None:
+        net_liquidation = _as_positive(account.get("net_liquidation"))
+        if net_liquidation is not None:
+            return net_liquidation
+    for attribute in ("equity", "net_liquidation"):
+        value = _as_positive(getattr(runner, attribute, None))
+        if value is not None:
+            return value
+    state = getattr(runner, "last_market_state", None)
+    return _as_positive(_field(state, "equity"))
+
+
+def _runner_regime(runner: object) -> str | None:
+    for attribute in ("last_regime", "regime"):
+        value = _optional_str(getattr(runner, attribute, None))
+        if value is not None:
+            return value
+    state = getattr(runner, "last_market_state", None)
+    return _optional_str(_field(state, "regime"))
+
+
+def _pipeline_rows_from_result(
+    result: object | None,
+    *,
+    master: object,
+    achieved: Mapping[str, float] | None,
+    equity: float | None,
+    regime: str | None,
+) -> tuple[BridgePipelineRow, ...]:
+    """Build the per-instrument weight-matrix rows from a pipeline result."""
+    if result is None:
+        return ()
+    base = _weight_map(_field(result, "base_weights"))
+    timing = _weight_map(_field(result, "timing_weights"))
+    risk = _weight_map(_field(result, "risk_weights"))
+    final = _weight_map(_field(result, "final_weights"))
+    targets = _targets_map(result)
+    selected = _universe_roots(result)
+    roots = set(base) | set(timing) | set(risk) | set(final) | set(targets) | selected
+    if not roots:
+        return ()
+    rows: list[BridgePipelineRow] = []
+    for root in sorted(roots):
+        target = targets.get(root)
+        quantity = None if target is None else _as_int(_field(target, "quantity"))
+        notional = None if target is None else _as_float(_field(target, "signed_notional"))
+        if notional is None and equity is not None:
+            notional = final.get(root, 0.0) * equity
+        row_base = base.get(root, 0.0)
+        row_timing = timing.get(root, 0.0)
+        row_risk = risk.get(root, 0.0)
+        row_final = final.get(root, 0.0)
+        rows.append(
+            BridgePipelineRow(
+                instrument_id=root,
+                root=root,
+                asset_class=_asset_class_text(master, root),
+                selected=root in selected,
+                weight_base=round(row_base, 8),
+                weight_timing=round(row_timing, 8),
+                weight_risk=round(row_risk, 8),
+                weight_final=round(row_final, 8),
+                weight_actual=(round(achieved.get(root, 0.0), 8) if achieved is not None else None),
+                delta_timing=round(row_timing - row_base, 8),
+                delta_risk=round(row_risk - row_timing, 8),
+                target_contracts=quantity,
+                notional=round(notional, 2) if notional is not None else None,
+                driver=_adjustment_driver(
+                    root in selected, row_base, row_timing, row_risk, quantity or 0
+                ),
+                regime=regime,
+            )
+        )
+    return tuple(rows)
+
+
+def _pipeline_detail(
+    runner: object, result: object | None, *, account: Mapping[str, float] | None
+) -> tuple[
+    tuple[BridgePipelineRow, ...],
+    tuple[BridgeMicroRouting, ...],
+    float | None,
+    str,
+]:
+    """Return ``(rows, micro_routing, tracking_error_pct, tracking_error_source)``."""
+    if result is None:
+        return ((), (), None, "fallback")
+    equity = _runner_equity(runner, account)
+    master = getattr(runner, "instrument_master", None)
+    targets = _targets_map(result)
+    final_weights = _weight_map(_field(result, "final_weights"))
+    report = _translator_report(runner, result, equity)
+    achieved = _achieved_from_report(report) if report is not None else None
+    if achieved is None:
+        achieved = _fallback_achieved_weights(targets, equity)
+    tracking: float | None = None
+    if report is not None:
+        tracking = _as_float(_field(report, "tracking_error_pct"))
+        if tracking is None:
+            raw_error = _as_float(_field(report, "tracking_error"))
+            tracking = raw_error * 100.0 if raw_error is not None else None
+    if tracking is None:
+        diagnostics = _field(result, "diagnostics")
+        if isinstance(diagnostics, Mapping):
+            tracking = _tracking_error_from_diagnostics(
+                cast("Mapping[object, object]", diagnostics)
+            )
+    if tracking is None and achieved is not None:
+        tracking = _tracking_error_from_weights(final_weights, achieved)
+    if tracking is not None:
+        tracking = round(max(0.0, float(tracking)), 6)
+    routes = _micro_routing_from_report(report) if report is not None else ()
+    if not routes:
+        routes = _micro_routing_from_targets(targets, master)
+    rows = _pipeline_rows_from_result(
+        result,
+        master=master,
+        achieved=achieved,
+        equity=equity,
+        regime=_runner_regime(runner),
+    )
+    return (rows, routes, tracking, "translator" if report is not None else "fallback")
 
 
 def _runner_mode(runner: object, explicit: str | None) -> BridgeMode:
@@ -1245,6 +1917,15 @@ def snapshot_from_runner(
     skipped gracefully (``None``/empty collections) instead of failing a live
     state transition.
 
+    The Phase-10 pipeline weight matrix is serialised from the latest pipeline
+    result plus the best available discretization report: ``runner
+    .last_discretization_report`` / ``runner.translator_report`` when the runner
+    exposes one, else ``runner.pipeline.translator.discretization_report(...)``
+    against ``runner.last_market_state`` (all duck-typed, no import of the risk
+    layer); failing that an arithmetic ``fallback`` computes achieved weights /
+    tracking error from the discrete target book and reports
+    ``tracking_error_source="fallback"``.
+
     Parameters
     ----------
     runner:
@@ -1281,6 +1962,19 @@ def snapshot_from_runner(
         limit=MAX_BRIDGE_FILLS,
         key="timestamp",
     )
+    account = _account_from_runner(runner, broker)
+    rows, micro_routing, tracking_error_pct, tracking_error_source = _pipeline_detail(
+        runner, resolved_result, account=account
+    )
+    pipeline = _pipeline_from_result(resolved_result)
+    if pipeline is not None:
+        enriched = dict(pipeline)
+        enriched["instruments"] = len(rows)
+        enriched["micro_routes"] = len(micro_routing)
+        enriched["tracking_error_source"] = tracking_error_source
+        if tracking_error_pct is not None:
+            enriched["tracking_error_pct"] = tracking_error_pct
+        pipeline = MappingProxyType(enriched)
     return RunnerBridgeSnapshot(
         schema_version=BRIDGE_SCHEMA_VERSION,
         runner_id=_runner_identifier(runner),
@@ -1289,9 +1983,13 @@ def snapshot_from_runner(
         updated_at=_runner_clock(runner),
         stale_after_seconds=stale,
         status=_status_from_runner(runner),
-        account=_account_from_runner(runner, broker),
-        pipeline=_pipeline_from_result(resolved_result),
+        account=account,
+        pipeline=pipeline,
         positions=_positions_from_runner(runner, broker),
         working_orders=tuple(BridgeWorkingOrder.from_dict(payload) for payload in working_orders),
         fills=tuple(BridgeFill.from_dict(payload) for payload in fills),
+        instruments=rows,
+        micro_routing=micro_routing,
+        tracking_error_pct=tracking_error_pct,
+        tracking_error_source=tracking_error_source,
     )
