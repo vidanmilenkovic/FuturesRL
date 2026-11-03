@@ -45,3 +45,6 @@ frontend/.turbo/
 /artifacts/
 /reports/*.html
 !reports/.gitkeep
+
+# Phase 11B: headless E2E verification screenshots stay out of git
+artifacts/screenshots/
