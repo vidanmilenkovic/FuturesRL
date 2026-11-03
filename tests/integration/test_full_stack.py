@@ -137,11 +137,17 @@ def test_market_states_are_point_in_time(market_states, instrument_master) -> No
     for feature in ("ret_1d", "ret_21d", "ret_126d", "vol_20d", "volume_oi_ratio"):
         assert np.isfinite(state.feature("ES", feature)), feature
     assert state.equity == pytest.approx(INITIAL_EQUITY)
-    # Documented data-layer behaviour: a single-contract synthetic frame has no
-    # term structure; term_slope/carry_annualized are NaN until a continuous
-    # (multi-expiry) frame or exogenous curve is supplied. Live ingestion always
-    # provides the continuous frame, so production pipelines see finite values.
-    assert np.isnan(state.feature("ES", "term_slope"))
+    # Post-A2 data-layer behaviour: the offline source emits a deterministic,
+    # roll-aware front (F1) + second-month (F2) pair, so term structure and carry
+    # are finite and non-zero at every decision timestamp (they used to be NaN when
+    # the synthetic frame carried a single contract).
+    term_slope = state.feature("ES", "term_slope")
+    carry = state.feature("ES", "carry_annualized")
+    assert np.isfinite(term_slope)
+    assert np.isfinite(carry)
+    assert term_slope != 0.0
+    assert carry != 0.0
+    assert np.sign(carry) == -np.sign(term_slope)
 
 
 def test_full_pipeline_runs_and_attaches_targets(

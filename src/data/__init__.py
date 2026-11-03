@@ -36,6 +36,14 @@ Live news / macro headlines
     deterministic-fixture headline resolution returning immutable
     :class:`~src.data.news_ingestor.NewsHeadline` objects (root/severity/sentiment
     classified) for the LLM Risk-First engine and the Risk Monitor live feed.
+
+Synthetic offline term structure
+    :class:`~src.data.term_structure.SyntheticTermStructure` — deterministic,
+    roll-aware F1/F2 curve (root/regime-specific contango/backwardation) used by
+    :class:`~src.data.databento_loader.OfflineBarSource` so offline/DRL training
+    derives finite, non-zero ``term_slope``/``carry_annualized`` instead of
+    zero-filled fallbacks. :func:`~src.data.term_structure.offline_term_structure_metadata`
+    reports the per-root curve metadata for trainer/strategy checkpoints.
 """
 
 from __future__ import annotations
@@ -60,9 +68,17 @@ from src.data.ibkr_data import IBKRMarketDataStreamer
 from src.data.market_state_builder import MarketStateBuilder
 from src.data.news_ingestor import NewsHeadline, NewsIngestor, Severity, SourceKind
 from src.data.storage import ParquetRepository, StorageError, WriteMode
+from src.data.term_structure import (
+    CarryProfile,
+    SyntheticTermStructure,
+    TermRegime,
+    TermStructureCurve,
+    offline_term_structure_metadata,
+)
 
 __all__ = [
     "CalendarRollSchedule",
+    "CarryProfile",
     "ContinuousContractBuilder",
     "DatabentoIngestError",
     "DatabentoLoader",
@@ -79,8 +95,12 @@ __all__ = [
     "Severity",
     "SourceKind",
     "StorageError",
+    "SyntheticTermStructure",
+    "TermRegime",
+    "TermStructureCurve",
     "VolumeOICrossoverRollSchedule",
     "WriteMode",
+    "offline_term_structure_metadata",
     "schema",
     "synthetic_reference_price",
 ]

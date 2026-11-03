@@ -628,15 +628,24 @@ class ColdStartHydrator:
 
     @staticmethod
     def _coverage(bars: pl.DataFrame, roots: Sequence[InstrumentId]) -> dict[str, int]:
-        """Observed bar count per root (``0`` for a root without stored bars)."""
+        """Observed bar count per root (``0`` for a root without stored bars).
+
+        Counts *distinct bar timestamps* per root, not raw rows: canonical history
+        may carry several expirations per timestamp (front + second month from
+        Databento parent symbology or the synthetic offline curve), and the warm-up
+        requirement is expressed in decision bars, not contract legs. For
+        single-expiration sources the result is identical to a row count.
+        """
         counts: dict[str, int] = dict.fromkeys(roots, 0)
         if bars.is_empty():
             return counts
-        grouped = bars.group_by(s.ROOT_SYMBOL_COLUMN).len()
+        grouped = bars.group_by(s.ROOT_SYMBOL_COLUMN).agg(
+            pl.col(s.TIMESTAMP_COLUMN).n_unique().alias("bars")
+        )
         for record in grouped.iter_rows(named=True):
             root = str(record[s.ROOT_SYMBOL_COLUMN])
             if root in counts:
-                counts[root] = int(record["len"])
+                counts[root] = int(record["bars"])
         return counts
 
     def _backfill_window(

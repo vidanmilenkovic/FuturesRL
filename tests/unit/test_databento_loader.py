@@ -382,12 +382,18 @@ def test_offline_source_is_deterministic_and_synthetic() -> None:
     first = source.load(["ES", "NQ"], window_start, window_end)
     second = source.load(["ES", "NQ"], window_start, window_end)
     assert source.is_synthetic is True
+    assert source.term_structure_enabled is True
     assert source.available_roots() == ("ES", "NQ")
     assert first.equals(second)
     assert s.ensure_bars_schema(first).equals(first)
-    assert first.height == 20  # two roots x ten daily bars
+    # Two roots x ten daily bars x (front F1 + synthetic second month F2).
+    assert first.height == 40
     assert set(first[s.ROOT_SYMBOL_COLUMN].to_list()) == {"ES", "NQ"}
     assert all("_SYN" in instrument for instrument in first[s.INSTRUMENT_ID_COLUMN].to_list())
+    per_moment = first.group_by([s.ROOT_SYMBOL_COLUMN, s.TIMESTAMP_COLUMN]).agg(
+        pl.col(s.EXPIRATION_COLUMN).n_unique().alias("expirations")
+    )
+    assert per_moment["expirations"].unique().to_list() == [2]
     assert isinstance(source, HistoricalDataSource)
 
 
@@ -399,8 +405,9 @@ def test_offline_source_intraday_intervals() -> None:
     hour_bars = source.load(
         ["ES"], source.start, source.start + timedelta(hours=6), schema="ohlcv-1h"
     )
-    assert minute_bars.height == 120
-    assert hour_bars.height == 6
+    # Front + synthetic second month per root/timestamp.
+    assert minute_bars.height == 240
+    assert hour_bars.height == 12
     with pytest.raises(ValueError, match="only produces OHLCV bars"):
         source.load(["ES"], source.start, source.start + timedelta(days=1), schema="tbbo")
 
@@ -410,13 +417,20 @@ def test_offline_source_definitions_match_bars() -> None:
     bars = source.load(["ES", "CL"], source.start, source.start + timedelta(days=5))
     definitions = source.load_definitions(["ES", "CL"], as_of=source.start)
     assert definitions.columns == list(s.DEFINITION_COLUMNS)
-    assert set(definitions[s.INSTRUMENT_ID_COLUMN].to_list()) == set(
-        bars[s.INSTRUMENT_ID_COLUMN].to_list()
+    # Every emitted (front or synthetic second-month) contract has a definition.
+    assert set(bars[s.INSTRUMENT_ID_COLUMN].unique().to_list()) <= set(
+        definitions[s.INSTRUMENT_ID_COLUMN].to_list()
     )
-    assert definitions["multiplier"].to_list() == [1_000.0, 50.0]  # CL, ES (root sorted)
-    assert set(definitions[s.EXPIRATION_COLUMN].to_list()) == set(
-        bars[s.EXPIRATION_COLUMN].unique().to_list()
+    assert set(bars[s.EXPIRATION_COLUMN].unique().to_list()) <= set(
+        definitions[s.EXPIRATION_COLUMN].to_list()
     )
+    # Per-root multipliers come from the real instrument master.
+    multipliers = {
+        record[s.ROOT_SYMBOL_COLUMN]: record["multiplier"]
+        for record in definitions.unique(s.ROOT_SYMBOL_COLUMN).iter_rows(named=True)
+    }
+    assert multipliers == {"ES": 50.0, "CL": 1_000.0}
+    assert set(definitions[s.ROOT_SYMBOL_COLUMN].to_list()) == {"ES", "CL"}
 
 
 def test_offline_source_validation() -> None:
@@ -429,4 +443,21 @@ def test_offline_source_validation() -> None:
     assert source.instrument_master.has("ES")
     assert synthetic_reference_price("ES") == 4_800.0
     assert synthetic_reference_price("UNKNOWN") == 1_000.0
-    assert source.load_definitions(["ES"], as_of=source.start).height == 1
+    assert source.load_definitions(["ES"], as_of=source.start).height > 1
+    with pytest.raises(TypeError):
+        OfflineBarSource(("ES",), term_structure="yes")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        OfflineBarSource(("ES",), term_structure_model=object())  # type: ignore[arg-type]
+
+
+def test_offline_source_legacy_single_series_mode() -> None:
+    legacy = OfflineBarSource(("ES", "CL"), seed=7, periods=8, term_structure=False)
+    bars = legacy.load(["ES", "CL"], legacy.start, legacy.start + timedelta(days=6))
+    assert legacy.term_structure_enabled is False
+    assert bars.height == 12  # two roots x six daily bars, no second month
+    per_moment = bars.group_by([s.ROOT_SYMBOL_COLUMN, s.TIMESTAMP_COLUMN]).agg(
+        pl.col(s.EXPIRATION_COLUMN).n_unique().alias("expirations")
+    )
+    assert per_moment["expirations"].unique().to_list() == [1]
+    single_expiry = bars[s.EXPIRATION_COLUMN].n_unique()
+    assert single_expiry == 2  # one front contract per root

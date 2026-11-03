@@ -65,7 +65,9 @@ def test_offline_bars_through_repository_features_and_state(settings: Settings) 
     source = OfflineBarSource(ROOTS, seed=5, periods=320)
     window_end = source.start + timedelta(days=260)
     bars = source.load(list(ROOTS), source.start, window_end)
-    assert bars.height == 260 * len(ROOTS)
+    # OfflineBarSource now emits a front (F1) *and* synthetic second-month (F2)
+    # bar per root/timestamp so term structure/carry are real, not zero-filled.
+    assert bars.height == 2 * 260 * len(ROOTS)
 
     repository.write_bars(bars)
     cached = repository.read_bars(list(ROOTS), source.start, window_end)
@@ -73,8 +75,14 @@ def test_offline_bars_through_repository_features_and_state(settings: Settings) 
     assert repository.available_roots() == tuple(sorted(ROOTS))
 
     features = FeatureProcessor().compute(cached)
-    assert features.height == cached.height
+    # The feature processor collapses the F1/F2 pair to one front-contract row per
+    # root/timestamp (decision timestep), so features are per timestep, not per leg.
+    assert features.height == 260 * len(ROOTS)
     assert set(s.ALL_FEATURES) <= set(features.columns)
+    # Term structure/carry are derived from the synthetic F2 leg: non-zero, no NaN.
+    assert features[s.TERM_SLOPE].is_nan().sum() == 0
+    assert features[s.CARRY_ANNUALIZED].is_nan().sum() == 0
+    assert features[s.TERM_SLOPE].abs().max() > 0.0
 
     builder = MarketStateBuilder(initial_equity=2_000_000.0)
     decision = source.start + timedelta(days=250)
@@ -112,11 +120,16 @@ def test_loader_serves_cached_synthetic_data_without_credentials(settings: Setti
 
     definitions = source.load_definitions(["ES", "CL"], as_of=source.start)
     repository.store_definitions(definitions)
+    # Definitions now cover the whole deterministic synthetic expiry chain
+    # (front + second month at every roll), not just one contract per root.
     cached_definitions = loader.load_definitions(
         ["ES", "CL"], as_of=source.start + timedelta(days=1)
     )
-    assert cached_definitions.height == 2
+    assert cached_definitions.height > 2
     assert set(cached_definitions["root_symbol"].to_list()) == {"ES", "CL"}
+    assert set(loaded[s.INSTRUMENT_ID_COLUMN].unique().to_list()) <= set(
+        cached_definitions[s.INSTRUMENT_ID_COLUMN].to_list()
+    )
 
 
 def test_loader_never_fakes_vendor_data(settings: Settings) -> None:

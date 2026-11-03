@@ -32,34 +32,6 @@ ROOTS: tuple[str, ...] = ("ES", "NQ", "CL")
 START: datetime = datetime(2024, 1, 2, 21, 0, tzinfo=UTC)
 PERIODS: int = 512
 
-#: Deterministic front/next term structure per root (contango for equities,
-#: backwardation for energy) so ``term_slope``/``carry_annualized`` are finite.
-TERM_SLOPES: dict[str, float] = {"ES": 0.004, "NQ": 0.003, "CL": -0.008}
-
-
-def _with_next_expiration(front: pl.DataFrame) -> pl.DataFrame:
-    """Add a deterministic second expiration per root so term structure exists."""
-    rows: list[pl.DataFrame] = [front]
-    grouped = {
-        str(key[0]): group
-        for key, group in front.partition_by(s.ROOT_SYMBOL_COLUMN, as_dict=True).items()
-    }
-    for root, group in grouped.items():
-        factor = 1.0 + TERM_SLOPES.get(root, 0.0)
-        rows.append(
-            group.with_columns(
-                (pl.col(s.OPEN_COLUMN) * factor).alias(s.OPEN_COLUMN),
-                (pl.col(s.HIGH_COLUMN) * factor).alias(s.HIGH_COLUMN),
-                (pl.col(s.LOW_COLUMN) * factor).alias(s.LOW_COLUMN),
-                (pl.col(s.CLOSE_COLUMN) * factor).alias(s.CLOSE_COLUMN),
-                (pl.col(s.SETTLEMENT_COLUMN) * factor).alias(s.SETTLEMENT_COLUMN),
-                pl.col(s.EXPIRATION_COLUMN).dt.offset_by("90d").alias(s.EXPIRATION_COLUMN),
-                (pl.col(s.INSTRUMENT_ID_COLUMN) + "_NEXT").alias(s.INSTRUMENT_ID_COLUMN),
-                (pl.col(s.VOLUME_COLUMN) * 0.5).alias(s.VOLUME_COLUMN),
-            )
-        )
-    return s.ensure_bars_schema(pl.concat(rows, how="vertical_relaxed"), context="test-bars")
-
 
 def make_history(
     roots: tuple[str, ...] = ROOTS,
@@ -69,10 +41,12 @@ def make_history(
     """Deterministic synthetic canonical bar history ending at ``as_of``."""
     source = OfflineBarSource(roots, periods=periods, start=START)
     end = START + timedelta(days=periods)
-    front = source.load(roots, start=START, end=end)
-    as_of = front[s.TIMESTAMP_COLUMN].max()
+    # OfflineBarSource now emits a roll-aware front (F1) + synthetic second
+    # month (F2) pair per root/timestamp, so term structure/carry are real.
+    bars = source.load(roots, start=START, end=end)
+    as_of = bars[s.TIMESTAMP_COLUMN].max()
     assert isinstance(as_of, datetime)
-    return _with_next_expiration(front), as_of
+    return bars, as_of
 
 
 @pytest.fixture(scope="module")
@@ -112,8 +86,10 @@ def test_hydrate_returns_warm_chronological_states(
     assert result.warnings == ()
     assert set(result.coverage) == set(ROOTS)
     assert all(count >= result.required_bars for count in result.coverage.values())
-    assert len(set(result.coverage.values())) == 1  # both expirations, equal roots
-    assert result.bars.height == sum(result.coverage.values())
+    assert len(set(result.coverage.values())) == 1  # equal decision timestamps per root
+    # Coverage counts decision timestamps; the offline source emits two synthetic
+    # legs (front F1 + second month F2) for every root/timestamp.
+    assert result.bars.height == 2 * sum(result.coverage.values())
     assert result.bar_count == result.bars.height
     assert set(s.BAR_COLUMNS).issubset(result.bars.columns)
     assert result.bars[s.TIMESTAMP_COLUMN].max() == as_of

@@ -22,6 +22,7 @@ from typing import Any
 
 import polars as pl
 import pytest
+import yaml
 from configs.instruments import InstrumentsConfig
 from configs.settings import Settings
 from src.backtest.simulated_broker import SimulatedBroker
@@ -458,7 +459,7 @@ def test_offline_backfill_is_deterministic_canonical_and_warm() -> None:
     assert frame.equals(again)
     assert set(s.BAR_COLUMNS).issubset(frame.columns)
     counts = frame.group_by(s.ROOT_SYMBOL_COLUMN).len()
-    assert counts["len"].min() >= MIN_REQUIRED_BARS * 2  # front + neutral next leg
+    assert counts["len"].min() >= MIN_REQUIRED_BARS * 2  # front + synthetic second month
     from src.data.feature_processor import FeatureProcessor
 
     features = FeatureProcessor().compute(frame)
@@ -470,7 +471,14 @@ def test_offline_backfill_is_deterministic_canonical_and_warm() -> None:
             value = record.get(feature)
             assert value is not None, (record[s.ROOT_SYMBOL_COLUMN], feature)
             assert value == pytest.approx(value)  # finite (NaN fails this)
-    assert final[s.TERM_SLOPE].to_list() == [0.0, 0.0]
+    # The offline source now carries a deterministic synthetic F1/F2 curve, so the
+    # neutral 0.0 fallback is gone: both equities are in contango (positive slope).
+    slopes = final[s.TERM_SLOPE].to_list()
+    carries = final[s.CARRY_ANNUALIZED].to_list()
+    assert all(value is not None and value != 0.0 for value in slopes)
+    assert all(value is not None and value != 0.0 for value in carries)
+    assert all(value > 0.0 for value in slopes)  # equity index contango
+    assert all(value < 0.0 for value in carries)
 
 
 def test_offline_backfill_validates_window() -> None:
@@ -812,9 +820,30 @@ def test_offline_streamer_validation_and_connection_flags(
     assert streamer.is_connected is False
 
 
-def test_offline_runner_submits_orders_end_to_end(settings: Settings) -> None:
+def _strategy_without_carry_filter(tmp_path: Path) -> str:
+    """Default offline template minus the carry filter stage.
+
+    With the Phase-10 synthetic F1/F2 curve the default ``tsmom_vol_target``
+    strategy sees real (negative) contango carry for its contango-only liquid
+    universe (NQ/ES/GC) and the ``carry_filter(min_carry_bps=0)`` correctly
+    zeroes every leg — end-to-end execution coverage therefore needs a variant
+    without that overlay. The overlay's reaction itself is covered separately.
+    """
+    source = Path("configs/strategies/tsmom_vol_target.yaml")
+    payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+    payload["id"] = "tsmom_no_carry_offline_test"
+    payload["timing"] = [
+        stage for stage in payload["timing"] if stage.get("name") != "carry_filter"
+    ]
+    assert payload["timing"]
+    destination = tmp_path / "tsmom_no_carry.yaml"
+    destination.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return str(destination)
+
+
+def test_offline_runner_submits_orders_end_to_end(settings: Settings, tmp_path: Path) -> None:
     args = argparse.Namespace(
-        strategy=None,
+        strategy=_strategy_without_carry_filter(tmp_path),
         check=False,
         offline=True,
         backfill_source=None,
@@ -831,6 +860,51 @@ def test_offline_runner_submits_orders_end_to_end(settings: Settings) -> None:
     assert status.orders_rejected == 0
     assert status.started_at == OFFLINE_SIMULATION_END
     assert status.roots == tuple(sorted(OFFLINE_DEFAULT_ROOTS))
+
+
+def test_default_carry_filter_zeroes_contango_only_offline_universe(settings: Settings) -> None:
+    """Post-A2 behaviour: real synthetic carry reaches the default strategy.
+
+    The offline liquidity selector keeps the most liquid synthetic roots (NQ/ES/GC
+    on this seed) and all three are in contango (negative annualised carry), so the
+    default template's ``carry_filter(min_carry_bps=0, mode="zero")`` correctly
+    zeroes every leg -> the runner stays flat. End-to-end order submission is
+    covered above with a carry-free variant of the same template; this test pins
+    the legitimate carry reaction instead of the old NaN/neutral fallback.
+    """
+    args = argparse.Namespace(
+        strategy=None,
+        check=False,
+        offline=True,
+        backfill_source=None,
+        roots=None,
+        max_states=5,
+        log_level=None,
+    )
+    status = _run_offline(settings, args)
+    assert status.hydrated is True
+    assert status.states_processed == 5
+    assert status.orders_submitted == 0
+
+    from src.data.databento_loader import OfflineBarSource
+    from src.data.feature_processor import FeatureProcessor
+    from src.data.market_state_builder import MarketStateBuilder
+    from src.strategies.timing.carry import CarryFilter
+
+    source = OfflineBarSource(OFFLINE_DEFAULT_ROOTS, seed=7, periods=512)
+    bars = source.load(
+        list(OFFLINE_DEFAULT_ROOTS),
+        source.start,
+        OFFLINE_SIMULATION_END + timedelta(microseconds=1),
+    )
+    features = FeatureProcessor().compute(bars)
+    state = MarketStateBuilder().build(features, OFFLINE_SIMULATION_END)
+    carry_filter = CarryFilter(min_carry_bps=0.0)
+    carries = {root: carry_filter.carry_bps(state, root) for root in state.ids}
+    contango = [root for root, value in carries.items() if value is not None and value < 0.0]
+    assert contango, carries
+    assert all(carry_filter.scaling_factor(state, root) == 0.0 for root in contango)
+    assert state.has("ES") and carries["ES"] is not None and carries["ES"] < 0.0
 
 
 # ---------------------------------------------------------------------------

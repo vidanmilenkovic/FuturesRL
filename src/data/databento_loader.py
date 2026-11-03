@@ -14,10 +14,17 @@ Two data sources share the canonical :mod:`src.data.schema` contract:
     A fully deterministic, seeded synthetic GBM source implementing
     :class:`src.core.interfaces.HistoricalDataSource`. It exists so backtests,
     tests and CI can run the *entire* pipeline with no network, no credentials
-    and reproducible numbers. It is **clearly synthetic**: every contract id is
-    suffixed ``_SYN<yyyymmdd>``, ``is_synthetic`` is ``True`` and the class must
-    never be used to impersonate Databento data in paper/live mode (the live
-    loop consumes :class:`~src.data.ibkr_data.IBKRMarketDataStreamer`).
+    and reproducible numbers. It generates a deterministic, roll-aware
+    front (F1) **and** synthetic second-month (F2) bar pair per root/timestamp
+    from :class:`~src.data.term_structure.SyntheticTermStructure` (contango for
+    equity/rates/metals, backwardation for energy, FX near flat, with a slow
+    calendar regime cycle), so ``term_slope``/``carry_annualized`` are finite,
+    non-zero and regime-consistent instead of NaN/zero-filled. It is **clearly
+    synthetic**: every contract id is suffixed ``_SYN<yyyymmdd>``,
+    ``is_synthetic`` is ``True`` and the class must never be used to impersonate
+    Databento data in paper/live mode (the live loop consumes
+    :class:`~src.data.ibkr_data.IBKRMarketDataStreamer`). Pass
+    ``term_structure=False`` for the legacy single-series behaviour.
 
 Returned frames are always canonical: bars pass
 :func:`src.data.schema.ensure_bars_schema`, quotes pass
@@ -45,6 +52,7 @@ import numpy as np
 import polars as pl
 from configs.instruments import InstrumentsConfig, InstrumentSpec, load_instruments
 from configs.settings import Settings, get_settings
+from numpy.typing import NDArray
 
 from src.core.types import InstrumentId
 from src.data import schema as s
@@ -54,6 +62,15 @@ from src.data.contracts import (
     parse_contract_symbol,
 )
 from src.data.storage import ParquetRepository, WriteMode
+from src.data.term_structure import SyntheticTermStructure
+
+#: Deterministic volume / open-interest scale of the synthetic second month.
+_SECOND_MONTH_VOLUME_SCALE = 0.40
+_SECOND_MONTH_OI_SCALE = 0.45
+#: Calendar buffer (days) added when building the synthetic expiry chain.
+_EXPIRY_CHAIN_BUFFER_DAYS = 400
+#: Minimum definition horizon (days) so generated expiries always resolve.
+_DEFINITION_HORIZON_PERIODS = 512
 
 __all__ = [
     "DatabentoIngestError",
@@ -619,10 +636,22 @@ class OfflineBarSource:
     """Deterministic synthetic OHLCV source for offline backtests and CI.
 
     The path is a seeded geometric Brownian motion per root with volatility
-    derived from the root's asset class. It is *entirely synthetic*: contract ids
-    are suffixed ``_SYN<yyyymmdd>`` and ``is_synthetic`` is ``True``. Use it for
-    deterministic tests and offline research only — never in paper/live mode and
-    never as a substitute for Databento vendor data in reported results.
+    derived from the root's asset class. By default every bar is emitted as a
+    **front/second-month pair**: F1 follows the seeded GBM and F2 is the same bar
+    scaled by ``1 + term_slope(t)`` from
+    :class:`~src.data.term_structure.SyntheticTermStructure`, whose carry is
+    root-specific (equity/rates/metals contango, energy backwardation, FX near
+    flat) and modulated by a slow deterministic calendar regime cycle. The
+    expiry pair follows the instrument master's delivery cycle and rolls with the
+    configured calendar buffer (``days_before_fnd`` + physical-delivery safety),
+    so ``FeatureProcessor`` derives finite, non-zero ``term_slope`` and
+    ``carry_annualized`` without any look-ahead.
+
+    Everything is *entirely synthetic*: contract ids are suffixed
+    ``_SYN<yyyymmdd>`` and ``is_synthetic`` is ``True``. Use it for deterministic
+    tests and offline research only — never in paper/live mode and never as a
+    substitute for Databento vendor data in reported results. Pass
+    ``term_structure=False`` to reproduce the legacy single-expiration series.
     """
 
     #: Marker consumed by guard-rails that must reject synthetic data in live mode.
@@ -636,6 +665,8 @@ class OfflineBarSource:
         start: datetime | None = None,
         periods: int = 512,
         instrument_master: InstrumentsConfig | None = None,
+        term_structure: bool = True,
+        term_structure_model: SyntheticTermStructure | None = None,
     ) -> None:
         self._roots = s.validate_roots(tuple(roots) if roots is not None else _SYNTHETIC_ROOTS)
         if start is None:
@@ -648,6 +679,17 @@ class OfflineBarSource:
         self._periods = periods
         self._seed = seed
         self._master = instrument_master
+        if not isinstance(term_structure, bool):
+            raise TypeError(f"term_structure must be a bool, got {type(term_structure)!r}")
+        self._term_structure_enabled = term_structure
+        if term_structure_model is not None and not isinstance(
+            term_structure_model, SyntheticTermStructure
+        ):
+            raise TypeError(
+                "term_structure_model must be a SyntheticTermStructure, got "
+                f"{type(term_structure_model)!r}"
+            )
+        self._term_structure_model = term_structure_model
 
     @property
     def roots(self) -> tuple[InstrumentId, ...]:
@@ -666,6 +708,18 @@ class OfflineBarSource:
             self._master = load_instruments()
         return self._master
 
+    @property
+    def term_structure_enabled(self) -> bool:
+        """Whether the synthetic F1/F2 curve is generated (default ``True``)."""
+        return self._term_structure_enabled
+
+    @property
+    def term_structure_model(self) -> SyntheticTermStructure:
+        """Deterministic synthetic curve model used for the F1/F2 spread."""
+        if self._term_structure_model is None:
+            self._term_structure_model = SyntheticTermStructure(instrument_master=self._master)
+        return self._term_structure_model
+
     def available_roots(self) -> Sequence[InstrumentId]:
         """Roots this source can generate (mirrors the cache contract)."""
         return self._roots
@@ -680,7 +734,12 @@ class OfflineBarSource:
         *,
         schema: str = s.DEFAULT_BAR_SCHEMA,
     ) -> pl.DataFrame:
-        """Generate deterministic synthetic bars in the half-open window ``[start, end)``."""
+        """Generate deterministic synthetic bars in the half-open window ``[start, end)``.
+
+        With the default ``term_structure=True`` each root/timestamp carries two
+        rows (front + synthetic second month); ``term_structure=False`` keeps the
+        legacy one-row-per-root/timestamp contract.
+        """
         if not s.is_bar_schema(schema):
             raise ValueError(
                 f"OfflineBarSource only produces OHLCV bars {list(s.DATABENTO_BAR_SCHEMAS)}, "
@@ -695,30 +754,35 @@ class OfflineBarSource:
         window = frame.filter(
             (pl.col(s.TIMESTAMP_COLUMN) >= pl.lit(start_utc))
             & (pl.col(s.TIMESTAMP_COLUMN) < pl.lit(end_utc))
-        ).sort([s.TIMESTAMP_COLUMN, s.ROOT_SYMBOL_COLUMN])
+        ).sort([s.TIMESTAMP_COLUMN, s.ROOT_SYMBOL_COLUMN, s.EXPIRATION_COLUMN])
         return s.ensure_bars_schema(window, context="offline-bars")
 
     def load_definitions(self, roots: Sequence[InstrumentId], *, as_of: datetime) -> pl.DataFrame:
-        """Synthetic definition rows for the front contracts generated by :meth:`load`."""
+        """Synthetic definition rows for every contract generated by :meth:`load`.
+
+        The generated expiry chain is deterministic for ``(roots, start, periods)``;
+        each expiration (front *and* synthetic second month) gets one definition
+        row so a join on ``instrument_id`` always resolves.
+        """
         normalised_roots = s.validate_roots(roots)
         if as_of.tzinfo is None:
             raise ValueError("as_of must be timezone-aware (UTC expected)")
         rows: list[dict[str, Any]] = []
         for root in normalised_roots:
             spec = self._spec_or_none(root)
-            expiration = self._front_expiration(spec)
-            rows.append(
-                {
-                    s.INSTRUMENT_ID_COLUMN: self._contract_id(root, expiration),
-                    s.ROOT_SYMBOL_COLUMN: root,
-                    s.EXPIRATION_COLUMN: expiration,
-                    "multiplier": spec.multiplier if spec is not None else 1.0,
-                    "tick_size": spec.tick_size if spec is not None else 0.01,
-                    "exchange": spec.exchange if spec is not None else "SYNTHETIC",
-                    "currency": spec.currency if spec is not None else "USD",
-                    "activation": self._start - timedelta(days=30),
-                }
-            )
+            for expiration in self._expirations_for(root, spec):
+                rows.append(
+                    {
+                        s.INSTRUMENT_ID_COLUMN: self._contract_id(root, expiration),
+                        s.ROOT_SYMBOL_COLUMN: root,
+                        s.EXPIRATION_COLUMN: expiration,
+                        "multiplier": spec.multiplier if spec is not None else 1.0,
+                        "tick_size": spec.tick_size if spec is not None else 0.01,
+                        "exchange": spec.exchange if spec is not None else "SYNTHETIC",
+                        "currency": spec.currency if spec is not None else "USD",
+                        "activation": self._start - timedelta(days=30),
+                    }
+                )
         return s.ensure_definitions_schema(pl.DataFrame(rows), context="offline-definitions")
 
     # -- internals -------------------------------------------------------------
@@ -732,8 +796,18 @@ class OfflineBarSource:
         return f"{root}_SYN{expiration:%Y%m%d}"
 
     def _front_expiration(self, spec: InstrumentSpec | None) -> date:
+        """Legacy single-series front expiry (no term structure mode)."""
         months = spec.roll.contract_months if spec is not None else (3, 6, 9, 12)
         return next_contract_expiration(months, self._start)
+
+    def _expirations_for(self, root: str, spec: InstrumentSpec | None) -> tuple[date, ...]:
+        """Expiries emitted by this source for ``root`` (front/second chain)."""
+        if not self._term_structure_enabled:
+            return (self._front_expiration(spec),)
+        horizon = max(self._periods, _DEFINITION_HORIZON_PERIODS) + _EXPIRY_CHAIN_BUFFER_DAYS
+        return self.term_structure_model.expiration_chain(
+            root, reference=self._start, horizon_days=horizon
+        )
 
     def _root_seed(self, root: str) -> int:
         """Stable per-root RNG seed (independent of dict/iteration order)."""
@@ -746,6 +820,36 @@ class OfflineBarSource:
             return SYNTHETIC_ANNUAL_VOL["unknown"]
         return SYNTHETIC_ANNUAL_VOL.get(str(spec.asset_class), SYNTHETIC_ANNUAL_VOL["unknown"])
 
+    @staticmethod
+    def _leg_frame(
+        root: str,
+        timestamps: Sequence[datetime],
+        opens: NDArray[np.float64],
+        highs: NDArray[np.float64],
+        lows: NDArray[np.float64],
+        closes: NDArray[np.float64],
+        volumes: NDArray[np.float64],
+        open_interest: NDArray[np.float64],
+        expirations: Sequence[date],
+    ) -> pl.DataFrame:
+        """Assemble one canonical-schema contract leg for ``root``."""
+        contract_ids = [f"{root}_SYN{expiration:%Y%m%d}" for expiration in expirations]
+        return pl.DataFrame(
+            {
+                s.TIMESTAMP_COLUMN: list(timestamps),
+                s.INSTRUMENT_ID_COLUMN: contract_ids,
+                s.ROOT_SYMBOL_COLUMN: [root] * len(timestamps),
+                s.EXPIRATION_COLUMN: list(expirations),
+                s.OPEN_COLUMN: opens.tolist(),
+                s.HIGH_COLUMN: highs.tolist(),
+                s.LOW_COLUMN: lows.tolist(),
+                s.CLOSE_COLUMN: closes.tolist(),
+                s.VOLUME_COLUMN: volumes.tolist(),
+                s.OPEN_INTEREST_COLUMN: open_interest.tolist(),
+                s.SETTLEMENT_COLUMN: closes.tolist(),
+            }
+        )
+
     def _generate(
         self,
         roots: Sequence[InstrumentId],
@@ -756,14 +860,21 @@ class OfflineBarSource:
         """Generate the deterministic synthetic bar frame for ``roots``."""
         frames: list[pl.DataFrame] = []
         bar_days = interval.total_seconds() / 86_400.0
+        timestamps = [origin + interval * step for step in range(periods)]
+        horizon_days = (
+            math.ceil((timestamps[-1] - origin).total_seconds() / 86_400.0)
+            + _EXPIRY_CHAIN_BUFFER_DAYS
+        )
         for root in roots:
             spec = self._spec_or_none(root)
+            # Single seeded draw order keeps the historical synthetic price path
+            # unchanged (chart/test baselines) while the term structure is layered
+            # on top purely from the calendar.
             rng = np.random.default_rng(self._root_seed(root))
             reference_price = synthetic_reference_price(root)
             annual_vol = self._annual_vol(spec)
             sigma = annual_vol * math.sqrt(max(bar_days, 1e-9) / 252.0)
-            drift = 0.0
-            returns = rng.normal(drift, sigma, size=periods)
+            returns = rng.normal(0.0, sigma, size=periods)
             closes = reference_price * np.cumprod(1.0 + returns)
             opens = np.concatenate([[reference_price], closes[:-1]])
             intrabar = rng.uniform(0.0, sigma, size=periods)
@@ -771,26 +882,71 @@ class OfflineBarSource:
             lows = np.minimum(opens, closes) * (1.0 - intrabar)
             volumes = np.abs(rng.normal(250_000.0, 25_000.0, size=periods))
             open_interest = np.abs(rng.normal(1_500_000.0, 50_000.0, size=periods))
-            expiration = self._front_expiration(spec)
-            contract_id = self._contract_id(root, expiration)
-            timestamps = [origin + interval * step for step in range(periods)]
+            if not self._term_structure_enabled:
+                expiration = self._front_expiration(spec)
+                frames.append(
+                    self._leg_frame(
+                        root,
+                        timestamps,
+                        opens,
+                        highs,
+                        lows,
+                        closes,
+                        volumes,
+                        open_interest,
+                        [expiration] * periods,
+                    )
+                )
+                continue
+            model = self.term_structure_model
+            chain = model.expiration_chain(root, reference=origin, horizon_days=horizon_days)
+            front_expirations: list[date] = []
+            second_expirations: list[date] = []
+            second_ratios: list[float] = []
+            for timestamp in timestamps:
+                pair = model.pair_at(root, timestamp, chain)
+                if pair is None:  # pragma: no cover - chain always has >= 2 expiries
+                    raise RuntimeError(
+                        f"synthetic term structure produced no expiry pair for {root!r}"
+                    )
+                curve = model.curve(
+                    root,
+                    timestamp,
+                    front_price=1.0,
+                    front_expiration=pair[0],
+                    second_expiration=pair[1],
+                )
+                front_expirations.append(pair[0])
+                second_expirations.append(pair[1])
+                second_ratios.append(curve.second_price / curve.front_price)
             frames.append(
-                pl.DataFrame(
-                    {
-                        s.TIMESTAMP_COLUMN: timestamps,
-                        s.INSTRUMENT_ID_COLUMN: [contract_id] * periods,
-                        s.ROOT_SYMBOL_COLUMN: [root] * periods,
-                        s.EXPIRATION_COLUMN: [expiration] * periods,
-                        s.OPEN_COLUMN: opens.tolist(),
-                        s.HIGH_COLUMN: highs.tolist(),
-                        s.LOW_COLUMN: lows.tolist(),
-                        s.CLOSE_COLUMN: closes.tolist(),
-                        s.VOLUME_COLUMN: volumes.tolist(),
-                        s.OPEN_INTEREST_COLUMN: open_interest.tolist(),
-                        s.SETTLEMENT_COLUMN: closes.tolist(),
-                    }
+                self._leg_frame(
+                    root,
+                    timestamps,
+                    opens,
+                    highs,
+                    lows,
+                    closes,
+                    volumes,
+                    open_interest,
+                    front_expirations,
                 )
             )
-        return s.ensure_bars_schema(
-            pl.concat(frames, how="vertical_relaxed"), context="offline-generate"
+            ratios = np.asarray(second_ratios, dtype=np.float64)
+            frames.append(
+                self._leg_frame(
+                    root,
+                    timestamps,
+                    opens * ratios,
+                    highs * ratios,
+                    lows * ratios,
+                    closes * ratios,
+                    volumes * _SECOND_MONTH_VOLUME_SCALE,
+                    open_interest * _SECOND_MONTH_OI_SCALE,
+                    second_expirations,
+                )
+            )
+        frame = pl.concat(frames, how="vertical_relaxed")
+        return s.ensure_bars_schema(frame, context="offline-generate").sort(
+            [s.TIMESTAMP_COLUMN, s.ROOT_SYMBOL_COLUMN, s.EXPIRATION_COLUMN]
         )
