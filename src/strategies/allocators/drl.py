@@ -28,7 +28,10 @@ rather than hidden behind an import alias.
 
 from __future__ import annotations
 
+import json
+import warnings
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +41,12 @@ from numpy.typing import NDArray
 
 from src.core.interfaces import PortfolioAllocator
 from src.core.types import InstrumentId, MarketState, RiskAssessment, WeightVector
-from src.strategies._observation import DEFAULT_OBSERVATION_FEATURES, build_observation
+from src.strategies._observation import (
+    DEFAULT_OBSERVATION_FEATURES,
+    build_observation,
+    feature_matrix,
+    observation_from_components,
+)
 from src.strategies._params import ParamReader
 from src.strategies._risk import (
     DEFAULT_CONFIDENCE_THRESHOLD,
@@ -57,6 +65,235 @@ _INSTALL_HINT = (
     "`pip install 'stable-baselines3>=2.3' 'gymnasium>=1.0' torch` "
     "(or `pip install -e '.[drl]'`)."
 )
+
+
+#: Sidecar suffix written by the trainer next to the SB3 checkpoint (``.zip.meta.json``).
+CHECKPOINT_META_SUFFIX: str = ".meta.json"
+
+
+@dataclass(frozen=True, slots=True)
+class DRLCheckpointMetadata:
+    """Parsed ``<checkpoint>.zip.meta.json`` sidecar written by the DRL trainer.
+
+    The trainer (``python -m src.strategies.train_drl`` / ``POST /api/drl/train``)
+    writes this sidecar so inference can prove a checkpoint and the live pipeline
+    agree on the observation layout. The two hard invariants are ``universe`` (the
+    per-row root order) and ``feature_names`` (the per-row feature order); shapes
+    are recorded for actionable mismatch errors and bind-preview reporting.
+    """
+
+    model_path: Path
+    meta_path: Path
+    universe: tuple[InstrumentId, ...]
+    feature_names: tuple[str, ...]
+    observation_shape: tuple[int, ...] = ()
+    action_shape: tuple[int, ...] = ()
+    algorithm: str | None = None
+    total_timesteps: int | None = None
+    strategy_id: str | None = None
+    trained_at: str | None = None
+
+    @property
+    def observation_dimension(self) -> int:
+        """Flat observation length implied by the metadata (features+weights+equity)."""
+        if self.observation_shape:
+            return self.observation_shape[0]
+        return len(self.universe) * len(self.feature_names) + len(self.universe) + 1
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable representation (sidecar-compatible keys)."""
+        return {
+            "model_path": str(self.model_path),
+            "meta_path": str(self.meta_path),
+            "universe": list(self.universe),
+            "feature_names": list(self.feature_names),
+            "observation_shape": list(self.observation_shape),
+            "action_shape": list(self.action_shape),
+            "algorithm": self.algorithm,
+            "total_timesteps": self.total_timesteps,
+            "strategy_id": self.strategy_id,
+            "trained_at": self.trained_at,
+        }
+
+
+def checkpoint_meta_path(model_path: str | Path) -> Path:
+    """Path of the metadata sidecar for ``model_path`` (``<model>.zip.meta.json``)."""
+    return Path(f"{Path(model_path)}{CHECKPOINT_META_SUFFIX}")
+
+
+def _meta_str_list(
+    payload: Mapping[str, object], key: str, meta_path: Path, *, upper: bool
+) -> tuple[str, ...]:
+    raw = payload.get(key)
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"checkpoint metadata {meta_path}: {key!r} must be a non-empty list of strings"
+        )
+    normalised: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                f"checkpoint metadata {meta_path}: {key!r} entries must be non-empty strings, "
+                f"got {item!r}"
+            )
+        token = item.strip()
+        if upper:
+            token = token.upper()
+        if token not in normalised:
+            normalised.append(token)
+    return tuple(normalised)
+
+
+def _meta_shape(payload: Mapping[str, object], key: str, meta_path: Path) -> tuple[int, ...]:
+    raw = payload.get(key)
+    if raw is None or raw == []:
+        return ()
+    if not isinstance(raw, list) or not all(
+        isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in raw
+    ):
+        raise ValueError(
+            f"checkpoint metadata {meta_path}: {key!r} must be a list of positive ints, got {raw!r}"
+        )
+    return tuple(raw)
+
+
+def load_checkpoint_metadata(model_path: str | Path) -> DRLCheckpointMetadata:
+    """Read and validate the ``<checkpoint>.zip.meta.json`` sidecar.
+
+    Raises ``FileNotFoundError`` when the sidecar is absent (legacy checkpoint
+    fallback is handled by :class:`DRLAllocator` with a warning) and ``ValueError``
+    with the sidecar path when it is malformed or missing the universe/features
+    needed for observation alignment. Importing/using this helper does not import
+    torch or Stable-Baselines3.
+    """
+    path = Path(model_path)
+    meta_path = checkpoint_meta_path(path)
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"DRL checkpoint metadata sidecar not found: {meta_path}")
+    try:
+        raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"checkpoint metadata {meta_path} is not valid JSON: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"checkpoint metadata {meta_path} must be a JSON object")
+    universe = _meta_str_list(raw, "universe", meta_path, upper=True)
+    feature_names = _meta_str_list(raw, "feature_names", meta_path, upper=False)
+    algorithm = raw.get("algorithm")
+    total_timesteps = raw.get("total_timesteps")
+    strategy_id = raw.get("strategy_id")
+    trained_at = raw.get("trained_at")
+    return DRLCheckpointMetadata(
+        model_path=path,
+        meta_path=meta_path,
+        universe=universe,
+        feature_names=feature_names,
+        observation_shape=_meta_shape(raw, "observation_shape", meta_path),
+        action_shape=_meta_shape(raw, "action_shape", meta_path),
+        algorithm=algorithm if isinstance(algorithm, str) else None,
+        total_timesteps=(
+            int(total_timesteps)
+            if isinstance(total_timesteps, int) and not isinstance(total_timesteps, bool)
+            else None
+        ),
+        strategy_id=strategy_id if isinstance(strategy_id, str) else None,
+        trained_at=trained_at if isinstance(trained_at, str) else None,
+    )
+
+
+def _missing_metadata_warning(model_path: Path, meta_path: Path) -> None:
+    warnings.warn(
+        f"DRL checkpoint {model_path} has no metadata sidecar {meta_path}; "
+        "universe/feature observation alignment is disabled and the policy receives "
+        "candidates in selector order (legacy behaviour). Retrain the checkpoint with "
+        "`python -m src.strategies.train_drl` (or POST /api/drl/train) to write the sidecar.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def checkpoint_universe_bind_patch(
+    metadata: DRLCheckpointMetadata | str | Path,
+) -> dict[str, object]:
+    """Universe patch for the Studio "Bind" flow: ``{"roots": [...], "top_n": N}``.
+
+    ``roots`` follows the checkpoint universe order; callers that persist a
+    strategy YAML/API stage must encode it as a comma-separated string because
+    ``configs.strategy.StageParam`` is scalar-only (see
+    :func:`checkpoint_strategy_params_patch`).
+    """
+    meta = (
+        metadata
+        if isinstance(metadata, DRLCheckpointMetadata)
+        else load_checkpoint_metadata(metadata)
+    )
+    if not meta.universe:
+        raise RuntimeError(
+            f"DRL checkpoint {meta.model_path} metadata has an empty universe; "
+            "cannot bind a universe patch"
+        )
+    return {"roots": list(meta.universe), "top_n": len(meta.universe)}
+
+
+def checkpoint_strategy_params_patch(
+    metadata: DRLCheckpointMetadata | str | Path,
+) -> dict[str, object]:
+    """PUT-ready ``universe.params`` scalar patch (``roots`` comma string, ``top_n``)."""
+    patch = checkpoint_universe_bind_patch(metadata)
+    roots = patch["roots"]
+    assert isinstance(roots, list)
+    return {"roots": ",".join(str(root) for root in roots), "top_n": patch["top_n"]}
+
+
+def checkpoint_bind_preview(model_path: str | Path) -> dict[str, object]:
+    """Non-raising Bind descriptor for a checkpoint (API/frontend friendly).
+
+    Returns ``metadata_available=False`` plus a ``warning`` and ``metadata_error``
+    (with ``roots_patch``/``params_patch`` set to ``None``) when the sidecar is
+    missing or malformed, so the UI can show "Universe synced (N roots)" vs the
+    metadata-unavailable warning without special-casing exceptions.
+    """
+    path = Path(model_path)
+    meta_path = checkpoint_meta_path(path)
+    checkpoint_name = path.name[: -len(".zip")] if path.name.endswith(".zip") else path.name
+    preview: dict[str, object] = {
+        "checkpoint_name": checkpoint_name,
+        "model_path": str(path),
+        "meta_path": str(meta_path),
+        "metadata_available": False,
+        "metadata_error": None,
+        "universe": [],
+        "feature_names": [],
+        "observation_shape": [],
+        "action_shape": [],
+        "roots_patch": None,
+        "params_patch": None,
+        "warning": None,
+    }
+    try:
+        meta = load_checkpoint_metadata(path)
+    except FileNotFoundError as exc:
+        preview["metadata_error"] = str(exc)
+        preview["warning"] = (
+            "Checkpoint metadata is unavailable; the universe cannot be synced on Bind. "
+            "Retrain the checkpoint to write the sidecar."
+        )
+        return preview
+    except ValueError as exc:
+        preview["metadata_error"] = str(exc)
+        preview["warning"] = f"Checkpoint metadata is invalid: {exc}"
+        return preview
+    preview.update(
+        {
+            "metadata_available": True,
+            "universe": list(meta.universe),
+            "feature_names": list(meta.feature_names),
+            "observation_shape": list(meta.observation_shape),
+            "action_shape": list(meta.action_shape),
+            "roots_patch": checkpoint_universe_bind_patch(meta),
+            "params_patch": checkpoint_strategy_params_patch(meta),
+        }
+    )
+    return preview
 
 
 def import_stable_baselines3() -> Any:
@@ -107,6 +344,8 @@ class DRLAllocator:
         "_gross_leverage",
         "_learning_rate",
         "_max_instrument_weight",
+        "_metadata",
+        "_metadata_loaded",
         "_model",
         "_model_path",
         "_policy",
@@ -192,6 +431,8 @@ class DRLAllocator:
         self._device = device.strip()
         self._model_path: Path | None = None if model_path is None else Path(model_path)
         self._checkpoint_error: Exception | None = None
+        self._metadata: DRLCheckpointMetadata | None = None
+        self._metadata_loaded = False
         self._model: Any = model
 
     # -- introspection --------------------------------------------------------
@@ -220,6 +461,41 @@ class DRLAllocator:
     def feature_names(self) -> tuple[str, ...]:
         """Per-instrument observation features expected by the policy."""
         return self._feature_names
+
+    @property
+    def checkpoint_metadata(self) -> DRLCheckpointMetadata | None:
+        """Sidecar metadata for the configured checkpoint (``None`` when absent/legacy).
+
+        Missing metadata is a warning fallback (legacy candidate-order behaviour);
+        malformed metadata raises an actionable ``RuntimeError`` naming the sidecar.
+        """
+        return self._load_metadata_once()
+
+    @property
+    def expected_roots(self) -> tuple[InstrumentId, ...]:
+        """Root order the checkpoint was trained on (``()`` without metadata)."""
+        meta = self._load_metadata_once()
+        return () if meta is None else meta.universe
+
+    @property
+    def expected_feature_names(self) -> tuple[str, ...]:
+        """Feature order the checkpoint expects (configured order without metadata)."""
+        meta = self._load_metadata_once()
+        return self._feature_names if meta is None else meta.feature_names
+
+    def universe_bind_patch(self) -> dict[str, object]:
+        """``{"roots": [...], "top_n": N}`` patch from the checkpoint metadata.
+
+        Raises ``RuntimeError`` when the checkpoint has no usable metadata (the
+        caller should surface the metadata-unavailable warning instead of binding).
+        """
+        meta = self._load_metadata_once()
+        if meta is None:
+            raise RuntimeError(
+                f"DRL checkpoint {self.model_path!r} has no metadata sidecar; cannot derive "
+                "a universe bind patch (retrain to write <checkpoint>.zip.meta.json)"
+            )
+        return checkpoint_universe_bind_patch(meta)
 
     @property
     def total_timesteps(self) -> int:
@@ -317,6 +593,91 @@ class DRLAllocator:
 
     # -- inference ------------------------------------------------------------
 
+    def _load_metadata_once(self) -> DRLCheckpointMetadata | None:
+        """Load/cache the checkpoint sidecar; missing sidecar = warning fallback."""
+        if self._metadata_loaded:
+            return self._metadata
+        self._metadata_loaded = True
+        if self._model_path is None:
+            self._metadata = None
+            return None
+        meta_path = checkpoint_meta_path(self._model_path)
+        if not meta_path.is_file():
+            _missing_metadata_warning(self._model_path, meta_path)
+            self._metadata = None
+            return None
+        try:
+            self._metadata = load_checkpoint_metadata(self._model_path)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"invalid DRL checkpoint metadata for {self._model_path}: {exc}"
+            ) from exc
+        return self._metadata
+
+    def _build_aligned_observation(
+        self,
+        state: MarketState,
+        candidates: Sequence[InstrumentId],
+        *,
+        metadata: DRLCheckpointMetadata,
+        current_weights: Mapping[InstrumentId, float] | None,
+        equity_ratio: float,
+    ) -> NDArray[np.float64]:
+        """Observation in the checkpoint's root/feature order (missing roots flat).
+
+        Expected roots that the selector did not pass as candidates (or that are
+        absent from the state) contribute a zero/flat row: zero features, zero held
+        weight. Extra candidates outside the checkpoint universe are ignored. The
+        observation width is therefore always the checkpoint's trained width.
+        """
+        candidate_set = set(candidates)
+        expected = metadata.universe
+        features = feature_matrix(state, expected, metadata.feature_names)
+        held = np.zeros(len(expected), dtype=np.float64)
+        for row, root in enumerate(expected):
+            if root not in candidate_set or root not in state.instruments:
+                features[row, :] = 0.0
+                continue
+            held[row] = 0.0 if current_weights is None else float(current_weights.get(root, 0.0))
+        return observation_from_components(features, held, equity_ratio=equity_ratio)
+
+    def _validate_observation_size(
+        self,
+        observation: NDArray[np.float64],
+        metadata: DRLCheckpointMetadata | None,
+    ) -> None:
+        """Raise an actionable error when metadata/model/observation disagree."""
+        size = int(observation.size)
+        expected_from_meta = None if metadata is None else metadata.observation_dimension
+        model = self._model
+        space = None if model is None else getattr(model, "observation_space", None)
+        shape = None if space is None else getattr(space, "shape", None)
+        model_size = (
+            int(shape[0])
+            if isinstance(shape, tuple) and len(shape) == 1 and isinstance(shape[0], int)
+            else None
+        )
+        if expected_from_meta is not None and expected_from_meta != size:
+            assert metadata is not None
+            raise RuntimeError(
+                "DRL checkpoint observation mismatch: metadata "
+                f"{self._model_path} declares observation length {expected_from_meta} "
+                f"(universe={len(metadata.universe)} roots x {len(metadata.feature_names)} "
+                f"features + weights + equity) but the aligned observation has {size} entries; "
+                "retrain the checkpoint with the current feature set or inspect the sidecar."
+            )
+        if model_size is not None and model_size != size:
+            detail = (
+                f" (checkpoint metadata aligns to {expected_from_meta}, built {size})"
+                if expected_from_meta is not None
+                else f" (built {size})"
+            )
+            raise RuntimeError(
+                "DRL policy observation-space mismatch: the loaded policy expects observation "
+                f"length {model_size} but the observation has {size} entries{detail}; the "
+                "checkpoint feature_names/universe do not match the current feature set."
+            )
+
     def build_observation(
         self,
         state: MarketState,
@@ -325,27 +686,68 @@ class DRLAllocator:
         current_weights: Mapping[InstrumentId, float] | None = None,
         equity_ratio: float = 1.0,
     ) -> NDArray[np.float64]:
-        """Observation vector layout shared with ``FuturesTradingEnv``."""
-        return build_observation(
+        """Observation vector layout shared with ``FuturesTradingEnv``.
+
+        With checkpoint metadata the vector is built in the checkpoint's universe
+        and feature order (missing/inactive roots flat, extra candidates ignored);
+        without metadata the legacy candidate-order layout is preserved.
+        """
+        metadata = self._load_metadata_once()
+        if metadata is None:
+            return build_observation(
+                state,
+                candidates,
+                feature_names=self._feature_names,
+                current_weights=current_weights,
+                equity_ratio=equity_ratio,
+            )
+        return self._build_aligned_observation(
             state,
             candidates,
-            feature_names=self._feature_names,
+            metadata=metadata,
             current_weights=current_weights,
             equity_ratio=equity_ratio,
         )
 
     def weights_from_action(
-        self, candidates: Sequence[InstrumentId], action: object
+        self,
+        candidates: Sequence[InstrumentId],
+        action: object,
+        *,
+        action_candidates: Sequence[InstrumentId] | None = None,
     ) -> WeightVector:
-        """Map a raw policy action to a validated target weight vector."""
+        """Map a raw policy action to a validated target weight vector.
+
+        ``action_candidates`` is the ordered universe the action vector refers to
+        (the checkpoint universe). When it differs from ``candidates`` the action is
+        remapped: expected roots feed their actual candidate weight, extra
+        candidates stay flat (0), and expected roots the selector dropped are
+        discarded. Gross-target semantics are unchanged (clip + leverage scaling
+        apply to the mapped actual-candidate weights).
+        """
         array = np.asarray(action, dtype=np.float64).reshape(-1)
-        if array.size != len(candidates):
+        expected = tuple(candidates) if action_candidates is None else tuple(action_candidates)
+        if array.size != len(expected):
+            if action_candidates is None:
+                raise ValueError(
+                    f"policy action has {array.size} entries but {len(candidates)} candidates "
+                    "were supplied; the policy was trained on a different universe"
+                )
             raise ValueError(
-                f"policy action has {array.size} entries but {len(candidates)} candidates "
-                "were supplied; the policy was trained on a different universe"
+                f"policy action has {array.size} entries but the checkpoint expects "
+                f"{len(expected)} roots {list(expected)!r}; the checkpoint universe and the "
+                "loaded policy/action shape disagree"
             )
         if not np.all(np.isfinite(array)):
             raise RuntimeError("policy returned a non-finite action vector")
+        if action_candidates is not None and expected != tuple(candidates):
+            mapped = np.zeros(len(candidates), dtype=np.float64)
+            index = {root: position for position, root in enumerate(candidates)}
+            for position, root in enumerate(expected):
+                actual = index.get(root)
+                if actual is not None:
+                    mapped[actual] = array[position]
+            array = mapped
         weights = np.clip(array, -self._max_instrument_weight, self._max_instrument_weight)
         gross = float(np.sum(np.abs(weights)))
         if self._action_mode == "normalized":
@@ -361,10 +763,16 @@ class DRLAllocator:
         if not candidates:
             return WeightVector.empty()
         model = self._require_model()
+        metadata = self._load_metadata_once()
         observation = self.build_observation(state, candidates)
+        self._validate_observation_size(observation, metadata)
         prediction = model.predict(observation, deterministic=True)
         action = prediction[0] if isinstance(prediction, tuple) else prediction
-        return self.weights_from_action(candidates, action)
+        return self.weights_from_action(
+            candidates,
+            action,
+            action_candidates=None if metadata is None else metadata.universe,
+        )
 
     # -- risk hook ------------------------------------------------------------
 
@@ -414,8 +822,15 @@ def build_drl_allocator(params: Mapping[str, StageParam]) -> PortfolioAllocator:
 
 __all__ = [
     "ACTION_MODES",
+    "CHECKPOINT_META_SUFFIX",
     "SUPPORTED_ALGORITHMS",
     "DRLAllocator",
+    "DRLCheckpointMetadata",
     "build_drl_allocator",
+    "checkpoint_bind_preview",
+    "checkpoint_meta_path",
+    "checkpoint_strategy_params_patch",
+    "checkpoint_universe_bind_patch",
     "import_stable_baselines3",
+    "load_checkpoint_metadata",
 ]

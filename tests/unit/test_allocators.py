@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import sys
 from pathlib import Path
@@ -499,6 +500,22 @@ def _train_tiny_ppo(
     model = allocator.train(_tiny_drl_env(feature_names), total_timesteps=64)
     checkpoint = tmp_path / "drl_checkpoint.zip"
     model.save(str(checkpoint))
+    # Trainer-compatible metadata sidecar: inference consumes the checkpoint in the
+    # trained root/feature order (Phase-11A universe guard).
+    Path(f"{checkpoint}.meta.json").write_text(
+        json.dumps(
+            {
+                "universe": ["ES", "NQ", "CL"],
+                "feature_names": list(feature_names),
+                "observation_shape": [3 * len(feature_names) + 3 + 1],
+                "action_shape": [3],
+                "algorithm": "PPO",
+                "total_timesteps": 64,
+                "strategy_id": "drl_smoke_test",
+            }
+        ),
+        encoding="utf-8",
+    )
     return allocator, checkpoint
 
 
@@ -539,6 +556,8 @@ def test_drl_allocator_loads_trained_checkpoint_from_model_path(tmp_path: Path) 
     )
     assert allocator.model_path == str(checkpoint)
     assert allocator.is_trained is False  # lazy: not loaded until first use
+    assert allocator.checkpoint_metadata is not None
+    assert allocator.expected_roots == ("ES", "NQ", "CL")
     state = make_market_state(roots=("ES", "NQ", "CL"))
     weights = allocator.allocate(state.ids, state)
     assert allocator.is_trained is True
