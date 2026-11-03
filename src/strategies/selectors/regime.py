@@ -43,6 +43,10 @@ from src.strategies._numeric import (
     trailing_sum,
 )
 from src.strategies._params import ParamReader
+from src.strategies.selectors._roots import (
+    normalise_requested_roots,
+    validate_requested_roots,
+)
 
 #: ``state.regime`` values that force a risk-off universe regardless of metrics.
 RISK_OFF_REGIME_LABELS: frozenset[str] = frozenset(
@@ -82,6 +86,7 @@ class RegimeSelector:
         "_require_both",
         "_risk_off_roots",
         "_risk_off_sectors",
+        "_roots",
         "_shock_lookback_days",
         "_shock_return_threshold",
         "_shock_z_threshold",
@@ -106,6 +111,7 @@ class RegimeSelector:
         min_universe: int = 1,
         top_n: int | None = None,
         require_both: bool = False,
+        roots: Sequence[str] | str = (),
         instrument_master: InstrumentsConfig | None = None,
     ) -> None:
         if trend_lookback_days < 2:
@@ -139,12 +145,19 @@ class RegimeSelector:
         self._min_universe = int(min_universe)
         self._top_n = top_n
         self._require_both = bool(require_both)
+        self._roots = normalise_requested_roots(roots)
+        validate_requested_roots(self._roots, instrument_master, stage="regime")
         self._instrument_master = instrument_master
 
     @property
     def name(self) -> str:
         """Registry name of this selector."""
         return "regime"
+
+    @property
+    def roots(self) -> tuple[InstrumentId, ...]:
+        """Explicit root allow-list from ``universe.params.roots`` (``()`` = all)."""
+        return self._roots
 
     # -- diagnostics ----------------------------------------------------------
 
@@ -242,8 +255,16 @@ class RegimeSelector:
     def select(self, state: MarketState) -> list[InstrumentId]:
         """Return the regime-filtered universe, strongest trend first."""
         diagnosis = self.diagnose(state)
+        # The regime signal is computed on the full state (market regime), but the
+        # tradable candidate universe is restricted to the explicit allow-list.
+        universe = list(diagnosis.trends)
+        if self._roots:
+            allowed = set(self._roots)
+            universe = [instrument_id for instrument_id in universe if instrument_id in allowed]
+            if not universe:
+                return []
         ranked = sorted(
-            diagnosis.trends,
+            universe,
             key=lambda instrument_id: (-diagnosis.trends[instrument_id], instrument_id),
         )
         if not diagnosis.risk_off:
@@ -293,6 +314,8 @@ def build_regime_selector(
         min_universe=reader.as_int("min_universe", 1),
         top_n=reader.as_optional_int("top_n"),
         require_both=reader.as_bool("require_both", False),
+        # Optional Studio-saved explicit root filter (intersected with state roots).
+        roots=reader.as_sequence("roots"),
         instrument_master=instruments,
     )
     reader.check()

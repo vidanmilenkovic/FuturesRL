@@ -366,3 +366,101 @@ def test_build_composite_selector(instrument_master: InstrumentsConfig) -> None:
 def test_composite_selector_weight_vector_type_is_unrelated() -> None:
     # Sanity: selectors never return WeightVector instances (contract check).
     assert not isinstance(_FixedSelector("a", ("ES",)).select(_composite_fixture()), WeightVector)
+
+
+# ---------------------------------------------------------------------------
+# Explicit root allow-list (Studio-saved ``universe.params.roots``)
+# ---------------------------------------------------------------------------
+
+
+def test_liquidity_selector_roots_allow_list_only_returns_members() -> None:
+    state = make_market_state()
+    selector = LiquiditySelector(roots=("ZN", "ES"))
+    selected = selector.select(state)
+    assert set(selected) == {"ES", "ZN"}
+    # Ranking is still by dollar volume within the allow-list.
+    dollar_volumes = selector.dollar_volume(state)
+    assert [dollar_volumes[root] for root in selected] == sorted(
+        (dollar_volumes[root] for root in ("ES", "ZN")), reverse=True
+    )
+    assert LiquiditySelector(roots="ES, NQ,CL").select(state) == ["NQ", "ES", "CL"]
+
+
+def test_liquidity_builder_accepts_roots_and_rejects_unknown(
+    instrument_master: InstrumentsConfig,
+) -> None:
+    selector = build_selector("liquidity", {"roots": "ES, nq ,cl"}, instrument_master)
+    assert isinstance(selector, LiquiditySelector)
+    assert selector.roots == ("ES", "NQ", "CL")
+    state = make_market_state()
+    assert set(selector.select(state)) == {"ES", "NQ", "CL"}
+    with pytest.raises(ValueError, match="GE"):
+        build_selector("liquidity", {"roots": "ES,GE"}, instrument_master)
+
+
+def test_liquidity_roots_intersect_state_roots_silently(
+    instrument_master: InstrumentsConfig,
+) -> None:
+    # ZC is a valid master root but absent from this fixture state: intersection,
+    # not an error (partial-data/warm-up backtests must keep working).
+    selector = build_selector("liquidity", {"roots": "ES,ZC"}, instrument_master)
+    state = make_market_state(roots=("ES", "NQ"))
+    assert selector.select(state) == ["ES"]
+
+
+def test_regime_selector_roots_allow_list_and_builder(
+    instrument_master: InstrumentsConfig,
+) -> None:
+    state = _returns_state(
+        make_market_state(regime="risk_off"),
+        {root: _negative_returns(150) for root in ("ES", "NQ", "CL", "GC", "ZN")},
+    )
+    selector = RegimeSelector(roots=("ES", "CL"), instrument_master=instrument_master)
+    selected = selector.select(state)
+    assert set(selected) <= {"ES", "CL"}
+    builder = build_selector("regime", {"roots": "ES,NQ"}, instrument_master)
+    assert isinstance(builder, RegimeSelector)
+    assert builder.roots == ("ES", "NQ")
+    with pytest.raises(ValueError, match="ZQ"):
+        build_selector("regime", {"roots": "ZQ"}, instrument_master)
+
+
+def test_composite_selector_roots_filter_final_selection(
+    instrument_master: InstrumentsConfig,
+) -> None:
+    components = (
+        _FixedSelector("a", ("ES", "NQ", "CL")),
+        _FixedSelector("b", ("ES", "NQ", "CL", "GC")),
+    )
+    selector = CompositeSelector(components, roots=("ES", "CL"))
+    assert selector.roots == ("ES", "CL")
+    assert selector.select(make_market_state()) == ["ES", "CL"]
+    union = CompositeSelector(components, mode="union", roots="CL,GC")
+    assert union.select(make_market_state()) == ["CL", "GC"]
+    # Explicit order is intersected with the allow-list too.
+    ordered = CompositeSelector(
+        components, mode="union", order=("GC", "NQ", "ES"), roots=("ES", "GC")
+    )
+    assert ordered.select(make_market_state()) == ["GC", "ES"]
+    with pytest.raises(ValueError, match="BTC"):
+        CompositeSelector(components, roots=("BTC",), instrument_master=instrument_master)
+
+
+def test_composite_builder_accepts_roots(instrument_master: InstrumentsConfig) -> None:
+    selector = build_selector(
+        "composite",
+        {"components": "liquidity,regime", "roots": "ES,NQ,CL"},
+        instrument_master,
+    )
+    assert isinstance(selector, CompositeSelector)
+    assert selector.roots == ("ES", "NQ", "CL")
+    selected = selector.select(make_market_state())
+    assert set(selected) <= {"ES", "NQ", "CL"}
+    assert selected
+
+
+def test_roots_normalisation_dedup_and_empty() -> None:
+    assert LiquiditySelector(roots="").roots == ()
+    assert LiquiditySelector(roots="es, ES ,nq,nq,ZN").roots == ("ES", "NQ", "ZN")
+    assert RegimeSelector(roots=["zn", "es"]).roots == ("ZN", "ES")
+    assert CompositeSelector([_FixedSelector("a", ("ES",))], roots="").roots == ()

@@ -22,6 +22,11 @@ from configs.strategy import StageParam
 from src.core.interfaces import UniverseSelector
 from src.core.types import InstrumentId, MarketState
 from src.strategies._params import ParamReader
+from src.strategies.selectors._roots import (
+    normalise_requested_roots,
+    restrict_roots,
+    validate_requested_roots,
+)
 
 #: Supported set operations.
 COMPOSITE_MODES: frozenset[str] = frozenset({"intersection", "union"})
@@ -30,7 +35,7 @@ COMPOSITE_MODES: frozenset[str] = frozenset({"intersection", "union"})
 class CompositeSelector:
     """Combine several :class:`UniverseSelector` components."""
 
-    __slots__ = ("_components", "_mode", "_order")
+    __slots__ = ("_components", "_mode", "_order", "_roots")
 
     def __init__(
         self,
@@ -38,6 +43,8 @@ class CompositeSelector:
         *,
         mode: str = "intersection",
         order: Sequence[InstrumentId] | None = None,
+        roots: Sequence[str] | str = (),
+        instrument_master: InstrumentsConfig | None = None,
     ) -> None:
         if not components:
             raise ValueError("CompositeSelector requires at least one component selector")
@@ -55,6 +62,8 @@ class CompositeSelector:
         self._components = tuple(components)
         self._mode = normalised_mode
         self._order = tuple(order) if order is not None else None
+        self._roots = normalise_requested_roots(roots)
+        validate_requested_roots(self._roots, instrument_master, stage="composite")
 
     @property
     def name(self) -> str:
@@ -70,6 +79,11 @@ class CompositeSelector:
     def components(self) -> tuple[UniverseSelector, ...]:
         """The composed selectors, in application order."""
         return self._components
+
+    @property
+    def roots(self) -> tuple[InstrumentId, ...]:
+        """Explicit root allow-list from ``universe.params.roots`` (``()`` = all)."""
+        return self._roots
 
     def select(self, state: MarketState) -> list[InstrumentId]:
         """Return the composed universe, preserving deterministic ordering."""
@@ -88,10 +102,11 @@ class CompositeSelector:
             for output in outputs[1:]:
                 members &= set(output)
             selected = [instrument_id for instrument_id in ordered_base if instrument_id in members]
-        if self._order is None:
-            return selected
-        explicit = set(selected)
-        return [instrument_id for instrument_id in self._order if instrument_id in explicit]
+        if self._order is not None:
+            explicit = set(selected)
+            selected = [instrument_id for instrument_id in self._order if instrument_id in explicit]
+        # Studio-saved explicit root filter is applied to the final composition.
+        return restrict_roots(selected, self._roots)
 
 
 def build_composite_selector(
@@ -111,6 +126,7 @@ def build_composite_selector(
     component_names = reader.as_sequence("components")
     mode = reader.as_str("mode", "intersection")
     order = reader.as_sequence("order")
+    roots = reader.as_sequence("roots")
     reader.check()
     if not component_names:
         raise ValueError("composite selector requires a 'components' parameter")
@@ -123,6 +139,8 @@ def build_composite_selector(
         components,
         mode=mode,
         order=order or None,
+        roots=roots,
+        instrument_master=instruments,
     )
 
 

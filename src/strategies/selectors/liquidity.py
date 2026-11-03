@@ -14,7 +14,7 @@ multi-day averaging, so this selector never needs to look at history beyond the
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from configs.instruments import InstrumentsConfig
 from configs.strategy import StageParam
@@ -22,12 +22,22 @@ from configs.strategy import StageParam
 from src.core.interfaces import UniverseSelector
 from src.core.types import InstrumentId, MarketState
 from src.strategies._params import ParamReader
+from src.strategies.selectors._roots import (
+    normalise_requested_roots,
+    validate_requested_roots,
+)
 
 
 class LiquiditySelector:
     """Rank futures roots by dollar volume and keep the most liquid ``top_n``."""
 
-    __slots__ = ("_min_avg_dollar_volume", "_min_history_days", "_min_open_interest", "_top_n")
+    __slots__ = (
+        "_min_avg_dollar_volume",
+        "_min_history_days",
+        "_min_open_interest",
+        "_roots",
+        "_top_n",
+    )
 
     def __init__(
         self,
@@ -36,6 +46,8 @@ class LiquiditySelector:
         min_open_interest: float = 0.0,
         top_n: int | None = None,
         min_history_days: int = 0,
+        roots: Sequence[str] | str = (),
+        instrument_master: InstrumentsConfig | None = None,
     ) -> None:
         if min_avg_dollar_volume < 0.0:
             raise ValueError("min_avg_dollar_volume must be non-negative")
@@ -45,6 +57,8 @@ class LiquiditySelector:
             raise ValueError("top_n must be a positive integer or None")
         if min_history_days < 0:
             raise ValueError("min_history_days must be non-negative")
+        self._roots = normalise_requested_roots(roots)
+        validate_requested_roots(self._roots, instrument_master, stage="liquidity")
         self._min_avg_dollar_volume = float(min_avg_dollar_volume)
         self._min_open_interest = float(min_open_interest)
         self._top_n = top_n
@@ -59,6 +73,11 @@ class LiquiditySelector:
     def top_n(self) -> int | None:
         """Maximum universe size (``None`` keeps every passing root)."""
         return self._top_n
+
+    @property
+    def roots(self) -> tuple[InstrumentId, ...]:
+        """Explicit root allow-list from ``universe.params.roots`` (``()`` = all)."""
+        return self._roots
 
     def dollar_volume(self, state: MarketState) -> dict[InstrumentId, float]:
         """Traded dollar volume proxy ``volume * mid`` per root."""
@@ -84,8 +103,11 @@ class LiquiditySelector:
 
     def select(self, state: MarketState) -> list[InstrumentId]:
         """Return the liquid tradable universe, most liquid first."""
+        allowed = set(self._roots) if self._roots else None
         rows: list[tuple[float, float, InstrumentId]] = []
         for instrument_id, snapshot in state.instruments.items():
+            if allowed is not None and instrument_id not in allowed:
+                continue
             dollar_volume = snapshot.volume * snapshot.mid
             if not dollar_volume >= self._min_avg_dollar_volume:
                 continue
@@ -104,13 +126,16 @@ def build_liquidity_selector(
     instruments: InstrumentsConfig | None = None,
 ) -> UniverseSelector:
     """Build a :class:`LiquiditySelector` from declarative stage parameters."""
-    del instruments  # liquidity ranking needs no contract master
     reader = ParamReader("selector.liquidity", params)
     selector = LiquiditySelector(
         min_avg_dollar_volume=reader.as_float("min_avg_dollar_volume", 0.0),
         min_open_interest=reader.as_float("min_open_interest", 0.0),
         top_n=reader.as_optional_int("top_n"),
         min_history_days=reader.as_int("min_history_days", 0),
+        # Studio-saved configs persist an explicit root filter alongside the
+        # thresholds; it restricts the candidate universe before ranking.
+        roots=reader.as_sequence("roots"),
+        instrument_master=instruments,
     )
     reader.check()
     return selector
