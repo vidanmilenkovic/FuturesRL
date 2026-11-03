@@ -34,6 +34,8 @@ type BacktestStatus = Literal["queued", "running", "completed", "failed"]
 type DataSource = Literal["engine", "fixture", "runner-bridge"]
 #: Provenance of a live/snapshot view: fresh runner bridge vs local fallback.
 type SnapshotSource = Literal["runner-bridge", "engine", "simulated", "fixture"]
+#: Provenance of the account equity curve (live IBKR vs synthetic vs offline).
+type EquityCurveSource = Literal["ibkr-live", "simulated-backfill", "fixture"]
 #: Provenance of the account/position snapshot.
 type AccountSource = Literal["engine", "simulated", "fixture", "runner-bridge"]
 type PipelineStageKey = Literal["universe", "base", "timing", "risk", "targets"]
@@ -149,6 +151,19 @@ class AccountSnapshotResponse(APIModel):
     stale: bool = False
     #: Human-readable reason the book is stale (``None`` when fresh).
     stale_reason: str | None = None
+    #: Additive v1.5.1 attribution: provenance of ``equity_curve``.
+    #: ``ibkr-live`` = real persisted IBKR NLV points; ``simulated-backfill`` =
+    #: IBKR enabled but <5 live points so the synthetic backfill curve is shown;
+    #: ``fixture`` = offline/simulated/bridge adapter (existing behaviour).
+    equity_curve_source: EquityCurveSource = "fixture"
+    #: Number of persisted real IBKR NLV points available for this book.
+    equity_curve_live_points: int = Field(default=0, ge=0)
+    #: Annualised ex-ante portfolio volatility (fraction, e.g. 0.119) from the
+    #: live book weights x market-state covariance. ``0.0`` for a flat IBKR book,
+    #: ``None`` when unavailable (never a synthetic period vol).
+    portfolio_volatility: float | None = Field(default=None, ge=0.0)
+    #: ``ex-ante-book`` | ``unavailable`` for IBKR; ``None`` for offline/bridge.
+    portfolio_volatility_source: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +800,7 @@ __all__ = [
     "BacktestStatus",
     "DataSource",
     "Environment",
+    "EquityCurveSource",
     "EquityPoint",
     "FillRow",
     "FlattenAllResponse",

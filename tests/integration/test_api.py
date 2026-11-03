@@ -68,7 +68,7 @@ def test_health_reports_offline_fixture_mode(client: TestClient) -> None:
     body = response.json()
     assert body["status"] in {"ok", "degraded"}
     assert body["app_name"] == "FuturesRL-X"
-    assert body["version"] == "1.5.0"
+    assert body["version"] == "1.5.1"
     assert body["environment"] == "backtest"
     assert body["offline_mode"] is True
     assert body["uptime_seconds"] >= 0.0
@@ -84,7 +84,7 @@ def test_cors_allows_configured_dashboard_origin(client: TestClient) -> None:
 def test_openapi_metadata_and_docs(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     assert schema["info"]["title"] == "FuturesRL-X Telemetry API"
-    assert schema["info"]["version"] == "1.5.0"
+    assert schema["info"]["version"] == "1.5.1"
     paths = schema["paths"]
     for route in (
         "/health",
@@ -126,6 +126,11 @@ def test_account_snapshot_contract(client: TestClient) -> None:
     assert curve_times[-1] <= FIXED_TIMESTAMP
     assert curve_times[-1] == FIXED_TIMESTAMP
     assert len(body["positions"]) >= 5
+    # v1.5.1 attribution fields: offline/fixture semantics unchanged.
+    assert body["equity_curve_source"] == "fixture"
+    assert body["equity_curve_live_points"] == 0
+    assert body["portfolio_volatility"] is None
+    assert body["portfolio_volatility_source"] is None
 
     for position in body["positions"]:
         assert set(position) >= {

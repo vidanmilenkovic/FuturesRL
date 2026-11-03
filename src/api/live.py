@@ -27,17 +27,23 @@ may be a synthetic JSON file written by a test.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import importlib
 import inspect
 import json
 import logging
-from collections.abc import Awaitable, Mapping, Sequence
+import math
+import os
+import tempfile
+import threading
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
+import numpy as np
 from configs.instruments import InstrumentsConfig
 from configs.settings import Settings
 from pydantic import ValidationError
@@ -61,22 +67,43 @@ from src.api.schemas import (
     WorkingOrderRow,
     WorkingOrdersResponse,
 )
-from src.core.types import AssetClass, ensure_utc
+from src.core.types import AssetClass, InstrumentId, ensure_utc
+
+if TYPE_CHECKING:  # pragma: no cover - typing-only imports
+    from src.api.protocols import MarketDataService
+    from src.core.types import MarketState
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "BridgeSnapshot",
+    "LiveEquityHistoryStore",
     "LiveStateService",
     "RunnerBridgeReader",
     "RunnerSessionController",
     "RunnerSessionUnavailable",
     "RunnerSessionUnavailableError",
+    "ex_ante_portfolio_volatility",
     "load_optional_module",
 ]
 
 #: File name of the runner -> API bridge snapshot inside ``runner_bridge_dir``.
 BRIDGE_FILE_NAME: str = "runner_state.json"
+
+#: File name of the durable IBKR live-NLV history inside ``settings.data_dir``.
+EQUITY_HISTORY_FILE_NAME: str = "ibkr_equity_history.json"
+
+#: Minimum number of real IBKR NLV points before the curve is labelled live.
+MIN_LIVE_CURVE_POINTS: int = 5
+
+#: Bound on the persisted live NLV history (newest wins).
+MAX_EQUITY_HISTORY_POINTS: int = 5000
+
+#: Bound on the age of persisted live NLV points (days).
+MAX_EQUITY_HISTORY_AGE_DAYS: float = 30.0
+
+#: Persisted history payload schema version.
+EQUITY_HISTORY_VERSION: int = 1
 
 #: Default staleness horizon when the snapshot does not declare its own.
 DEFAULT_STALE_AFTER_SECONDS: float = 30.0
@@ -92,6 +119,206 @@ class RunnerSessionUnavailableError(RuntimeError):
 
 #: Backwards/forwards compatible shorter alias.
 RunnerSessionUnavailable = RunnerSessionUnavailableError
+
+
+# ---------------------------------------------------------------------------
+# Durable live IBKR NLV history (attribution)
+# ---------------------------------------------------------------------------
+
+
+class LiveEquityHistoryStore:
+    """Atomic, bounded and deduped JSON history of real observed IBKR NLV points.
+
+    The dashboard must never present a synthetic equity curve as live. This store
+    keeps the *real* points fetched from an IBKR session so the account snapshot
+    can switch from the synthetic backfill curve to a genuine ``ibkr-live`` curve
+    once at least :data:`MIN_LIVE_CURVE_POINTS` observations exist.
+
+    Design rules
+    ------------
+    * Atomic writes (temp file + ``os.replace``) so a crash can never truncate a
+      previously good history document.
+    * One point per UTC timestamp (dedupe; later value wins).
+    * Bounded by :data:`MAX_EQUITY_HISTORY_POINTS` and
+      :data:`MAX_EQUITY_HISTORY_AGE_DAYS` so the file cannot grow forever.
+    * A corrupt file is quarantined (``*.corrupt-*``) and treated as "no history"
+      instead of crashing the trading/API process.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        clock: Callable[[], datetime],
+        max_points: int = MAX_EQUITY_HISTORY_POINTS,
+        max_age_days: float = MAX_EQUITY_HISTORY_AGE_DAYS,
+    ) -> None:
+        resolved = Path(path)
+        if resolved.suffix == "":
+            resolved = resolved / EQUITY_HISTORY_FILE_NAME
+        self._path = resolved
+        self._clock = clock
+        self._max_points = max(1, int(max_points))
+        if not math.isfinite(max_age_days) or max_age_days < 0.0:
+            raise ValueError("max_age_days must be a finite non-negative number")
+        self._max_age_days = float(max_age_days)
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        """Absolute path of the persisted history JSON document."""
+        return self._path.resolve()
+
+    # -- public API ------------------------------------------------------------
+
+    def load(self) -> list[EquityPoint]:
+        """Return the persisted points (oldest first, ``[]`` when absent/corrupt)."""
+        with self._lock:
+            return self._load_locked()
+
+    def append(self, point: EquityPoint) -> list[EquityPoint]:
+        """Append one observed NLV point (deduped/bounded) and persist atomically."""
+        with self._lock:
+            existing = self._load_locked()
+            moment = ensure_utc(point.time)
+            merged: dict[datetime, float] = {
+                existing_point.time: existing_point.value for existing_point in existing
+            }
+            merged[moment] = float(point.value)
+            points = self._trim(
+                [EquityPoint(time=timestamp, value=value) for timestamp, value in merged.items()]
+            )
+            self._save_locked(points)
+            return points
+
+    def clear(self) -> None:
+        """Delete the persisted history (operator reset / tests)."""
+        with self._lock, contextlib.suppress(FileNotFoundError):
+            self._path.unlink()
+
+    # -- internals -------------------------------------------------------------
+
+    def _load_locked(self) -> list[EquityPoint]:
+        if not self._path.is_file():
+            return []
+        try:
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self._quarantine(exc)
+            return []
+        if not isinstance(payload, Mapping):
+            self._quarantine(ValueError("payload is not a JSON object"))
+            return []
+        raw_points = cast("Mapping[str, object]", payload).get("points")
+        if not isinstance(raw_points, Sequence) or isinstance(raw_points, (str, bytes)):
+            return []
+        points: list[EquityPoint] = []
+        for entry in raw_points:
+            parsed = self._parse_point(entry)
+            if parsed is not None:
+                points.append(parsed)
+        points.sort(key=lambda item: item.time)
+        return points
+
+    @staticmethod
+    def _parse_point(entry: object) -> EquityPoint | None:
+        if not isinstance(entry, Mapping):
+            return None
+        mapping = cast("Mapping[str, object]", entry)
+        raw_time = mapping.get("time")
+        raw_value = mapping.get("value")
+        if not isinstance(raw_time, str) or isinstance(raw_value, bool):
+            return None
+        if not isinstance(raw_value, (int, float)):
+            return None
+        value = float(raw_value)
+        if not math.isfinite(value) or value <= 0.0:
+            return None
+        try:
+            moment = ensure_utc(datetime.fromisoformat(raw_time.replace("Z", "+00:00")))
+        except (TypeError, ValueError):
+            return None
+        return EquityPoint(time=moment, value=value)
+
+    def _trim(self, points: Sequence[EquityPoint]) -> list[EquityPoint]:
+        moment = ensure_utc(self._clock())
+        cutoff = moment - timedelta(days=self._max_age_days)
+        fresh = sorted(
+            (point for point in points if point.time >= cutoff),
+            key=lambda item: item.time,
+        )
+        if len(fresh) > self._max_points:
+            fresh = fresh[-self._max_points :]
+        return fresh
+
+    def _save_locked(self, points: Sequence[EquityPoint]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": EQUITY_HISTORY_VERSION,
+            "points": [{"time": point.time.isoformat(), "value": point.value} for point in points],
+        }
+        serialised = json.dumps(payload, sort_keys=True, indent=2)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{self._path.name}.", suffix=".tmp", dir=str(self._path.parent)
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(serialised)
+                handle.flush()
+                os.fsync(handle.fileno())
+            Path(temp_name).replace(self._path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                Path(temp_name).unlink(missing_ok=True)
+            raise
+
+    def _quarantine(self, exc: BaseException) -> None:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        target = self._path.with_name(f"{self._path.name}.corrupt-{stamp}")
+        logger.error(
+            "IBKR equity history %s is corrupt (%s); quarantining to %s",
+            self._path,
+            exc,
+            target,
+        )
+        with contextlib.suppress(OSError):
+            self._path.replace(target)
+
+
+# ---------------------------------------------------------------------------
+# Ex-ante portfolio volatility from the live book
+# ---------------------------------------------------------------------------
+
+
+def ex_ante_portfolio_volatility(
+    weights: Mapping[InstrumentId, float],
+    state: MarketState | None,
+) -> tuple[float | None, str]:
+    """Annualised ``sqrt(w' Σ w)`` from signed notional weights and market state.
+
+    Returns ``(0.0, "ex-ante-book")`` for a flat book (no open positions),
+    ``(None, "unavailable")`` when the covariance matrix cannot value the book,
+    and ``(volatility, "ex-ante-book")`` otherwise. The covariance carried by
+    :class:`~src.core.types.MarketState` is already annualised.
+    """
+    active = {
+        instrument_id: float(weight)
+        for instrument_id, weight in weights.items()
+        if math.isfinite(float(weight)) and abs(float(weight)) > 1e-12
+    }
+    if not active:
+        return 0.0, "ex-ante-book"
+    if state is None or state.covariance is None:
+        return None, "unavailable"
+    instruments = tuple(sorted(active))
+    covariance = state.covariance_submatrix(instruments)
+    if covariance is None:
+        return None, "unavailable"
+    vector = np.array([active[instrument] for instrument in instruments], dtype=np.float64)
+    variance = float(vector @ covariance @ vector)
+    if not math.isfinite(variance):
+        return None, "unavailable"
+    return math.sqrt(max(variance, 0.0)), "ex-ante-book"
 
 
 def load_optional_module(path: str) -> object | None:
@@ -679,11 +906,13 @@ class LiveStateService:
         clock: object,
         execution: object,
         instrument_master: InstrumentsConfig,
+        market: MarketDataService | None = None,
     ) -> None:
         self._settings = settings
         self._clock = clock
         self._execution = execution
         self._master = instrument_master
+        self._market = market
         self._reader = RunnerBridgeReader(settings, clock=clock)
         self._session = RunnerSessionController(
             settings=settings, clock=clock, instrument_master=instrument_master
@@ -989,13 +1218,72 @@ class LiveStateService:
 
         The adapter's additive ``stale`` / ``stale_reason`` provenance is preserved:
         for an IBKR-enabled process this is either the live book or the last-known-good
-        IBKR book (never the simulated fixture book).
+        IBKR book (never the simulated fixture book). IBKR books are additionally
+        enriched with the real persisted equity curve provenance and the ex-ante
+        portfolio volatility of the current book; bridge/offline responses keep
+        their existing semantics.
         """
         bridged = self.bridge_account()
         if bridged is not None:
             return bridged
         snapshot = await cast(Awaitable[AccountSnapshotResponse], self._execution.account())  # type: ignore[attr-defined]
-        return snapshot.model_copy(update={"source": self._execution_source()})
+        snapshot = snapshot.model_copy(update={"source": self._execution_source()})
+        if self._ibkr_enabled():
+            return self._enrich_ibkr_account(snapshot)
+        return snapshot
+
+    # -- IBKR attribution (v1.5.1) -------------------------------------------
+
+    def _ibkr_enabled(self) -> bool:
+        return bool(getattr(self._execution, "ibkr_enabled", False))
+
+    def _live_equity_points(self) -> tuple[EquityPoint, ...]:
+        provider = getattr(self._execution, "live_equity_points", None)
+        if provider is None:
+            return ()
+        try:
+            raw = provider() if callable(provider) else provider
+        except Exception:
+            logger.warning("execution live_equity_points() failed", exc_info=True)
+            return ()
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            return ()
+        points: list[EquityPoint] = []
+        for entry in raw:
+            if isinstance(entry, EquityPoint) and math.isfinite(entry.value):
+                points.append(entry)
+        points.sort(key=lambda point: point.time)
+        return tuple(points)
+
+    def _market_state(self) -> MarketState | None:
+        market = self._market
+        if market is None:
+            return None
+        try:
+            return market.latest_state()
+        except Exception:
+            logger.warning("market latest_state() unavailable for volatility", exc_info=True)
+            return None
+
+    def _enrich_ibkr_account(self, snapshot: AccountSnapshotResponse) -> AccountSnapshotResponse:
+        """Attach real-curve provenance and ex-ante book volatility for IBKR."""
+        points = self._live_equity_points()
+        updates: dict[str, object] = {
+            "equity_curve_live_points": len(points),
+            "equity_curve_source": "simulated-backfill",
+        }
+        if len(points) >= MIN_LIVE_CURVE_POINTS:
+            updates["equity_curve"] = [point.model_copy() for point in points]
+            updates["equity_curve_source"] = "ibkr-live"
+        weights = {
+            row.instrument_id: row.weight
+            for row in snapshot.positions
+            if math.isfinite(row.weight) and abs(row.weight) > 1e-12
+        }
+        volatility, volatility_source = ex_ante_portfolio_volatility(weights, self._market_state())
+        updates["portfolio_volatility"] = volatility
+        updates["portfolio_volatility_source"] = volatility_source
+        return snapshot.model_copy(update=updates)
 
     async def working_orders(self) -> WorkingOrdersResponse:
         """Working orders: fresh bridge first, then the execution adapter."""

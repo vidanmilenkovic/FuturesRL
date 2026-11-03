@@ -18,7 +18,10 @@ router = APIRouter(tags=["positions"])
         "NLV, margin consumption, gross/net exposure, the active futures contract "
         "book (expiry, days-to-roll, signed quantity, notional weight w_i, "
         "unrealised PnL, margin) and a mark-to-market equity curve. Prefers a fresh "
-        "live-runner bridge snapshot (``source=runner-bridge``)."
+        "live-runner bridge snapshot (``source=runner-bridge``). IBKR books also "
+        "expose attribution fields: ``equity_curve_source`` (``ibkr-live`` / "
+        "``simulated-backfill`` / ``fixture``), ``equity_curve_live_points`` and the "
+        "ex-ante book ``portfolio_volatility`` (+``portfolio_volatility_source``)."
     ),
 )
 async def account_snapshot(container: ContainerDep) -> AccountSnapshotResponse:

@@ -8,9 +8,10 @@ and last-known-good /api/positions serving while the socket is lost.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Iterator, Mapping
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,13 @@ import src.execution.ibkr_client as ibkr_client_module
 from configs.instruments import InstrumentsConfig
 from configs.settings import Settings
 from fastapi.testclient import TestClient
+from src.api.live import (
+    EQUITY_HISTORY_FILE_NAME,
+    MIN_LIVE_CURVE_POINTS,
+    LiveEquityHistoryStore,
+)
 from src.api.main import create_app
+from src.api.schemas import EquityPoint
 from src.api.services import IBKRExecutionService
 from src.core.types import AccountSnapshot, InstrumentId, Position
 from src.execution.ibkr_client import MarginImpact
@@ -45,6 +52,7 @@ class FakeIBKRManager:
         self.heartbeat_running = False
         self.connect_calls = 0
         self.ensure_calls = 0
+        self.fetch_calls = 0
         self.fail_connect = True
         self.account = AccountSnapshot(
             timestamp=FIXED_TIMESTAMP,
@@ -120,7 +128,12 @@ class FakeIBKRManager:
     async def fetch_account(self) -> AccountSnapshot:
         if not self.is_connected:
             raise ConnectionError("IBKR connection is not established")
-        return self.account
+        # Real IBKR observations carry the fetch wall-clock; keep them distinct so
+        # the persisted live-equity history grows instead of deduping one point.
+        self.fetch_calls += 1
+        return dataclasses.replace(
+            self.account, timestamp=FIXED_TIMESTAMP + timedelta(seconds=self.fetch_calls)
+        )
 
     async def fetch_positions(
         self, prices: Mapping[InstrumentId, float] | None = None
@@ -240,3 +253,41 @@ def test_single_probe_interval_never_busy_loops(
         # ~5 probes in 250ms at a 50ms cadence, far below a busy loop (~thousands).
         assert fake_manager.ensure_calls <= 20
         assert fake_manager.ensure_calls >= 1
+
+
+def test_live_equity_attribution_end_to_end(fake_manager: FakeIBKRManager, tmp_path: Path) -> None:
+    """Real IBKR NLV points persist, become an ``ibkr-live`` curve, and the
+    portfolio volatility comes from the live book (never the synthetic period)."""
+    settings = _settings(tmp_path).model_copy(update={"telemetry_interval_seconds": 3600.0})
+    history_path = settings.data_dir / EQUITY_HISTORY_FILE_NAME
+    seed_store = LiveEquityHistoryStore(history_path, clock=lambda: FIXED_TIMESTAMP)
+    for index in range(3):
+        seed_store.append(
+            EquityPoint(time=FIXED_TIMESTAMP - timedelta(minutes=3 - index), value=LIVE_NLV)
+        )
+    with TestClient(create_app(settings, clock=lambda: FIXED_TIMESTAMP)) as client:
+        fake_manager.fail_connect = False
+        assert _wait_for(lambda: client.get("/health").json()["ibkr_connected"] is True)
+
+        first = client.get("/api/positions").json()
+        # 3 seeded points + this fetch are below the live threshold: the synthetic
+        # backfill curve is kept but honestly badged as simulated.
+        assert 1 <= first["equity_curve_live_points"] < MIN_LIVE_CURVE_POINTS
+        assert first["equity_curve_source"] == "simulated-backfill"
+
+        body = first
+        for _ in range(MIN_LIVE_CURVE_POINTS):
+            body = client.get("/api/positions").json()
+        assert body["equity_curve_live_points"] >= MIN_LIVE_CURVE_POINTS
+        assert body["equity_curve_source"] == "ibkr-live"
+        assert len(body["equity_curve"]) == body["equity_curve_live_points"]
+        assert all(item["value"] == pytest.approx(LIVE_NLV) for item in body["equity_curve"])
+        # The curve is chronologically ordered.
+        curve_times = [item["time"] for item in body["equity_curve"]]
+        assert curve_times == sorted(curve_times)
+
+        # Portfolio volatility is ex-ante from the live book weights/covariance.
+        assert body["portfolio_volatility_source"] in {"ex-ante-book", "unavailable"}
+        if body["portfolio_volatility_source"] == "ex-ante-book":
+            assert body["portfolio_volatility"] is not None
+            assert 0.0 < body["portfolio_volatility"] < 1.0

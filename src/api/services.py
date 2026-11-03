@@ -50,7 +50,12 @@ from configs.settings import Settings
 from configs.strategy import StrategyConfig, discover_strategy_configs, parse_strategy_config
 
 from src.api import fixtures
-from src.api.live import LiveStateService, micro_routing_from_payload
+from src.api.live import (
+    EQUITY_HISTORY_FILE_NAME,
+    LiveEquityHistoryStore,
+    LiveStateService,
+    micro_routing_from_payload,
+)
 from src.api.news import NewsFeedService
 from src.api.protocols import (
     BacktestService,
@@ -112,6 +117,7 @@ __all__ = [
     "IBKRBookUnavailableError",
     "IBKRExecutionService",
     "InMemoryStrategyCatalog",
+    "LiveEquityHistoryStore",
     "SimulatedExecutionService",
     "build_container",
 ]
@@ -780,6 +786,7 @@ class IBKRExecutionService:
         market: fixtures.OfflineMarket,
         clock: fixtures.Clock = fixtures.utc_now,
         connection_manager: IBKRConnectionManager | None = None,
+        equity_history_store: LiveEquityHistoryStore | None = None,
     ) -> None:
         from src.execution.ibkr_client import IBKRConnectionManager
         from src.execution.oms import OrderManagementSystem
@@ -815,6 +822,15 @@ class IBKRExecutionService:
         self._probe_interval: float = max(
             self._MIN_PROBE_INTERVAL_SECONDS,
             float(settings.ibkr_heartbeat_interval_seconds),
+        )
+        #: Durable history of real observed IBKR NLV points (never synthetic).
+        self._equity_history: LiveEquityHistoryStore = (
+            equity_history_store
+            if equity_history_store is not None
+            else LiveEquityHistoryStore(
+                settings.data_dir / EQUITY_HISTORY_FILE_NAME,
+                clock=clock,
+            )
         )
 
     # -- introspection ---------------------------------------------------------
@@ -857,6 +873,20 @@ class IBKRExecutionService:
     def source_name(self) -> str:
         """Provenance reported by the API (the IBKR book is always ``engine``)."""
         return "engine"
+
+    @property
+    def live_equity_points(self) -> tuple[EquityPoint, ...]:
+        """Persisted real IBKR NLV points (oldest first; ``()`` when absent)."""
+        try:
+            return tuple(self._equity_history.load())
+        except Exception:
+            logger.warning("failed to load IBKR equity history", exc_info=True)
+            return ()
+
+    @property
+    def equity_history_path(self) -> Path:
+        """Path of the durable IBKR NLV history document."""
+        return self._equity_history.path
 
     @property
     def connection_error(self) -> str | None:
@@ -1062,7 +1092,17 @@ class IBKRExecutionService:
         ).model_copy(update={"source": "engine"})
         self._last_good_positions = dict(positions)
         self._last_good_at = self._clock()
+        self._record_equity_point(
+            EquityPoint(time=snapshot.timestamp, value=snapshot.net_liquidation)
+        )
         return True
+
+    def _record_equity_point(self, point: EquityPoint) -> None:
+        """Persist one observed NLV point; attribution I/O must never break trading."""
+        try:
+            self._equity_history.append(point)
+        except Exception:
+            logger.warning("failed to persist IBKR equity history point", exc_info=True)
 
     def _unavailable_reason(self) -> str:
         detail = self.last_error or "IBKR session not connected"
@@ -2218,6 +2258,7 @@ def build_container(
         clock=resolved_clock,
         execution=execution,
         instrument_master=master,
+        market=market_service,
     )
     warnings.extend(live.warnings)
     offline_mode = not isinstance(execution, IBKRExecutionService)
