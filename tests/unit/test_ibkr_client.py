@@ -514,6 +514,25 @@ async def test_fetch_account_maps_tags(
     assert snapshot.timestamp == clock.now
 
 
+async def test_fetch_account_accepts_account_base_currency_rows(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    """EUR-base IBKR accounts must not be rejected as if only USD rows counted."""
+    eur_settings = settings.model_copy(update={"account_currency": "EUR"})
+    fake_client.account_rows = [
+        VenueAccountValue("NetLiquidation", "1003547.18", "EUR"),
+        VenueAccountValue("TotalCashValue", "1001970.93", "EUR"),
+        VenueAccountValue("BuyingPower", "4007883.72", "EUR"),
+        VenueAccountValue("NetLiquidation", "1.00", "GBP"),
+    ]
+    manager = make_manager(eur_settings, fake_client, clock)
+    await manager.connect()
+    snapshot = await manager.fetch_account()
+    assert snapshot.net_liquidation == pytest.approx(1_003_547.18)
+    assert snapshot.cash_balance == pytest.approx(1_001_970.93)
+    assert snapshot.buying_power == pytest.approx(4_007_883.72)
+
+
 async def test_fetch_account_requires_net_liquidation(
     settings: Settings, fake_client: FakeIBClient, clock: FakeClock
 ) -> None:

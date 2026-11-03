@@ -916,13 +916,23 @@ class IBKRConnectionManager:
         """Fetch the current account valuation and margin consumption."""
         client = self._require_client()
         rows = await client.account_values()
-        tags: dict[str, float] = {}
+        # IBKR reports the ledger in the account's base currency (EUR on many
+        # European paper accounts) plus optional per-currency rows. Accept the
+        # configured account currency, USD and the currency-less rows, preferring
+        # the configured base currency, then USD.
+        base_currency = self._settings.account_currency.upper()
+        per_currency: dict[str, dict[str, float]] = {}
         for row in rows:
-            if row.currency and row.currency != "USD":
+            currency = (row.currency or "").upper()
+            if currency not in {"", "USD", base_currency}:
                 continue
             parsed = _optional_float(row.value)
             if parsed is not None:
-                tags[row.tag] = parsed
+                per_currency.setdefault(currency, {})[row.tag] = parsed
+        tags: dict[str, float] = {}
+        for currency in (base_currency, "USD", ""):
+            for tag, value in per_currency.get(currency, {}).items():
+                tags.setdefault(tag, value)
         net_liquidation = tags.get("NetLiquidation")
         if net_liquidation is None or net_liquidation <= 0.0:
             raise IBKRDataError(
@@ -1187,6 +1197,8 @@ class _IbAsyncIBClient:
 
         self._ib: Any = IB()
         self._contracts: dict[int, Any] = {}
+        self._requested_accounts: set[str] = set()
+        self._account_tasks: set[asyncio.Future[Any]] = set()
 
     @property
     def is_connected(self) -> bool:
@@ -1197,11 +1209,49 @@ class _IbAsyncIBClient:
             host=host, port=port, clientId=client_id, timeout=timeout
         )
 
+    async def _request_account_updates_once(self) -> None:  # pragma: no cover
+        """Request account updates for every account not requested yet.
+
+        TWS only streams the ledger (NetLiquidation, margins, ...) after a
+        per-account update subscription. Accounts may not be populated at the
+        instant the socket opens, so this is retried from ``account_values``
+        until the account codes are known.
+        """
+        accounts_method = getattr(self._ib, "managedAccounts", None)
+        accounts = list(accounts_method() or []) if callable(accounts_method) else []
+        request = getattr(self._ib, "reqAccountUpdatesAsync", None)
+        if not callable(request):
+            return
+        loop = asyncio.get_running_loop()
+        for account in accounts:
+            if account in self._requested_accounts:
+                continue
+            self._requested_accounts.add(account)
+            try:
+                pending = request(account)
+                future = asyncio.ensure_future(pending, loop=loop)
+            except Exception:  # pragma: no cover - defensive SDK behaviour
+                self._requested_accounts.discard(account)
+                logger.debug("IBKR account-update subscription failed", exc_info=True)
+                continue
+            self._account_tasks.add(future)
+            future.add_done_callback(self._account_tasks.discard)
+
     async def disconnect(self) -> None:  # pragma: no cover - SDK round trip
         self._ib.disconnect()
 
     async def account_values(self) -> Sequence[VenueAccountValue]:  # pragma: no cover
-        return [
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 1.5
+        while loop.time() < deadline:
+            await self._request_account_updates_once()
+            values = self._ib.accountValues()
+            if any(
+                value.tag == "NetLiquidation" and value.currency in ("", "USD") for value in values
+            ):
+                break
+            await asyncio.sleep(0.25)
+        rows = [
             VenueAccountValue(
                 tag=value.tag,
                 value=str(value.value),
@@ -1210,6 +1260,25 @@ class _IbAsyncIBClient:
             )
             for value in self._ib.accountValues()
         ]
+        if not any(row.tag == "NetLiquidation" for row in rows):
+            # TWS may not stream the ledger to this client (multi-client sessions);
+            # accountSummary is a request/response fallback that always returns it.
+            summary = getattr(self._ib, "accountSummaryAsync", None)
+            if callable(summary):
+                try:
+                    values = await summary()
+                except Exception:  # pragma: no cover - defensive SDK behaviour
+                    values = []
+                for value in values or []:
+                    rows.append(
+                        VenueAccountValue(
+                            tag=str(value.tag),
+                            value=str(value.value),
+                            currency=str(getattr(value, "currency", "")),
+                            account=str(getattr(value, "account", "")),
+                        )
+                    )
+        return rows
 
     async def positions(self) -> Sequence[VenuePosition]:  # pragma: no cover
         rows: list[VenuePosition] = []

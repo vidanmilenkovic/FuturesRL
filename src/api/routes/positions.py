@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from src.api.deps import ContainerDep
 from src.api.schemas import AccountSnapshotResponse
@@ -23,4 +23,14 @@ router = APIRouter(tags=["positions"])
 )
 async def account_snapshot(container: ContainerDep) -> AccountSnapshotResponse:
     """Return the current account/position snapshot (bridge-first)."""
-    return await container.live.account()
+    try:
+        return await container.live.account()
+    except Exception as exc:  # IBKR/data-layer failure: degrade clearly, no raw 500
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "account snapshot unavailable: "
+                f"{type(exc).__name__}: {exc}. Check the TWS/IB Gateway session, "
+                "FUTURESRLX_IBKR_HOST/PORT and that the account is fully logged in."
+            ),
+        ) from exc
