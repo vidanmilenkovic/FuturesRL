@@ -503,6 +503,14 @@ ex-ante from the live book's weights and covariance (`0.0%` for a flat book) and
 synthetic fixture curve; if covariance is unavailable it shows `—`. Real IBKR NLV observations are
 persisted to `data/ibkr_equity_history.json`: the equity chart shows a **Simulated Backfill ·
 Recording Live Paper NLV** badge until five real points exist, then switches to **Live IBKR NLV**.
+The `/ws/telemetry` `pnl`/`margin` frames are sourced from the same live IBKR account (no demo
+jitter); a flat IBKR book publishes `0.0%` margin/volatility and the dashboard merge guards ignore
+synthetic-looking frames while IBKR is connected. Multi-day charts switch from "Simulated Backfill"
+to "Live IBKR NLV" only after five **distinct UTC calendar days** of real observations; `1D` plots
+the recorded intraday points directly. Legacy optimization studies with inactive/structural
+parameters are quarantined on API startup (`artifacts/optimizations/legacy/`) and are not shown or
+auto-selected in the Studio.
+
 The Annualised vol statistic follows the same live-book value while IBKR is connected.
 
 The API **never falls back to simulated positions** once IBKR is enabled. A lost session serves the

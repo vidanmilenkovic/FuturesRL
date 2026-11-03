@@ -386,6 +386,20 @@ both engines produce identical targets and deltas for identical market states.
   positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
   book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
+### v1.5.2 state-sync hardening
+
+- **WS/REST parity for IBKR.** The telemetry broadcaster now emits `pnl`/`margin`/`positions`
+  frames from the same enriched IBKR account as `GET /api/positions`: no demo jitter, exact margin
+  and ex-ante volatility, and a flat IBKR book always publishes `0.0%` margin/volatility. The
+  dashboard merge guards ignore simulated-looking frames while IBKR is connected.
+- **Distinct-day equity provenance.** Real IBKR NLV history switches the multi-day chart to "Live
+  IBKR NLV" only after **5 distinct UTC calendar days**; until then the synthetic backfill stays
+  clearly badged, and the 1D timeframe plots the real recorded intraday points.
+- **Legacy optimization cleanup.** Persisted Optuna studies are validated against their base
+  strategy's active/tunable search space on API startup; legacy studies (inactive overlays,
+  structural/hygiene parameters) are quarantined to `artifacts/optimizations/legacy/` and never
+  auto-selected or applied. The Studio additionally hides any legacy ids client-side.
+
 ### v1.5.1 surgical hardening
 
 - **Optuna defaults are active-only.** The parameter catalog marks structural/data-hygiene parameters

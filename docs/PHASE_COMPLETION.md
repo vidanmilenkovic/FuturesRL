@@ -540,3 +540,36 @@ setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, 
 frontend `tsc --noEmit`/`lint`/`build` clean, independent `tests/integration/test_phase10_2_v151.py`
 (24 tests) plus catalog/optimizer/API acceptance suites green; live API restarted with v1.5.1 and
 Command Center/Optuna verified against the real endpoints.
+
+
+---
+
+## v1.5.2 — state-sync, equity provenance & legacy optimization cleanup
+
+1. **WS/REST IBKR parity.** `TelemetryBroadcaster` uses an injectable account provider wired to
+   `LiveStateService.account`, so `pnl`/`margin`/`positions` frames carry the same enriched IBKR
+   book as `GET /api/positions`; IBKR frames carry no demo jitter and publish actual
+   margin/utilization/`portfolio_volatility`/`open_positions` (flat book = 0.0). Payloads gained
+   additive attribution fields; no honest book still emits heartbeat only. Offline behaviour is
+   unchanged.
+2. **Distinct-day equity provenance.** `LiveEquityHistoryStore` now exposes distinct UTC days and
+   intraday points. `equity_curve_source="ibkr-live"` requires **≥5 distinct UTC days** (not merely
+   5 points); <5 days keeps the synthetic backfill badged as such, while `equity_curve_live_days` and
+   `equity_curve_intraday` let the frontend plot real intraday points on `1D`. Live mode plots only
+   real recorded points (no synthetic prefix).
+3. **Legacy optimization purge.** New `validate_persisted_optimization` in the optimizer flags old
+   studies whose search space/params include inactive overlays or structural/hygiene paths. On
+   startup the API validates every persisted artifact, moves legacy/invalid studies to
+   `artifacts/optimizations/legacy/`, excludes them from list/detail/apply/default selection, and
+   remains idempotent/corrupt-safe; clean studies stay byte-canonical. The Studio also hides legacy
+   ids client-side, so the Optuna pane auto-selects a clean active-space study.
+4. **Frontend merge/equity guards.** While IBKR is connected the AccountProvider accepts only
+   IBKR-sourced telemetry frames (ignoring synthetic-looking margin/vol/NLV values), keeps REST
+   `portfolio_volatility`, and renders timeframe-aware "Live IBKR NLV"/"Simulated Backfill" badges
+   with intraday support on `1D`.
+
+**Verification** — hostile-env `./scripts/quality_gate.sh --cov`: **1710 passed, 0 failures,
+0 warnings**, coverage 94.24%, mypy strict 103 files; independent v1.5.2 verification suite
+(16 tests) and updated v1.5.1 acceptance suite (24 tests) green; frontend `tsc`/`lint`/`build`
+clean; live API smoke + headless checks confirm flat IBKR REST and WS parity, distinct-day source
+switching, and legacy-study quarantine.
