@@ -50,8 +50,11 @@ import type {
   ApiResult,
   BacktestListResponse,
   ConnectionState,
+  ArtifactMutationResult,
   BacktestRunConfig,
   BacktestRunSummary,
+  PaperStateResetResult,
+  RiskLockResetResult,
   FlattenAllResponse,
   HealthResponse,
   PipelineWaterfallResponse,
@@ -59,6 +62,7 @@ import type {
   RiskThresholdOverride,
   RiskThresholds,
   StrategyConfig,
+  StrategyMutationResult,
   TearsheetResponse,
   DrlBindResult,
   DrlModel,
@@ -306,6 +310,316 @@ export function runBacktest(config: BacktestRunConfig): Promise<ApiResult<Backte
     { method: "POST", body: JSON.stringify(config) },
     20_000,
   );
+}
+
+// ---------------------------------------------------------------------------
+// QoL artifact management / operator operations
+// ---------------------------------------------------------------------------
+
+async function requestRaw(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${apiBaseUrl()}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        Accept: "*/*",
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...init?.headers,
+      },
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new ApiError(`${response.status} ${response.statusText} · ${path}`, response.status);
+    }
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export async function deleteOptimization(studyId: string): Promise<ApiResult<ArtifactMutationResult>> {
+  return mutationRequest(`/api/optimize/${encodeURIComponent(studyId)}`, "DELETE", undefined, () =>
+    artifactRequired("Optimization studies cannot be deleted without the FastAPI backend."),
+  );
+}
+
+export async function deleteBacktest(runId: string): Promise<ApiResult<ArtifactMutationResult>> {
+  return mutationRequest(`/api/backtests/${encodeURIComponent(runId)}`, "DELETE", undefined, () =>
+    artifactRequired("Backtest runs cannot be deleted without the FastAPI backend."),
+  );
+}
+
+export async function deleteStrategy(strategyId: string): Promise<ApiResult<ArtifactMutationResult>> {
+  return mutationRequest(`/api/strategies/${encodeURIComponent(strategyId)}`, "DELETE", undefined, () =>
+    artifactRequired("Strategies cannot be deleted without the FastAPI backend."),
+  );
+}
+
+async function mutationRequest(
+  path: string,
+  method: string,
+  body: unknown,
+  fallback: () => ArtifactMutationResult,
+  timeoutMs = 30_000,
+): Promise<ApiResult<ArtifactMutationResult>> {
+  try {
+    const response = await requestRaw(
+      path,
+      { method, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) },
+      timeoutMs,
+    );
+    const text = await response.text();
+    let parsed: unknown = null;
+    try {
+      parsed = text.length > 0 ? JSON.parse(text) : null;
+    } catch {
+      parsed = { message: text };
+    }
+    const message =
+      parsed && typeof parsed === "object" && "message" in parsed
+        ? asMessage((parsed as Record<string, unknown>).message)
+        : `${method === "DELETE" ? "Deleted" : "Updated"} successfully.`;
+    return {
+      data: {
+        ok: true,
+        message,
+        status:
+          parsed && typeof parsed === "object" && "status" in parsed
+            ? asMessage((parsed as Record<string, unknown>).status)
+            : "ok",
+      },
+      source: "live",
+      error: null,
+    };
+  } catch (error) {
+    return { data: fallback(), source: "demo", error: errorMessage(error) };
+  }
+}
+
+function artifactRequired(message: string): ArtifactMutationResult {
+  return { ok: false, message };
+}
+
+function asMessage(value: unknown): string {
+  return typeof value === "string" ? value : value === null || value === undefined ? "" : String(value);
+}
+
+export async function cloneStrategy(
+  strategyId: string,
+  newStrategyId: string,
+): Promise<ApiResult<StrategyMutationResult>> {
+  return strategyMutation(`/api/strategies/${encodeURIComponent(strategyId)}/clone`, newStrategyId, "clone");
+}
+
+export async function renameStrategy(
+  strategyId: string,
+  newStrategyId: string,
+): Promise<ApiResult<StrategyMutationResult>> {
+  return strategyMutation(`/api/strategies/${encodeURIComponent(strategyId)}/rename`, newStrategyId, "rename");
+}
+
+async function strategyMutation(
+  path: string,
+  newStrategyId: string,
+  operation: "clone" | "rename",
+): Promise<ApiResult<StrategyMutationResult>> {
+  try {
+    const raw = await requestRaw(
+      path,
+      { method: "POST", body: JSON.stringify({ new_strategy_id: newStrategyId }) },
+      30_000,
+    );
+    const parsed = (await raw.json()) as unknown;
+    const strategy = normalizeStrategyConfig(parsed);
+    if (!strategy) {
+      return {
+        data: { ok: false, strategy: null, message: "The API returned an unrecognized strategy payload." },
+        source: "demo",
+        error: "unrecognized strategy payload",
+      };
+    }
+    return {
+      data: { ok: true, strategy, message: `${operation === "clone" ? "Cloned" : "Renamed"} to ${strategy.id}.` },
+      source: "live",
+      error: null,
+    };
+  } catch (error) {
+    return {
+      data: {
+        ok: false,
+        strategy: null,
+        message:
+          operation === "clone"
+            ? "Cloning requires the FastAPI backend."
+            : "Renaming requires the FastAPI backend.",
+      },
+      source: "demo",
+      error: errorMessage(error),
+    };
+  }
+}
+
+/** Download a raw artifact (YAML/CSV/JSON) through the browser. */
+export async function downloadArtifact(
+  path: string,
+  fallbackFilename: string,
+): Promise<{ ok: boolean; error: string | null }> {
+  try {
+    const response = await requestRaw(path, { method: "GET" }, 30_000);
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") ?? "";
+    const match = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(disposition);
+    const filename = (match?.[1] ?? fallbackFilename).replace(/"/g, "").trim() || fallbackFilename;
+    if (typeof window === "undefined") throw new Error("downloads require a browser");
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2_000);
+    return { ok: true, error: null };
+  } catch (error) {
+    return { ok: false, error: errorMessage(error) };
+  }
+}
+
+export function downloadStrategyYaml(strategyId: string): Promise<{ ok: boolean; error: string | null }> {
+  return downloadArtifact(
+    `/api/strategies/${encodeURIComponent(strategyId)}/yaml`,
+    `${strategyId}.yaml`,
+  );
+}
+
+export function exportTearSheet(runId: string): Promise<{ ok: boolean; error: string | null }> {
+  return downloadArtifact(
+    `/api/backtests/${encodeURIComponent(runId)}/export.json`,
+    `${runId}-tearsheet.json`,
+  );
+}
+
+export function exportTradesCsv(runId: string): Promise<{ ok: boolean; error: string | null }> {
+  return downloadArtifact(
+    `/api/backtests/${encodeURIComponent(runId)}/trades.csv`,
+    `${runId}-trades.csv`,
+  );
+}
+
+export async function resetRiskLock(
+  options: { operatorToken?: string } = {},
+): Promise<ApiResult<RiskLockResetResult>> {
+  try {
+    const response = await requestRaw(
+      "/api/risk/reset-lock",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          confirm: "RESET RISK LOCK",
+          operator_token: options.operatorToken?.trim() || null,
+          reset_persisted_state: true,
+        }),
+      },
+      30_000,
+    );
+    const parsed = (await response.json()) as Record<string, unknown>;
+    return {
+      data: {
+        ok: true,
+        message: asMessage(parsed.message) || "Risk lock reset accepted.",
+        kill_switch_active:
+          typeof parsed.kill_switch_active === "boolean" ? parsed.kill_switch_active : null,
+        state: null,
+      },
+      source: "live",
+      error: null,
+    };
+  } catch (error) {
+    return {
+      data: { ok: false, message: "Risk-lock reset requires the FastAPI backend." },
+      source: "demo",
+      error: errorMessage(error),
+    };
+  }
+}
+
+export async function resetPaperState(
+  options: { confirm: string; clearRiskState: boolean; clearRunnerBridge: boolean; clearPaperCache: boolean },
+): Promise<ApiResult<PaperStateResetResult>> {
+  try {
+    const response = await requestRaw(
+      "/api/maintenance/reset-paper-state",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          confirm: options.confirm,
+          clear_risk_state: options.clearRiskState,
+          clear_runner_bridge: options.clearRunnerBridge,
+          clear_paper_cache: options.clearPaperCache,
+        }),
+      },
+      60_000,
+    );
+    const parsed = (await response.json()) as Record<string, unknown>;
+    return {
+      data: {
+        ok: true,
+        message: asMessage(parsed.message) || "Paper state reset.",
+        receipts:
+          parsed.receipts && typeof parsed.receipts === "object"
+            ? (parsed.receipts as Record<string, unknown> | unknown[])
+            : null,
+      },
+      source: "live",
+      error: null,
+    };
+  } catch (error) {
+    return {
+      data: { ok: false, message: "Clearing paper state requires the FastAPI backend." },
+      source: "demo",
+      error: errorMessage(error),
+    };
+  }
+}
+
+export async function resetRunnerBridge(): Promise<ApiResult<ArtifactMutationResult>> {
+  try {
+    const response = await requestRaw(
+      "/api/runner/reset",
+      { method: "POST", body: JSON.stringify({}) },
+      30_000,
+    );
+    const parsed = (await response.json()) as Record<string, unknown>;
+    const stopped = parsed.session_running === false;
+    return {
+      data: {
+        ok: true,
+        message: stopped
+          ? "Runner bridge reset — offline session closed."
+          : "Runner bridge reset requested.",
+        status: asMessage(parsed.mode) || "ok",
+      },
+      source: "live",
+      error: null,
+    };
+  } catch (error) {
+    return {
+      data: artifactRequired("Runner bridge reset requires the FastAPI backend."),
+      source: "demo",
+      error: errorMessage(error),
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------

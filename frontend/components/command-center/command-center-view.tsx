@@ -15,14 +15,18 @@ import {
   SortHeader,
   Tabs,
   EmptyState,
+  Field,
   Skeleton,
+  TextInput,
   signedColor,
 } from "@/components/ui/primitives";
+import { Modal } from "@/components/ui/dialog";
 import {
   getRecentFills,
   getRiskState,
   getRunnerStatus,
   getWorkingOrders,
+  resetRiskLock,
   stepRunner,
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
@@ -99,6 +103,13 @@ export function CommandCenterView() {
   const { events, latest, health } = useTelemetry();
   const risk = useAsyncData(getRiskState);
   const thresholds = risk.data?.thresholds ?? FALLBACK_THRESHOLDS;
+  const [riskResetOpen, setRiskResetOpen] = useState(false);
+  const [riskResetConfirm, setRiskResetConfirm] = useState("");
+  const [riskResetChecked, setRiskResetChecked] = useState(false);
+  const [riskResetToken, setRiskResetToken] = useState("");
+  const [riskResetError, setRiskResetError] = useState<string | null>(null);
+  const [riskResetNote, setRiskResetNote] = useState<{ text: string; tone: "gain" | "warn" } | null>(null);
+  const [riskResetting, setRiskResetting] = useState(false);
 
   const [timeframe, setTimeframe] = useState<Timeframe>("6M");
   const [showDrawdown, setShowDrawdown] = useState(true);
@@ -198,6 +209,10 @@ export function CommandCenterView() {
   const showLiveEquityBadge = ibkrConnected && (isIntradayLive || equitySource === "ibkr-live");
   const showSimulatedBackfillBadge =
     ibkrConnected && !showLiveEquityBadge && equitySource === "simulated-backfill";
+  const riskLockActive =
+    risk.data?.kill_switch_active === true ||
+    risk.data?.daily_loss_breaker_active === true ||
+    Boolean(risk.data?.execution_locked_until ?? risk.data?.lock_until);
   const equityBadgePoints = isIntradayLive ? intradayReal.length : equityLivePoints;
   const equityBadgeSource = showLiveEquityBadge ? "ibkr-live" : "simulated-backfill";
 
@@ -574,9 +589,57 @@ export function CommandCenterView() {
       <div className="col-span-12 flex flex-col gap-3 xl:col-span-4">
         <Panel
           title="Risk budget"
-          actions={<span className="text-[11px] text-zinc-600">thresholds · API</span>}
+          actions={
+            <div className="flex items-center gap-2">
+              {riskLockActive ? <Badge tone="loss">KILL SWITCH ACTIVE</Badge> : null}
+              <span className="text-[11px] text-zinc-600">thresholds · API</span>
+              {riskLockActive ? (
+                <Button
+                  variant="danger"
+                  size="xs"
+                  testId="reset-risk-lock"
+                  disabled={risk.data?.reset_available === false}
+                  title={
+                    risk.data?.reset_available === false
+                      ? "Manual reset unavailable (flatten in progress or adapter does not support it)"
+                      : "Reset the risk lock after double confirmation"
+                  }
+                  onClick={() => {
+                    setRiskResetConfirm("");
+                    setRiskResetChecked(false);
+                    setRiskResetToken("");
+                    setRiskResetError(null);
+                    setRiskResetOpen(true);
+                  }}
+                >
+                  Reset Risk Lock
+                </Button>
+              ) : null}
+            </div>
+          }
         >
           <BulletBars rows={bullets} />
+          {riskResetNote ? (
+            <p
+              data-testid="risk-reset-note"
+              className={cn(
+                "mt-2 rounded border px-2 py-1 text-[10.5px]",
+                riskResetNote.tone === "gain"
+                  ? "border-gain/30 bg-gain-soft/30 text-emerald-300"
+                  : "border-warn/30 bg-warn-soft/30 text-amber-300",
+              )}
+            >
+              {riskResetNote.text}
+            </p>
+          ) : null}
+          {riskLockActive ? (
+            <p className="mt-2 border-t border-hairline pt-2 text-[10.5px] leading-4 text-zinc-600" data-testid="risk-lock-detail">
+              {risk.data?.kill_switch_reason
+                ? risk.data.kill_switch_reason
+                : "Execution is locked by the risk kill switch. Reset requires operator confirmation."}
+              {risk.data?.reset_available === false ? " Manual reset is not available in this environment." : ""}
+            </p>
+          ) : null}
         </Panel>
         <Panel className="flex-1" title="Exposure by asset class">
           {exposureRows.length > 0 ? (
@@ -766,6 +829,104 @@ export function CommandCenterView() {
           </div>
         ) : null}
       </Panel>
+      <Modal
+        open={riskResetOpen}
+        title="Reset risk lock / resume execution"
+        description="The kill switch halted execution. Resetting clears the persisted lock and daily breaker; resume only after you have reviewed the book."
+        onClose={() => {
+          if (riskResetting) return;
+          setRiskResetOpen(false);
+          setRiskResetError(null);
+        }}
+        busy={riskResetting}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setRiskResetOpen(false);
+                setRiskResetError(null);
+              }}
+              disabled={riskResetting}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              testId="confirm-reset-risk-lock"
+              disabled={
+                riskResetting ||
+                riskResetConfirm.trim() !== "RESET" ||
+                !riskResetChecked ||
+                (risk.data?.operator_reset_token_required === true && riskResetToken.trim() === "")
+              }
+              onClick={() => {
+                setRiskResetting(true);
+                setRiskResetError(null);
+                void resetRiskLock({ operatorToken: riskResetToken }).then((result) => {
+                  setRiskResetting(false);
+                  if (result.source === "live" && result.data.ok) {
+                    setRiskResetOpen(false);
+                    setRiskResetNote({ text: result.data.message || "Risk lock reset accepted.", tone: "gain" });
+                    risk.reload();
+                  } else {
+                    setRiskResetError(
+                      result.source === "demo"
+                        ? result.data.message || "Risk-lock reset requires the FastAPI backend."
+                        : result.data.message || "Risk-lock reset failed.",
+                    );
+                  }
+                });
+              }}
+            >
+              {riskResetting ? "Resetting…" : "RESET RISK LOCK"}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-2.5">
+          <label className="flex items-start gap-2 text-[11px] leading-4 text-zinc-400">
+            <input
+              type="checkbox"
+              checked={riskResetChecked}
+              onChange={(event) => setRiskResetChecked(event.target.checked)}
+              className="mt-0.5 h-3 w-3 rounded border-zinc-600 bg-canvas accent-red-500"
+              data-testid="reset-risk-lock-checkbox"
+            />
+            I have reviewed the open book and understand this resumes automated execution.
+          </label>
+          {risk.data?.operator_reset_token_required ? (
+            <Field label="Operator reset token" htmlFor="risk-reset-token">
+              <TextInput
+                id="risk-reset-token"
+                type="password"
+                value={riskResetToken}
+                onChange={setRiskResetToken}
+                placeholder="FUTURESRLX_OPERATOR_RESET_TOKEN"
+                disabled={riskResetting}
+              />
+            </Field>
+          ) : null}
+          <Field label="Type RESET to confirm" htmlFor="risk-reset-confirm">
+            <TextInput
+              id="risk-reset-confirm"
+              value={riskResetConfirm}
+              onChange={setRiskResetConfirm}
+              placeholder="RESET"
+              disabled={riskResetting}
+            />
+          </Field>
+          {riskResetError ? (
+            <div
+              role="alert"
+              data-testid="risk-reset-error"
+              className="rounded-md border border-loss/40 bg-loss-soft/40 px-2.5 py-2 text-[11px] text-rose-300"
+            >
+              {riskResetError}
+            </div>
+          ) : null}
+        </div>
+      </Modal>
     </div>
   );
 }

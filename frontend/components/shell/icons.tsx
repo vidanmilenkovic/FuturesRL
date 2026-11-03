@@ -114,3 +114,46 @@ export function ArrowRightIcon(props: IconProps) {
     </Svg>
   );
 }
+
+export function TrashIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3.5 5.5h13M8 5.5V3.8h4v1.7M5.5 5.5l.8 11h7.4l.8-11M8.5 8.5v5M11.5 8.5v5" />
+    </Svg>
+  );
+}
+
+export function DownloadIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M10 3.5v8M6.5 8 10 11.5 13.5 8M3.5 14v2.5h13V14" />
+    </Svg>
+  );
+}
+
+export function CopyIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="6.5" y="6.5" width="9" height="9" rx="1.2" />
+      <path d="M4.5 13.5h-1v-9h9v1" />
+    </Svg>
+  );
+}
+
+export function RenameIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3.5 14.5h13M10 3.5v7M6.5 7 10 10.5 13.5 7" />
+    </Svg>
+  );
+}
+
+export function DotsIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="4.5" cy="10" r="1" />
+      <circle cx="10" cy="10" r="1" />
+      <circle cx="15.5" cy="10" r="1" />
+    </Svg>
+  );
+}

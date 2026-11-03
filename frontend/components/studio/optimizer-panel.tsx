@@ -14,7 +14,14 @@ import {
   type Tone,
 } from "@/components/ui/primitives";
 import { Modal } from "@/components/ui/dialog";
-import { applyOptimization, getOptimization, listOptimizations, runOptimization } from "@/lib/api";
+import { TrashIcon } from "@/components/shell/icons";
+import {
+  applyOptimization,
+  deleteOptimization,
+  getOptimization,
+  listOptimizations,
+  runOptimization,
+} from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { formatInteger, formatNumber, formatPct } from "@/lib/format";
 import {
@@ -85,6 +92,13 @@ export function OptimizerPanel({
     strategyPath: string | null;
     backtestRunId: string | null;
   } | null>(null);
+  const [applyToast, setApplyToast] = useState<{
+    strategyId: string;
+    backtestRunId: string | null;
+  } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<OptimizationStudy | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "value", dir: "desc" });
 
   const baseStrategy = useMemo(
@@ -214,6 +228,12 @@ export function OptimizerPanel({
     onNotify(`Optimization complete · ${result.data.n_trials} trials`, result.source === "live" ? "gain" : "warn");
   };
 
+  useEffect(() => {
+    if (!applyToast) return;
+    const timer = setTimeout(() => setApplyToast(null), 12_000);
+    return () => clearTimeout(timer);
+  }, [applyToast]);
+
   const openApplyDialog = () => {
     if (!study) return;
     const base = baseStrategy?.id ?? study.base_strategy_id ?? "strategy";
@@ -274,6 +294,7 @@ export function OptimizerPanel({
       strategyPath: result.data.strategy_path ?? null,
       backtestRunId,
     });
+    setApplyToast({ strategyId: savedId, backtestRunId });
     setApplyOpen(false);
     setMessage({
       text: `Saved strategy "${savedId}"${
@@ -534,30 +555,47 @@ export function OptimizerPanel({
             ) : (
               <div className="space-y-1">
                 {cleanStudies.map((entry) => (
-                  <button
+                  <div
                     key={entry.study_id}
-                    type="button"
-                    onClick={() => setStudy(entry)}
                     data-testid="optimization-study-row"
                     data-study-id={entry.study_id}
                     data-selected={study?.study_id === entry.study_id ? "true" : "false"}
                     className={cn(
-                      "focus-ring flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-[10.5px] transition-colors",
+                      "flex w-full items-center gap-1 rounded border pr-1 transition-colors",
                       study?.study_id === entry.study_id
                         ? "border-accent/40 bg-accent-soft/40"
                         : "border-transparent hover:bg-surface",
                     )}
                   >
-                    <span className="min-w-0">
-                      <span className="block truncate font-mono text-zinc-300">{entry.study_id}</span>
-                      <span className="block truncate text-zinc-600">
-                        {entry.base_strategy_id} · {entry.objective_metric} · {entry.n_trials} trials
+                    <button
+                      type="button"
+                      onClick={() => setStudy(entry)}
+                      className="focus-ring flex min-w-0 flex-1 items-center justify-between gap-2 px-2 py-1.5 text-left text-[10.5px]"
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate font-mono text-zinc-300">{entry.study_id}</span>
+                        <span className="block truncate text-zinc-600">
+                          {entry.base_strategy_id} · {entry.objective_metric} · {entry.n_trials} trials
+                        </span>
                       </span>
-                    </span>
-                    <span className="shrink-0 font-mono tabular-nums text-emerald-400">
-                      {formatObjectiveValue(entry.best_value)}
-                    </span>
-                  </button>
+                      <span className="shrink-0 font-mono tabular-nums text-emerald-400">
+                        {formatObjectiveValue(entry.best_value)}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Delete study ${entry.study_id}`}
+                      title="Delete this optimization study artifact"
+                      data-testid={`delete-study-${entry.study_id}`}
+                      onClick={() => {
+                        setDeleteError(null);
+                        setDeleteTarget(entry);
+                      }}
+                      className="focus-ring grid h-6 w-6 shrink-0 place-items-center rounded text-zinc-600 hover:bg-loss-soft hover:text-rose-300"
+                    >
+                      <TrashIcon className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 ))}
               </div>
             )}
@@ -876,6 +914,122 @@ export function OptimizerPanel({
           </p>
         </div>
       </Modal>
+      <Modal
+        open={deleteTarget !== null}
+        title="Delete optimization study"
+        description={
+          <span>
+            Permanently remove <span className="font-mono text-zinc-300">{deleteTarget?.study_id}</span> and its
+            persisted artifact. This cannot be undone.
+          </span>
+        }
+        onClose={() => {
+          if (deleting) return;
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+        busy={deleting}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setDeleteTarget(null);
+                setDeleteError(null);
+              }}
+              disabled={deleting}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              testId="confirm-delete-study"
+              disabled={deleting}
+              onClick={() => {
+                if (!deleteTarget) return;
+                setDeleting(true);
+                setDeleteError(null);
+                void deleteOptimization(deleteTarget.study_id).then((result) => {
+                  setDeleting(false);
+                  if (result.source === "live" && result.data.ok) {
+                    const removed = deleteTarget.study_id;
+                    setDeleteTarget(null);
+                    if (study?.study_id === removed) setStudy(null);
+                    studies.reload();
+                    setMessage({ text: `Deleted study ${removed}.`, tone: "gain" });
+                    onNotify(`Deleted study ${removed}`, "gain");
+                  } else {
+                    setDeleteError(
+                      result.data.message ||
+                        `Delete failed${result.error ? `: ${result.error}` : "."}`,
+                    );
+                  }
+                });
+              }}
+            >
+              {deleting ? "Deleting…" : "Delete study"}
+            </Button>
+          </>
+        }
+      >
+        {deleteError ? (
+          <div
+            role="alert"
+            data-testid="delete-study-error"
+            className="rounded-md border border-loss/40 bg-loss-soft/40 px-2.5 py-2 text-[11px] leading-4 text-rose-300"
+          >
+            {deleteError}
+          </div>
+        ) : (
+          <p className="text-[10.5px] leading-4 text-zinc-600">
+            The study disappears from the persisted list immediately. Legacy quarantine files are untouched.
+          </p>
+        )}
+      </Modal>
+
+      {applyToast ? (
+        <div
+          data-testid="apply-toast"
+          data-strategy-id={applyToast.strategyId}
+          data-run-id={applyToast.backtestRunId ?? ""}
+          role="status"
+          className="fixed bottom-12 right-4 z-50 w-[320px] rounded-md border border-gain/40 bg-panel px-3 py-2.5 shadow-popover"
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <p className="text-[11.5px] font-medium text-emerald-300">Verification backtest ready</p>
+              <p className="mt-0.5 truncate font-mono text-[10px] text-zinc-500">
+                {applyToast.backtestRunId ?? "backtest pending"}
+              </p>
+            </div>
+            <button
+              type="button"
+              aria-label="Dismiss toast"
+              onClick={() => setApplyToast(null)}
+              className="focus-ring -mr-1 grid h-5 w-5 place-items-center rounded text-zinc-500 hover:bg-surface hover:text-zinc-300"
+            >
+              ×
+            </button>
+          </div>
+          <div className="mt-1.5 flex items-center gap-3 text-[10.5px]">
+            {applyToast.backtestRunId ? (
+              <a
+                href={`/backtests?run=${encodeURIComponent(applyToast.backtestRunId)}`}
+                data-testid="toast-view-tearsheet"
+                className="font-medium text-emerald-300 underline decoration-emerald-500/40 underline-offset-2 hover:text-emerald-200"
+              >
+                View Tear Sheet
+              </a>
+            ) : null}
+            <a
+              href={`/backtests?strategy=${encodeURIComponent(applyToast.strategyId)}`}
+              className="text-zinc-400 underline decoration-zinc-600 underline-offset-2 hover:text-zinc-200"
+            >
+              Backtest Lab
+            </a>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -215,6 +215,10 @@ export function normalizeStrategyConfig(raw: unknown): StrategyConfig | null {
     timing: asArray(raw.timing).map((stage) => encodeStage(normalizeStage(stage))),
     risk: asArray(raw.risk).map((stage) => encodeStage(normalizeStage(stage))),
     updated_at: asString(raw.updated_at, new Date().toISOString()),
+    ...(typeof raw.builtin === "boolean" ? { builtin: raw.builtin } : {}),
+    ...(typeof raw.path === "string" ? { path: raw.path } : {}),
+    ...(typeof raw.strategy_path === "string" ? { strategy_path: raw.strategy_path } : {}),
+    ...(typeof raw.source === "string" ? { source: raw.source } : {}),
     ...(isRecord(raw.drl) ? { drl: normalizeDrlConfig(raw.drl) } : {}),
   };
 }

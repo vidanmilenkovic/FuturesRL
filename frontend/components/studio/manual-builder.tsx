@@ -11,8 +11,18 @@ import {
   TextInput,
   type Tone,
 } from "@/components/ui/primitives";
-import { ChevronDownIcon, ChevronUpIcon } from "@/components/shell/icons";
-import { getInstruments, listDrlModels, saveStudioStrategy } from "@/lib/api";
+import { Modal } from "@/components/ui/dialog";
+import { ChevronDownIcon, ChevronUpIcon, DownloadIcon, TrashIcon } from "@/components/shell/icons";
+import {
+  cloneStrategy,
+  deleteStrategy,
+  downloadStrategyYaml,
+  getInstruments,
+  listDrlModels,
+  renameStrategy,
+  saveStudioStrategy,
+} from "@/lib/api";
+import { isBuiltinStrategy } from "@/lib/artifacts";
 import { cn } from "@/lib/cn";
 import {
   SECTOR_TABS,
@@ -24,6 +34,7 @@ import {
   draftToYaml,
   buildEncodingMap,
   getDraftValue,
+  ID_PATTERN,
   isAdvancedParameter,
   numericBadge,
   orderUniverseRoots,
@@ -112,6 +123,11 @@ export function ManualBuilder({
   const [saving, setSaving] = useState<null | "save" | "run">(null);
   const [saveNote, setSaveNote] = useState<{ text: string; tone: Tone } | null>(null);
   const [syncWithAllocator, setSyncWithAllocator] = useState(false);
+  const [actionDialog, setActionDialog] = useState<null | "clone" | "rename" | "delete">(null);
+  const [actionTargetId, setActionTargetId] = useState("");
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [saveToast, setSaveToast] = useState<{ strategyId: string } | null>(null);
 
   const sectors = useMemo(
     () => instrumentsSource.data?.sectors ?? catalog.universe?.sectors ?? [],
@@ -127,6 +143,11 @@ export function ManualBuilder({
   const encodings = useMemo(() => buildEncodingMap(catalog.parameters), [catalog.parameters]);
   const yaml = useMemo(() => draftToYaml(draft, encodings), [draft, encodings]);
   const editingExisting = strategies.some((strategy) => strategy.id === draft.id);
+  const sourceStrategy = useMemo(
+    () => strategies.find((strategy) => strategy.id === draft.id) ?? strategies.find((strategy) => strategy.id === loadId) ?? null,
+    [strategies, draft.id, loadId],
+  );
+  const sourceBuiltin = isBuiltinStrategy(sourceStrategy);
   const selectedRoots = useMemo(() => rootsOf(draft), [draft]);
   const drlModels = drlModelsSource.data?.models ?? [];
 
@@ -145,6 +166,12 @@ export function ManualBuilder({
     const defaults = defaultUniverseRoots(sectors);
     if (defaults.length > 0) onDraftChange(withRoots(draft, defaults));
   }, [sectors, draft, onDraftChange]);
+
+  useEffect(() => {
+    if (!saveToast) return;
+    const timer = setTimeout(() => setSaveToast(null), 8_000);
+    return () => clearTimeout(timer);
+  }, [saveToast]);
 
   const loadExisting = (id: string) => {
     setLoadId(id);
@@ -188,7 +215,74 @@ export function ManualBuilder({
     onStrategiesChanged();
     if (mode === "run") {
       const id = result.data.strategy?.id ?? draft.id;
-      router.push(`/backtests?strategy=${encodeURIComponent(id)}`);
+      setSaveToast({ strategyId: id });
+      // Keep the toast/tear-sheet quick action visible briefly before handing
+      // over to the Backtest Lab deep link.
+      setTimeout(() => router.push(`/backtests?strategy=${encodeURIComponent(id)}`), 1_200);
+    }
+  };
+
+  const openActionDialog = (kind: "clone" | "rename" | "delete") => {
+    if (!sourceStrategy) return;
+    setActionError(null);
+    setActionTargetId(kind === "clone" ? `${sourceStrategy.id}_copy` : sourceStrategy.id);
+    setActionDialog(kind);
+  };
+
+  const runStrategyAction = async () => {
+    if (!sourceStrategy || !actionDialog) return;
+    setActionError(null);
+    if (actionDialog === "delete") {
+      setActionBusy(true);
+      const result = await deleteStrategy(sourceStrategy.id);
+      setActionBusy(false);
+      if (result.source === "live" && result.data.ok) {
+        const removed = sourceStrategy.id;
+        setActionDialog(null);
+        setLoadId("");
+        onStrategiesChanged();
+        setSaveNote({ text: `Deleted strategy ${removed}.`, tone: "gain" });
+        onNotify(`Deleted strategy ${removed}`, "gain");
+      } else {
+        setActionError(result.data.message || `Delete failed${result.error ? `: ${result.error}` : "."}`);
+      }
+      return;
+    }
+    if (!ID_PATTERN.test(actionTargetId.trim())) {
+      setActionError("Strategy ID must match ^[a-z][a-z0-9_]{0,63}$ (lowercase slug).");
+      return;
+    }
+    setActionBusy(true);
+    const result =
+      actionDialog === "clone"
+        ? await cloneStrategy(sourceStrategy.id, actionTargetId.trim())
+        : await renameStrategy(sourceStrategy.id, actionTargetId.trim());
+    setActionBusy(false);
+    if (result.source === "live" && result.data.ok && result.data.strategy) {
+      const strategy = result.data.strategy;
+      setActionDialog(null);
+      setLoadId(strategy.id);
+      onDraftChange(draftFromStrategy(strategy));
+      onStrategiesChanged();
+      if (typeof window !== "undefined") {
+        window.history.replaceState({}, "", `/studio?strategy=${encodeURIComponent(strategy.id)}`);
+      }
+      setSaveNote({ text: `${actionDialog === "clone" ? "Cloned" : "Renamed"} to ${strategy.id}.`, tone: "gain" });
+      onNotify(`Strategy ${strategy.id} ${actionDialog === "clone" ? "cloned" : "renamed"}`, "gain");
+    } else {
+      setActionError(
+        result.data.message || `${actionDialog === "clone" ? "Clone" : "Rename"} failed${result.error ? `: ${result.error}` : "."}`,
+      );
+    }
+  };
+
+  const downloadYaml = async () => {
+    if (!sourceStrategy) return;
+    const result = await downloadStrategyYaml(sourceStrategy.id);
+    if (result.ok) {
+      onNotify(`Downloaded ${sourceStrategy.id}.yaml`, "gain");
+    } else {
+      setSaveNote({ text: `YAML download failed${result.error ? `: ${result.error}` : "."}`, tone: "warn" });
     }
   };
 
@@ -318,6 +412,51 @@ export function ManualBuilder({
           >
             {saving === "run" ? "Saving…" : "Save & Run in Backtest Lab"}
           </Button>
+        </div>
+        <div className="flex items-center gap-1 pb-0.5">
+          <Button
+            variant="ghost"
+            size="xs"
+            onClick={() => openActionDialog("clone")}
+            disabled={!sourceStrategy || actionBusy}
+            testId="studio-clone"
+            title="Clone the loaded strategy under a new id"
+          >
+            Clone
+          </Button>
+          <Button
+            variant="ghost"
+            size="xs"
+            onClick={() => openActionDialog("rename")}
+            disabled={!sourceStrategy || sourceBuiltin || actionBusy}
+            testId="studio-rename"
+            title={sourceBuiltin ? "Committed built-in strategies cannot be renamed" : "Rename the loaded custom strategy"}
+          >
+            Rename
+          </Button>
+          <Button
+            variant="ghost"
+            size="xs"
+            onClick={() => void downloadYaml()}
+            disabled={!sourceStrategy}
+            testId="studio-download-yaml"
+            title="Download the current strategy YAML"
+          >
+            <DownloadIcon className="h-3 w-3" />
+            YAML
+          </Button>
+          {sourceStrategy && !sourceBuiltin ? (
+            <Button
+              variant="ghost"
+              size="xs"
+              onClick={() => openActionDialog("delete")}
+              testId="studio-delete"
+              title="Delete this custom strategy"
+              ariaLabel="Delete loaded strategy"
+            >
+              <TrashIcon className="h-3.5 w-3.5 text-rose-300" />
+            </Button>
+          ) : null}
         </div>
         <div className="ml-auto flex min-w-0 items-center gap-2 pb-0.5 text-[11px]">
           {saveNote ? (
@@ -615,6 +754,123 @@ export function ManualBuilder({
           </div>
         </div>
       </div>
+      {actionDialog ? (
+        <Modal
+          open
+          title={
+            actionDialog === "clone"
+              ? "Clone strategy"
+              : actionDialog === "rename"
+                ? "Rename strategy"
+                : "Delete strategy"
+          }
+          description={
+            <span>
+              {actionDialog === "delete" ? (
+                <>
+                  Permanently delete <span className="font-mono text-zinc-300">{sourceStrategy?.id}</span> and its
+                  YAML artifact.
+                </>
+              ) : (
+                <>
+                  {actionDialog === "clone" ? "Create a copy of" : "Rename"}{" "}
+                  <span className="font-mono text-zinc-300">{sourceStrategy?.id}</span> to a new strategy id.
+                </>
+              )}
+            </span>
+          }
+          onClose={() => {
+            if (actionBusy) return;
+            setActionDialog(null);
+            setActionError(null);
+          }}
+          busy={actionBusy}
+          footer={
+            <>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setActionDialog(null);
+                  setActionError(null);
+                }}
+                disabled={actionBusy}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant={actionDialog === "delete" ? "danger" : "primary"}
+                onClick={() => void runStrategyAction()}
+                disabled={
+                  actionBusy ||
+                  (actionDialog !== "delete" && !ID_PATTERN.test(actionTargetId.trim()))
+                }
+                testId={actionDialog === "delete" ? "confirm-delete-strategy" : "confirm-strategy-action"}
+              >
+                {actionBusy
+                  ? actionDialog === "delete"
+                    ? "Deleting…"
+                    : "Saving…"
+                  : actionDialog === "delete"
+                    ? "Delete strategy"
+                    : actionDialog === "clone"
+                      ? "Clone strategy"
+                      : "Rename strategy"}
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-2">
+            {actionDialog !== "delete" ? (
+              <Field label="New strategy ID" htmlFor="studio-action-id">
+                <TextInput
+                  id="studio-action-id"
+                  value={actionTargetId}
+                  onChange={(value) => setActionTargetId(value.toLowerCase().replace(/\s+/g, "_"))}
+                  disabled={actionBusy}
+                />
+              </Field>
+            ) : null}
+            {actionError ? (
+              <div
+                role="alert"
+                data-testid="strategy-action-error"
+                className="rounded-md border border-loss/40 bg-loss-soft/40 px-2.5 py-2 text-[11px] leading-4 text-rose-300"
+              >
+                {actionError}
+              </div>
+            ) : null}
+          </div>
+        </Modal>
+      ) : null}
+
+      {saveToast ? (
+        <div
+          data-testid="save-toast"
+          role="status"
+          className="fixed bottom-12 right-4 z-50 w-[300px] rounded-md border border-accent/40 bg-panel px-3 py-2.5 shadow-popover"
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <p className="text-[11.5px] font-medium text-blue-300">Strategy saved & opening Backtest Lab</p>
+              <p className="mt-0.5 truncate font-mono text-[10px] text-zinc-500">{saveToast.strategyId}</p>
+            </div>
+            <button
+              type="button"
+              aria-label="Dismiss toast"
+              onClick={() => setSaveToast(null)}
+              className="focus-ring -mr-1 grid h-5 w-5 place-items-center rounded text-zinc-500 hover:bg-surface hover:text-zinc-300"
+            >
+              ×
+            </button>
+          </div>
+          <a
+            href={`/backtests?strategy=${encodeURIComponent(saveToast.strategyId)}`}
+            className="mt-1.5 inline-block text-[10.5px] font-medium text-blue-300 underline decoration-blue-500/40 underline-offset-2 hover:text-blue-200"
+          >
+            Open Backtest Lab now
+          </a>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -872,17 +1128,25 @@ function UniverseRootPicker({
     commit(selected.filter((root) => !drop.has(root)));
   };
 
+  const searching = query.trim().length > 0;
   const matches = (root: InstrumentRoot) => {
-    if (query.trim().length > 0) {
-      const q = query.toLowerCase();
-      if (!root.root.toLowerCase().includes(q) && !root.name.toLowerCase().includes(q)) return false;
+    if (searching) {
+      // Global search: match every root in the universe regardless of the
+      // currently active sector tab.
+      const q = query.trim().toLowerCase();
+      return root.root.toLowerCase().includes(q) || root.name.toLowerCase().includes(q);
     }
     return sectorFilter === "all" || root.sector === sectorFilter;
   };
 
-  const visibleSectors = sectorFilter === "all" ? sectors : sectors.filter((sector) => sector.id === sectorFilter);
+  const matchCount = allRoots.filter(matches).length;
+  const visibleSectors = searching
+    ? sectors
+    : sectorFilter === "all"
+      ? sectors
+      : sectors.filter((sector) => sector.id === sectorFilter);
   const activeSector = sectorFilter === "all" ? null : sectorById.get(sectorFilter) ?? null;
-  const activeLabel = activeSector?.label ?? "all roots";
+  const activeLabel = searching ? "all roots" : activeSector?.label ?? "all roots";
 
   return (
     <div className="rounded-md border border-edge bg-canvas/50" data-testid="universe-root-picker">
@@ -894,13 +1158,19 @@ function UniverseRootPicker({
             {sectors.length} sectors · paired micro roots included
           </span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex w-full flex-wrap items-center justify-end gap-2 2xl:w-auto">
           <TextInput
+            id="universe-root-search"
             value={query}
             onChange={setQuery}
-            placeholder="Search root / name"
-            className="h-6 w-[160px] text-[11px]"
+            placeholder="Search all 45 roots / names"
+            className="h-6 w-[178px] text-[11px]"
           />
+          {searching ? (
+            <span className="whitespace-nowrap text-[9.5px] text-accent" data-testid="universe-search-count">
+              {matchCount} match{matchCount === 1 ? "" : "es"} · all sectors
+            </span>
+          ) : null}
           <Button variant="secondary" size="xs" onClick={() => selectSector(activeSector)} testId="select-all-sector">
             Select all {activeSector ? activeSector.label : "roots"}
           </Button>
@@ -939,6 +1209,10 @@ function UniverseRootPicker({
       <div className="px-2.5 py-2">
         {visibleSectors.length === 0 ? (
           <p className="text-[10.5px] text-zinc-600">No instruments returned by GET /api/instruments.</p>
+        ) : searching && matchCount === 0 ? (
+          <p className="text-[10.5px] text-zinc-500" data-testid="universe-search-empty">
+            No roots match “{query.trim()}”. Clear the search to restore the active sector view.
+          </p>
         ) : (
           <div className="flex flex-col gap-2">
             {visibleSectors.map((sector) => {

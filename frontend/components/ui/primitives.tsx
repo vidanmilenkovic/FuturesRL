@@ -392,7 +392,7 @@ export function TextInput({
   value: string | number;
   onChange: (value: string) => void;
   id?: string;
-  type?: "text" | "number" | "date";
+  type?: "text" | "number" | "date" | "password";
   step?: number;
   min?: number;
   max?: number;

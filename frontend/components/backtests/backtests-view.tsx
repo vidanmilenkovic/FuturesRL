@@ -16,7 +16,19 @@ import {
   TextInput,
   type Tone,
 } from "@/components/ui/primitives";
-import { getTearsheet, listBacktests, listStrategies, runBacktest } from "@/lib/api";
+import { Modal } from "@/components/ui/dialog";
+import { DownloadIcon, TrashIcon } from "@/components/shell/icons";
+import {
+  deleteBacktest,
+  exportTearSheet,
+  exportTradesCsv,
+  getBacktest,
+  getTearsheet,
+  listBacktests,
+  listStrategies,
+  runBacktest,
+} from "@/lib/api";
+import { diffStrategyConfigs, formatDiffValue } from "@/lib/artifacts";
 import { cn } from "@/lib/cn";
 import {
   formatDateTime,
@@ -122,21 +134,53 @@ export function BacktestsView() {
   const [running, setRunning] = useState(false);
   const [runnerMessage, setRunnerMessage] = useState<string | null>(null);
   const [runnerDemo, setRunnerDemo] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<BacktestRunSummary | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportMessage, setExportMessage] = useState<string | null>(null);
+  const [exportBusy, setExportBusy] = useState<string | null>(null);
+  const [runDetails, setRunDetails] = useState<Record<string, BacktestRunSummary | null>>({});
 
   useEffect(() => {
     if (backtests.data) {
-      setRuns(backtests.data.runs);
-      setSelectedRunId((current) =>
-        current && backtests.data?.runs.some((run) => run.id === current)
-          ? current
-          : (backtests.data?.runs[0]?.id ?? null),
-      );
+      const runsNow = backtests.data.runs;
+      const requestedRun =
+        typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("run") : null;
+      setRuns(runsNow);
+      setSelectedRunId((current) => {
+        if (current && runsNow.some((run) => run.id === current)) return current;
+        if (requestedRun && runsNow.some((run) => run.id === requestedRun)) return requestedRun;
+        return runsNow[0]?.id ?? null;
+      });
       setCompareIds((current) => {
         if (current.length > 0) return current;
-        return backtests.data?.runs.slice(0, 2).map((run) => run.id) ?? [];
+        const requestedValid =
+          requestedRun && runsNow.some((run) => run.id === requestedRun) ? requestedRun : null;
+        const defaults = runsNow.slice(0, 2).map((run) => run.id);
+        return requestedValid ? [requestedValid, ...defaults.filter((id) => id !== requestedValid)].slice(0, 2) : defaults;
       });
     }
   }, [backtests.data]);
+
+  // QoL parameter diff: fetch strategy_config snapshots for the compared runs.
+  const detailKey = columnsSignature(compareIds, selectedRunId);
+  useEffect(() => {
+    let cancelled = false;
+    const ids = [...new Set([...compareIds, ...(selectedRunId ? [selectedRunId] : [])])];
+    if (ids.length === 0) return;
+    void Promise.all(
+      ids.map(async (id) => {
+        const result = await getBacktest(id);
+        return [id, result.data] as const;
+      }),
+    ).then((entries) => {
+      if (!cancelled) setRunDetails(Object.fromEntries(entries));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [detailKey, compareIds, selectedRunId]);
 
   useEffect(() => {
     if (!strategyId && strategies.data && strategies.data.length > 0) {
@@ -358,6 +402,7 @@ export function BacktestsView() {
                 <th className="text-right">Rebal.</th>
                 <th className="text-right">Duration</th>
                 <th className="w-32">Created</th>
+                <th className="w-10" />
               </tr>
             </thead>
             <tbody>
@@ -427,6 +472,22 @@ export function BacktestsView() {
                       {run.duration_seconds === null ? "—" : formatDuration(run.duration_seconds)}
                     </td>
                     <td className="text-[11px] text-zinc-500">{formatDateTime(run.created_at)}</td>
+                    <td className="text-right">
+                      <button
+                        type="button"
+                        aria-label={`Delete backtest ${run.id}`}
+                        title="Delete this backtest artifact"
+                        data-testid={`delete-backtest-${run.id}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setDeleteError(null);
+                          setDeleteTarget(run);
+                        }}
+                        className="focus-ring grid h-6 w-6 place-items-center rounded text-zinc-600 hover:bg-loss-soft hover:text-rose-300"
+                      >
+                        <TrashIcon className="h-3.5 w-3.5" />
+                      </button>
+                    </td>
                   </tr>
                 );
               })}
@@ -451,21 +512,99 @@ export function BacktestsView() {
             : "Tear sheet"
         }
         actions={
-          selectedRun?.metrics ? (
-            <div className="flex items-center gap-3 font-mono text-[11px] tabular-nums">
-              <span className="text-zinc-500">
-                CAGR <span className={selectedRun.metrics.cagr >= 0 ? "text-gain" : "text-loss"}>{formatPct(selectedRun.metrics.cagr)}</span>
-              </span>
-              <span className="text-zinc-500">
-                Sharpe <span className="text-zinc-200">{selectedRun.metrics.sharpe.toFixed(2)}</span>
-              </span>
-              <span className="text-zinc-500">
-                Max DD <span className="text-loss">{formatPctPlain(selectedRun.metrics.max_drawdown)}</span>
-              </span>
+          <div className="flex items-center gap-3">
+            {selectedRun?.metrics ? (
+              <div className="flex items-center gap-3 font-mono text-[11px] tabular-nums">
+                <span className="text-zinc-500">
+                  CAGR <span className={selectedRun.metrics.cagr >= 0 ? "text-gain" : "text-loss"}>{formatPct(selectedRun.metrics.cagr)}</span>
+                </span>
+                <span className="text-zinc-500">
+                  Sharpe <span className="text-zinc-200">{selectedRun.metrics.sharpe.toFixed(2)}</span>
+                </span>
+                <span className="hidden text-zinc-500 sm:inline">
+                  Max DD <span className="text-loss">{formatPctPlain(selectedRun.metrics.max_drawdown)}</span>
+                </span>
+              </div>
+            ) : null}
+            <div className="relative">
+              <Button
+                variant="secondary"
+                size="xs"
+                onClick={() => {
+                  setExportMessage(null);
+                  setExportOpen((open) => !open);
+                }}
+                disabled={!selectedRun}
+                testId="export-menu-button"
+                title="Download run artifacts"
+              >
+                <DownloadIcon className="h-3 w-3" />
+                Export
+              </Button>
+              {exportOpen && selectedRun ? (
+                <div className="absolute right-0 top-7 z-30 w-[220px] rounded-md border border-edge bg-panel p-1 shadow-popover">
+                  {(() => {
+                    const fixture = selectedRun.data_source === "fixture";
+                    const unavailable = fixture || selectedRun.status !== "completed";
+                    return (
+                      <>
+                        <button
+                          type="button"
+                          data-testid="export-trades-csv"
+                          disabled={unavailable || exportBusy !== null}
+                          onClick={() => {
+                            setExportOpen(false);
+                            setExportBusy("trades");
+                            void exportTradesCsv(selectedRun.id).then((result) => {
+                              setExportBusy(null);
+                              if (!result.ok) setExportMessage(`Trades CSV export failed${result.error ? `: ${result.error}` : "."}`);
+                            });
+                          }}
+                          className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[11px] text-zinc-300 hover:bg-surface disabled:cursor-not-allowed disabled:opacity-40"
+                          title={fixture ? "Fixture runs have no persisted trade ledger" : "Download the trade ledger CSV"}
+                        >
+                          Export Trades CSV
+                          {exportBusy === "trades" ? <span className="text-[10px] text-zinc-500">…</span> : null}
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="export-tearsheet-json"
+                          disabled={unavailable || exportBusy !== null}
+                          onClick={() => {
+                            setExportOpen(false);
+                            setExportBusy("json");
+                            void exportTearSheet(selectedRun.id).then((result) => {
+                              setExportBusy(null);
+                              if (!result.ok) setExportMessage(`Tear-sheet JSON export failed${result.error ? `: ${result.error}` : "."}`);
+                            });
+                          }}
+                          className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[11px] text-zinc-300 hover:bg-surface disabled:cursor-not-allowed disabled:opacity-40"
+                          title={fixture ? "Fixture runs have no persisted export artifact" : "Download the full tear sheet + strategy config JSON"}
+                        >
+                          Export Full Tear Sheet JSON
+                          {exportBusy === "json" ? <span className="text-[10px] text-zinc-500">…</span> : null}
+                        </button>
+                        {unavailable ? (
+                          <p className="px-2 py-1 text-[9.5px] leading-4 text-amber-400/80">
+                            {fixture
+                              ? "Fixture runs have no persisted artifacts."
+                              : "Exports are available after the run completes."}
+                          </p>
+                        ) : null}
+                      </>
+                    );
+                  })()}
+                </div>
+              ) : null}
             </div>
-          ) : null
+          </div>
         }
       >
+        {exportMessage ? (
+          <div role="alert" className="mb-2 rounded border border-loss/30 bg-loss-soft/40 px-2 py-1 text-[10.5px] text-rose-300">
+            {exportMessage}
+          </div>
+        ) : null}
         {selectedRunId ? (
           <TearsheetOverlay
             key={`${compareIds.join("|")}|${selectedRunId}`}
@@ -511,7 +650,151 @@ export function BacktestsView() {
           </div>
         )}
       </Panel>
+
+      <ParameterDiffAccordion runs={compareRuns} details={runDetails} />
+      <Modal
+        open={deleteTarget !== null}
+        title="Delete backtest"
+        description={
+          <span>
+            Remove <span className="font-mono text-zinc-300">{deleteTarget?.id}</span> from history and delete its
+            persisted artifact. This cannot be undone.
+          </span>
+        }
+        onClose={() => {
+          if (deleting) return;
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+        busy={deleting}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setDeleteTarget(null);
+                setDeleteError(null);
+              }}
+              disabled={deleting}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              testId="confirm-delete-backtest"
+              disabled={deleting}
+              onClick={() => {
+                if (!deleteTarget) return;
+                const target = deleteTarget;
+                setDeleting(true);
+                setDeleteError(null);
+                void deleteBacktest(target.id).then((result) => {
+                  setDeleting(false);
+                  if (result.source === "live" && result.data.ok) {
+                    setRuns((current) => current.filter((run) => run.id !== target.id));
+                    setCompareIds((current) => current.filter((id) => id !== target.id));
+                    if (selectedRunId === target.id) setSelectedRunId(null);
+                    setDeleteTarget(null);
+                    backtests.reload();
+                  } else {
+                    setDeleteError(
+                      result.data.message || `Delete failed${result.error ? `: ${result.error}` : "."}`,
+                    );
+                  }
+                });
+              }}
+            >
+              {deleting ? "Deleting…" : "Delete backtest"}
+            </Button>
+          </>
+        }
+      >
+        {deleteError ? (
+          <div
+            role="alert"
+            data-testid="delete-backtest-error"
+            className="rounded-md border border-loss/40 bg-loss-soft/40 px-2.5 py-2 text-[11px] leading-4 text-rose-300"
+          >
+            {deleteError}
+          </div>
+        ) : (
+          <p className="text-[10.5px] leading-4 text-zinc-600">
+            Seeded fixture runs may be regenerated by the API on restart; persisted engine runs are deleted from disk.
+          </p>
+        )}
+      </Modal>
     </div>
+  );
+}
+
+function columnsSignature(compareIds: string[], selectedRunId: string | null): string {
+  return `${compareIds.join("|")}::${selectedRunId ?? ""}`;
+}
+
+function ParameterDiffAccordion({
+  runs,
+  details,
+}: {
+  runs: BacktestRunSummary[];
+  details: Record<string, BacktestRunSummary | null>;
+}) {
+  const pair = runs.slice(0, 2);
+  const [a, b] = pair;
+  const snapshotA = a ? details[a.id]?.strategy_config ?? null : null;
+  const snapshotB = b ? details[b.id]?.strategy_config ?? null : null;
+  const rows = useMemo(() => diffStrategyConfigs(snapshotA, snapshotB), [snapshotA, snapshotB]);
+  return (
+    <Panel className="col-span-12 xl:col-span-5" title="Parameter diff" flush>
+      <details className="group" data-testid="parameter-diff">
+        <summary className="flex cursor-pointer select-none items-center gap-2 px-3 py-2 text-[11px] text-zinc-400 hover:text-zinc-200">
+          <span className="text-zinc-600 transition-transform group-open:rotate-90">›</span>
+          {pair.length < 2
+            ? "Select at least two runs to compare parameters"
+            : `${a?.id ?? "Run A"} vs ${b?.id ?? "Run B"}`}
+          {pair.length === 2 && (snapshotA === null || snapshotB === null) ? (
+            <Badge tone="warn" className="ml-auto">snapshot unavailable</Badge>
+          ) : pair.length === 2 ? (
+            <Badge tone={rows.length > 0 ? "accent" : "neutral"} className="ml-auto">
+              {rows.length} changed
+            </Badge>
+          ) : null}
+        </summary>
+        <div className="max-h-[280px] overflow-auto border-t border-hairline">
+          {pair.length < 2 ? (
+            <p className="px-3 py-3 text-[11px] text-zinc-600">Check two or three runs in the history table.</p>
+          ) : snapshotA === null || snapshotB === null ? (
+            <p
+              data-testid="parameter-diff-unavailable"
+              className="px-3 py-3 text-[11px] leading-4 text-amber-300/90"
+            >
+              Parameter snapshot unavailable for this legacy run. Re-run the backtest with the current engine to
+              capture a strategy_config snapshot.
+            </p>
+          ) : rows.length === 0 ? (
+            <p className="px-3 py-3 text-[11px] text-zinc-600">No parameter differences between these runs.</p>
+          ) : (
+            <table className="data-table" data-testid="parameter-diff-table">
+              <thead>
+                <tr>
+                  <th>Parameter</th>
+                  <th className="w-36">{a?.id}</th>
+                  <th className="w-36">{b?.id}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr key={row.path}>
+                    <td className="font-mono text-[10.5px] text-zinc-400">{row.path}</td>
+                    <td className="font-mono text-[10.5px] text-rose-300">{formatDiffValue(row.a)}</td>
+                    <td className="font-mono text-[10.5px] text-emerald-300">{formatDiffValue(row.b)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </details>
+    </Panel>
   );
 }
 

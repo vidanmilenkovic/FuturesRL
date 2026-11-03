@@ -269,6 +269,14 @@ export interface RiskStateResponse {
   macro_events: MacroEvent[];
   news: NewsEvent[];
   neutralized_instruments: string[];
+  /** QoL additive kill-switch/execution-lock state (absent on older backends). */
+  kill_switch_active?: boolean;
+  kill_switch_reason?: string | null;
+  daily_loss_breaker_active?: boolean;
+  lock_until?: string | null;
+  execution_locked_until?: string | null;
+  reset_available?: boolean;
+  operator_reset_token_required?: boolean;
 }
 
 export interface FlattenReceipt {
@@ -349,6 +357,11 @@ export interface StrategyConfig {
   updated_at: string;
   /** Present on studio/catalog payloads; not exposed by GET /api/strategies today. */
   drl?: StudioDrlConfig;
+  /** QoL: committed built-in strategy flag (delete/rename protection). */
+  builtin?: boolean;
+  source?: string | null;
+  path?: string | null;
+  strategy_path?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -764,8 +777,24 @@ export interface AttributionRow {
   roll_pnl: number;
 }
 
+export interface BacktestTrade {
+  timestamp?: string;
+  order_id?: string;
+  instrument_id?: string;
+  side?: "BUY" | "SELL" | string;
+  quantity?: number;
+  price?: number;
+  notional?: number;
+  commissions?: number;
+  commission?: number;
+  slippage?: number;
+  kind?: string;
+}
+
 export interface TearsheetResponse {
   run_id: string;
+  /** QoL: persisted trade ledger (additive; may be missing on legacy runs). */
+  trades?: BacktestTrade[];
   equity_curve: SeriesPoint[];
   rolling_sharpe: SeriesPoint[];
   underwater: SeriesPoint[];
@@ -808,6 +837,9 @@ export interface BacktestRunSummary {
   wf_splits?: number | null;
   /** Phase 10 additive: actual number of walk-forward folds reported by the API. */
   n_folds?: number | null;
+  /** QoL: strategy config snapshot captured when the run was created. */
+  strategy_config?: Record<string, unknown> | null;
+  strategy_yaml?: string | null;
 }
 
 export interface BacktestRunDetail extends BacktestRunSummary {
@@ -959,4 +991,40 @@ export interface ApiResult<T> {
   /** `live` = served by the FastAPI backend, `demo` = deterministic fixture. */
   source: "live" | "demo";
   error: string | null;
+}
+
+
+// ---------------------------------------------------------------------------
+// QoL artifact management / operation contracts
+// ---------------------------------------------------------------------------
+
+export interface ArtifactMutationResult {
+  ok: boolean;
+  message: string;
+  status?: string | null;
+  receipts?: Record<string, unknown> | unknown[] | null;
+}
+
+export interface StrategyMutationResult {
+  ok: boolean;
+  strategy: StrategyConfig | null;
+  message: string;
+}
+
+export interface RiskLockResetResult {
+  ok: boolean;
+  message: string;
+  kill_switch_active?: boolean | null;
+  state?: RiskStateResponse | null;
+}
+
+export interface PaperStateResetResult {
+  ok: boolean;
+  message: string;
+  receipts?: Record<string, unknown> | unknown[] | null;
+}
+
+export interface BacktestExportFormat {
+  kind: "json" | "trades-csv";
+  filename: string;
 }
