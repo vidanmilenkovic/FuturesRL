@@ -95,7 +95,7 @@ const BOOK_TABS: { value: BookTab; label: string }[] = [
 ];
 
 export function CommandCenterView() {
-  const { account, positions, loading, source, dataMode } = useAccount();
+  const { account, positions, loading, source, dataMode, stale, staleReason } = useAccount();
   const { events, latest } = useTelemetry();
   const risk = useAsyncData(getRiskState);
   const thresholds = risk.data?.thresholds ?? FALLBACK_THRESHOLDS;
@@ -276,8 +276,12 @@ export function CommandCenterView() {
     return (
       <Panel title="Command Center">
         <EmptyState
-          title="Account snapshot unavailable"
-          description="The telemetry API did not return an account snapshot and the deterministic fixture could not be built."
+          title={dataMode.key === "reconnecting" ? "IBKR session reconnecting" : "Account snapshot unavailable"}
+          description={
+            dataMode.key === "reconnecting"
+              ? "IBKR is enabled but the account snapshot is not available yet. The ribbon shows IBKR · RECONNECTING and simulated positions are never substituted for the live book."
+              : "The telemetry API did not return an account snapshot and the deterministic fixture could not be built."
+          }
         />
       </Panel>
     );
@@ -525,7 +529,11 @@ export function CommandCenterView() {
             className="flex-1"
           />
           <div className="shrink-0 text-[11px] text-zinc-600">
-            {dataMode.key === "ui_fallback" ? "UI FALLBACK · fixtures" : "Broker reconciled"} ·{" "}
+            {dataMode.key === "ui_fallback"
+              ? "UI FALLBACK · fixtures"
+              : stale
+                ? `Last-known-good${staleReason ? ` · ${staleReason}` : " · stale"}`
+                : "Broker reconciled"} ·{" "}
             {formatInteger(positions.reduce((sum, position) => sum + Math.abs(position.quantity), 0))} contracts
           </div>
         </div>

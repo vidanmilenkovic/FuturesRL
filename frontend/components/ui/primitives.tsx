@@ -381,6 +381,7 @@ export function TextInput({
   type = "text",
   step,
   min,
+  max,
   placeholder,
   disabled,
   className,
@@ -391,6 +392,7 @@ export function TextInput({
   type?: "text" | "number" | "date";
   step?: number;
   min?: number;
+  max?: number;
   placeholder?: string;
   disabled?: boolean;
   className?: string;
@@ -402,6 +404,7 @@ export function TextInput({
       value={value}
       step={step}
       min={min}
+      max={max}
       placeholder={placeholder}
       disabled={disabled}
       onChange={(event) => onChange(event.target.value)}
@@ -487,7 +490,7 @@ export function NavTab({
     <Link
       href={href}
       aria-current={active ? "page" : undefined}
-      className={`focus-ring relative flex h-12 items-center px-2.5 text-[13px] font-medium transition-colors ${
+      className={`focus-ring relative flex h-12 items-center px-2 text-[13px] font-medium transition-colors ${
         active ? "text-zinc-100" : "text-zinc-500 hover:text-zinc-300"
       }`}
     >

@@ -134,3 +134,38 @@
     scrollbar-width: none;
   }
 }
+
+
+/* Strategy Studio parameter sliders (matte finish) */
+.studio-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: #27272a;
+  outline: none;
+  cursor: pointer;
+}
+
+.studio-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid #1e1e22;
+  background: #3b82f6;
+}
+
+.studio-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid #1e1e22;
+  background: #3b82f6;
+}
+
+.studio-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}

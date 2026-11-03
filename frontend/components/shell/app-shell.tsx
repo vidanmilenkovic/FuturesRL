@@ -28,6 +28,7 @@ const NAV_ITEMS: { href: string; label: string }[] = [
   { href: "/pipeline", label: "Pipeline & Weights" },
   { href: "/risk", label: "Risk & LLM" },
   { href: "/term-structure", label: "Term Structure" },
+  { href: "/studio", label: "Strategy Studio" },
   { href: "/backtests", label: "Backtest Lab" },
 ];
 
@@ -41,6 +42,7 @@ const MODE_TONE: Record<DataModeKey, Tone> = {
   connecting: "neutral",
   ui_fallback: "warn",
   offline_engine: "neutral",
+  reconnecting: "warn",
   paper_ibkr: "accent",
   live_ibkr: "gain",
 };
@@ -156,7 +158,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               {formatPctPlain(marginUtil)}
             </span>
-            <span className="relative h-1 w-[60px] overflow-hidden rounded-full bg-zinc-800">
+            <span className="relative hidden h-1 w-[60px] overflow-hidden rounded-full bg-zinc-800 2xl:inline-block">
               <span
                 className={cn(
                   "block h-full rounded-full",
@@ -165,7 +167,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                 style={{ width: `${Math.min(100, (marginUtil / MARGIN_CAP) * 100)}%` }}
               />
             </span>
-            <span className="font-mono text-[10px] tabular-nums text-zinc-600">60%</span>
+            <span className="hidden font-mono text-[10px] tabular-nums text-zinc-600 2xl:inline">60%</span>
           </div>
 
           <div className="hidden items-baseline gap-1.5 2xl:flex">
@@ -175,7 +177,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             </span>
           </div>
 
-          <span data-testid="data-mode-badge" data-state={dataMode.key} data-mode={dataMode.label}>
+          <span data-testid="data-mode-badge" data-state={dataMode.key} data-mode={dataMode.label} title={modeTooltip}>
             <ModePill label={dataMode.label} tone={modeTone} title={modeTooltip} />
           </span>
 

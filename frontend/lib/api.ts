@@ -17,13 +17,32 @@ import {
   mockPipeline,
   mockRiskState,
   mockStrategies,
+  mockDrlBind,
+  mockDrlModels,
+  mockDrlTrain,
+  mockOptimizationApply,
+  mockOptimizationList,
+  mockOptimizationStudy,
   mockRecentFills,
   mockRunnerStatus,
+  mockSavedStrategy,
+  mockStudioCatalog,
   mockTelemetryStatus,
   mockTearsheet,
   mockTermStructure,
   mockWorkingOrders,
 } from "./mock";
+import {
+  draftToPayload,
+  normalizeDrlModelsResponse,
+  normalizeDrlTrainResult,
+  normalizeOptimizationApply,
+  normalizeOptimizationList,
+  normalizeOptimizationStudy,
+  normalizeStrategyConfig,
+  normalizeStudioCatalog,
+  type YamlEncodingMap,
+} from "./studio";
 import type {
   AccountSnapshotResponse,
   ApiResult,
@@ -39,8 +58,20 @@ import type {
   RiskThresholds,
   StrategyConfig,
   TearsheetResponse,
+  DrlBindResult,
+  DrlModel,
+  DrlModelsResponse,
+  DrlTrainRequest,
+  DrlTrainResult,
   FillsResponse,
+  OptimizationApplyResult,
+  OptimizationListResponse,
+  OptimizationRequest,
+  OptimizationStudy,
   RunnerStatus,
+  StudioCatalogResponse,
+  StudioDraft,
+  StudioSaveResult,
   TelemetryEnvelope,
   TelemetryStatusResponse,
   TermStructureResponse,
@@ -378,4 +409,185 @@ export function connectTelemetry(options: {
       options.onStatus("offline");
     },
   };
+}
+
+
+// ---------------------------------------------------------------------------
+// Strategy Studio (Phase 10)
+// ---------------------------------------------------------------------------
+
+export function getStudioCatalog(): Promise<ApiResult<StudioCatalogResponse>> {
+  const fallback = mockStudioCatalog();
+  return withFallback<unknown>("/api/strategies/schema/catalog", () => fallback).then((result) => ({
+    ...result,
+    data: normalizeStudioCatalog(result.data, fallback),
+  }));
+}
+
+/**
+ * Create (POST) or update (PUT) a strategy YAML. The Manual Builder uses this
+ * for "Save Strategy YAML"; the API persists to configs/strategies or
+ * artifacts/strategies and re-validates the full FinRL-X pipeline contract.
+ */
+export function saveStudioStrategy(
+  draft: StudioDraft,
+  options: { update?: boolean; encodings?: YamlEncodingMap } = {},
+): Promise<ApiResult<StudioSaveResult>> {
+  const payload = draftToPayload(draft, options.encodings);
+  const path = options.update ? `/api/strategies/${encodeURIComponent(draft.id)}` : "/api/strategies";
+  return withFallback<unknown>(
+    path,
+    () => ({ strategy: mockSavedStrategy(payload), persisted: false, message: "UI FALLBACK: strategy saved in memory only." }),
+    { method: options.update ? "PUT" : "POST", body: JSON.stringify(payload) },
+    15_000,
+  ).then((result) => {
+    if (result.source === "demo") return result as ApiResult<unknown> as ApiResult<StudioSaveResult>;
+    const normalized = normalizeStrategyConfig(isRecord(result.data) ? (result.data.strategy ?? result.data) : result.data);
+    if (!normalized) {
+      return {
+        data: {
+          strategy: mockSavedStrategy(payload),
+          persisted: false,
+          message: "API returned an unrecognized strategy payload; kept the local draft.",
+        },
+        source: "demo" as const,
+        error: "unrecognized strategy payload",
+      };
+    }
+    return {
+      data: {
+        strategy: normalized,
+        persisted: true,
+        message: `Saved ${normalized.id} to the strategy catalog.`,
+      },
+      source: "live" as const,
+      error: null,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Optuna auto-optimizer (Phase 10)
+// ---------------------------------------------------------------------------
+
+export function listOptimizations(): Promise<ApiResult<OptimizationListResponse>> {
+  return withFallback<unknown>("/api/optimize", mockOptimizationList).then((result) => ({
+    ...result,
+    data:
+      result.source === "live"
+        ? normalizeOptimizationList(result.data)
+        : (result.data as OptimizationListResponse),
+  }));
+}
+
+export function getOptimization(studyId: string): Promise<ApiResult<OptimizationStudy>> {
+  return withFallback<unknown>(`/api/optimize/${encodeURIComponent(studyId)}`, () =>
+    mockOptimizationStudy(),
+  ).then((result) => {
+    const normalized = normalizeOptimizationStudy(result.data);
+    if (normalized) return { ...result, data: normalized };
+    const fallback = mockOptimizationStudy();
+    return { data: { ...fallback, study_id: studyId }, source: "demo" as const, error: "unrecognized optimization payload" };
+  });
+}
+
+export function runOptimization(
+  request: OptimizationRequest,
+): Promise<ApiResult<OptimizationStudy>> {
+  return withFallback<unknown>(
+    "/api/optimize",
+    () => mockOptimizationStudy(request),
+    { method: "POST", body: JSON.stringify(request) },
+    120_000,
+  ).then((result) => {
+    if (result.source === "demo") return result as ApiResult<unknown> as ApiResult<OptimizationStudy>;
+    const normalized = normalizeOptimizationStudy(result.data);
+    if (normalized) return { ...result, data: normalized };
+    const fallback = mockOptimizationStudy(request);
+    return { data: fallback, source: "demo" as const, error: "unrecognized optimization payload" };
+  });
+}
+
+export function applyOptimization(studyId: string): Promise<ApiResult<OptimizationApplyResult>> {
+  return withFallback<unknown>(
+    `/api/optimize/${encodeURIComponent(studyId)}/apply`,
+    () => mockOptimizationApply(studyId),
+    { method: "POST", body: JSON.stringify({}) },
+    60_000,
+  ).then((result) => ({
+    ...result,
+    data: result.source === "live"
+      ? normalizeOptimizationApply(result.data, studyId)
+      : (result.data as OptimizationApplyResult),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// DRL neural trainer (Phase 10)
+// ---------------------------------------------------------------------------
+
+export function listDrlModels(): Promise<ApiResult<DrlModelsResponse>> {
+  return withFallback<unknown>("/api/drl/models", mockDrlModels).then((result) => ({
+    ...result,
+    data:
+      result.source === "live"
+        ? normalizeDrlModelsResponse(result.data)
+        : (result.data as DrlModelsResponse),
+  }));
+}
+
+export function trainDrlModel(request: DrlTrainRequest): Promise<ApiResult<DrlTrainResult>> {
+  return withFallback<unknown>(
+    "/api/drl/train",
+    () => mockDrlTrain(request),
+    { method: "POST", body: JSON.stringify(request) },
+    180_000,
+  ).then((result) => {
+    const normalized = normalizeDrlTrainResult(result.data);
+    if (normalized) return { ...result, data: normalized };
+    const fallback = mockDrlTrain(request);
+    return { data: fallback, source: "demo" as const, error: "unrecognized DRL training payload" };
+  });
+}
+
+/**
+ * Bind a trained checkpoint to a strategy by writing the DRL allocator config
+ * through the existing PUT /api/strategies/{id} editor.
+ */
+export function bindDrlModel(
+  strategy: StrategyConfig,
+  model: DrlModel,
+): Promise<ApiResult<DrlBindResult>> {
+  const payload: StrategyConfig = {
+    ...strategy,
+    allocator: {
+      name: "drl",
+      params: {
+        algorithm: model.algorithm,
+        total_timesteps: model.timesteps,
+        model_path: model.path ?? `artifacts/models/${model.name}.zip`,
+        policy: "MlpPolicy",
+      },
+    },
+  };
+  return withFallback<unknown>(
+    `/api/strategies/${encodeURIComponent(strategy.id)}`,
+    () => mockDrlBind(model, strategy.id),
+    { method: "PUT", body: JSON.stringify(payload) },
+  ).then((result) => ({
+    ...result,
+    data:
+      result.source === "live"
+        ? {
+            model: model.name,
+            strategy_id: strategy.id,
+            bound: true,
+            message: `Bound ${model.name} to ${strategy.id}.`,
+          }
+        : (result.data as DrlBindResult),
+  }));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

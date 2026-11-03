@@ -48,6 +48,10 @@ export interface HealthResponse {
   runner_bridge_available?: boolean;
   runner_bridge_stale?: boolean;
   runner_mode?: string | null;
+  /** Phase 10 additive reconnect state (absent on older backends). */
+  ibkr_enabled?: boolean;
+  ibkr_reconnecting?: boolean;
+  ibkr_last_error?: string | null;
 }
 
 /** Data provenance shown by the ribbon badge. */
@@ -55,6 +59,7 @@ export type DataModeKey =
   | "connecting"
   | "ui_fallback"
   | "offline_engine"
+  | "reconnecting"
   | "paper_ibkr"
   | "live_ibkr";
 
@@ -111,6 +116,10 @@ export interface AccountSnapshotResponse {
   /** Point-in-time equity curve used by the Command Center chart. */
   equity_curve: EquityPoint[];
   positions: PositionRow[];
+  /** Additive: last-known-good book served while IBKR reconnects. */
+  stale?: boolean;
+  stale_reason?: string | null;
+  source?: string;
 }
 
 export interface EquityPoint {
@@ -329,6 +338,327 @@ export interface StrategyConfig {
   timing: StageConfig[];
   risk: StageConfig[];
   updated_at: string;
+  /** Present on studio/catalog payloads; not exposed by GET /api/strategies today. */
+  drl?: StudioDrlConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Strategy Studio (Phase 10)
+// ---------------------------------------------------------------------------
+
+export type StudioStageKey = "universe" | "allocator" | "timing" | "risk" | "translator";
+
+export type StudioParamType =
+  | "int"
+  | "float"
+  | "bool"
+  | "select"
+  | "multiselect"
+  | "root_multiselect"
+  | "text";
+
+export interface StudioParamOption {
+  value: string | number | boolean;
+  label: string;
+}
+
+/** One editable strategy parameter served by GET /api/strategies/schema/catalog. */
+export type StudioParamValue = string | number | boolean | string[];
+
+export interface StudioStageConfig {
+  name: string;
+  params: Record<string, StudioParamValue>;
+}
+
+export interface StudioParameter {
+  /** Dotted draft path understood by the builder, e.g. `timing.tsmom.params.lookback_fast`. */
+  path: string;
+  stage: StudioStageKey;
+  /** Overlay / registry stage name (tsmom, quant_risk, ...), when applicable. */
+  group?: string | null;
+  label: string;
+  description: string;
+  type: StudioParamType;
+  default: StudioParamValue;
+  min?: number | null;
+  max?: number | null;
+  step?: number | null;
+  options?: StudioParamOption[];
+  unit?: string | null;
+  optuna_tunable: boolean;
+  /** Catalog hints (Phase 10): log-scaled sliders and YAML encodings. */
+  log_scale?: boolean;
+  yaml_encoding?: string | null;
+  min_items?: number | null;
+  max_items?: number | null;
+  /** Backend stage group (e.g. timing overlay name). */
+  stage_name?: string | null;
+  /** Stable catalog key used in optimization search spaces. */
+  key?: string;
+  /** `stage_params` | `translator` | `drl_block`. */
+  location?: string | null;
+}
+
+export interface StudioTranslatorConfig {
+  rounding_mode: "nearest" | "floor" | "ceil" | string;
+  rebalance_buffer_contracts: number;
+  max_margin_utilization: number;
+  enable_micro_routing: boolean;
+  min_micro_notional_ratio: number;
+}
+
+/** Hypothesis template returned by the studio catalog (5 presets). */
+export interface StudioDrlConfig {
+  algorithm: string;
+  policy: string;
+  total_timesteps: number;
+  learning_rate: number;
+  gamma: number;
+  seed: number;
+  reward_risk_penalty_lambda: number;
+  normalize_observations: boolean;
+  model_path: string | null;
+}
+
+export interface StudioPreset {
+  id: string;
+  name: string;
+  description: string;
+  hypothesis: string;
+  tags: string[];
+  universe: StudioStageConfig;
+  allocator: StudioStageConfig;
+  timing: StudioStageConfig[];
+  risk: StudioStageConfig[];
+  translator: StudioTranslatorConfig;
+  /** Complete POST-ready strategy dict returned by the catalog. */
+  strategy?: StudioDraft | null;
+  drl?: StudioDrlConfig;
+}
+
+export interface StudioCatalogResponse {
+  version?: string | null;
+  roots: string[];
+  parameters: StudioParameter[];
+  presets: StudioPreset[];
+  /** Optional list of saved strategy views served with the catalog. */
+  strategies?: StrategyConfig[];
+  source?: string | null;
+  preset_source?: string | null;
+  generated_at?: string | null;
+}
+
+/** Editable draft the Manual Builder serializes to YAML + POST/PUT payload. */
+export interface StudioDraft {
+  id: string;
+  description: string;
+  tags: string[];
+  universe: StudioStageConfig;
+  allocator: StudioStageConfig;
+  timing: StudioStageConfig[];
+  risk: StudioStageConfig[];
+  translator: StudioTranslatorConfig;
+  /** Optional DRL policy section (present in the DRL preset). */
+  drl?: StudioDrlConfig;
+}
+
+export interface StudioSaveResult {
+  strategy: StrategyConfig;
+  /** `live` = FastAPI persisted the YAML, `demo` = local fixture (UI fallback). */
+  persisted: boolean;
+  message: string;
+}
+
+export interface StudioValidation {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Optuna auto-optimizer (Phase 10)
+// ---------------------------------------------------------------------------
+
+export type OptimizationObjective =
+  | "sharpe"
+  | "sortino"
+  | "calmar"
+  | "cagr"
+  | "rachev"
+  | "return_on_margin";
+
+export interface OptimizationParamRange {
+  param_path: string;
+  type: "int" | "float" | "categorical";
+  low?: number;
+  high?: number;
+  step?: number;
+  choices?: string[];
+}
+
+export interface OptimizationRequest {
+  base_strategy_id: string;
+  objective_metric: OptimizationObjective;
+  n_trials: number;
+  walk_forward: boolean;
+  wf_splits: number;
+  purge_bars: number;
+  embargo_bars: number;
+  drawdown_penalty_threshold: number;
+  search_space: OptimizationParamRange[];
+  /** Optional deterministic seed (defaults to 7 on the backend). */
+  seed?: number;
+}
+
+export interface OptimizationTrial {
+  trial_number: number;
+  params: Record<string, number | string | boolean>;
+  state?: string | null;
+  oos_sharpe: number;
+  cagr: number;
+  max_dd: number;
+  calmar: number;
+  rachev: number;
+  duration_ms: number;
+  /** Objective value after the drawdown penalty (what Optuna maximised). */
+  value: number;
+  best: boolean;
+}
+
+export interface OptimizationImportance {
+  param_path: string;
+  importance: number;
+}
+
+export interface OptimizationStudy {
+  study_id: string;
+  base_strategy_id: string;
+  objective_metric: OptimizationObjective | string;
+  n_trials: number;
+  walk_forward: boolean;
+  wf_splits: number;
+  status: "completed" | "running" | "failed" | string;
+  created_at: string;
+  duration_ms: number;
+  best_value: number;
+  best_trial_number: number | null;
+  best_params: Record<string, number | string | boolean>;
+  param_importances: OptimizationImportance[];
+  trials: OptimizationTrial[];
+  /** Full strategy config ready to save/apply (optional in the contract). */
+  best_strategy_config?: StudioDraft | null;
+  direction?: string | null;
+  completed_trials?: number | null;
+  fold_count?: number | null;
+  backend?: string | null;
+  provenance?: "engine" | "fixture" | string | null;
+  artifact_path?: string | null;
+  message?: string | null;
+  best_raw_value?: number | null;
+}
+
+export interface OptimizationListResponse {
+  studies: OptimizationStudy[];
+}
+
+export interface OptimizationVerificationBacktest {
+  status: "completed" | "skipped" | string;
+  message?: string;
+}
+
+export interface OptimizationApplyResult {
+  study_id: string;
+  strategy_id: string;
+  strategy?: StrategyConfig | null;
+  backtest_run_id?: string | null;
+  applied: boolean;
+  message: string;
+  best_params?: Record<string, number | string | boolean>;
+  verification_backtest?: OptimizationVerificationBacktest | null;
+}
+
+// ---------------------------------------------------------------------------
+// DRL neural trainer (Phase 10)
+// ---------------------------------------------------------------------------
+
+export type DrlAlgorithm = "PPO" | "CPPO" | "SAC" | "TD3" | "A2C";
+
+export interface DrlTrainRequest {
+  strategy_id: string;
+  algorithm: DrlAlgorithm | string;
+  timesteps: number;
+  learning_rate: number | null;
+  gamma: number | null;
+  llm_reward_penalty_lambda: number | null;
+  checkpoint_name: string | null;
+  seed: number | null;
+  device: string;
+  periods: number | null;
+  offline: true;
+}
+
+export interface DrlRewardPoint {
+  step: number;
+  reward: number;
+}
+
+export interface DrlRewardSummary {
+  window_steps: number | null;
+  samples: number;
+  episode_count: number;
+  env_steps: number | null;
+  final_mean_reward: number | null;
+  best_mean_reward: number | null;
+  path: string | null;
+}
+
+export interface DrlModel {
+  name: string;
+  algorithm: string;
+  timesteps: number;
+  universe: string[];
+  features: string[];
+  created_at: string;
+  git_commit: string | null;
+  size_bytes: number | null;
+  reward_curve: DrlRewardPoint[];
+  reward_summary: DrlRewardSummary | null;
+  hyperparameters: Record<string, number | string | boolean>;
+  /** Metadata fields for the `.meta.json` inspector (listing or training payload). */
+  meta: Record<string, unknown>;
+  path: string | null;
+  meta_path?: string | null;
+  metadata_available?: boolean;
+  metadata_error?: string | null;
+  sb3_algorithm?: string | null;
+  strategy_id?: string | null;
+  policy?: string | null;
+  learning_rate?: number | null;
+  gamma?: number | null;
+  llm_reward_penalty_lambda?: number | null;
+  seed?: number | null;
+  device?: string | null;
+  offline?: boolean | null;
+}
+
+export interface DrlModelsResponse {
+  models: DrlModel[];
+  count?: number | null;
+  models_dir?: string | null;
+  generated_at?: string | null;
+}
+
+export interface DrlTrainResult {
+  model: DrlModel;
+  reward_curve: DrlRewardPoint[];
+  summary: Record<string, unknown>;
+}
+
+export interface DrlBindResult {
+  model: string;
+  strategy_id: string;
+  bound: boolean;
+  message: string;
 }
 
 export interface MetricsSet {
@@ -409,9 +739,11 @@ export interface BacktestRunSummary {
   n_rebalances?: number | null;
   /** Additive: `engine` = real BacktestEngine, `fixture` = deterministic seed. */
   data_source?: "engine" | "fixture";
-  /** Phase 9 additive: `walk_forward` runs carry fold metadata. */
-  kind?: "walk_forward" | "standard" | string | null;
+  /** Phase 9/10 additive: `walk_forward` runs carry fold metadata. */
+  kind?: "walk_forward" | "backtest" | "standard" | string | null;
   wf_splits?: number | null;
+  /** Phase 10 additive: actual number of walk-forward folds reported by the API. */
+  n_folds?: number | null;
 }
 
 export interface BacktestRunDetail extends BacktestRunSummary {

@@ -43,6 +43,22 @@ import type {
   FillsResponse,
   RunnerStatus,
   WorkingOrdersResponse,
+  DrlModel,
+  DrlModelsResponse,
+  DrlRewardPoint,
+  DrlTrainRequest,
+  DrlTrainResult,
+  OptimizationApplyResult,
+  OptimizationListResponse,
+  OptimizationRequest,
+  OptimizationStudy,
+  OptimizationTrial,
+  StageConfig,
+  StudioCatalogResponse,
+  StudioParameter,
+  StudioPreset,
+  StudioTranslatorConfig,
+  StudioParamValue,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -1130,6 +1146,7 @@ export function mockBacktestList(): BacktestListResponse {
       data_source: "fixture",
       kind: seed.walkForward ? "walk_forward" : "standard",
       wf_splits: seed.walkForward ? 5 : null,
+      n_folds: seed.walkForward ? 5 : null,
     };
   });
   return {
@@ -1308,4 +1325,677 @@ export function demoConnectionLabel(state: ConnectionState): string {
     default:
       return "OFFLINE";
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// Strategy Studio (Phase 10)
+// ---------------------------------------------------------------------------
+
+const STUDIO_ROOTS: string[] = [
+  "ES", "NQ", "RTY", "YM", "ZN", "ZB", "ZF", "CL", "GC", "SI", "HG", "6E", "6J", "ZC", "ZS", "LE",
+];
+
+function studioTranslator(overrides: Partial<StudioTranslatorConfig> = {}): StudioTranslatorConfig {
+  return {
+    rounding_mode: "nearest",
+    rebalance_buffer_contracts: 2,
+    max_margin_utilization: 0.6,
+    enable_micro_routing: true,
+    min_micro_notional_ratio: 0,
+    ...overrides,
+  };
+}
+
+function param(
+  path: string,
+  stage: StudioParameter["stage"],
+  label: string,
+  description: string,
+  type: StudioParameter["type"],
+  defaultValue: StudioParamValue,
+  extra: Partial<StudioParameter> = {},
+): StudioParameter {
+  return {
+    path,
+    key: extra.key ?? path,
+    stage,
+    label,
+    description,
+    type,
+    default: defaultValue,
+    min: extra.min ?? null,
+    max: extra.max ?? null,
+    step: extra.step ?? null,
+    options: extra.options,
+    unit: extra.unit ?? null,
+    optuna_tunable: extra.optuna_tunable ?? false,
+    log_scale: extra.log_scale ?? false,
+    yaml_encoding: extra.yaml_encoding ?? null,
+    location: extra.location ?? null,
+    min_items: extra.min_items ?? null,
+    max_items: extra.max_items ?? null,
+    group: extra.group ?? null,
+    stage_name: extra.stage_name ?? null,
+  };
+}
+
+/** Deterministic fallback catalog consumed when the live catalog is absent. */
+export function mockStudioCatalog(): StudioCatalogResponse {
+  const parameters: StudioParameter[] = [
+    param("universe.selector", "universe", "Universe selector", "Filters the tradable roots by liquidity, open interest and term-structure regime.", "select", "liquidity", {
+      options: [
+        { value: "liquidity", label: "Liquidity + OI" },
+        { value: "regime", label: "Macro regime" },
+        { value: "composite", label: "Composite" },
+      ],
+    }),
+    param("universe.roots", "universe", "Universe roots", "Futures roots eligible for this strategy. Selected roots still pass the point-in-time liquidity filter.", "root_multiselect", "ES,NQ,RTY,YM,ZN,CL,GC,6E", {
+      min: 2, max: 16, step: 1, yaml_encoding: "comma_strings",
+    }),
+    param("universe.params.min_avg_dollar_volume", "universe", "Min ADV (USD)", "Roots below this average daily dollar volume are excluded before allocation.", "float", 50_000_000, {
+      min: 10_000_000, max: 200_000_000, step: 5_000_000, unit: "$", optuna_tunable: true,
+    }),
+    param("universe.params.min_open_interest", "universe", "Min open interest", "Reject thin contracts that would be costly to roll or exit.", "int", 5_000, {
+      min: 1_000, max: 20_000, step: 500, optuna_tunable: true,
+    }),
+    param("universe.params.top_n", "universe", "Max roots", "Hard cap on the number of roots admitted after ranking.", "int", 10, {
+      min: 3, max: 15, step: 1, optuna_tunable: true,
+    }),
+    param("universe.params.min_history_days", "universe", "Min history (days)", "Warm-up requirement so trend and covariance features are available.", "int", 252, {
+      min: 60, max: 504, step: 21,
+    }),
+
+    param("allocator.name", "allocator", "Allocator", "Base portfolio construction before timing and risk overlays.", "select", "risk_parity", {
+      options: [
+        { value: "risk_parity", label: "Risk parity (ERC)" },
+        { value: "volatility_target", label: "Volatility target" },
+        { value: "mean_variance", label: "Mean variance" },
+        { value: "equal_weight", label: "Equal weight" },
+        { value: "drl", label: "DRL policy" },
+      ],
+    }),
+    param("allocator.params.target_annual_volatility", "allocator", "Target annual vol", "Portfolio volatility the allocator aims for before overlays.", "float", 0.12, {
+      min: 0.05, max: 0.3, step: 0.005, unit: "%", optuna_tunable: true,
+    }),
+    param("allocator.params.covariance_lookback_days", "allocator", "Covariance lookback (days)", "EWMA window used to estimate the risk model.", "int", 60, {
+      min: 20, max: 120, step: 5, optuna_tunable: true,
+    }),
+    param("allocator.params.max_gross_leverage", "allocator", "Max gross leverage", "Ceiling on the sum of absolute weights before risk scaling.", "float", 3.0, {
+      min: 1, max: 5, step: 0.1, unit: "×", optuna_tunable: true,
+    }),
+    param("allocator.params.risk_aversion", "allocator", "Risk aversion", "Mean-variance utility penalty on portfolio variance.", "float", 4.0, {
+      min: 1, max: 10, step: 0.5, optuna_tunable: true,
+    }),
+
+    param("timing.tsmom.enabled", "timing", "Time-series momentum", "Trade with the 21/126-day trend, sized by volatility.", "bool", true, { group: "TSMOM" }),
+    param("timing.tsmom.params.lookback_fast", "timing", "Fast lookback (days)", "Short trend window; shorter reacts faster but churns more.", "int", 21, {
+      min: 5, max: 63, step: 1, group: "TSMOM", optuna_tunable: true,
+    }),
+    param("timing.tsmom.params.lookback_slow", "timing", "Slow lookback (days)", "Long trend window; defines the structural trend regime.", "int", 126, {
+      min: 63, max: 252, step: 7, group: "TSMOM", optuna_tunable: true,
+    }),
+    param("timing.tsmom.params.vol_lookback", "timing", "Volatility lookback", "Realised volatility window used to size the momentum signal.", "int", 20, {
+      min: 10, max: 60, step: 5, group: "TSMOM",
+    }),
+    param("timing.kama.enabled", "timing", "KAMA trend filter", "Adaptive moving average confirmation to avoid whipsaw entries.", "bool", true, { group: "KAMA" }),
+    param("timing.kama.params.window", "timing", "KAMA efficiency window", "Window for the Kaufman efficiency ratio.", "int", 10, {
+      min: 5, max: 30, step: 1, group: "KAMA", optuna_tunable: true,
+    }),
+    param("timing.carry_filter.enabled", "timing", "Carry / term-structure filter", "Tilt towards backwardated roots and penalise expensive contango.", "bool", true, { group: "Carry" }),
+    param("timing.carry_filter.params.min_carry_bps", "timing", "Min carry (bps)", "Minimum annualised roll yield required to keep a long position.", "float", 0, {
+      min: -50, max: 50, step: 5, group: "Carry", optuna_tunable: true,
+    }),
+    param("timing.mean_reversion.enabled", "timing", "Mean reversion (RSI + Bollinger)", "Fade panic sell-offs when RSI or the lower Bollinger band is breached and turbulence is calm.", "bool", false, { group: "Mean reversion" }),
+    param("timing.mean_reversion.params.rsi_period", "timing", "RSI period", "RSI window for oversold / overbought detection.", "int", 14, {
+      min: 5, max: 30, step: 1, group: "Mean reversion", optuna_tunable: true,
+    }),
+    param("timing.mean_reversion.params.oversold_threshold", "timing", "Oversold threshold", "RSI level that triggers a reversion long.", "float", 25, {
+      min: 10, max: 40, step: 0.5, group: "Mean reversion",
+    }),
+    param("timing.mean_reversion.params.overbought_threshold", "timing", "Overbought threshold", "RSI level that reduces or shorts the position.", "float", 75, {
+      min: 60, max: 90, step: 0.5, group: "Mean reversion",
+    }),
+    param("timing.mean_reversion.params.reversion_strength", "timing", "Reversion strength", "How aggressively an oversold signal tilts the base weight.", "float", 0.5, {
+      min: 0, max: 1, step: 0.05, group: "Mean reversion", optuna_tunable: true,
+    }),
+    param("timing.mean_reversion.params.bollinger_window", "timing", "Bollinger window", "Window for the Bollinger band envelope.", "int", 20, {
+      min: 10, max: 50, step: 1, group: "Mean reversion", optuna_tunable: true,
+    }),
+    param("timing.mean_reversion.params.bollinger_std", "timing", "Bollinger std", "Band width in standard deviations.", "float", 2.0, {
+      min: 1, max: 3, step: 0.1, group: "Mean reversion",
+    }),
+    param("timing.mean_reversion.params.turbulence_veto_threshold", "timing", "Turbulence veto", "Skip reversion when the Mahalanobis turbulence index exceeds this level.", "float", 0.95, {
+      min: 0.5, max: 1, step: 0.05, group: "Mean reversion",
+    }),
+    param("timing.seasonality.enabled", "timing", "Seasonality tilt", "Tilt weights by root-specific calendar seasonality; scale down out of season.", "bool", false, { group: "Seasonality" }),
+    param("timing.seasonality.params.active_months", "timing", "Active months", "Calendar months in which the seasonal tilt is allowed to apply (all by default).", "multiselect", [
+      "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+    ], {
+      options: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].map(
+        (label, index) => ({ value: String(index + 1), label }),
+      ),
+      group: "Seasonality", min_items: 1, max_items: 12, min: 1, max: 12, step: 1,
+      yaml_encoding: "comma_ints",
+    }),
+    param("timing.seasonality.params.root_month_biases", "timing", "Seasonal roots", "Roots with built-in commodity seasonality curves (backend encodes the month biases).", "multiselect", [
+      "CL", "GC", "ZC", "ZS", "LE", "HG",
+    ], {
+      options: ["CL", "GC", "ZC", "ZS", "LE", "HG", "SI", "6E"].map((root) => ({ value: root, label: root })),
+      group: "Seasonality", min_items: 1, max_items: 8, min: 1, max: 8, step: 1,
+      yaml_encoding: "json_object",
+    }),
+    param("timing.seasonality.params.out_of_season_scale", "timing", "Out-of-season scale", "Multiplier applied to weights outside the active month window.", "float", 1.0, {
+      min: 0, max: 2, step: 0.05, group: "Seasonality", optuna_tunable: true,
+    }),
+
+    param("risk.quant_risk.enabled", "risk", "Quant risk overlay", "Volatility targeting, covariance scaling, drawdown stops and daily kill-switch.", "bool", true, { group: "Quant risk" }),
+    param("risk.quant_risk.params.vol_target", "risk", "Vol target", "Annualised portfolio volatility enforced by the quant overlay.", "float", 0.12, {
+      min: 0.05, max: 0.25, step: 0.005, group: "Quant risk", optuna_tunable: true,
+    }),
+    param("risk.quant_risk.params.ewma_halflife_days", "risk", "EWMA half-life (days)", "Covariance decay half-life for risk scaling.", "int", 20, {
+      min: 5, max: 60, step: 1, group: "Quant risk", optuna_tunable: true,
+    }),
+    param("risk.quant_risk.params.max_single_instrument_weight", "risk", "Max single weight", "Concentration cap per root after risk projection.", "float", 0.35, {
+      min: 0.05, max: 0.6, step: 0.01, group: "Quant risk", optuna_tunable: true,
+    }),
+    param("risk.quant_risk.params.max_sector_weight", "risk", "Max sector weight", "Correlation-cluster cap (e.g. equity index beta bucket).", "float", 0.4, {
+      min: 0.1, max: 0.8, step: 0.01, group: "Quant risk",
+    }),
+    param("risk.quant_risk.params.drawdown_limit_pct", "risk", "Drawdown limit", "Trailing drawdown that forces de-risking.", "float", 0.2, {
+      min: 0.05, max: 0.5, step: 0.01, unit: "%", group: "Quant risk", optuna_tunable: true,
+    }),
+    param("risk.quant_risk.params.daily_max_loss_pct", "risk", "Daily max loss", "Intraday loss that trips the kill-switch and flattens the book.", "float", 0.03, {
+      min: 0.005, max: 0.1, step: 0.001, unit: "%", group: "Quant risk", optuna_tunable: true,
+    }),
+    param("risk.llm_risk.enabled", "risk", "LLM Risk-First overlay", "Semantic risk scores with the anti-hallucination filter and deterministic circuit breaker.", "bool", true, { group: "LLM risk" }),
+    param("risk.llm_risk.params.confidence_threshold", "risk", "Confidence τ", "Below this confidence the LLM signal is neutralised to θ_safe.", "float", 0.7, {
+      min: 0.4, max: 0.95, step: 0.01, group: "LLM risk", optuna_tunable: true,
+    }),
+    param("risk.llm_risk.params.safe_score", "risk", "Safe score θ_safe", "Semantic risk score treated as benign.", "float", 1.5, {
+      min: 1, max: 2.5, step: 0.1, group: "LLM risk",
+    }),
+    param("risk.llm_risk.params.critical_score", "risk", "Critical score κ", "At or above this score the breaker forces the weight to zero.", "float", 4.5, {
+      min: 3, max: 5, step: 0.1, group: "LLM risk",
+    }),
+    param("risk.llm_risk.params.risk_penalty_lambda", "risk", "LLM penalty λ", "Reward-shaping weight for semantic risk during DRL training.", "float", 0.5, {
+      min: 0, max: 2, step: 0.05, group: "LLM risk", optuna_tunable: true,
+    }),
+
+    param("translator.rounding_mode", "translator", "Rounding mode", "Contract conversion rounding. Conservative strategies should use floor.", "select", "nearest", {
+      options: [
+        { value: "nearest", label: "Nearest" },
+        { value: "floor", label: "Floor (conservative)" },
+        { value: "ceil", label: "Ceil" },
+      ],
+    }),
+    param("translator.rebalance_buffer_contracts", "translator", "Rebalance buffer", "Minimum contract delta before an order is sent, to prevent fee churn.", "int", 2, {
+      min: 0, max: 10, step: 1, optuna_tunable: true,
+    }),
+    param("translator.max_margin_utilization", "translator", "Margin ceiling η_max", "Hard projected initial-margin ceiling enforced before order generation (policy max 60%).", "float", 0.6, {
+      min: 0.3, max: 0.6, step: 0.01, unit: "%", optuna_tunable: true,
+    }),
+    param("translator.enable_micro_routing", "translator", "Micro routing", "Route residual exposure to MES/MNQ/MCL/MGC when standard capital is too large.", "bool", true),
+    param("translator.min_micro_notional_ratio", "translator", "Min micro ratio", "Minimum fraction of a standard contract before micro routing engages.", "float", 0, {
+      min: 0, max: 0.5, step: 0.01, optuna_tunable: true,
+    }),
+  ];
+
+  const presets: StudioPreset[] = [
+    {
+      id: "trend_following_tsmom_kama",
+      name: "Trend Following (TSMOM + KAMA)",
+      description: "Volatility-targeted time-series momentum across the liquid futures universe with KAMA confirmation and a carry filter.",
+      hypothesis: "Markets trend; sizing by inverse volatility harvests persistent multi-month moves while capping risk.",
+      tags: ["classical", "tsmom", "vol-target"],
+      universe: { name: "liquidity", params: { roots: "ES,NQ,RTY,YM,ZN,CL,GC,6E", min_avg_dollar_volume: 50_000_000, min_open_interest: 5_000, top_n: 10, min_history_days: 252 } },
+      allocator: { name: "volatility_target", params: { target_annual_volatility: 0.12, covariance_lookback_days: 60, max_gross_leverage: 3.0 } },
+      timing: [
+        { name: "tsmom", params: { lookback_fast: 21, lookback_slow: 126, vol_lookback: 20 } },
+        { name: "kama", params: { window: 10 } },
+        { name: "carry_filter", params: { min_carry_bps: 0 } },
+      ],
+      risk: [
+        { name: "quant_risk", params: { vol_target: 0.12, ewma_halflife_days: 20, max_single_instrument_weight: 0.35, max_sector_weight: 0.4, drawdown_limit_pct: 0.2, daily_max_loss_pct: 0.03 } },
+        { name: "llm_risk", params: { confidence_threshold: 0.7, safe_score: 1.5, critical_score: 4.5, risk_penalty_lambda: 0.5 } },
+      ],
+      translator: studioTranslator(),
+    },
+    {
+      id: "commodity_carry_term_structure",
+      name: "Commodity Carry & Term Structure",
+      description: "Roll-yield carry harvest on backwardated commodities with risk-parity sizing and a macro lockout.",
+      hypothesis: "Backwardated curves pay a roll yield; risk-parity sizing diversifies the carry factor across energy, metals and agriculture.",
+      tags: ["carry", "risk-parity", "macro"],
+      universe: { name: "liquidity", params: { roots: "CL,GC,SI,HG,ZC,ZS,LE", min_avg_dollar_volume: 75_000_000, min_open_interest: 5_000, top_n: 8, min_history_days: 252 } },
+      allocator: { name: "risk_parity", params: { covariance_lookback_days: 60 } },
+      timing: [{ name: "carry_filter", params: { min_carry_bps: 10 } }],
+      risk: [
+        { name: "quant_risk", params: { vol_target: 0.1, ewma_halflife_days: 20, max_single_instrument_weight: 0.35, max_sector_weight: 0.4, drawdown_limit_pct: 0.2, daily_max_loss_pct: 0.03 } },
+      ],
+      translator: studioTranslator({ max_margin_utilization: 0.55, rebalance_buffer_contracts: 2 }),
+    },
+    {
+      id: "panic_mean_reversion",
+      name: "Panic Mean-Reversion (RSI + Bollinger)",
+      description: "Fade panic sell-offs with RSI and Bollinger bands; suppress reversion entries during high-turbulence regime breaks.",
+      hypothesis: "Fade RSI/Bollinger extremes only when the turbulence index says the move is noise, not a regime break.",
+      tags: ["mean-reversion", "rsi", "bollinger"],
+      universe: { name: "liquidity", params: { roots: "ES,NQ,RTY,YM,CL,GC", min_avg_dollar_volume: 50_000_000, min_open_interest: 5_000, top_n: 8, min_history_days: 252 } },
+      allocator: { name: "equal_weight", params: {} },
+      timing: [
+        { name: "mean_reversion", params: { rsi_period: 14, oversold_threshold: 25, overbought_threshold: 75, bollinger_window: 20, bollinger_std: 2.0, turbulence_veto_threshold: 0.95, reversion_strength: 0.5 } },
+        { name: "tsmom", params: { lookback_fast: 21, lookback_slow: 126, vol_lookback: 20 } },
+      ],
+      risk: [
+        { name: "quant_risk", params: { vol_target: 0.1, drawdown_limit_pct: 0.15, daily_max_loss_pct: 0.025 } },
+        { name: "llm_risk", params: { confidence_threshold: 0.7 } },
+      ],
+      translator: studioTranslator({ rounding_mode: "floor", rebalance_buffer_contracts: 3 }),
+    },
+    {
+      id: "seasonal_commodity_cycle",
+      name: "Seasonal Commodity Cycle",
+      description: "Calendar-seasonality tilt across energy, metals and grains with carry confirmation and vol targeting.",
+      hypothesis: "Commodity demand/inventory cycles create repeatable calendar tilts; lean into seasonal strength and de-risk out of season.",
+      tags: ["seasonality", "commodities", "carry"],
+      universe: { name: "regime", params: { roots: "CL,GC,SI,HG,ZC,ZS,LE", min_avg_dollar_volume: 60_000_000, min_open_interest: 5_000, top_n: 8, min_history_days: 252 } },
+      allocator: { name: "risk_parity", params: { covariance_lookback_days: 60 } },
+      timing: [
+        {
+          name: "seasonality",
+          params: {
+            active_months: ["4", "5", "6", "7", "8", "9", "10"],
+            root_month_biases: ["CL", "GC", "ZC", "ZS"],
+            out_of_season_scale: 0.6,
+          },
+        },
+        { name: "carry_filter", params: { min_carry_bps: 0 } },
+      ],
+      risk: [
+        { name: "quant_risk", params: { vol_target: 0.12, drawdown_limit_pct: 0.2 } },
+      ],
+      translator: studioTranslator({ max_margin_utilization: 0.5 }),
+    },
+    {
+      id: "drl_neural_policy_llm_risk",
+      name: "DRL Neural Policy + LLM Risk",
+      description: "PPO allocator over the liquid universe with TSMOM timing, the LLM Risk-First overlay and deterministic circuit breaker.",
+      hypothesis: "A learned policy can capture non-linear cross-asset structure while the deterministic risk layer bounds tail behaviour.",
+      tags: ["drl", "ppo", "llm-risk"],
+      universe: { name: "liquidity", params: { roots: "ES,NQ,RTY,YM,ZN,CL,GC,6E", min_avg_dollar_volume: 50_000_000, min_open_interest: 5_000, top_n: 10, min_history_days: 252 } },
+      allocator: { name: "drl", params: { algorithm: "PPO", total_timesteps: 100_000, learning_rate: 0.0003, gamma: 0.99 } },
+      timing: [{ name: "tsmom", params: { lookback_fast: 21, lookback_slow: 126, vol_lookback: 20 } }],
+      risk: [
+        { name: "quant_risk", params: { vol_target: 0.12, drawdown_limit_pct: 0.2 } },
+        { name: "llm_risk", params: { confidence_threshold: 0.7, risk_penalty_lambda: 0.5 } },
+      ],
+      translator: studioTranslator(),
+      drl: {
+        algorithm: "PPO",
+        policy: "MlpPolicy",
+        total_timesteps: 100_000,
+        learning_rate: 0.0003,
+        gamma: 0.99,
+        seed: 7,
+        reward_risk_penalty_lambda: 0.5,
+        normalize_observations: true,
+        model_path: null,
+      },
+    },
+  ];
+
+  return {
+    version: "1.0",
+    roots: STUDIO_ROOTS,
+    parameters,
+    presets,
+    strategies: mockStrategies(),
+  };
+}
+
+/** Deterministic fallback for POST /api/strategies / PUT /api/strategies/{id}. */
+export function mockSavedStrategy(payload: Record<string, unknown>): StrategyConfig {
+  const universeRaw = (payload.universe ?? {}) as Record<string, unknown>;
+  const allocatorRaw = (payload.allocator ?? {}) as Record<string, unknown>;
+  const asStage = (raw: unknown): StageConfig => {
+    const record = (raw ?? {}) as Record<string, unknown>;
+    const params: Record<string, number | string | boolean> = {};
+    for (const [key, value] of Object.entries((record.params ?? {}) as Record<string, unknown>)) {
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        params[key] = value;
+      }
+    }
+    return { name: String(record.name ?? record.selector ?? "unknown"), params };
+  };
+  const timing = Array.isArray(payload.timing) ? payload.timing.map(asStage) : [];
+  const risk = Array.isArray(payload.risk) ? payload.risk.map(asStage) : [];
+  return {
+    id: String(payload.id ?? "studio_strategy").trim().toLowerCase().replace(/\s+/g, "_"),
+    description: String(payload.description ?? ""),
+    tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
+    universe: asStage(universeRaw),
+    allocator: asStage(allocatorRaw),
+    timing,
+    risk,
+    updated_at: isoFromMs(nowMs()),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Optuna optimizer fixtures (Phase 10)
+// ---------------------------------------------------------------------------
+
+const OPTIMIZER_PARAM_BOUNDS: Record<string, [number, number, number]> = {
+  "universe.params.min_avg_dollar_volume": [20_000_000, 120_000_000, 5_000_000],
+  "universe.params.top_n": [3, 12, 1],
+  "allocator.params.target_annual_volatility": [0.07, 0.18, 0.005],
+  "allocator.params.covariance_lookback_days": [20, 120, 5],
+  "timing.tsmom.params.lookback_fast": [5, 63, 1],
+  "timing.tsmom.params.lookback_slow": [84, 252, 7],
+  "risk.quant_risk.params.vol_target": [0.07, 0.18, 0.005],
+  "risk.quant_risk.params.drawdown_limit_pct": [0.08, 0.3, 0.01],
+  "risk.llm_risk.params.confidence_threshold": [0.55, 0.9, 0.01],
+  "translator.rebalance_buffer_contracts": [0, 8, 1],
+  "translator.max_margin_utilization": [0.4, 0.6, 0.01],
+};
+
+/** Deterministic fallback for POST /api/optimize. */
+export function mockOptimizationStudy(request?: Partial<OptimizationRequest>): OptimizationStudy {
+  const seed = 0x5eed + (request?.n_trials ?? 25) * 13 + String(request?.objective_metric ?? "sharpe").length;
+  const rng = mulberry32(seed);
+  const nTrials = Math.max(2, Math.min(200, request?.n_trials ?? 25));
+  const objective = request?.objective_metric ?? "sharpe";
+  const threshold = request?.drawdown_penalty_threshold ?? 0.2;
+  const spaces = (request?.search_space ?? []).filter((entry) => entry.low !== undefined && entry.high !== undefined);
+  const trials: OptimizationTrial[] = [];
+  let bestValue = Number.NEGATIVE_INFINITY;
+  let bestTrial = 1;
+  for (let index = 0; index < nTrials; index += 1) {
+    const trialNumber = index + 1;
+    const params: Record<string, number | string | boolean> = {};
+    for (const entry of spaces.length > 0 ? spaces : Object.keys(OPTIMIZER_PARAM_BOUNDS).slice(0, 6).map((path) => {
+      const bounds = OPTIMIZER_PARAM_BOUNDS[path] as [number, number, number];
+      return { param_path: path, low: bounds[0], high: bounds[1], type: "float" as const, step: bounds[2] };
+    })) {
+      if (entry.low === undefined || entry.high === undefined) continue;
+      const value = entry.low + rng() * (entry.high - entry.low);
+      const step = entry.step ?? (entry.type === "int" ? 1 : 0.01);
+      params[entry.param_path] = entry.type === "int" ? Math.round(value) : Math.round(value / step) * step;
+    }
+    const base = 0.72 + rng() * 0.55;
+    const maxDd = 0.08 + rng() * 0.18;
+    const penalty = objective === "sharpe" && maxDd > threshold ? (maxDd - threshold) * 1.8 : 0;
+    const value = Math.max(-0.5, base - penalty);
+    const trial: OptimizationTrial = {
+      trial_number: trialNumber,
+      params,
+      oos_sharpe: Math.max(-0.4, Number((base + (rng() - 0.5) * 0.18).toFixed(3))),
+      cagr: Number((0.06 + rng() * 0.16).toFixed(4)),
+      max_dd: Number(maxDd.toFixed(4)),
+      calmar: Number((0.4 + rng() * 1.1).toFixed(3)),
+      rachev: Number((0.9 + rng() * 0.6).toFixed(3)),
+      duration_ms: Math.round(180 + rng() * 520),
+      value: Number(value.toFixed(4)),
+      best: false,
+    };
+    if (value > bestValue) {
+      bestValue = value;
+      bestTrial = trialNumber;
+    }
+    trials.push(trial);
+  }
+  const winner = trials[bestTrial - 1] as OptimizationTrial;
+  winner.best = true;
+  const importances = Object.keys(OPTIMIZER_PARAM_BOUNDS)
+    .slice(0, 8)
+    .map((path, index) => ({
+      param_path: path,
+      importance: Number((0.42 / (index + 1) + rng() * 0.06).toFixed(4)),
+    }))
+    .sort((a, b) => b.importance - a.importance);
+  const studyId = `opt-${request?.base_strategy_id ?? "tsmom_vol_target"}-${nTrials}-${objective}`;
+  return {
+    study_id: studyId,
+    base_strategy_id: request?.base_strategy_id ?? "tsmom_vol_target",
+    objective_metric: objective,
+    n_trials: nTrials,
+    walk_forward: true,
+    wf_splits: request?.wf_splits ?? 5,
+    status: "completed",
+    created_at: isoFromMs(nowMs() - 86_400_000),
+    duration_ms: 48_200 + Math.round(rng() * 30_000),
+    best_value: Number(bestValue.toFixed(4)),
+    best_trial_number: bestTrial,
+    best_params: { ...winner.params },
+    param_importances: importances,
+    trials,
+    best_strategy_config: null,
+    direction: "maximize",
+    completed_trials: nTrials,
+    fold_count: request?.wf_splits ?? 5,
+    backend: "deterministic",
+    provenance: "fixture",
+    artifact_path: `artifacts/optimizations/${studyId}.json`,
+    message: "UI FALLBACK: deterministic offline optimizer fixture (no Optuna study run).",
+  };
+}
+
+export function mockOptimizationList(): OptimizationListResponse {
+  return {
+    studies: [
+      mockOptimizationStudy({ n_trials: 25, objective_metric: "sharpe", wf_splits: 5 }),
+      mockOptimizationStudy({ n_trials: 18, objective_metric: "calmar", wf_splits: 4 }),
+    ],
+  };
+}
+
+export function mockOptimizationApply(studyId: string): OptimizationApplyResult {
+  const study = mockOptimizationList().studies.find((entry) => entry.study_id === studyId) ?? mockOptimizationStudy();
+  return {
+    study_id: studyId,
+    strategy_id: `${study.base_strategy_id}_opt`,
+    strategy: null,
+    backtest_run_id: null,
+    applied: true,
+    verification_backtest: {
+      status: "skipped",
+      message: "UI FALLBACK: verification backtest skipped in offline preview.",
+    },
+    message: "UI FALLBACK: best parameters applied to an in-memory strategy config.",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// DRL trainer fixtures (Phase 10)
+// ---------------------------------------------------------------------------
+
+function drlRewardCurve(seed: number, length = 96): DrlRewardPoint[] {
+  const rng = mulberry32(seed);
+  const points: DrlRewardPoint[] = [];
+  let level = 0.1;
+  for (let index = 0; index < length; index += 1) {
+    level += (rng() - 0.42) * 0.06 + 0.004;
+    points.push({
+      step: Math.round(((index + 1) / length) * 20_000),
+      reward: Number(level.toFixed(4)),
+    });
+  }
+  return points;
+}
+
+function drlModel(
+  name: string,
+  algorithm: string,
+  timesteps: number,
+  universe: string[],
+  seed: number,
+  createdDaysAgo: number,
+): DrlModel {
+  const curve = drlRewardCurve(seed);
+  const finals = curve.map((point) => point.reward);
+  const finalMean = finals[finals.length - 1] ?? 0;
+  const bestMean = Math.max(...finals, 0);
+  const hyperparameters = {
+    algorithm,
+    sb3_algorithm: algorithm === "CPPO" ? "PPO" : algorithm,
+    policy: "MlpPolicy",
+    total_timesteps: timesteps,
+    learning_rate: 0.0003,
+    gamma: 0.99,
+    llm_reward_penalty_lambda: 0.5,
+    seed,
+    device: "cpu",
+  };
+  const meta = {
+    checkpoint_name: name,
+    model_path: `artifacts/models/${name}.zip`,
+    meta_path: `artifacts/models/${name}.zip.meta.json`,
+    metadata_available: true,
+    metadata_error: null,
+    algorithm,
+    sb3_algorithm: hyperparameters.sb3_algorithm,
+    strategy_id: "tsmom_vol_target",
+    policy: "MlpPolicy",
+    total_timesteps: timesteps,
+    learning_rate: 0.0003,
+    gamma: 0.99,
+    llm_reward_penalty_lambda: 0.5,
+    seed,
+    device: "cpu",
+    offline: true,
+    universe,
+    feature_names: ["tsmom", "carry", "term_slope", "turbulence", "llm_risk_score"],
+    reward_curve: {
+      window_steps: 500,
+      samples: curve.length,
+      episode_count: Math.round(timesteps / 500),
+      env_steps: timesteps,
+      final_mean_reward: finalMean,
+      best_mean_reward: bestMean,
+      path: `artifacts/models/${name}.zip.reward_curve.json`,
+    },
+    created_at: daysAgoIso(createdDaysAgo),
+    git_commit: "a3f9c21",
+    format: "sb3-checkpoint-meta-v1",
+  };
+  return {
+    name,
+    algorithm,
+    timesteps,
+    universe,
+    features: meta.feature_names,
+    created_at: meta.created_at,
+    git_commit: meta.git_commit,
+    size_bytes: 3_200_000 + seed * 997,
+    reward_curve: curve,
+    reward_summary: {
+      window_steps: 500,
+      samples: curve.length,
+      episode_count: Math.round(timesteps / 500),
+      env_steps: timesteps,
+      final_mean_reward: finalMean,
+      best_mean_reward: bestMean,
+      path: meta.reward_curve.path,
+    },
+    hyperparameters,
+    meta,
+    path: meta.model_path,
+    meta_path: meta.meta_path,
+    metadata_available: true,
+    metadata_error: null,
+    sb3_algorithm: hyperparameters.sb3_algorithm,
+    strategy_id: "tsmom_vol_target",
+    policy: "MlpPolicy",
+    learning_rate: 0.0003,
+    gamma: 0.99,
+    llm_reward_penalty_lambda: 0.5,
+    seed,
+    device: "cpu",
+    offline: true,
+  };
+}
+
+export function mockDrlModels(): DrlModelsResponse {
+  const models = [
+    drlModel("ppo_tsmom_100k", "PPO", 20_000, ["ES", "NQ", "ZN", "CL", "GC"], 7, 2),
+    drlModel("cppo_llm_risk_250k", "CPPO", 20_000, ["ES", "NQ", "RTY", "CL", "GC", "6E"], 11, 4),
+    drlModel("sac_carry_150k", "SAC", 20_000, ["CL", "GC", "ZC", "HG", "6E"], 13, 9),
+  ];
+  return {
+    models,
+    count: models.length,
+    models_dir: "artifacts/models",
+    generated_at: isoFromMs(nowMs()),
+  };
+}
+
+export function mockDrlTrain(request: DrlTrainRequest): DrlTrainResult {
+  const algorithm = request.algorithm || "PPO";
+  const requested = (request.checkpoint_name ?? "").trim();
+  const baseName = requested.length > 0
+    ? requested.toLowerCase().replace(/[^a-z0-9._-]+/g, "_")
+    : `drl_${algorithm.toLowerCase()}_${request.timesteps}`;
+  const seed = 17 + algorithm.length + (request.timesteps % 997);
+  const model = drlModel(baseName, algorithm, request.timesteps, ["ES", "NQ", "ZN", "CL", "GC"], seed, 0);
+  model.created_at = isoFromMs(nowMs());
+  model.hyperparameters = {
+    ...model.hyperparameters,
+    learning_rate: request.learning_rate ?? 0.0003,
+    gamma: request.gamma ?? 0.99,
+    llm_reward_penalty_lambda: request.llm_reward_penalty_lambda ?? 0.5,
+    strategy_id: request.strategy_id,
+    device: request.device,
+  };
+  model.reward_curve = drlRewardCurve(seed + 3, 64).map((point) => ({
+    step: point.step,
+    reward: point.reward,
+  }));
+  const finals = model.reward_curve.map((point) => point.reward);
+  model.reward_summary = {
+    window_steps: 500,
+    samples: model.reward_curve.length,
+    episode_count: 40,
+    env_steps: request.timesteps,
+    final_mean_reward: finals[finals.length - 1] ?? 0,
+    best_mean_reward: Math.max(...finals, 0),
+    path: `artifacts/models/${model.name}.zip.reward_curve.json`,
+  };
+  model.meta = {
+    ...model.meta,
+    checkpoint_name: model.name,
+    strategy_id: request.strategy_id,
+    algorithm,
+    total_timesteps: request.timesteps,
+    duration_seconds: 4.2,
+    status: "ok",
+    offline: request.offline,
+  };
+  return {
+    model,
+    reward_curve: model.reward_curve,
+    summary: {
+      status: "ok",
+      strategy_id: request.strategy_id,
+      algorithm,
+      checkpoint_name: model.name,
+      total_timesteps: request.timesteps,
+      offline: request.offline,
+      note: "UI FALLBACK: deterministic offline training summary (no SB3 run).",
+    },
+  };
+}
+
+export function mockDrlBind(model: DrlModel, strategyId: string): {
+  model: string;
+  strategy_id: string;
+  bound: boolean;
+  message: string;
+} {
+  return {
+    model: model.name,
+    strategy_id: strategyId,
+    bound: true,
+    message: `UI FALLBACK: ${model.name} bound to ${strategyId} in memory.`,
+  };
 }

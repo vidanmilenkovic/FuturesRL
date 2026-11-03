@@ -140,7 +140,12 @@ export function BacktestsView() {
 
   useEffect(() => {
     if (!strategyId && strategies.data && strategies.data.length > 0) {
-      setStrategyId(strategies.data[0]?.id ?? "");
+      const requested =
+        typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("strategy") : null;
+      const match = requested
+        ? strategies.data.find((strategy) => strategy.id === requested)
+        : undefined;
+      setStrategyId(match?.id ?? strategies.data[0]?.id ?? "");
     }
   }, [strategies.data, strategyId]);
 
@@ -385,13 +390,24 @@ export function BacktestsView() {
                       </Badge>
                     </td>
                     <td>
-                      {run.kind === "walk_forward" ? (
-                        <Badge tone="accent" title={`Purged & embargoed walk-forward validation · ${run.wf_splits ?? "?"} folds`}>
-                          {`WF · ${run.wf_splits ?? "—"} folds`}
-                        </Badge>
-                      ) : (
-                        <span className="text-[11px] text-zinc-600">—</span>
-                      )}
+                      {(() => {
+                        const folds = run.n_folds ?? run.wf_splits ?? run.config?.wf_splits ?? null;
+                        if (run.kind !== "walk_forward") {
+                          return <span className="text-[11px] text-zinc-600">—</span>;
+                        }
+                        return (
+                          <Badge
+                            tone="accent"
+                            title={
+                              folds !== null && folds !== undefined
+                                ? `Purged & embargoed walk-forward validation · ${folds} folds`
+                                : "Purged & embargoed walk-forward validation · fold count not reported"
+                            }
+                          >
+                            {folds !== null && folds !== undefined ? `WF · ${folds} folds` : "WF"}
+                          </Badge>
+                        );
+                      })()}
                     </td>
                     <td className={cn("num text-right", (run.metrics?.cagr ?? 0) >= 0 ? "text-gain" : "text-loss")}>
                       {run.metrics ? formatPct(run.metrics.cagr) : "—"}

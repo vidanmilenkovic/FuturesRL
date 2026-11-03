@@ -23,8 +23,11 @@ interface AccountContextValue {
   /** `live` = FastAPI answered, `demo` = deterministic fixture fallback. */
   source: "live" | "demo" | "loading";
   error: string | null;
-  /** Ribbon provenance state (UI FALLBACK / OFFLINE ENGINE / PAPER · IBKR / LIVE · IBKR). */
+  /** Ribbon provenance state (UI FALLBACK / OFFLINE ENGINE / IBKR · RECONNECTING / PAPER / LIVE). */
   dataMode: DataMode;
+  /** True when the account book is a last-known-good snapshot while IBKR reconnects. */
+  stale: boolean;
+  staleReason: string | null;
   reload: () => void;
 }
 
@@ -80,6 +83,9 @@ export function AccountProvider({ children }: { children: ReactNode }) {
     const margin = latest.margin;
     const positions = latest.positions;
     if (!pnl && !margin && !positions) return;
+    // IBKR-owned books are REST-authoritative: stream frames may refresh PnL and
+    // margin, but must never replace the broker position book (stale last-good).
+    const ibkrManaged = Boolean(health?.ibkr_enabled);
     setAccount((previous) => {
       if (!previous) return previous;
       const next: AccountSnapshotResponse = { ...previous };
@@ -101,16 +107,34 @@ export function AccountProvider({ children }: { children: ReactNode }) {
         next.margin_utilization = margin.payload.margin_utilization;
         next.excess_liquidity = next.net_liquidation - margin.payload.initial_margin_used;
       }
-      if (positions && "positions" in positions.payload) {
+      if (positions && "positions" in positions.payload && !ibkrManaged) {
         next.positions = positions.payload.positions;
         next.gross_leverage = positions.payload.gross_leverage;
         next.net_exposure = positions.payload.net_exposure;
       }
       return next;
     });
-  }, [latest.pnl, latest.margin, latest.positions, source, status]);
+  }, [latest.pnl, latest.margin, latest.positions, source, status, health?.ibkr_enabled]);
 
   const reload = useCallback(() => setNonce((value) => value + 1), []);
+
+  // When IBKR is enabled, a fixture book must never be shown. If the REST snapshot
+  // failed (e.g. 503 while the session is being established), surface an honest
+  // empty state and let the polling loop fetch the real book.
+  useEffect(() => {
+    if (!health?.ibkr_enabled) return;
+    if (source === "demo" && account !== null) {
+      setAccount(null);
+    }
+  }, [health?.ibkr_enabled, source, account]);
+
+  // REST-authoritative refresh cadence for IBKR-owned accounts.
+  useEffect(() => {
+    if (!health?.ibkr_enabled) return;
+    const period = account?.stale ? 5_000 : 15_000;
+    const timer = setInterval(reload, period);
+    return () => clearInterval(timer);
+  }, [health?.ibkr_enabled, account?.stale, reload]);
 
   const dataMode = useMemo<DataMode>(() => {
     if (backend === "checking") {
@@ -126,6 +150,16 @@ export function AccountProvider({ children }: { children: ReactNode }) {
         label: "UI FALLBACK",
         description:
           "FastAPI unreachable — deterministic fixtures and a local WebSocket simulator drive the UI",
+      };
+    }
+    if (health.ibkr_enabled && !health.ibkr_connected) {
+      return {
+        key: "reconnecting",
+        label: "IBKR · RECONNECTING",
+        description:
+          health.ibkr_last_error
+            ? `IBKR session lost — reconnecting (${health.ibkr_last_error}); book is last-known-good`
+            : "IBKR session lost — reconnect probe is running; book is last-known-good",
       };
     }
     if (health.ibkr_connected && health.environment === "live") {
@@ -161,6 +195,16 @@ export function AccountProvider({ children }: { children: ReactNode }) {
         };
       }
     }
+    if (health.ibkr_enabled && !health.ibkr_connected) {
+      return {
+        key: "offline_engine",
+        label: "OFFLINE ENGINE",
+        description:
+          health.ibkr_last_error
+            ? `IBKR enabled but disconnected (${health.ibkr_last_error}); serving the last-known-good book`
+            : "IBKR enabled but disconnected; serving the last-known-good book",
+      };
+    }
     if (health.offline_mode) {
       return {
         key: "offline_engine",
@@ -185,6 +229,8 @@ export function AccountProvider({ children }: { children: ReactNode }) {
       source,
       error,
       dataMode,
+      stale: Boolean(account?.stale),
+      staleReason: account?.stale_reason ?? null,
       reload,
     }),
     [account, source, error, dataMode, reload],
