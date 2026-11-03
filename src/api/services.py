@@ -2149,12 +2149,31 @@ def _build_market_service(
         return FixtureMarketService(market=market, settings=settings, reason=reason, clock=clock)
 
 
+def _warm_optional_imports() -> None:
+    """Import the optional strategy stack before any background thread starts.
+
+    The telemetry publisher imports ``src.strategies`` to build its first pipeline
+    frame, while Studio requests import ``src.strategies.parameter_catalog``; Python's
+    per-module import locks can deadlock if both first imports race in different
+    threads. Container construction is single-threaded and runs before the telemetry
+    task starts, so warming the imports here removes the contention window.
+    """
+    import importlib
+
+    for module_name in ("src.strategies", "src.strategies.parameter_catalog"):
+        try:
+            importlib.import_module(module_name)
+        except Exception:  # pragma: no cover - strategy layer always present
+            logger.debug("optional strategy import %s unavailable", module_name)
+
+
 def build_container(
     settings: Settings | None = None,
     *,
     clock: fixtures.Clock | None = None,
 ) -> Container:
     """Build the service container (real adapters with deterministic fallbacks)."""
+    _warm_optional_imports()
     resolved_settings = settings if settings is not None else Settings()
     resolved_clock = clock if clock is not None else fixtures.utc_now
     warnings: list[str] = []

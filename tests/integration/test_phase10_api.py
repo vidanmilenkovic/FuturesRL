@@ -114,6 +114,81 @@ def test_catalog_exposes_parameters_stages_and_five_presets(client: TestClient) 
         assert preset["name"]
         assert preset["hypothesis"]
 
+    # Additive Studio UX metadata: stage dropdown choices passed through unchanged.
+    stage_choices = body["stage_choices"]
+    assert stage_choices["universe"] == ["liquidity", "regime", "composite"]
+    assert stage_choices["allocator"] == [
+        "volatility_target",
+        "risk_parity",
+        "equal_weight",
+        "mean_variance",
+        "drl",
+    ]
+    assert set(stage_choices) >= {"universe", "allocator", "timing", "risk", "translator"}
+    assert all(stage_choices[key] for key in stage_choices)
+    stages_by_id = {stage["id"]: stage for stage in body["stages"]}
+    assert stages_by_id["universe"]["choices"]
+    first_choice = stages_by_id["universe"]["choices"][0]
+    assert {"name", "label", "description", "parameter_keys"} <= set(first_choice)
+    assert [choice["name"] for choice in stages_by_id["universe"]["choices"]] == stage_choices[
+        "universe"
+    ]
+
+    # Additive Studio UX metadata: sector-grouped instrument universe explorer.
+    universe = body["universe"]
+    assert set(universe) >= {"sectors", "roots"}
+    sector_ids = [sector["id"] for sector in universe["sectors"]]
+    expected_groups = ["equities", "rates", "energy", "metals", "fx", "agri", "crypto"]
+    assert sector_ids[0] == "all"
+    assert sector_ids[1:8] == expected_groups
+    all_sector = universe["sectors"][0]
+    assert all_sector["count"] == len(universe["roots"]) == len(all_sector["roots"])
+    assert len(universe["roots"]) >= 40
+    groups = {sector["id"]: sector for sector in universe["sectors"][1:]}
+    for group in expected_groups:
+        assert groups[group]["count"] > 0
+        assert groups[group]["count"] == len(groups[group]["roots"])
+        roots = [row["root"] for row in groups[group]["roots"]]
+        assert len(set(roots)) == len(roots)
+        assert {row["sector_group"] for row in groups[group]["roots"]} == {group}
+    for root in universe["roots"]:
+        assert {
+            "root",
+            "name",
+            "asset_class",
+            "sector",
+            "sector_group",
+            "exchange",
+            "multiplier",
+            "tick_size",
+            "micro_root",
+            "standard_root",
+            "currency",
+        } <= set(root)
+        assert root["sector_group"] in groups
+    # The whole catalog JSON round-trips (typed models serialise cleanly).
+    assert json.loads(json.dumps(body)) == body
+
+
+def test_catalog_universe_agrees_with_instruments_endpoint(client: TestClient) -> None:
+    catalog = client.get("/api/strategies/schema/catalog").json()
+    instruments = client.get("/api/instruments").json()
+    universe = catalog["universe"]
+    catalog_roots = {row["root"] for row in universe["roots"]}
+    instrument_roots = {row["root"] for row in instruments["roots"]}
+    assert catalog_roots == instrument_roots
+    assert len(universe["roots"]) == instruments["count"]
+    catalog_groups = {
+        sector["id"]: sector["count"] for sector in universe["sectors"] if sector["id"] != "all"
+    }
+    for sector in instruments["sectors"]:
+        assert catalog_groups.get(sector["id"]) == sector["count"]
+    by_root = {row["root"]: row for row in universe["roots"]}
+    for row in instruments["roots"]:
+        if row["micro_root"]:
+            assert by_root[row["micro_root"]]["standard_root"] == row["root"]
+    assert json.loads(json.dumps(universe)) == universe
+
 
 def test_create_strategy_from_preset_persists_yaml(tmp_path: Path) -> None:
     settings = _settings(tmp_path)

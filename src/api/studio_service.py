@@ -34,6 +34,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -42,6 +43,12 @@ from types import MappingProxyType
 from typing import Literal, cast
 
 import yaml
+from configs.instruments import (
+    InstrumentsConfig,
+    InstrumentSpec,
+    clear_instruments_cache,
+    load_instruments,
+)
 from configs.settings import Settings
 from configs.strategy import StrategyConfig, parse_strategy_config
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -136,13 +143,57 @@ class ParameterSpec(_StudioModel):
         return self.model_dump(mode="json")
 
 
+class StageChoiceOption(_StudioModel):
+    """One selectable option (implementation) inside a pipeline stage."""
+
+    name: str
+    label: str = ""
+    description: str = ""
+    parameter_keys: list[str] = Field(default_factory=list)
+
+
 class CatalogStage(_StudioModel):
-    """One Studio stage section with its parameter keys."""
+    """One Studio stage section with its parameter keys and dropdown options."""
 
     id: str
     label: str
     description: str = ""
     parameter_keys: list[str] = Field(default_factory=list)
+    #: Additive Studio UX metadata: selectable implementations of this stage.
+    choices: list[StageChoiceOption] = Field(default_factory=list)
+
+
+class UniverseRoot(_StudioModel):
+    """One instrument-master root mirrored into the Studio universe explorer."""
+
+    root: str
+    name: str
+    asset_class: str
+    sector: str
+    sector_group: str
+    exchange: str
+    multiplier: float
+    tick_size: float
+    micro_root: str | None = None
+    standard_root: str | None = None
+    currency: str = "USD"
+
+
+class UniverseSector(_StudioModel):
+    """One sector lane of the Studio universe explorer (``all`` + seven sectors)."""
+
+    id: str
+    label: str
+    description: str = ""
+    count: int = Field(default=0, ge=0)
+    roots: list[UniverseRoot] = Field(default_factory=list)
+
+
+class UniverseCatalog(_StudioModel):
+    """Sector-grouped instrument master metadata (mirrors universe_metadata().to_dict())."""
+
+    sectors: list[UniverseSector] = Field(default_factory=list)
+    roots: list[UniverseRoot] = Field(default_factory=list)
 
 
 class StrategyPreset(_StudioModel):
@@ -166,6 +217,10 @@ class StrategyCatalogResponse(_StudioModel):
     version: int = 1
     stages: list[CatalogStage] = Field(default_factory=list)
     stage_ids: list[str] = Field(default_factory=list)
+    #: Additive Studio UX metadata: ``{stage_id: [option_name, ...]}``.
+    stage_choices: dict[str, list[str]] = Field(default_factory=dict)
+    #: Additive Studio UX metadata: sector-grouped instrument universe explorer data.
+    universe: UniverseCatalog = Field(default_factory=UniverseCatalog)
     parameters: list[ParameterSpec] = Field(default_factory=list)
     presets: list[StrategyPreset] = Field(default_factory=list)
     source: str = "fallback"
@@ -199,19 +254,54 @@ def _translator_block(**overrides: object) -> dict[str, object]:
     return payload
 
 
+#: Static fallback dropdown options when the strategy layer is not importable.
+_FALLBACK_STAGE_CHOICES: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "universe": ("liquidity", "regime", "composite"),
+        "allocator": (
+            "volatility_target",
+            "risk_parity",
+            "equal_weight",
+            "mean_variance",
+            "drl",
+        ),
+        "timing": (
+            "tsmom",
+            "kama",
+            "carry_filter",
+            "mean_reversion",
+            "seasonality",
+            "composite",
+        ),
+        "risk": ("quant_risk", "llm_risk"),
+        "translator": ("translator",),
+    }
+)
+
+
+def _fallback_stage_choices() -> dict[str, list[str]]:
+    return {stage: list(options) for stage, options in _FALLBACK_STAGE_CHOICES.items()}
+
+
 def _stage_specs() -> list[CatalogStage]:
+    definitions = (
+        ("universe", "Universe · S_t", "Root eligibility filters."),
+        ("allocator", "Allocator · A_t", "Weight generation."),
+        ("timing", "Timing & Signals · T_t", "Signal overlays."),
+        ("risk", "Risk & LLM · R_t", "Risk projection."),
+        ("translator", "Contract Translator", "w_t -> N_i,t rounding/margin."),
+    )
     return [
         CatalogStage(
-            id="universe", label="Universe · S_t", description="Root eligibility filters."
-        ),
-        CatalogStage(id="allocator", label="Allocator · A_t", description="Weight generation."),
-        CatalogStage(id="timing", label="Timing & Signals · T_t", description="Signal overlays."),
-        CatalogStage(id="risk", label="Risk & LLM · R_t", description="Risk projection."),
-        CatalogStage(
-            id="translator",
-            label="Contract Translator",
-            description="w_t -> N_i,t rounding/margin.",
-        ),
+            id=stage_id,
+            label=label,
+            description=description,
+            choices=[
+                StageChoiceOption(name=name, label=name.replace("_", " ").title())
+                for name in _FALLBACK_STAGE_CHOICES.get(stage_id, ())
+            ],
+        )
+        for stage_id, label, description in definitions
     ]
 
 
@@ -724,17 +814,49 @@ def _load_catalog_module() -> object | None:
         return None
 
 
-def _catalog_payload(module: object) -> Mapping[str, object] | None:
+def _catalog_payload(
+    module: object, instrument_master: InstrumentsConfig | None = None
+) -> Mapping[str, object] | None:
+    """``catalog_dict(...)`` payload, built for the current instrument master.
+
+    The strategy layer rebuilds the catalog per instrument-master fingerprint, so
+    passing the freshly loaded master keeps universe/root multiselect choices in
+    sync with ``configs/instruments.yaml`` (important for a long-running API after
+    data-eng adds roots).
+    """
     for name in ("catalog_dict", "catalog_json"):
         provider = getattr(module, name, None)
-        if callable(provider):
+        if not callable(provider):
+            continue
+        attempts: list[tuple[object, ...]] = (
+            [(instrument_master,), ()] if instrument_master is not None else [()]
+        )
+        for arguments in attempts:
             try:
-                payload = provider()
-            except Exception:  # pragma: no cover - defensive adapter
+                payload = provider(*arguments)
+            except TypeError:
                 continue
+            except Exception:  # pragma: no cover - defensive adapter
+                payload = None
+                break
             mapping = _object_mapping(payload)
             if mapping:
                 return mapping
+    provider = getattr(module, "parameter_catalog", None)
+    if callable(provider):
+        for arguments in [(instrument_master,), ()] if instrument_master is not None else [()]:
+            try:
+                candidate = provider(*arguments)
+            except TypeError:
+                continue
+            except Exception:  # pragma: no cover - defensive adapter
+                candidate = None
+                break
+            dumper = getattr(candidate, "to_dict", None)
+            if callable(dumper):
+                mapping = _object_mapping(dumper())
+                if mapping:
+                    return mapping
     for name in ("CATALOG", "catalog", "PARAMETER_CATALOG"):
         candidate = getattr(module, name, None)
         if candidate is None:
@@ -750,11 +872,13 @@ def _catalog_payload(module: object) -> Mapping[str, object] | None:
     return None
 
 
-def load_parameter_catalog() -> tuple[list[ParameterSpec], str]:
+def load_parameter_catalog(
+    instrument_master: InstrumentsConfig | None = None,
+) -> tuple[list[ParameterSpec], str]:
     """Load the strategy layer's typed catalog, falling back deterministically."""
     module = _load_catalog_module()
     if module is not None:
-        payload = _catalog_payload(module)
+        payload = _catalog_payload(module, instrument_master)
         if payload is not None:
             specs = [
                 spec
@@ -766,57 +890,299 @@ def load_parameter_catalog() -> tuple[list[ParameterSpec], str]:
             ]
             if specs:
                 return specs, PARAMETER_CATALOG_MODULE
-        else:
-            provider = getattr(module, "parameter_catalog", None)
-            if callable(provider):
-                try:
-                    candidate = provider()
-                except Exception:  # pragma: no cover - defensive adapter
-                    candidate = None
-                specs = [
-                    spec
-                    for spec in (_coerce_parameter(entry) for entry in _sequence_entries(candidate))
-                    if spec is not None
-                ]
-                if specs:
-                    return specs, PARAMETER_CATALOG_MODULE
     return fallback_parameter_catalog(), "fallback"
 
 
-def load_stages() -> list[CatalogStage]:
-    """Load stage metadata from the strategy layer, falling back to the static five."""
+def _stage_options(mapping: Mapping[str, object]) -> list[StageChoiceOption]:
+    options: list[StageChoiceOption] = []
+    for entry in _sequence_entries(mapping.get("choices")):
+        option = _object_mapping(entry)
+        name = str(_pick(option, "name", "id", "key") or "").strip()
+        if not name:
+            continue
+        options.append(
+            StageChoiceOption(
+                name=name,
+                label=str(_pick(option, "label", "title") or name.replace("_", " ").title()),
+                description=str(_pick(option, "description") or ""),
+                parameter_keys=[
+                    str(item)
+                    for item in _sequence_entries(_pick(option, "parameter_keys") or ())
+                    if isinstance(item, str)
+                ],
+            )
+        )
+    return options
+
+
+def _stages_from_payload(payload: Mapping[str, object]) -> list[CatalogStage]:
+    stages: list[CatalogStage] = []
+    for entry in _sequence_entries(payload.get("stages")):
+        mapping = _object_mapping(entry)
+        stage_id = str(_pick(mapping, "id", "key", "name") or "").strip()
+        if not stage_id:
+            continue
+        stages.append(
+            CatalogStage(
+                id=stage_id,
+                label=str(_pick(mapping, "label", "name") or stage_id.title()),
+                description=str(_pick(mapping, "description") or ""),
+                parameter_keys=[
+                    str(item)
+                    for item in _sequence_entries(_pick(mapping, "parameter_keys") or ())
+                    if isinstance(item, str)
+                ],
+                choices=_stage_options(mapping),
+            )
+        )
+    return stages
+
+
+def _stage_choices_from_payload(payload: Mapping[str, object]) -> dict[str, list[str]]:
+    raw = payload.get("stage_choices")
+    choices: dict[str, list[str]] = {}
+    if isinstance(raw, Mapping):
+        for stage_id, values in cast(Mapping[object, object], raw).items():
+            key = str(stage_id).strip()
+            if not key:
+                continue
+            names: list[str] = []
+            for entry in _sequence_entries(values):
+                if isinstance(entry, str):
+                    names.append(entry)
+                    continue
+                mapping = _object_mapping(entry)
+                name = str(_pick(mapping, "name", "id", "key") or "").strip()
+                if name:
+                    names.append(name)
+            if names:
+                choices[key] = names
+    return choices
+
+
+def _universe_root(entry: object) -> UniverseRoot | None:
+    mapping = _object_mapping(entry)
+    root = str(_pick(mapping, "root", "instrument_id", "symbol") or "").strip().upper()
+    if not root:
+        return None
+    multiplier = _pick(mapping, "multiplier")
+    tick_size = _pick(mapping, "tick_size")
+    return UniverseRoot(
+        root=root,
+        name=str(_pick(mapping, "name", "description") or root),
+        asset_class=str(_pick(mapping, "asset_class") or "unknown"),
+        sector=str(_pick(mapping, "sector") or "").lower(),
+        sector_group=str(_pick(mapping, "sector_group") or "").lower(),
+        exchange=str(_pick(mapping, "exchange") or ""),
+        multiplier=float(multiplier) if isinstance(multiplier, int | float) else 0.0,
+        tick_size=float(tick_size) if isinstance(tick_size, int | float) else 0.0,
+        micro_root=cast("str | None", _pick(mapping, "micro_root")),
+        standard_root=cast("str | None", _pick(mapping, "standard_root")),
+        currency=str(_pick(mapping, "currency") or "USD"),
+    )
+
+
+def _universe_roots(entries: object) -> list[UniverseRoot]:
+    roots: list[UniverseRoot] = []
+    for entry in _sequence_entries(entries):
+        root = _universe_root(entry)
+        if root is not None:
+            roots.append(root)
+    return roots
+
+
+def _universe_from_payload(payload: Mapping[str, object]) -> UniverseCatalog:
+    raw = _pick(payload, "universe")
+    universe = _object_mapping(raw)
+    sectors: list[UniverseSector] = []
+    for entry in _sequence_entries(universe.get("sectors")):
+        mapping = _object_mapping(entry)
+        sector_id = str(_pick(mapping, "id", "key", "name") or "").strip().lower()
+        if not sector_id:
+            continue
+        roots = _universe_roots(mapping.get("roots"))
+        sectors.append(
+            UniverseSector(
+                id=sector_id,
+                label=str(_pick(mapping, "label", "name") or sector_id.title()),
+                description=str(_pick(mapping, "description") or ""),
+                count=len(roots)
+                if not isinstance(_pick(mapping, "count"), int)
+                else int(cast(int, _pick(mapping, "count"))),
+                roots=roots,
+            )
+        )
+    flat = _universe_roots(universe.get("roots"))
+    if not flat:
+        flat = [root for sector in sectors for root in sector.roots]
+    return UniverseCatalog(sectors=sectors, roots=flat)
+
+
+#: Canonical Studio sector groups for the master-derived fallback universe.
+_SECTOR_GROUP_ORDER: tuple[str, ...] = (
+    "equities",
+    "rates",
+    "energy",
+    "metals",
+    "fx",
+    "agri",
+    "crypto",
+)
+_SECTOR_GROUP_LABELS: Mapping[str, str] = {
+    "equities": "Equities",
+    "rates": "Rates",
+    "energy": "Energy",
+    "metals": "Metals",
+    "fx": "FX",
+    "agri": "Agriculture",
+    "crypto": "Crypto",
+}
+_SECTOR_GROUP_ALIASES: Mapping[str, str] = {
+    "equity": "equities",
+    "equities": "equities",
+    "equity_index": "equities",
+    "index": "equities",
+    "rates": "rates",
+    "rate": "rates",
+    "interest_rates": "rates",
+    "energy": "energy",
+    "metals": "metals",
+    "metal": "metals",
+    "fx": "fx",
+    "forex": "fx",
+    "currency": "fx",
+    "agri": "agri",
+    "agriculture": "agri",
+    "grains": "agri",
+    "crypto": "crypto",
+    "cryptocurrency": "crypto",
+}
+
+
+def _sector_group_for(spec: InstrumentSpec) -> str:
+    raw = str(getattr(spec, "sector", "") or "").strip().lower()
+    resolved = _SECTOR_GROUP_ALIASES.get(raw)
+    if resolved is not None:
+        return resolved
+    asset_class = str(spec.asset_class).lower()
+    return _SECTOR_GROUP_ALIASES.get(asset_class, "other")
+
+
+def _universe_from_master(master: InstrumentsConfig) -> UniverseCatalog:
+    """Fallback universe metadata derived directly from the instrument master."""
+    groups: dict[str, list[UniverseRoot]] = {sector: [] for sector in _SECTOR_GROUP_ORDER}
+    for spec in master.instruments.values():
+        group = _sector_group_for(spec)
+        groups.setdefault(group, []).append(
+            UniverseRoot(
+                root=spec.root,
+                name=spec.name,
+                asset_class=str(spec.asset_class),
+                sector=str(spec.sector).lower(),
+                sector_group=group,
+                exchange=spec.exchange,
+                multiplier=spec.multiplier,
+                tick_size=spec.tick_size,
+                micro_root=spec.micro_root,
+                standard_root=spec.standard_root,
+                currency=spec.currency,
+            )
+        )
+    flat = sorted((root for roots in groups.values() for root in roots), key=lambda row: row.root)
+    sectors = [
+        UniverseSector(
+            id="all",
+            label="All",
+            description="Every futures root in the instrument master",
+            count=len(flat),
+            roots=flat,
+        )
+    ]
+    for sector in (*_SECTOR_GROUP_ORDER, "other"):
+        roots = sorted(groups.get(sector, []), key=lambda row: row.root)
+        if sector == "other" and not roots:
+            continue
+        sectors.append(
+            UniverseSector(
+                id=sector,
+                label=_SECTOR_GROUP_LABELS.get(sector, sector.title()),
+                description="",
+                count=len(roots),
+                roots=roots,
+            )
+        )
+    return UniverseCatalog(sectors=sectors, roots=flat)
+
+
+#: Path -> (mtime, master) cache: catalog universe follows the instrument YAML live.
+_MASTER_CACHE: dict[str, tuple[float, InstrumentsConfig]] = {}
+_MASTER_LOCK = threading.Lock()
+
+
+def load_current_instrument_master(settings: Settings) -> InstrumentsConfig:
+    """Instrument master, refreshed when the YAML changed on disk."""
+    path = Path(settings.instruments_path or (settings.configs_dir / "instruments.yaml"))
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:  # pragma: no cover - committed master always exists
+        return settings.instruments
+    key = str(path.resolve())
+    with _MASTER_LOCK:
+        cached = _MASTER_CACHE.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        clear_instruments_cache()
+        master = load_instruments(path)
+        _MASTER_CACHE[key] = (mtime, master)
+        return master
+
+
+def load_stages(instrument_master: InstrumentsConfig | None = None) -> list[CatalogStage]:
+    """Load stage metadata (with dropdown options) from the strategy layer."""
     module = _load_catalog_module()
     if module is not None:
-        payload = _catalog_payload(module)
+        payload = _catalog_payload(module, instrument_master)
         if payload is not None:
-            stages: list[CatalogStage] = []
-            for entry in _sequence_entries(payload.get("stages")):
-                mapping = _object_mapping(entry)
-                stage_id = str(_pick(mapping, "id", "key", "name") or "").strip()
-                if not stage_id:
-                    continue
-                stages.append(
-                    CatalogStage(
-                        id=stage_id,
-                        label=str(_pick(mapping, "label", "name") or stage_id.title()),
-                        description=str(_pick(mapping, "description") or ""),
-                        parameter_keys=[
-                            str(item)
-                            for item in _sequence_entries(_pick(mapping, "parameter_keys") or ())
-                            if isinstance(item, str)
-                        ],
-                    )
-                )
+            stages = _stages_from_payload(payload)
             if stages:
                 return stages
     return _stage_specs()
 
 
-def load_presets() -> tuple[list[StrategyPreset], str]:
+def load_stage_choices(
+    instrument_master: InstrumentsConfig | None = None,
+) -> dict[str, list[str]]:
+    """Load ``{stage_id: [option_name, ...]}`` from the strategy layer."""
+    module = _load_catalog_module()
+    if module is not None:
+        payload = _catalog_payload(module, instrument_master)
+        if payload is not None:
+            choices = _stage_choices_from_payload(payload)
+            if choices:
+                return choices
+    return _fallback_stage_choices()
+
+
+def load_universe(instrument_master: InstrumentsConfig | None = None) -> UniverseCatalog:
+    """Load sector-grouped instrument metadata from the strategy layer or master."""
+    module = _load_catalog_module()
+    if module is not None:
+        payload = _catalog_payload(module, instrument_master)
+        if payload is not None:
+            universe = _universe_from_payload(payload)
+            if universe.roots:
+                return universe
+    master = instrument_master if instrument_master is not None else load_instruments()
+    return _universe_from_master(master)
+
+
+def load_presets(
+    instrument_master: InstrumentsConfig | None = None,
+) -> tuple[list[StrategyPreset], str]:
     """Load the strategy layer's hypothesis presets, falling back deterministically."""
     module = _load_catalog_module()
     if module is not None:
-        payload = _catalog_payload(module)
+        payload = _catalog_payload(module, instrument_master)
         if payload is not None:
             presets = _presets_from_entries(_sequence_entries(payload.get("presets")))
             if presets:
@@ -1046,22 +1412,64 @@ class StrategyStudioService:
     # -- catalog ---------------------------------------------------------------
 
     def catalog(self) -> StrategyCatalogResponse:
-        """Typed parameter catalog, stage metadata and the five hypothesis presets."""
+        """Typed parameter catalog, stage/universe metadata and the five presets.
+
+        The third-party strategy layer is queried with the *current* instrument
+        master (mtime-refreshed), so the universe explorer and root/sector
+        multiselect choices follow ``configs/instruments.yaml`` without an API
+        restart. Additive Studio-UX fields (``stage_choices``, ``stages[].choices``,
+        ``universe``) are passed through unchanged when the layer provides them;
+        otherwise they are derived from the instrument master / static fallback.
+        """
+        master = load_current_instrument_master(self._settings)
+        module = _load_catalog_module()
+        payload = _catalog_payload(module, master) if module is not None else None
         if self._parameter_provider is not None:
             specs = self._specs_from_payload(self._parameter_provider())
             source = "injected"
+        elif payload is not None:
+            specs = [
+                spec
+                for spec in (
+                    _coerce_parameter(entry)
+                    for entry in _sequence_entries(payload.get("parameters"))
+                )
+                if spec is not None
+            ]
+            if specs:
+                source = PARAMETER_CATALOG_MODULE
+            else:  # pragma: no cover - defensive: catalog without parameters
+                specs, source = fallback_parameter_catalog(), "fallback"
         else:
-            specs, source = load_parameter_catalog()
+            specs, source = fallback_parameter_catalog(), "fallback"
+
         if self._preset_provider is not None:
             presets = _presets_from_entries(_sequence_entries(self._preset_provider()))
             preset_source = "injected"
+        elif payload is not None:
+            presets = _presets_from_entries(_sequence_entries(payload.get("presets")))
+            if presets:
+                preset_source = PARAMETER_CATALOG_MODULE
+            else:  # pragma: no cover - defensive: catalog without presets
+                presets, preset_source = fallback_presets(), "fallback"
         else:
-            presets, preset_source = load_presets()
-        stages = load_stages()
+            presets, preset_source = fallback_presets(), "fallback"
+
+        stages = _stages_from_payload(payload) if payload is not None else []
+        if not stages:
+            stages = _stage_specs()
+        stage_choices = _stage_choices_from_payload(payload) if payload is not None else {}
+        if not stage_choices:
+            stage_choices = _fallback_stage_choices()
+        universe = _universe_from_payload(payload) if payload is not None else UniverseCatalog()
+        if not universe.roots:
+            universe = _universe_from_master(master)
         return StrategyCatalogResponse(
             version=1,
             stages=stages,
             stage_ids=[stage.id for stage in stages],
+            stage_choices=stage_choices,
+            universe=universe,
             parameters=specs,
             presets=presets,
             source=source,
