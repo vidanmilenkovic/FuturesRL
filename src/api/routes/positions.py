@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from src.api.deps import ExecutionDep
+from src.api.deps import ContainerDep
 from src.api.schemas import AccountSnapshotResponse
 
 router = APIRouter(tags=["positions"])
@@ -17,9 +17,10 @@ router = APIRouter(tags=["positions"])
     description=(
         "NLV, margin consumption, gross/net exposure, the active futures contract "
         "book (expiry, days-to-roll, signed quantity, notional weight w_i, "
-        "unrealised PnL, margin) and a mark-to-market equity curve."
+        "unrealised PnL, margin) and a mark-to-market equity curve. Prefers a fresh "
+        "live-runner bridge snapshot (``source=runner-bridge``)."
     ),
 )
-async def account_snapshot(execution: ExecutionDep) -> AccountSnapshotResponse:
-    """Return the current account/position snapshot."""
-    return await execution.account()
+async def account_snapshot(container: ContainerDep) -> AccountSnapshotResponse:
+    """Return the current account/position snapshot (bridge-first)."""
+    return await container.live.account()

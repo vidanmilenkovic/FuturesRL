@@ -28,19 +28,25 @@ from src.api.schemas import (
     BacktestRunSummary,
     FlattenAllResponse,
     PipelineWaterfallResponse,
+    RecentFillsResponse,
     RiskStateResponse,
     RiskThresholdOverride,
     RiskThresholds,
+    RunnerStatusResponse,
+    RunnerStepRequest,
+    RunnerStepResponse,
     StrategyConfigUpdate,
     StrategyConfigView,
     TearsheetResponse,
     TermStructureResponse,
+    WorkingOrdersResponse,
 )
 from src.core.types import InstrumentId, MarketState, Position
 
 __all__ = [
     "BacktestService",
     "ExecutionService",
+    "LiveStateService",
     "MarketDataService",
     "RiskService",
     "StrategyCatalog",
@@ -151,4 +157,57 @@ class BacktestService(Protocol):
 
     def tearsheet(self, run_id: str) -> TearsheetResponse | None:
         """Tear sheet series + metrics for a stored run."""
+        ...
+
+
+@runtime_checkable
+class LiveStateService(Protocol):
+    """Bridge-first live state (orders, fills, account, runner session)."""
+
+    def bridge_available(self) -> bool:
+        """Whether a runner bridge snapshot is currently readable."""
+        ...
+
+    def bridge_stale(self) -> bool:
+        """Whether the latest bridge snapshot is stale (or absent)."""
+        ...
+
+    def runner_mode(self) -> str | None:
+        """Runner mode reported by the bridge (``None`` when absent)."""
+        ...
+
+    def bridge_pipeline(self) -> PipelineWaterfallResponse | None:
+        """Fresh runner pipeline snapshot, or ``None`` when unavailable/stale."""
+        ...
+
+    async def account(self) -> AccountSnapshotResponse:
+        """Bridge-backed account snapshot when fresh, else the execution adapter."""
+        ...
+
+    async def working_orders(self) -> WorkingOrdersResponse:
+        """Working orders (fresh bridge preferred)."""
+        ...
+
+    async def recent_fills(self, limit: int = 50) -> RecentFillsResponse:
+        """Recent fills, newest first (fresh bridge preferred)."""
+        ...
+
+    def runner_status(self) -> RunnerStatusResponse:
+        """Bridge staleness plus offline-runner session state."""
+        ...
+
+    async def runner_step(self, request: RunnerStepRequest) -> RunnerStepResponse:
+        """Advance the singleton offline runner session."""
+        ...
+
+    async def runner_reset(self) -> RunnerStatusResponse:
+        """Close the singleton offline runner session and report status."""
+        ...
+
+    async def start(self) -> None:
+        """Lifecycle hook (no-op unless a session is eagerly required)."""
+        ...
+
+    async def close(self) -> None:
+        """Release the offline runner session on shutdown."""
         ...

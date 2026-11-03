@@ -18,6 +18,7 @@ Run with ``uvicorn src.api.main:app --port 8000`` or the ``futuresrl-api`` scrip
 
 from __future__ import annotations
 
-from src.api.main import API_VERSION, app, create_app, main
+from src.api.main import app, create_app, main
+from src.api.version import API_VERSION
 
 __all__ = ["API_VERSION", "app", "create_app", "main"]

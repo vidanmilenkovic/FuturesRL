@@ -15,6 +15,7 @@ from fastapi import Depends, Request
 from src.api.protocols import (
     BacktestService,
     ExecutionService,
+    LiveStateService,
     MarketDataService,
     RiskService,
     StrategyCatalog,
@@ -25,12 +26,14 @@ __all__ = [
     "BacktestDep",
     "ContainerDep",
     "ExecutionDep",
+    "LiveDep",
     "MarketDataDep",
     "RiskDep",
     "StrategyCatalogDep",
     "get_backtests",
     "get_container",
     "get_execution",
+    "get_live",
     "get_market_data",
     "get_risk",
     "get_strategies",
@@ -82,8 +85,14 @@ def get_backtests(container: ContainerDep) -> BacktestService:
     return container.backtests
 
 
+def get_live(container: ContainerDep) -> LiveStateService:
+    """Runner bridge / live-state service protocol."""
+    return container.live
+
+
 MarketDataDep = Annotated[MarketDataService, Depends(get_market_data)]
 ExecutionDep = Annotated[ExecutionService, Depends(get_execution)]
 RiskDep = Annotated[RiskService, Depends(get_risk)]
 StrategyCatalogDep = Annotated[StrategyCatalog, Depends(get_strategies)]
 BacktestDep = Annotated[BacktestService, Depends(get_backtests)]
+LiveDep = Annotated[LiveStateService, Depends(get_live)]

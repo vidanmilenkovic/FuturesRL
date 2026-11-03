@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import polars as pl
 from configs.instruments import InstrumentsConfig
@@ -46,6 +46,8 @@ from configs.settings import Settings
 from configs.strategy import StrategyConfig, discover_strategy_configs, parse_strategy_config
 
 from src.api import fixtures
+from src.api.live import LiveStateService, micro_routing_from_payload
+from src.api.news import NewsFeedService
 from src.api.protocols import (
     BacktestService,
     ExecutionService,
@@ -59,6 +61,7 @@ from src.api.schemas import (
     FlattenAllResponse,
     FlattenReceipt,
     HealthResponse,
+    MicroRoutingEntry,
     PipelineDiagnostic,
     PipelineInstrumentRow,
     PipelineStage,
@@ -74,6 +77,7 @@ from src.api.schemas import (
     TermStructureResponse,
 )
 from src.api.telemetry import TelemetryBroadcaster
+from src.api.version import API_VERSION
 from src.core.interfaces import ContractTranslatorProtocol, RiskOverlay, StrategyPipeline
 from src.core.types import (
     AccountSnapshot,
@@ -431,6 +435,46 @@ class SimulatedExecutionService:
         self._kill_switch = _KillSwitchState(clock)
         self._seed_book()
 
+    @property
+    def source_name(self) -> str:
+        """Provenance reported by the API for this execution adapter."""
+        return "simulated"
+
+    def working_orders_snapshot(self) -> list[dict[str, object]]:
+        """Working orders as plain rows for ``GET /api/orders/working``."""
+        as_of = self._market.as_of
+        return [
+            {
+                "order_id": order.order_id,
+                "instrument_id": order.instrument_id,
+                "side": order.side.value,
+                "quantity": order.quantity,
+                "filled_quantity": 0,
+                "remaining_quantity": order.quantity,
+                "status": "SUBMITTED",
+                "order_type": order.order_type.value,
+                "limit_price": order.limit_price,
+                "updated_at": as_of,
+            }
+            for order in self._broker.working_orders
+        ]
+
+    def recent_fills_snapshot(self, limit: int = 50) -> list[dict[str, object]]:
+        """Most recent simulated fills as plain rows for ``GET /api/fills/recent``."""
+        fills = list(self._broker.fills)[-max(1, limit) :]
+        return [
+            {
+                "order_id": fill.order_id,
+                "instrument_id": fill.instrument_id,
+                "side": fill.side.value,
+                "quantity": fill.quantity,
+                "price": fill.price,
+                "commission": fill.cost.commission,
+                "timestamp": fill.timestamp,
+            }
+            for fill in fills
+        ]
+
     def _seed_book(self) -> None:
         from src.backtest.simulated_broker import TradeKind
         from src.core.types import OrderEvent
@@ -548,6 +592,20 @@ class FixtureExecutionService:
         self._settings = settings
         self._clock = clock
         self._kill_switch = _KillSwitchState(clock)
+
+    @property
+    def source_name(self) -> str:
+        """Provenance reported by the API for this execution adapter."""
+        return "fixture"
+
+    def working_orders_snapshot(self) -> list[dict[str, object]]:
+        """A pure fixture adapter never carries working orders."""
+        return []
+
+    def recent_fills_snapshot(self, limit: int = 50) -> list[dict[str, object]]:
+        """A pure fixture adapter never carries real fills."""
+        del limit
+        return []
 
     def _positions(self) -> dict[InstrumentId, Position]:
         positions: dict[InstrumentId, Position] = {}
@@ -690,6 +748,51 @@ class IBKRExecutionService:
     def connected(self) -> bool:
         """Whether the IBKR session is established."""
         return self._manager.is_connected
+
+    @property
+    def source_name(self) -> str:
+        """Provenance reported by the API for this execution adapter."""
+        return "engine" if self._manager.is_connected else "simulated"
+
+    def working_orders_snapshot(self) -> list[dict[str, object]]:
+        """Working OMS orders as plain rows for ``GET /api/orders/working``."""
+        rows: list[dict[str, object]] = []
+        timestamp = self._clock()
+        for managed in self._oms.orders.values():
+            if managed.is_terminal:
+                continue
+            event = managed.event
+            rows.append(
+                {
+                    "order_id": event.order_id,
+                    "instrument_id": event.instrument_id,
+                    "side": event.side.value,
+                    "quantity": event.quantity,
+                    "filled_quantity": managed.filled_quantity,
+                    "remaining_quantity": max(0, event.quantity - managed.filled_quantity),
+                    "status": managed.status.value,
+                    "order_type": event.order_type.value,
+                    "limit_price": event.limit_price,
+                    "updated_at": timestamp,
+                }
+            )
+        return rows
+
+    def recent_fills_snapshot(self, limit: int = 50) -> list[dict[str, object]]:
+        """Most recent OMS fills as plain rows for ``GET /api/fills/recent``."""
+        fills = self._oms.all_fills()[-max(1, limit) :]
+        return [
+            {
+                "order_id": fill.order_id,
+                "instrument_id": fill.instrument_id,
+                "side": fill.side.value,
+                "quantity": fill.quantity,
+                "price": fill.price,
+                "commission": fill.commission,
+                "timestamp": fill.timestamp,
+            }
+            for fill in fills
+        ]
 
     @property
     def connection_error(self) -> str | None:
@@ -862,11 +965,26 @@ def build_llm_risk_overlay(
         logger.warning("src.risk.llm_risk_overlay is unavailable; LLM stage will be skipped")
         return None
     thresholds = thresholds_from_settings(settings)
-    client = fixtures.OfflineLLMClient(state, thresholds, clock())
+    client: object = fixtures.OfflineLLMClient(state, thresholds, clock())
+    # Phase-9: prefer the risk layer's provider factory when it is importable and a
+    # real provider is configured; the offline deterministic client stays the
+    # default so unit/integration runs never touch the network.
+    if settings.llm_provider != "offline":
+        try:
+            from src.risk.llm_clients import build_llm_client as _build_llm_client
+
+            wired_client = _build_llm_client(settings)
+            if wired_client is not None:
+                client = wired_client
+        except Exception as exc:
+            logger.warning(
+                "src.risk.llm_clients is unavailable (%s); using the offline LLM client",
+                exc,
+            )
     calendar = _macro_calendar(str(settings.configs_dir / "macro_calendar.yaml"))
     try:
         overlay = LLMRiskOverlay(
-            client,
+            cast("Any", client),
             settings.risk,
             calendar=calendar,
             instruments=master,
@@ -914,6 +1032,102 @@ def build_pipeline_parts(
         if llm is not None:
             overlays.append(_NamedRiskOverlay(llm, "llm_risk"))
     return build_pipeline(config, master, translator, risk_overlays=overlays), translator
+
+
+def _report_field(report: object, name: str, default: object = None) -> object:
+    """Field access on a discretization report (attribute or mapping based)."""
+    if isinstance(report, Mapping):
+        return cast(Mapping[str, object], report).get(name, default)
+    return getattr(report, name, default)
+
+
+def _report_float(report: object, name: str) -> float | None:
+    value = _report_field(report, name)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _report_weights(report: object, name: str) -> dict[str, float] | None:
+    value = _report_field(report, name)
+    if not isinstance(value, Mapping):
+        return None
+    weights: dict[str, float] = {}
+    for key, weight in cast(Mapping[object, object], value).items():
+        if isinstance(weight, bool) or not isinstance(weight, int | float):
+            continue
+        result = float(weight)
+        if math.isfinite(result):
+            weights[str(key).upper()] = result
+    return weights or None
+
+
+def achieved_weights(
+    targets: ContractTargetSet, state: MarketState, equity: float
+) -> dict[str, float]:
+    """Signed notional weight actually achieved by the discrete contract book."""
+    achieved: dict[str, float] = {}
+    target_rows = targets.by_instrument
+    for root in state.instruments:
+        target = target_rows.get(root)
+        if target is None or equity <= 0.0:
+            achieved[root] = 0.0
+        else:
+            achieved[root] = target.signed_notional / equity
+    return achieved
+
+
+def discretization_details(
+    translator: ContractTranslatorProtocol | None,
+    weights: WeightVector,
+    targets: ContractTargetSet,
+    state: MarketState,
+    equity: float,
+) -> tuple[float, list[MicroRoutingEntry], dict[str, float], str]:
+    """Return ``(tracking_error_pct, micro_routing, achieved_weights, source)``.
+
+    Uses the real ``ContractTranslator.discretization_report`` when the risk layer
+    exposes it; otherwise computes the tracking error arithmetically from the
+    discrete contract book, so the Pipeline Inspector never shows a fabricated
+    zero or crashes on a missing translator API.
+    """
+    fallback_achieved = achieved_weights(targets, state, equity)
+    fallback_error = sum(
+        abs(weights.get(root, 0.0) - fallback_achieved.get(root, 0.0))
+        for root in set(weights) | set(fallback_achieved)
+    )
+    report: object | None = None
+    if translator is not None:
+        reporter = getattr(translator, "discretization_report", None)
+        if callable(reporter):
+            attempts: tuple[dict[str, object], ...] = (
+                {"equity": equity},
+                {},
+            )
+            for extra in attempts:
+                try:
+                    report = reporter(weights, targets, state, **extra)
+                    break
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    logger.warning("discretization_report failed: %s", exc)
+                    report = None
+                    break
+    if report is None:
+        return (round(max(0.0, fallback_error) * 100.0, 6), [], fallback_achieved, "fallback")
+    tracking = _report_float(report, "tracking_error_pct")
+    if tracking is None:
+        raw_error = _report_float(report, "tracking_error")
+        tracking = raw_error * 100.0 if raw_error is not None else fallback_error * 100.0
+    micro_routes = _report_field(report, "micro_routes")
+    if micro_routes is None:
+        micro_routes = _report_field(report, "routes", ())
+    routing = micro_routing_from_payload(micro_routes)
+    report_achieved = _report_weights(report, "achieved_weights")
+    achieved = report_achieved if report_achieved is not None else fallback_achieved
+    return (round(max(0.0, float(tracking)), 6), routing, achieved, "translator")
 
 
 class EngineMarketService:
@@ -965,15 +1179,17 @@ class EngineMarketService:
                 return config
         return None
 
-    def _pipeline_for(self, config: StrategyConfig, state: MarketState) -> StrategyPipeline:
-        pipeline, _ = build_pipeline_parts(
+    def _pipeline_for(
+        self, config: StrategyConfig, state: MarketState
+    ) -> tuple[StrategyPipeline, ContractTranslatorProtocol]:
+        pipeline, translator = build_pipeline_parts(
             config,
             self._master,
             self._settings,
             clock=self._clock,
             state=state,
         )
-        return pipeline
+        return pipeline, translator
 
     def pipeline(self) -> PipelineWaterfallResponse:
         """Run the real FinRL-X pipeline on the latest offline state."""
@@ -988,9 +1204,9 @@ class EngineMarketService:
                 "the pipeline inspector requires at least one YAML config"
             )
         state = self.latest_state()
-        pipeline = self._pipeline_for(config, state)
+        pipeline, translator = self._pipeline_for(config, state)
         result = pipeline.run(state)
-        response = self._map_pipeline(config, state, result)
+        response = self._map_pipeline(config, state, result, translator)
         self._pipeline_cache[key] = response
         return response
 
@@ -999,11 +1215,15 @@ class EngineMarketService:
         config: StrategyConfig,
         state: MarketState,
         result: PipelineResult,
+        translator: ContractTranslatorProtocol | None = None,
     ) -> PipelineWaterfallResponse:
         targets = result.targets if result.targets is not None else ContractTargetSet.empty()
         target_rows = targets.by_instrument
         selected = set(result.universe)
         equity = state.equity or INITIAL_EQUITY
+        tracking_error_pct, micro_routing, achieved, tracking_source = discretization_details(
+            translator, result.final_weights, targets, state, equity
+        )
         instruments: list[PipelineInstrumentRow] = []
         for root in sorted(state.instruments):
             base = result.base_weights.get(root, 0.0)
@@ -1020,6 +1240,7 @@ class EngineMarketService:
                     weight_timing=round(timing, 8),
                     weight_risk=round(risk, 8),
                     weight_final=round(final, 8),
+                    weight_actual=round(achieved.get(root, 0.0), 8),
                     delta_timing=round(timing - base, 8),
                     delta_risk=round(risk - timing, 8),
                     target_contracts=target.quantity if target is not None else None,
@@ -1097,6 +1318,9 @@ class EngineMarketService:
             diagnostics=diagnostics,
             elapsed_ms=round(float(elapsed or 0.0), 3),
             data_source="engine",
+            tracking_error_pct=tracking_error_pct,
+            micro_routing=micro_routing,
+            tracking_error_source=cast('Literal["translator", "fallback"]', tracking_source),
         )
 
     def _diagnostics(
@@ -1279,6 +1503,7 @@ class FixtureMarketService:
         state = self.latest_state()
         roots = sorted(state.instruments)
         selected = tuple(roots[:5])
+        equity = state.equity or INITIAL_EQUITY
         instruments: list[PipelineInstrumentRow] = []
         for index, root in enumerate(roots):
             base = 0.3 if root in selected else 0.0
@@ -1289,6 +1514,13 @@ class FixtureMarketService:
                 if root in selected
                 else None
             )
+            spec = self._master.get(root) if self._master.has(root) else None
+            multiplier = spec.multiplier if spec is not None else 50.0
+            achieved = (
+                (quantity or 0) * state.price(root) * multiplier / INITIAL_EQUITY
+                if equity > 0
+                else 0.0
+            )
             instruments.append(
                 PipelineInstrumentRow(
                     instrument_id=root,
@@ -1298,6 +1530,7 @@ class FixtureMarketService:
                     weight_timing=timing,
                     weight_risk=risk,
                     weight_final=risk,
+                    weight_actual=round(achieved, 8),
                     delta_timing=timing - base,
                     delta_risk=risk - timing,
                     target_contracts=quantity,
@@ -1306,6 +1539,11 @@ class FixtureMarketService:
                 )
             )
         gross = sum(abs(row.weight_final) for row in instruments)
+        equity = state.equity or INITIAL_EQUITY
+        tracking_error_pct = round(
+            sum(abs(row.weight_final - (row.weight_actual or 0.0)) for row in instruments) * 100.0,
+            6,
+        )
         stages = [
             PipelineStage(
                 key="universe",
@@ -1369,6 +1607,9 @@ class FixtureMarketService:
             ],
             elapsed_ms=0.0,
             data_source="fixture",
+            tracking_error_pct=tracking_error_pct,
+            micro_routing=[],
+            tracking_error_source="fallback",
         )
 
     def term_structure(self) -> TermStructureResponse:
@@ -1405,11 +1646,13 @@ class EngineRiskService:
         market: MarketDataService,
         execution: ExecutionService,
         clock: fixtures.Clock = fixtures.utc_now,
+        news: NewsFeedService | None = None,
     ) -> None:
         self._settings = settings
         self._market = market
         self._execution = execution
         self._clock = clock
+        self._news = news
         self._thresholds = thresholds_from_settings(settings)
 
     def thresholds(self) -> RiskThresholds:
@@ -1449,7 +1692,13 @@ class EngineRiskService:
         assessments = fixtures.risk_assessment_rows(core, thresholds, now)
         events = fixtures.macro_calendar(now)
         lockout = fixtures.macro_lockout(events, thresholds, now)
-        news = fixtures.news_feed(assessments, now)
+        ingested_news = self._news.items() if self._news is not None else []
+        if ingested_news:
+            news = ingested_news
+            news_source = self._news.source if self._news is not None else "fixture"
+        else:
+            news = fixtures.news_feed(assessments, now)
+            news_source = "fixture"
         liquidated = [row for row in assessments if row.action == "liquidate"]
         coerced = [row for row in assessments if row.action == "neutralized"]
         if liquidated:
@@ -1478,6 +1727,7 @@ class EngineRiskService:
             macro_events=events,
             news=news,
             neutralized_instruments=[row.instrument_id for row in coerced],
+            news_source=news_source,
         )
 
 
@@ -1500,20 +1750,27 @@ class Container:
     execution: ExecutionService
     risk: RiskService
     telemetry: TelemetryBroadcaster
+    live: LiveStateService
+    news: NewsFeedService
     offline_mode: bool
     warnings: list[str] = field(default_factory=list)
 
     def health(self) -> HealthResponse:
         """Liveness payload (``degraded`` when any fallback is active)."""
         now = self.clock()
+        bridge_available = self.live.bridge_available()
         return HealthResponse(
             status="degraded" if self.warnings or self.offline_mode else "ok",
             app_name=self.settings.app_name,
-            version="1.0.0",
+            version=API_VERSION,
             environment=self.settings.environment,
             offline_mode=self.offline_mode,
             uptime_seconds=max(0.0, (now - self.started_at).total_seconds()),
             server_time=now,
+            ibkr_connected=bool(getattr(self.execution, "connected", False)),
+            runner_bridge_available=bridge_available,
+            runner_bridge_stale=self.live.bridge_stale(),
+            runner_mode=self.live.runner_mode(),
         )
 
     def telemetry_status(self) -> TelemetryStatusResponse:
@@ -1530,10 +1787,14 @@ class Container:
                 self.warnings.append("IBKR session unavailable — offline execution fallback active")
                 self.offline_mode = True
         await self.telemetry.start()
+        await self.news.start()
+        await self.live.start()
 
     async def stop(self) -> None:
-        """Stop telemetry and disconnect live sessions."""
+        """Stop telemetry, the news poller, runner session and live sessions."""
         await self.telemetry.stop()
+        await self.news.stop()
+        await self.live.close()
         disconnector = getattr(self.execution, "disconnect", None)
         if callable(disconnector):
             outcome = disconnector()
@@ -1601,11 +1862,13 @@ def build_container(
         clock=resolved_clock,
         warnings=warnings,
     )
+    news = NewsFeedService(settings=resolved_settings, clock=resolved_clock)
     risk = EngineRiskService(
         settings=resolved_settings,
         market=market_service,
         execution=execution,
         clock=resolved_clock,
+        news=news,
     )
     from src.api.backtests_service import EngineBacktestService
 
@@ -1622,6 +1885,13 @@ def build_container(
         risk=risk,
         market=market_service,
     )
+    live = LiveStateService(
+        settings=resolved_settings,
+        clock=resolved_clock,
+        execution=execution,
+        instrument_master=master,
+    )
+    warnings.extend(live.warnings)
     offline_mode = not isinstance(execution, IBKRExecutionService)
     return Container(
         settings=resolved_settings,
@@ -1634,6 +1904,8 @@ def build_container(
         execution=execution,
         risk=risk,
         telemetry=telemetry,
+        live=live,
+        news=news,
         offline_mode=offline_mode,
         warnings=warnings,
     )

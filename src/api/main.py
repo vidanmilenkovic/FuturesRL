@@ -24,12 +24,11 @@ from src.api import fixtures
 from src.api.routes import ROUTERS
 from src.api.routes.health import router as health_router
 from src.api.services import Container, build_container
+from src.api.version import API_VERSION
 from src.api.ws import router as websocket_router
 
 logger = logging.getLogger(__name__)
 
-#: API version surfaced in ``/health`` and the OpenAPI document.
-API_VERSION: str = "1.0.0"
 
 #: OpenAPI tag metadata (orders the generated docs).
 OPENAPI_TAGS: list[dict[str, str]] = [
@@ -61,6 +60,14 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     {
         "name": "telemetry",
         "description": "WebSocket telemetry broadcaster status.",
+    },
+    {
+        "name": "orders",
+        "description": "Working orders and recent fills (Command Center live book).",
+    },
+    {
+        "name": "runner",
+        "description": "Live-runner bridge status and the offline runner step/reset controls.",
     },
 ]
 

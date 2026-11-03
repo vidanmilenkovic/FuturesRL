@@ -31,7 +31,11 @@ type Severity = Literal["ok", "info", "warn", "critical"]
 type TermRegime = Literal["contango", "backwardation", "flat"]
 type RiskAction = Literal["pass", "scale", "liquidate", "neutralized"]
 type BacktestStatus = Literal["queued", "running", "completed", "failed"]
-type DataSource = Literal["engine", "fixture"]
+type DataSource = Literal["engine", "fixture", "runner-bridge"]
+#: Provenance of a live/snapshot view: fresh runner bridge vs local fallback.
+type SnapshotSource = Literal["runner-bridge", "simulated", "fixture"]
+#: Provenance of the account/position snapshot.
+type AccountSource = Literal["engine", "simulated", "fixture", "runner-bridge"]
 type PipelineStageKey = Literal["universe", "base", "timing", "risk", "targets"]
 type TelemetryKind = Literal["pnl", "margin", "positions", "risk_alert", "pipeline", "heartbeat"]
 #: A scalar allowed in a declarative pipeline stage ``params`` mapping.
@@ -67,6 +71,11 @@ class HealthResponse(APIModel):
     )
     uptime_seconds: float = Field(ge=0.0)
     server_time: datetime
+    #: Additive Phase-9 connectivity/runner fields (frontend derives the mode badge).
+    ibkr_connected: bool = False
+    runner_bridge_available: bool = False
+    runner_bridge_stale: bool = True
+    runner_mode: str | None = None
 
 
 class TelemetryStatusResponse(APIModel):
@@ -129,6 +138,8 @@ class AccountSnapshotResponse(APIModel):
     net_exposure: float
     equity_curve: list[EquityPoint] = Field(default_factory=list)
     positions: list[PositionRow] = Field(default_factory=list)
+    #: Provenance: ``runner-bridge`` wins over ``engine``/``simulated``/``fixture``.
+    source: AccountSource = "fixture"
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +169,8 @@ class PipelineInstrumentRow(APIModel):
     weight_timing: float
     weight_risk: float
     weight_final: float
+    #: Weight actually achieved by the discrete contract book (signed notional / equity).
+    weight_actual: float | None = None
     delta_timing: float
     delta_risk: float
     target_contracts: int | None = None
@@ -174,6 +187,16 @@ class PipelineDiagnostic(APIModel):
     status: Severity
 
 
+class MicroRoutingEntry(APIModel):
+    """One standard -> micro contract routing pair from the discretization step."""
+
+    family: str
+    standard_root: str
+    standard_quantity: int
+    micro_root: str
+    micro_quantity: int
+
+
 class PipelineWaterfallResponse(APIModel):
     """A complete rebalance cycle trace for the Pipeline Inspector view."""
 
@@ -185,6 +208,11 @@ class PipelineWaterfallResponse(APIModel):
     diagnostics: list[PipelineDiagnostic]
     elapsed_ms: float = Field(ge=0.0)
     data_source: DataSource = "fixture"
+    #: Rounding/discretization quality of ``w_t -> N_i,t`` (percentage points).
+    tracking_error_pct: float = Field(default=0.0, ge=0.0)
+    micro_routing: list[MicroRoutingEntry] = Field(default_factory=list)
+    #: ``translator`` when the real discretization report was used, else ``fallback``.
+    tracking_error_source: Literal["translator", "fallback"] = "fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +326,8 @@ class RiskStateResponse(APIModel):
     macro_events: list[MacroEvent] = Field(default_factory=list)
     news: list[NewsEvent] = Field(default_factory=list)
     neutralized_instruments: list[str] = Field(default_factory=list)
+    #: ``news-ingestor`` when live/ingested headlines are wired, else ``fixture``.
+    news_source: str = "fixture"
 
 
 class FlattenReceipt(APIModel):
@@ -427,7 +457,10 @@ class BacktestRunConfig(StrictModel):
     end: date
     initial_equity: float = Field(default=1_000_000.0, gt=0.0)
     rebalance_frequency: str = "W-FRI"
-    walk_forward: bool = True
+    walk_forward: bool = False
+    wf_splits: int = Field(default=5, ge=2)
+    purge_bars: int = Field(default=5, ge=0)
+    embargo_bars: int = Field(default=5, ge=0)
     random_seed: int = 7
 
     @model_validator(mode="after")
@@ -507,6 +540,10 @@ class BacktestRunSummary(APIModel):
     n_rebalances: int | None = Field(default=None, ge=0)
     #: ``engine`` = real BacktestEngine; ``fixture`` = deterministic seeded run.
     data_source: DataSource = "engine"
+    #: ``backtest`` = single-pass run; ``walk_forward`` = purged/embargoed WF run.
+    kind: Literal["backtest", "walk_forward"] = "backtest"
+    #: Number of walk-forward folds (``None`` for a single-pass backtest).
+    n_folds: int | None = Field(default=None, ge=0)
 
 
 class BacktestListResponse(APIModel):
@@ -514,6 +551,21 @@ class BacktestListResponse(APIModel):
 
     runs: list[BacktestRunSummary] = Field(default_factory=list)
     available_strategies: list[str] = Field(default_factory=list)
+
+
+class WalkForwardFold(APIModel):
+    """One purged/embargoed walk-forward fold in the tear sheet."""
+
+    fold_index: int = Field(ge=1)
+    train_start: datetime | None = None
+    train_end: datetime | None = None
+    test_start: datetime | None = None
+    test_end: datetime | None = None
+    sharpe: float | None = None
+    return_pct: float | None = None
+    n_trades: int | None = Field(default=None, ge=0)
+    equity_curve: list[SeriesPoint] = Field(default_factory=list)
+    underwater: list[SeriesPoint] = Field(default_factory=list)
 
 
 class TearsheetResponse(APIModel):
@@ -527,6 +579,113 @@ class TearsheetResponse(APIModel):
     roll_yield_attribution: list[AttributionRow] = Field(default_factory=list)
     monthly_returns: list[MonthlyReturn] = Field(default_factory=list)
     metrics: MetricsSet
+    #: Per-fold series for ``kind="walk_forward"`` runs (empty for single-pass runs).
+    folds: list[WalkForwardFold] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Live runner bridge / working orders / recent fills (Phase 9)
+# ---------------------------------------------------------------------------
+
+
+class WorkingOrderRow(APIModel):
+    """One working (not fully filled, not terminal) order."""
+
+    order_id: str
+    instrument_id: str
+    side: Literal["BUY", "SELL"]
+    quantity: int = Field(ge=0)
+    filled_quantity: int = Field(default=0, ge=0)
+    #: Contracts still working at the venue (``quantity - filled_quantity`` unless reported).
+    remaining_quantity: int = Field(default=0, ge=0)
+    status: str = "SUBMITTED"
+    order_type: str | None = None
+    limit_price: float | None = None
+    updated_at: datetime | None = None
+
+
+class WorkingOrdersResponse(APIModel):
+    """``GET /api/orders/working`` payload."""
+
+    timestamp: datetime
+    source: SnapshotSource
+    orders: list[WorkingOrderRow] = Field(default_factory=list)
+    bridge_stale: bool | None = None
+
+
+class FillRow(APIModel):
+    """One recent execution fill."""
+
+    order_id: str
+    instrument_id: str
+    side: Literal["BUY", "SELL"]
+    quantity: int = Field(gt=0)
+    price: float = Field(gt=0.0)
+    commission: float = 0.0
+    timestamp: datetime
+
+
+class RecentFillsResponse(APIModel):
+    """``GET /api/fills/recent`` payload."""
+
+    timestamp: datetime
+    source: SnapshotSource
+    fills: list[FillRow] = Field(default_factory=list)
+    limit: int = Field(default=50, ge=1)
+    bridge_stale: bool | None = None
+
+
+class RunnerBridgeSummary(APIModel):
+    """Summary of the runner bridge snapshot the API is currently reading."""
+
+    runner_id: str | None = None
+    mode: str | None = None
+    sequence: int | None = None
+    updated_at: datetime | None = None
+    stale_after_seconds: float | None = None
+    stale: bool = True
+    status: str | None = None
+
+
+class RunnerStatusResponse(APIModel):
+    """``GET /api/runner/status`` payload (bridge staleness + session state)."""
+
+    timestamp: datetime
+    bridge_available: bool
+    bridge_stale: bool
+    runner_mode: str | None = None
+    #: Alias of ``runner_mode`` (the bridge contract calls it ``mode``).
+    mode: str | None = None
+    #: Alias of ``bridge_stale`` (the bridge contract calls it ``stale``).
+    stale: bool = True
+    session_active: bool = False
+    session_available: bool = False
+    runner_id: str | None = None
+    sequence: int | None = None
+    updated_at: datetime | None = None
+    stale_after_seconds: float | None = None
+    status: str | None = None
+    source: Literal["runner-bridge", "unavailable"] = "unavailable"
+    message: str = ""
+
+
+class RunnerStepRequest(StrictModel):
+    """``POST /api/runner/step`` body."""
+
+    states: int = Field(default=1, ge=1, le=10_000)
+    mode: Literal["offline"] = "offline"
+
+
+class RunnerStepResponse(APIModel):
+    """``POST /api/runner/step`` payload."""
+
+    status: Literal["completed", "unavailable", "error"]
+    states_processed: int = Field(default=0, ge=0)
+    mode: str = "offline"
+    source: SnapshotSource | Literal["unavailable"] = "runner-bridge"
+    bridge: RunnerBridgeSummary | None = None
+    message: str = ""
+    timestamp: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +772,7 @@ __all__ = [
     "DataSource",
     "Environment",
     "EquityPoint",
+    "FillRow",
     "FlattenAllResponse",
     "FlattenReceipt",
     "HealthResponse",
@@ -621,6 +781,7 @@ __all__ = [
     "MacroLockout",
     "MarginTelemetryPayload",
     "MetricsSet",
+    "MicroRoutingEntry",
     "MonthlyReturn",
     "NewsEvent",
     "PipelineDiagnostic",
@@ -631,6 +792,7 @@ __all__ = [
     "PnlTelemetryPayload",
     "PositionRow",
     "PositionsTelemetryPayload",
+    "RecentFillsResponse",
     "RiskAction",
     "RiskAlertTelemetryPayload",
     "RiskAssessmentRow",
@@ -638,8 +800,13 @@ __all__ = [
     "RiskThresholdOverride",
     "RiskThresholds",
     "RollCalendarEntry",
+    "RunnerBridgeSummary",
+    "RunnerStatusResponse",
+    "RunnerStepRequest",
+    "RunnerStepResponse",
     "SeriesPoint",
     "Severity",
+    "SnapshotSource",
     "StageConfig",
     "StageParamValue",
     "StrategyConfigUpdate",
@@ -654,4 +821,7 @@ __all__ = [
     "TermCurve",
     "TermRegime",
     "TermStructureResponse",
+    "WalkForwardFold",
+    "WorkingOrderRow",
+    "WorkingOrdersResponse",
 ]

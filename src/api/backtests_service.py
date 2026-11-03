@@ -18,17 +18,24 @@ fallback is a real simulation.
 
 from __future__ import annotations
 
+import inspect
+import json
+import logging
 import math
+import os
+import tempfile
 import time
-from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from collections.abc import Mapping, Sequence
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 from configs.instruments import InstrumentsConfig
 from configs.settings import Settings
 from configs.strategy import StrategyConfig
+from pydantic import ValidationError
 
 from src.api import fixtures
 from src.api.protocols import StrategyCatalog
@@ -42,11 +49,14 @@ from src.api.schemas import (
     SeriesPoint,
     TailPoint,
     TearsheetResponse,
+    WalkForwardFold,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from src.analytics.metrics import PerformanceMetrics
     from src.backtest.engine import BacktestResult
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["EngineBacktestService"]
 
@@ -61,6 +71,35 @@ MAX_RUNS: int = 40
 
 #: Seed runs created at boot (one per strategy, capped).
 SEED_RUNS: int = 3
+
+#: Version of the persisted backtest-artifact JSON payload.
+ARTIFACT_SCHEMA_VERSION: int = 1
+
+#: Default metric aliases when mapping a walk-forward report onto ``MetricsSet``.
+_METRIC_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "cagr": ("cagr", "annualized_return", "annual_return"),
+    "annual_volatility": ("annual_volatility", "annualized_volatility", "volatility"),
+    "sharpe": ("sharpe", "sharpe_ratio", "mean_sharpe"),
+    "sortino": ("sortino", "sortino_ratio"),
+    "calmar": ("calmar", "calmar_ratio"),
+    "omega": ("omega", "omega_ratio"),
+    "max_drawdown": ("max_drawdown", "max_drawdown_pct"),
+    "max_drawdown_duration_days": ("max_drawdown_duration_days", "max_drawdown_duration"),
+    "var_95": ("var_95", "var_95_historical"),
+    "var_99": ("var_99", "var_99_historical"),
+    "cvar_95": ("cvar_95",),
+    "cvar_99": ("cvar_99",),
+    "rachev_ratio": ("rachev_ratio", "rachev_ratio_05"),
+    "rom": ("rom", "return_on_max_initial_margin"),
+    "avg_margin_utilization": ("avg_margin_utilization", "average_margin_utilization"),
+    "peak_margin_utilization": ("peak_margin_utilization",),
+    "turnover": ("turnover",),
+    "implementation_shortfall_ticks": (
+        "implementation_shortfall_ticks",
+        "implementation_shortfall",
+    ),
+    "commission_to_gross_pnl": ("commission_to_gross_pnl", "commission_to_gross_pnl_ratio"),
+}
 
 
 def _series_points(timestamps: Sequence[datetime], values: Sequence[float]) -> list[SeriesPoint]:
@@ -168,6 +207,414 @@ def _simple_metrics(values: Sequence[float], count_per_year: int = 252) -> Metri
     )
 
 
+def _object_mapping(value: object) -> Mapping[str, object]:
+    """Best-effort mapping view of a report/metrics object."""
+    if isinstance(value, Mapping):
+        return cast(Mapping[str, object], value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            result = to_dict()
+        except Exception:  # pragma: no cover - defensive report adapter
+            return {}
+        if isinstance(result, Mapping):
+            return cast(Mapping[str, object], result)
+    as_dict = getattr(value, "model_dump", None) if not isinstance(value, type) else None
+    if callable(as_dict):
+        try:
+            result = as_dict()
+        except Exception:  # pragma: no cover - defensive report adapter
+            return {}
+        if isinstance(result, Mapping):
+            return cast(Mapping[str, object], result)
+    return {}
+
+
+def _object_sequence(value: object) -> list[object]:
+    """Sequence view of a report field (empty when absent/wrong-typed)."""
+    if isinstance(value, Mapping):
+        return []
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return list(cast(Sequence[object], value))
+    return []
+
+
+def _mappings(value: object) -> list[Mapping[str, object]]:
+    """Mappings for a sequence of report records (mapping or dataclass-like)."""
+    records: list[Mapping[str, object]] = []
+    for item in _object_sequence(value):
+        mapping = _object_mapping(item)
+        if mapping:
+            records.append(mapping)
+    return records
+
+
+def _first_float(mappings: Sequence[Mapping[str, object]], aliases: Sequence[str]) -> float | None:
+    for mapping in mappings:
+        for alias in aliases:
+            value = mapping.get(alias)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int | float) and math.isfinite(float(value)):
+                return float(value)
+    return None
+
+
+def _first_int(mappings: Sequence[Mapping[str, object]], aliases: Sequence[str]) -> int | None:
+    number = _first_float(mappings, aliases)
+    return None if number is None else round(number)
+
+
+def _first_datetime(mapping: Mapping[str, object], aliases: Sequence[str]) -> datetime | None:
+    for alias in aliases:
+        value = mapping.get(alias)
+        if isinstance(value, datetime):
+            return value.astimezone(UTC) if value.tzinfo is not None else None
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+        if value is not None and hasattr(value, "year") and hasattr(value, "month"):
+            try:
+                return datetime.combine(cast("date", value), dt_time.min, tzinfo=UTC)
+            except TypeError:  # pragma: no cover - exotic date-like value
+                continue
+    return None
+
+
+def _metric_mappings(
+    report: object, report_dict: Mapping[str, object]
+) -> list[Mapping[str, object]]:
+    """Every mapping that may carry walk-forward aggregate metrics."""
+    found: list[Mapping[str, object]] = []
+    sources: list[object] = [report_dict]
+    for key in (
+        "combined_metrics",
+        "aggregate_metrics",
+        "aggregated_metrics",
+        "mean_metrics",
+        "aggregate",
+        "metrics",
+        "summary",
+    ):
+        if key in report_dict:
+            sources.append(report_dict[key])
+    for name in ("combined_metrics", "aggregate_metrics", "aggregate", "metrics", "summary"):
+        value = getattr(report, name, None)
+        if value is not None:
+            sources.append(value)
+    for source in sources:
+        mapping = _object_mapping(source)
+        if not mapping:
+            continue
+        found.append(mapping)
+        for nested_key in ("metrics", "combined_metrics", "aggregate", "mean", "mean_metrics"):
+            nested = mapping.get(nested_key)
+            nested_mapping = _object_mapping(nested) if nested is not None else {}
+            if nested_mapping:
+                found.append(nested_mapping)
+        # Aggregate stats are often ``{"sharpe": {"mean": 1.2, ...}, ...}``.
+        flattened: dict[str, object] = {}
+        for metric_key, stats in mapping.items():
+            stats_mapping = _object_mapping(stats) if isinstance(stats, Mapping) else {}
+            if not stats_mapping:
+                continue
+            for stat_key in ("mean", "combined", "pooled", "median", "value"):
+                number = _first_float([stats_mapping], (stat_key,))
+                if number is not None:
+                    flattened.setdefault(metric_key, number)
+                    flattened[f"{metric_key}_{stat_key}"] = number
+                    break
+        if flattened:
+            found.append(flattened)
+    return found
+
+
+def _metrics_with_defaults(
+    mappings: Sequence[Mapping[str, object]], fallback: MetricsSet
+) -> MetricsSet:
+    """Map a (versioned) walk-forward metric payload onto ``MetricsSet``."""
+    values: dict[str, float] = {
+        field: float(getattr(fallback, field)) for field in MetricsSet.model_fields
+    }
+    for field, aliases in _METRIC_ALIASES.items():
+        resolved = _first_float(mappings, aliases)
+        if resolved is not None:
+            values[field] = resolved
+    return MetricsSet(**values)
+
+
+def _series_points_from_payload(
+    payload: Mapping[str, object], keys: Sequence[str]
+) -> list[SeriesPoint]:
+    """Parse a fold's series payload (list of points, values+timestamps, or mapping)."""
+    for key in keys:
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        entries = _object_sequence(raw)
+        points: list[SeriesPoint] = []
+        for entry in entries:
+            mapping = _object_mapping(entry)
+            if mapping:
+                timestamp = _first_datetime(mapping, ("time", "timestamp", "date"))
+                value = _first_float([mapping], ("value", "equity", "drawdown"))
+                if timestamp is not None and value is not None:
+                    points.append(SeriesPoint(time=timestamp, value=round(value, 6)))
+        if points:
+            return points
+        mapping = _object_mapping(raw)
+        if mapping:
+            timestamps = _object_sequence(mapping.get("timestamps") or mapping.get("times"))
+            values = _object_sequence(mapping.get("values") or mapping.get("equity"))
+            times = [
+                parsed
+                for parsed in (_fold_datetime(item) for item in timestamps)
+                if parsed is not None
+            ]
+            numbers = [
+                float(item)
+                for item in values
+                if isinstance(item, int | float) and not isinstance(item, bool)
+            ]
+            return _series_points(times, numbers)
+        numbers = [
+            float(item)
+            for item in entries
+            if isinstance(item, int | float) and not isinstance(item, bool)
+        ]
+        times = [
+            parsed
+            for parsed in (
+                _fold_datetime(item) for item in _object_sequence(payload.get("timestamps"))
+            )
+            if parsed is not None
+        ]
+        if numbers and len(times) == len(numbers):
+            return _series_points(times, numbers)
+    return []
+
+
+def _fold_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo is not None else None
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+    return None
+
+
+def _walks(
+    payload: Mapping[str, object],
+) -> tuple[list[datetime], list[float]]:
+    timestamps: list[datetime] = []
+    values: list[float] = []
+    for entry in _object_sequence(payload.get("timestamps") or payload.get("times")):
+        parsed = _fold_datetime(entry)
+        if parsed is not None:
+            timestamps.append(parsed)
+    for entry in _object_sequence(payload.get("values") or payload.get("equity")):
+        if isinstance(entry, int | float) and not isinstance(entry, bool):
+            values.append(float(entry))
+    return timestamps, values
+
+
+def _fold_from_payload(index: int, payload: Mapping[str, object]) -> WalkForwardFold:
+    equity = _series_points_from_payload(
+        payload, ("equity_curve", "equity", "test_equity", "equity_values")
+    )
+    underwater = _series_points_from_payload(
+        payload, ("underwater", "underwater_curve", "drawdown")
+    )
+    stored_fold = _first_int([payload], ("fold", "fold_index", "index"))
+    fold_index = stored_fold + 1 if stored_fold is not None and stored_fold >= 0 else index
+    metrics = _object_mapping(payload.get("metrics"))
+    return WalkForwardFold(
+        fold_index=fold_index,
+        train_start=_first_datetime(
+            payload, ("train_start_time", "train_start", "train_start_date", "train_from")
+        ),
+        train_end=_first_datetime(
+            payload, ("train_end_time", "train_end", "train_end_date", "train_to")
+        ),
+        test_start=_first_datetime(
+            payload,
+            ("test_start_time", "test_start", "test_start_date", "test_from", "start"),
+        ),
+        test_end=_first_datetime(
+            payload, ("test_end_time", "test_end", "test_end_date", "test_to", "end")
+        ),
+        sharpe=_first_float([payload, metrics], ("sharpe", "sharpe_ratio", "mean_sharpe")),
+        return_pct=_first_float([payload, metrics], ("return_pct", "total_return", "return")),
+        n_trades=_first_int([payload, metrics], ("n_trades", "total_trades", "trades")),
+        equity_curve=equity,
+        underwater=underwater,
+    )
+
+
+def _fold_payloads(report: object, report_dict: Mapping[str, object]) -> list[Mapping[str, object]]:
+    for key in ("folds", "fold_reports", "results", "splits", "fold_metrics"):
+        if key in report_dict:
+            records = _mappings(report_dict[key])
+            if records:
+                return records
+    for name in ("folds", "fold_reports", "results", "splits"):
+        value = getattr(report, name, None)
+        if value is not None:
+            records = _mappings(value)
+            if records:
+                return records
+    return []
+
+
+def _series_from_curve_mapping(payload: Mapping[str, object], value_key: str) -> list[SeriesPoint]:
+    raw = payload.get("concatenated_equity_curve") or payload.get("equity_curve")
+    mapping = _object_mapping(raw)
+    if not mapping:
+        return []
+    timestamps = [
+        parsed
+        for parsed in (_fold_datetime(item) for item in _object_sequence(mapping.get("timestamps")))
+        if parsed is not None
+    ]
+    numbers = [
+        float(item)
+        for item in _object_sequence(mapping.get(value_key))
+        if isinstance(item, int | float) and not isinstance(item, bool)
+    ]
+    if len(timestamps) == len(numbers) and numbers:
+        return _series_points(timestamps, numbers)
+    return []
+
+
+def _merge_combined_folds(
+    folds: Sequence[WalkForwardFold],
+    combined: Sequence[SeriesPoint],
+    drawdown: Sequence[SeriesPoint],
+    fold_count: int,
+) -> list[WalkForwardFold]:
+    """Attach per-fold equity/underwater slices from the compounded WF curve."""
+    if not combined or fold_count < 1:
+        return list(folds)
+    timestamps = [point.time for point in combined]
+    values = [point.value for point in combined]
+    underwater_values = [point.value for point in drawdown] if drawdown else None
+    synthesized = _synthesize_walk_forward_folds(
+        timestamps, values, fold_count, underwater=underwater_values
+    )
+    merged: list[WalkForwardFold] = []
+    for index, synthesized_fold in enumerate(synthesized):
+        if index < len(folds):
+            merged.append(
+                folds[index].model_copy(
+                    update={
+                        "equity_curve": synthesized_fold.equity_curve,
+                        "underwater": synthesized_fold.underwater,
+                        "test_start": folds[index].test_start or synthesized_fold.test_start,
+                        "test_end": folds[index].test_end or synthesized_fold.test_end,
+                        "sharpe": folds[index].sharpe
+                        if folds[index].sharpe is not None
+                        else synthesized_fold.sharpe,
+                        "return_pct": folds[index].return_pct
+                        if folds[index].return_pct is not None
+                        else synthesized_fold.return_pct,
+                    }
+                )
+            )
+        else:
+            merged.append(synthesized_fold)
+    return merged
+
+
+def _run_id_number(run_id: str) -> int | None:
+    """Numeric suffix of a ``bt-0007`` run id (``None`` for unknown formats)."""
+    _, _, suffix = run_id.partition("-")
+    return int(suffix) if suffix.isdigit() else None
+
+
+def _report_attributes(report: object) -> Mapping[str, object]:
+    """Scalar/list attributes of a walk-forward report object (mapping view)."""
+    names = (
+        "fold_count",
+        "n_folds",
+        "splits",
+        "mean_sharpe",
+        "sharpe",
+        "total_trades",
+        "n_trades",
+        "total_rebalances",
+        "n_rebalances",
+        "rebalances",
+        "final_equity",
+        "combined_metrics",
+        "aggregate_metrics",
+        "aggregate",
+        "folds",
+        "fold_reports",
+    )
+    mapping: dict[str, object] = {}
+    for name in names:
+        value = getattr(report, name, None)
+        if value is not None:
+            mapping[name] = value
+    return mapping
+
+
+def _synthesize_walk_forward_folds(
+    timestamps: Sequence[datetime],
+    values: Sequence[float],
+    count: int,
+    *,
+    underwater: Sequence[float] | None = None,
+) -> list[WalkForwardFold]:
+    """Deterministic per-fold series for the fixture fallback (and missing folds)."""
+    size = min(len(timestamps), len(values))
+    if size < 2 or count < 1:
+        return []
+    numeric = np.asarray([float(value) for value in values[:size]], dtype=np.float64)
+    moments = list(timestamps[:size])
+    peaks = np.maximum.accumulate(numeric)
+    chunks = np.array_split(np.arange(size, dtype=np.int64), max(1, min(count, size)))
+    folds: list[WalkForwardFold] = []
+    for fold_index, indices in enumerate(chunks, start=1):
+        if indices.size == 0:
+            continue
+        slice_values = [float(numeric[index]) for index in indices]
+        slice_times = [moments[int(index)] for index in indices]
+        returns = np.diff(np.asarray(slice_values, dtype=np.float64)) / np.asarray(
+            slice_values[:-1], dtype=np.float64
+        )
+        deviation = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
+        sharpe = float(np.mean(returns) / deviation * math.sqrt(252.0)) if deviation > 0.0 else 0.0
+        return_pct = (
+            float(slice_values[-1] / slice_values[0] - 1.0) if slice_values[0] != 0.0 else 0.0
+        )
+        if underwater is not None and len(underwater) >= size:
+            drawdown = [float(underwater[int(index)]) for index in indices]
+        else:
+            drawdown = [
+                float(numeric[index] / peaks[index] - 1.0) if peaks[index] > 0 else 0.0
+                for index in indices
+            ]
+        folds.append(
+            WalkForwardFold(
+                fold_index=fold_index,
+                test_start=slice_times[0],
+                test_end=slice_times[-1],
+                sharpe=round(sharpe, 6),
+                return_pct=round(return_pct, 8),
+                equity_curve=_series_points(slice_times, slice_values),
+                underwater=_series_points(slice_times, drawdown),
+            )
+        )
+    return folds
+
+
 def fixture_backtest_config(config: StrategyConfig) -> StrategyConfig:
     """Fixture-simulation variant of a production strategy config.
 
@@ -205,7 +652,16 @@ class EngineBacktestService:
         self._runs: dict[str, BacktestRunSummary] = {}
         self._tearsheets: dict[str, TearsheetResponse] = {}
         self._next_id = 1
+        self._artifacts_dir: Path = settings.backtest_artifacts_dir
+        self._persisted_ids: set[str] = set()
+        self._warnings: list[str] = []
+        self._load_persisted_runs()
         self._seed_fixture_runs()
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """Non-fatal artifact-store warnings (corrupt files, write failures)."""
+        return tuple(self._warnings)
 
     # -- protocol API ----------------------------------------------------------
 
@@ -223,10 +679,12 @@ class EngineBacktestService:
         return self._tearsheets.get(run_id)
 
     def run(self, request: BacktestRunConfig) -> BacktestRunSummary:
-        """Execute one deterministic offline backtest and store its tear sheet."""
+        """Execute one deterministic offline backtest (or walk-forward) and store it."""
         config = self._catalog.core_config(request.strategy_id)
         if config is None:
             raise KeyError(f"unknown strategy {request.strategy_id!r}")
+        if request.walk_forward:
+            return self._run_walk_forward(config, request)
         started = time.perf_counter()
         try:
             summary, tearsheet = self._execute_engine(config, request)
@@ -237,12 +695,11 @@ class EngineBacktestService:
                     "id": run_id,
                     "created_at": self._clock(),
                     "duration_seconds": round(duration, 3),
+                    "kind": "backtest",
                 }
             )
-            self._runs[run_id] = stored
             tearsheet = tearsheet.model_copy(update={"run_id": run_id})
-            self._tearsheets[run_id] = tearsheet
-            self._trim_store()
+            self._store_run(stored, tearsheet)
             return stored
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
@@ -377,6 +834,243 @@ class EngineBacktestService:
             )
         return rows
 
+    # -- walk-forward execution ------------------------------------------------
+
+    def _run_walk_forward(
+        self, config: StrategyConfig, request: BacktestRunConfig
+    ) -> BacktestRunSummary:
+        """Execute a purged/embargoed walk-forward run (fixture fallback on error)."""
+        started = time.perf_counter()
+        try:
+            summary, tearsheet = self._execute_walk_forward(config, request)
+            run_id = self._allocate_run_id()
+            duration = time.perf_counter() - started
+            stored = summary.model_copy(
+                update={
+                    "id": run_id,
+                    "created_at": self._clock(),
+                    "duration_seconds": round(duration, 3),
+                }
+            )
+            tearsheet = tearsheet.model_copy(update={"run_id": run_id})
+            self._store_run(stored, tearsheet)
+            return stored
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "walk-forward backtest unavailable; deterministic fixture fallback: %s", reason
+            )
+            return self._fixture_walk_forward(config, request, reason=reason, started=started)
+
+    def _execute_walk_forward(
+        self, config: StrategyConfig, request: BacktestRunConfig
+    ) -> tuple[BacktestRunSummary, TearsheetResponse]:
+        from src.backtest.engine import run_walk_forward
+
+        window = fixtures.build_window_market(
+            self._master,
+            request.start,
+            request.end,
+            seed=request.random_seed,
+            warmup_bars=260,
+        )
+        states = fixtures.build_rebalance_states(
+            window,
+            rebalance_frequency=request.rebalance_frequency,
+            initial_equity=request.initial_equity,
+        )
+        if not states:
+            raise ValueError("no market states available for the requested walk-forward window")
+        variable = fixture_backtest_config(config)
+        report = self._call_walk_forward(run_walk_forward, variable, request, window, states)
+        report_dict = _object_mapping(report)
+        attributes = _report_attributes(report)
+        lookup: list[Mapping[str, object]] = (
+            [attributes, report_dict] if attributes else [report_dict]
+        )
+        fold_payloads = _fold_payloads(report, report_dict)
+        fold_count = (
+            _first_int(lookup, ("fold_count", "n_folds", "splits"))
+            or len(fold_payloads)
+            or request.wf_splits
+        )
+        n_trades = _first_int(lookup, ("total_trades", "n_trades", "trades"))
+        n_rebalances = _first_int(lookup, ("total_rebalances", "n_rebalances", "rebalances"))
+        curve, timestamps = self._fixture_curve(
+            request.strategy_id,
+            seed=request.random_seed,
+            initial_equity=request.initial_equity,
+        )
+        values = [value for _, value in curve]
+        fallback_metrics = self._metrics_for(values, timestamps)
+        metrics = self._walk_forward_metrics(report, report_dict, fallback_metrics)
+        folds = [
+            _fold_from_payload(index + 1, payload) for index, payload in enumerate(fold_payloads)
+        ]
+        if not folds:
+            folds = _synthesize_walk_forward_folds(timestamps, values, fold_count)
+        fold_count = max(fold_count, len(folds))
+        combined = self._combined_equity(report, report_dict)
+        drawdown = _series_from_curve_mapping(report_dict, "drawdown")
+        folds = _merge_combined_folds(folds, combined, drawdown, fold_count)
+        base = self._fixture_tearsheet("pending", timestamps, values, metrics)
+        tearsheet = base.model_copy(
+            update={
+                "equity_curve": combined or base.equity_curve,
+                "underwater": drawdown or base.underwater,
+                "folds": folds,
+            }
+        )
+        summary = BacktestRunSummary(
+            id="pending",
+            strategy_id=config.id,
+            status="completed",
+            created_at=self._clock(),
+            duration_seconds=None,
+            config=request,
+            metrics=metrics,
+            error=None,
+            n_trades=n_trades if n_trades is not None else 0,
+            n_rebalances=n_rebalances if n_rebalances is not None else fold_count,
+            data_source="engine",
+            kind="walk_forward",
+            n_folds=fold_count,
+        )
+        return summary, tearsheet
+
+    def _call_walk_forward(
+        self,
+        runner: object,
+        config: StrategyConfig,
+        request: BacktestRunConfig,
+        window: fixtures.OfflineMarket,
+        states: Sequence[object],
+    ) -> object:
+        """Call the (versioned) ``run_walk_forward`` helper, adapting keyword names."""
+        function = runner
+        if not callable(function):  # pragma: no cover - defensive
+            raise TypeError("run_walk_forward is not callable")
+        try:
+            signature = inspect.signature(function)
+        except (TypeError, ValueError):  # pragma: no cover - builtins only
+            return function(config)
+        candidates: dict[str, object] = {
+            "config": config,
+            "strategy_config": config,
+            "request": request,
+            "market": window,
+            "window": window,
+            "offline_market": window,
+            "states": states,
+            "rebalance_states": states,
+            "bars": window.bars,
+            "frame": window.bars,
+            "instrument_master": self._master,
+            "instruments": self._master,
+            "initial_equity": request.initial_equity,
+            "equity": request.initial_equity,
+            "rebalance_frequency": request.rebalance_frequency,
+            "splits": request.wf_splits,
+            "n_splits": request.wf_splits,
+            "wf_splits": request.wf_splits,
+            "purge_bars": request.purge_bars,
+            "purge": request.purge_bars,
+            "embargo_bars": request.embargo_bars,
+            "embargo": request.embargo_bars,
+            "seed": request.random_seed,
+            "random_seed": request.random_seed,
+            "start": datetime.combine(request.start, dt_time.min, tzinfo=UTC),
+            "end": datetime.combine(request.end, dt_time(23, 59, 59), tzinfo=UTC),
+        }
+        kwargs: dict[str, object] = {}
+        takes_config_keyword = False
+        for name, parameter in signature.parameters.items():
+            if name == "self":
+                continue
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                continue
+            if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                continue
+            if name in ("config", "strategy_config"):
+                takes_config_keyword = True
+            if name in candidates:
+                kwargs[name] = candidates[name]
+            elif parameter.default is inspect.Parameter.empty:
+                raise TypeError(
+                    f"run_walk_forward requires unsupported parameter {name!r}; "
+                    "cannot adapt to this helper version"
+                )
+        if takes_config_keyword:
+            return function(**kwargs)
+        return function(config, **kwargs)
+
+    def _walk_forward_metrics(
+        self,
+        report: object,
+        report_dict: Mapping[str, object],
+        fallback: MetricsSet,
+    ) -> MetricsSet:
+        mappings = _metric_mappings(report, report_dict)
+        attributes = _report_attributes(report)
+        if attributes:
+            mappings.append(attributes)
+        return _metrics_with_defaults(mappings, fallback)
+
+    def _combined_equity(
+        self, report: object, report_dict: Mapping[str, object]
+    ) -> list[SeriesPoint]:
+        points = _series_from_curve_mapping(report_dict, "equity")
+        if points:
+            return points
+        keys = (
+            "equity_curve",
+            "combined_equity_curve",
+            "portfolio_equity_curve",
+            "equity",
+            "combined_equity",
+        )
+        attributes = _object_mapping(report)
+        return _series_points_from_payload(attributes, keys)
+
+    def _fixture_walk_forward(
+        self,
+        config: StrategyConfig,
+        request: BacktestRunConfig,
+        *,
+        reason: str,
+        started: float | None = None,
+    ) -> BacktestRunSummary:
+        """Deterministic walk-forward fixture fallback with explicit error text."""
+        run_id = self._allocate_run_id()
+        duration = time.perf_counter() - started if started is not None else 0.05
+        curve, timestamps = self._fixture_curve(
+            request.strategy_id,
+            seed=request.random_seed,
+            initial_equity=request.initial_equity,
+        )
+        values = [value for _, value in curve]
+        metrics = self._metrics_for(values, timestamps)
+        folds = _synthesize_walk_forward_folds(timestamps, values, request.wf_splits)
+        tearsheet = self._fixture_tearsheet(run_id, timestamps, values, metrics)
+        tearsheet = tearsheet.model_copy(update={"folds": folds})
+        summary = BacktestRunSummary(
+            id=run_id,
+            strategy_id=config.id,
+            status="completed",
+            created_at=self._clock(),
+            duration_seconds=round(duration, 3),
+            config=request,
+            metrics=metrics,
+            error=f"deterministic fixture walk-forward fallback: {reason}",
+            n_trades=request.wf_splits * 3,
+            n_rebalances=request.wf_splits,
+            data_source="fixture",
+            kind="walk_forward",
+            n_folds=request.wf_splits,
+        )
+        self._store_run(summary, tearsheet)
+        return summary
+
     # -- fixture fallback ------------------------------------------------------
 
     def _fixture_run(
@@ -406,10 +1100,9 @@ class EngineBacktestService:
             n_trades=None,
             n_rebalances=None,
             data_source="fixture",
+            kind="backtest",
         )
-        self._runs[run_id] = summary
-        self._tearsheets[run_id] = tearsheet
-        self._trim_store()
+        self._store_run(summary, tearsheet)
         return summary
 
     def _seed_fixture_runs(self) -> None:
@@ -556,11 +1249,106 @@ class EngineBacktestService:
             )
         return rows
 
+    # -- persistence -----------------------------------------------------------
+
+    def _artifact_path(self, run_id: str) -> Path:
+        return self._artifacts_dir / f"{run_id}.json"
+
+    def _load_persisted_runs(self) -> None:
+        """Reload custom runs written by a previous API process (newest-first list)."""
+        directory = self._artifacts_dir
+        if not directory.is_dir():
+            return
+        for path in sorted(directory.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                self._quarantine_artifact(path, exc)
+                continue
+            if not isinstance(payload, Mapping):
+                self._quarantine_artifact(path, ValueError("artifact payload is not a JSON object"))
+                continue
+            mapping = cast(Mapping[str, object], payload)
+            try:
+                summary = BacktestRunSummary.model_validate(mapping["summary"])
+                tearsheet = TearsheetResponse.model_validate(mapping["tearsheet"])
+            except (KeyError, TypeError, ValidationError) as exc:
+                self._quarantine_artifact(path, exc)
+                continue
+            if summary.id in self._runs:
+                continue
+            self._runs[summary.id] = summary
+            self._tearsheets[summary.id] = tearsheet
+            self._persisted_ids.add(summary.id)
+            number = _run_id_number(summary.id)
+            if number is not None:
+                self._next_id = max(self._next_id, number)
+        if self._persisted_ids:
+            logger.info(
+                "loaded %d persisted backtest run(s) from %s",
+                len(self._persisted_ids),
+                directory,
+            )
+
+    def _quarantine_artifact(self, path: Path, exc: BaseException) -> None:
+        warning = f"corrupt backtest artifact {path.name}: {type(exc).__name__}: {exc}; skipped"
+        logger.warning(warning)
+        self._warnings.append(warning)
+        try:
+            path.replace(path.with_name(f"{path.name}.corrupt-{int(time.time())}"))
+        except OSError:  # pragma: no cover - best-effort quarantine
+            logger.exception("failed to quarantine corrupt backtest artifact %s", path)
+
+    def _persist_run(self, summary: BacktestRunSummary, tearsheet: TearsheetResponse) -> None:
+        """Atomically persist one custom run (temp file + ``os.replace``)."""
+        try:
+            directory = self._artifacts_dir
+            directory.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "summary": summary.model_dump(mode="json"),
+                "tearsheet": tearsheet.model_dump(mode="json"),
+                "request": summary.config.model_dump(mode="json"),
+            }
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{summary.id}.", suffix=".json.tmp", dir=str(directory)
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                Path(temp_name).replace(self._artifact_path(summary.id))
+            except BaseException:
+                Path(temp_name).unlink(missing_ok=True)
+                raise
+            self._persisted_ids.add(summary.id)
+        except Exception as exc:  # the artifact store must never fail the API run
+            warning = f"could not persist backtest {summary.id}: {type(exc).__name__}: {exc}"
+            logger.warning(warning)
+            self._warnings.append(warning)
+
+    def _store_run(
+        self,
+        summary: BacktestRunSummary,
+        tearsheet: TearsheetResponse,
+        *,
+        persist: bool = True,
+    ) -> None:
+        self._runs[summary.id] = summary
+        self._tearsheets[summary.id] = tearsheet
+        self._trim_store()
+        if persist:
+            self._persist_run(summary, tearsheet)
+
     # -- store -----------------------------------------------------------------
 
     def _allocate_run_id(self) -> str:
-        self._next_id += 1
-        return f"bt-{self._next_id:04d}"
+        while True:
+            self._next_id += 1
+            candidate = f"bt-{self._next_id:04d}"
+            if candidate not in self._runs:
+                return candidate
 
     def _trim_store(self) -> None:
         if len(self._runs) <= MAX_RUNS:
@@ -569,3 +1357,9 @@ class EngineBacktestService:
         for stale in ordered[: len(self._runs) - MAX_RUNS]:
             self._runs.pop(stale.id, None)
             self._tearsheets.pop(stale.id, None)
+            if stale.id in self._persisted_ids:
+                self._persisted_ids.discard(stale.id)
+                try:
+                    self._artifact_path(stale.id).unlink(missing_ok=True)
+                except OSError:  # pragma: no cover - best-effort cleanup
+                    logger.warning("could not delete trimmed backtest artifact %s", stale.id)

@@ -6,9 +6,11 @@ from fastapi import APIRouter
 
 from src.api.routes import (
     backtests,
+    orders,
     pipeline,
     positions,
     risk,
+    runner,
     strategies,
     telemetry,
     term_structure,
@@ -23,6 +25,8 @@ ROUTERS: tuple[APIRouter, ...] = (
     strategies.router,
     backtests.router,
     telemetry.router,
+    orders.router,
+    runner.router,
 )
 
 __all__ = ["ROUTERS"]

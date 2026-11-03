@@ -64,7 +64,7 @@ def test_health_reports_offline_fixture_mode(client: TestClient) -> None:
     body = response.json()
     assert body["status"] in {"ok", "degraded"}
     assert body["app_name"] == "FuturesRL-X"
-    assert body["version"] == "1.0.0"
+    assert body["version"] == "1.3.0"
     assert body["environment"] == "backtest"
     assert body["offline_mode"] is True
     assert body["uptime_seconds"] >= 0.0
@@ -80,7 +80,7 @@ def test_cors_allows_configured_dashboard_origin(client: TestClient) -> None:
 def test_openapi_metadata_and_docs(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     assert schema["info"]["title"] == "FuturesRL-X Telemetry API"
-    assert schema["info"]["version"] == "1.0.0"
+    assert schema["info"]["version"] == "1.3.0"
     paths = schema["paths"]
     for route in (
         "/health",
@@ -371,7 +371,7 @@ def test_backtest_run_uses_real_engine_and_returns_tearsheet(client: TestClient)
         "end": "2025-12-31",
         "initial_equity": 1_000_000.0,
         "rebalance_frequency": "W-FRI",
-        "walk_forward": True,
+        "walk_forward": False,
         "random_seed": 7,
     }
     response = client.post("/api/backtests", json=request)
@@ -447,7 +447,7 @@ def test_backtest_short_window_is_non_degenerate(client: TestClient) -> None:
             "end": "2024-06-30",
             "initial_equity": 1_000_000.0,
             "rebalance_frequency": "W-FRI",
-            "walk_forward": True,
+            "walk_forward": False,
             "random_seed": 7,
         },
     )
