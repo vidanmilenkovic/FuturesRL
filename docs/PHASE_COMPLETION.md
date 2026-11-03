@@ -508,3 +508,35 @@ setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, 
   working overlay toggles, slider+numeric inputs, advanced collapse, no page-level scroll,
   `PAPER · IBKR` badge and zero page errors. Live API: `/api/instruments` count 45 with sector counts
   9/7/6/8/6/7/2, catalog universe 8 groups, `/api/positions` 200 with the live MES book.
+
+---
+
+## v1.5.1 — surgical Studio/Optuna/IBKR attribution fixes
+
+**Branch:** `fix/studio-optuna-ibkr-attribution`
+
+1. **Optuna search-space hygiene.** `ParameterSpec.optuna_default_selected` (exactly 6 curated core
+   parameters: TSMOM fast/slow, KAMA window, carry min-carry-bps, volatility-target target vol,
+   quant-risk trailing stop) plus a 25-key structural/data-hygiene non-tunable policy. New catalog
+   helpers (`active_parameter_keys`, `parameters_for_strategy`, `default_selected_parameter_keys`)
+   filter to the selected universe selector/allocator, enabled timing overlays and enabled risk
+   overlays. The Studio lists only active tunables for the selected base strategy, pre-checks the
+   curated defaults (4–6), renders hygiene parameters as read-only structural rows, and warns above
+   eight checked parameters; the optimizer's `default_search_space` is active-only (6 paths for
+   TSMOM, mean-reversion-only for the panic preset) and `filter_search_space_for_config` drops
+   inactive/hygiene paths from explicit UI requests.
+2. **Live IBKR risk/equity attribution.** `LiveEquityHistoryStore` persists real observed NLV points
+   to `data/ibkr_equity_history.json` (atomic, deduped, bounded 5000 points/30 days, corrupt
+   quarantine). `/api/positions` additively reports `equity_curve_source`
+   (`ibkr-live|simulated-backfill|fixture`), `equity_curve_live_points`, `portfolio_volatility` and
+   `portfolio_volatility_source`. When IBKR is connected the risk budget uses ex-ante sqrt(w'Σw) from
+   the live book (0.0 for a flat book, `—` when covariance is unavailable) and never the fixture
+   curve; the Command Center badges simulated backfill vs live NLV points.
+3. **Preset/config root validation.** Unit tests validate every preset template and committed strategy
+   YAML root reference against `configs/instruments.yaml`; no delisted/non-canonical tokens (GE, ZQ,
+   KE, BTC) are present or accepted.
+
+**Verification** — hostile-env `./scripts/quality_gate.sh --cov` green (**1679 passed, 0 failures, 0 warnings**, coverage 94.24%),
+frontend `tsc --noEmit`/`lint`/`build` clean, independent `tests/integration/test_phase10_2_v151.py`
+(24 tests) plus catalog/optimizer/API acceptance suites green; live API restarted with v1.5.1 and
+Command Center/Optuna verified against the real endpoints.

@@ -417,7 +417,12 @@ The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
    launches a Backtest Lab run on the new id. Built-ins are immutable in test/backtest environments
    (edits persist as `artifacts/strategies/<id>.yaml` overlays); development/paper/live can update
    `configs/strategies/<id>.yaml`.
-2. **Optuna Auto-Optimizer** — choose the base strategy, objective (OOS Sharpe/Sortino/Calmar/CAGR/
+2. **Optuna Auto-Optimizer** — choose the base strategy. Only parameters for the **active**
+   selector/allocator/timing/risk stages are listed; structural/data-hygiene parameters (universe
+   liquidity/OI/history caps, LLM sample/cache/macro-lockout, translator plumbing) are read-only and
+   excluded, and the curated six core signal/sizing parameters are pre-checked. Checking more than
+   eight parameters shows an overfitting warning ("Recommended: tune 3–6 parameters per study").
+   Existing text: , objective (OOS Sharpe/Sortino/Calmar/CAGR/
    Rachev/Return-on-Margin), trials (2–200), purged walk-forward folds (locked ON; amber data-snooping
    warning if you try to disable), and editable tunable bounds. Results show the trial-vs-objective
    history with a best-so-far frontier, parameter importances, a sortable trial table with the winner
@@ -492,6 +497,13 @@ If the broker reports the ledger in a different base currency than
 `FUTURESRLX_ACCOUNT_CURRENCY`, the API logs a warning and uses the broker's actual ledger currency
 instead of failing; set `FUTURESRLX_ACCOUNT_CURRENCY` and `FUTURESRLX_FX_RATES` to match so USD
 notional/risk sizing stays correct.
+
+When connected to IBKR, the Command Center's risk-budget **Portfolio volatility** is computed
+ex-ante from the live book's weights and covariance (`0.0%` for a flat book) and never from the
+synthetic fixture curve; if covariance is unavailable it shows `—`. Real IBKR NLV observations are
+persisted to `data/ibkr_equity_history.json`: the equity chart shows a **Simulated Backfill ·
+Recording Live Paper NLV** badge until five real points exist, then switches to **Live IBKR NLV**.
+The Annualised vol statistic follows the same live-book value while IBKR is connected.
 
 The API **never falls back to simulated positions** once IBKR is enabled. A lost session serves the
 last-known-good book with `stale=true` and a `stale_reason` (so a bought MES position does not

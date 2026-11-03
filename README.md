@@ -386,6 +386,18 @@ both engines produce identical targets and deltas for identical market states.
   positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
   book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
+### v1.5.1 surgical hardening
+
+- **Optuna defaults are active-only.** The parameter catalog marks structural/data-hygiene parameters
+  non-tunable and pre-selects only six core signal/sizing parameters; the Studio and optimizer list
+  only parameters for selectors/overlays actually enabled in the selected strategy, warn above eight
+  checked parameters, and never send inactive or hygiene paths into a study. Preset/config root lists
+  are validated against the 45-root instrument master.
+- **Live IBKR attribution is honest.** When connected to IBKR, the Command Center risk budget uses
+  ex-ante `sqrt(w'Σw)` from the actual book (0.0% when flat), never the synthetic fixture curve;
+  real observed NLV points persist to `data/ibkr_equity_history.json`, and charts show either
+  "Simulated Backfill · Recording Live Paper NLV" (<5 real points) or "Live IBKR NLV · N pts".
+
 ## Studio UX & expanded 45-root futures universe (`v1.5.0`)
 
 - **Instrument master.** 45+ liquid CME Globex roots across seven sectors with paired micros:
