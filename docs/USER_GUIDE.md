@@ -397,10 +397,22 @@ fallback, so either streaming path is sufficient.
 
 The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
 
+![Strategy Studio — Manual Builder with stage switcher, sticky YAML and 45-root sector picker](screenshots/phase10ux-studio-1920.png)
+
 1. **Manual Strategy Builder** — pick a preset (trend following TSMOM+KAMA, commodity carry & term
-   structure, panic mean-reversion, seasonal commodity cycle, DRL + LLM risk) or an existing YAML;
-   edit every Universe/Allocator/Timing/Risk/Translator parameter with sliders/toggles/pills and a
-   plain-English hypothesis subtitle; the right pane shows live YAML plus validation. **Save YAML**
+   structure, panic mean-reversion, seasonal commodity cycle, DRL + LLM risk) or an existing YAML.
+   A **five-step stage switcher** (`1 Universe → 2 Allocator → 3 Timing → 4 Risk/LLM → 5 Translator`)
+   shows one stage card at a time, so the builder fits on a single screen; the **live YAML preview is
+   sticky** on the right with its own scroll area and the margin-ceiling footer anchored at the bottom.
+   Stage 1 groups the **45+ CME roots by sector tabs** (All/Equities/Rates/Energy/Metals/FX/Agri/Crypto)
+   with Select All/Clear shortcuts; a Selector Type dropdown switches liquidity/regime/composite.
+   Stage 2 has an Allocator Type dropdown (volatility target/risk parity/equal weight/mean variance/DRL;
+   DRL shows the checkpoint registry). Stage 3/4 overlay cards have **enable/disable toggles** that
+   add/remove the stage from the YAML. Every numeric parameter has a slider **and** a direct numeric
+   input (with formatted values such as `$50.0M`); advanced math parameters are collapsed under
+   *Advanced Parameters*. Stage-2 sizing controls (`Base Allocator Target Vol`, `Base Allocator Max
+   Weight`) are visually separated from Stage-4 hard caps (`Hard Portfolio Vol Ceiling`, `Hard
+   Single-Root Cap`) with a **Sync with Allocator** control to avoid conflicting limits. **Save YAML**
    calls `POST /api/strategies` (new id) or `PUT /api/strategies/{id}`; **Save & Run** additionally
    launches a Backtest Lab run on the new id. Built-ins are immutable in test/backtest environments
    (edits persist as `artifacts/strategies/<id>.yaml` overlays); development/paper/live can update
@@ -416,6 +428,12 @@ The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
    `POST /api/drl/train` (offline deterministic; synchronous, bounded to 20k timesteps). The registry
    lists `artifacts/models/*.zip` with parsed metadata, reward curve and a **Bind to Strategy** action
    that sets `allocator: drl` + `model_path`.
+
+**Expanded futures universe** — the instrument master declares 45+ CME Globex roots across
+Equities, Rates, Energy, Metals, FX, Agri and Crypto, including paired micros. The Studio reads it via
+`GET /api/instruments` (sector-grouped, with multiplier/tick/micro metadata); the deterministic
+offline source generates synthetic F1/F2 term structures for every root so backtests and DRL training
+cover the full universe without vendor credentials.
 
 **Parameter catalog API** — `GET /api/strategies/schema/catalog` returns
 `{version, stages[], parameters[], presets[]}`. Each parameter has `key`, `stage`, `label`,

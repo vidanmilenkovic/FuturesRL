@@ -465,3 +465,46 @@ setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, 
 - Verified live against TWS paper (MES 1 position): `/health` connected, `/api/positions` 200 with
   `NetLiquidation ≈ €1,003,691` and MES @ 7568.62, dashboard `PAPER · IBKR` with the position
   visible and no "account snapshot unavailable"; full gate 1555 passed / 0 warnings.
+
+
+---
+
+## Studio UX overhaul & 45-root futures universe (`v1.5.0`)
+
+**Branch:** `feat/studio-ux-universe`
+
+- **Universe expansion** — `configs/instruments.yaml` now declares 45+ liquid CME Globex roots across
+  seven sectors (Equity incl. NKD, Rates incl. SR3/TN/UB, Energy RB/HO, Metals PL/PA, six FX pairs,
+  seven agri roots, Crypto MBT/MET) with realistic multipliers, tick sizes, margin estimates, roll
+  calendars and standard↔micro links. `OfflineBarSource` synthesises roll-aware F1/F2 bars and
+  sector-specific carry/volumes for every root, deterministic and vendor-free. New
+  `GET /api/instruments` exposes the sector-grouped master (root/name/asset class/exchange/
+  multiplier/tick/micro pair) for the Studio and external tooling.
+- **Parameter catalog** — universe multiselects and sector groups are derived from the instrument
+  master (no hardcoded 13-root lists); the catalog exposes sector-grouped universe metadata plus
+  selector (liquidity/regime/composite) and allocator (volatility_target/risk_parity/equal_weight/
+  mean_variance/drl) choices for the new Studio dropdowns.
+- **Manual Builder redesign** — five-step stage switcher (Universe → Allocator → Timing → Risk →
+  Translator) replaces the stacked wall; the live-YAML pane is sticky with internal scrolling and an
+  anchored η_max footer. Stage 1 groups 45+ roots by sector tabs with Select All/Clear; Stage 1/2
+  expose selector/allocator dropdowns; every timing overlay (TSMOM, KAMA, carry, mean reversion,
+  seasonality) and risk overlay (quant risk, LLM risk) has a real enable/disable toggle that adds or
+  removes the YAML stage; numeric parameters use a slider **plus** direct numeric input with formatted
+  values; advanced math parameters (covariance ridge/shrinkage, vol floors, KAMA fallback band, micro
+  dust floor) are collapsed under *Advanced Parameters*. Stage-2 sizing labels are separated from
+  Stage-4 hard caps with a **Sync with Allocator** control.
+- **Verification** — full hostile-env quality gate: **1622 passed, 0 failures, 0 warnings**, mypy
+  strict clean on 103 source files, coverage `src/core`+`src/risk` **94.24%**. New
+  `tests/integration/test_phase10_1_universe.py` (18 tests, 0 skips) covers all 45 roots end-to-end:
+  config integrity, ContractTranslator long/short/micro-routing/margin<=60% for every root, paired
+  standard/micro mark equality (all 9 families, F1+F2), offline F1/F2 + finite non-zero term/carry
+  for every root, ComposablePipeline/selectors/backtest/walk-forward with finite metrics, DRL
+  training data covering the full universe with `feature_fallbacks == ()`, `/api/instruments`
+  (45 roots, 7 Studio sector lanes, bidirectional micro links) and catalog `universe`/`stage_choices`.
+  The DRL offline data cache makes repeated 45-root builds near-free (cold 15.9 s → 0.0005 s hit;
+  same outputs/fallbacks). Frontend: `tsc --noEmit` clean, `eslint` 0 warnings, `npm run build`
+  success (9/9 pages, `/studio` 18.1 kB), routes 200; headless live checks at 1920×1080 and 1440×900
+  show one stage card at a time, sticky YAML + anchored η_max footer, 8 sector tabs/45 root pills,
+  working overlay toggles, slider+numeric inputs, advanced collapse, no page-level scroll,
+  `PAPER · IBKR` badge and zero page errors. Live API: `/api/instruments` count 45 with sector counts
+  9/7/6/8/6/7/2, catalog universe 8 groups, `/api/positions` 200 with the live MES book.

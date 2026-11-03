@@ -386,6 +386,25 @@ both engines produce identical targets and deltas for identical market states.
   positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
   book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
+## Studio UX & expanded 45-root futures universe (`v1.5.0`)
+
+- **Instrument master.** 45+ liquid CME Globex roots across seven sectors with paired micros:
+  Equity (ES/MES, NQ/MNQ, RTY/M2K, YM/MYM, NKD), Rates (ZT, ZF, ZN, TN, ZB, UB, SR3),
+  Energy (CL/MCL, NG/MNG, RB, HO), Metals (GC/MGC, SI/SIL, HG/MHG, PL, PA),
+  FX (6E, 6J, 6B, 6A, 6C, 6S), Agri (ZC, ZS, ZW, ZM, ZL, LE, HE) and Crypto (MBT, MET).
+  The deterministic offline source generates roll-aware F1/F2 bars for every root, so selectors,
+  backtests and DRL training work across the full universe with no vendor credentials.
+- **`GET /api/instruments`.** Sector-grouped universe metadata (root/name/asset class/exchange/
+  multiplier/tick/micro pair) for the Studio and any external tooling.
+- **Manual Builder redesign.** A five-step stage switcher (Universe → Allocator → Timing → Risk →
+  Translator) replaces the stacked wall of cards, with a sticky live-YAML pane and anchored η_max
+  footer. Stage 1 groups 45+ roots by sector tabs with Select All/Clear; Stage 1/2 expose selector
+  and allocator dropdowns; Timing overlays (TSMOM, KAMA, carry filter, mean reversion, seasonality)
+  and Risk overlays (quant risk, LLM risk) have real enable/disable toggles that add/remove YAML
+  stages; every numeric parameter has a slider plus direct numeric input, with advanced math
+  parameters (covariance ridge/shrinkage, vol floors, KAMA fallback band, micro dust floor) collapsed;
+  Stage-2 sizing labels are separated from Stage-4 hard caps with a "Sync with Allocator" control.
+
 ## Live runner ↔ API bridge, DRL training, live news (Phase 9)
 
 - **Shared live state.** A running `TradingRunner` (offline dry-run or IBKR paper/live) publishes an
