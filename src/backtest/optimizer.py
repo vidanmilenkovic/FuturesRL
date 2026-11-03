@@ -81,6 +81,15 @@ OBJECTIVE_METRICS: tuple[str, ...] = (
 #: Penalised objective returned to Optuna for a trial that could not be evaluated.
 _FAILED_OBJECTIVE: float = -1.0e12
 
+#: Hard objective assigned to flat/zero-activity trials (never crowned as best).
+HARD_INVALID_OBJECTIVE: float = -10.0
+
+#: Minimum offline bar window for walk-forward optimisation/warm-up.
+MIN_OFFLINE_BARS: int = 750
+
+#: Default warm-up (annual indicator history) used to size the offline window.
+_MIN_INDICATOR_WARMUP_BARS: int = 252
+
 #: Default number of optimisation trials.
 DEFAULT_TRIAL_COUNT: int = 25
 
@@ -190,6 +199,8 @@ class OptimizationRequest(BaseModel):
     purge_bars: int = Field(default=5, ge=0)
     embargo_bars: int = Field(default=5, ge=0)
     drawdown_penalty_threshold: float = Field(default=0.20, ge=0.0, le=1.0)
+    min_trades: int = Field(default=3, ge=0)
+    min_avg_gross_exposure: float = Field(default=0.01, ge=0.0, le=1.0)
     search_space: tuple[ParameterRange, ...] = Field(min_length=1)
 
     @field_validator("base_strategy_id")
@@ -226,6 +237,9 @@ class TrialSummary(BaseModel):
     oos_return_on_margin: float = 0.0
     max_dd: float = 0.0
     fold_count: int = Field(default=0, ge=0)
+    n_trades: int = Field(default=0, ge=0)
+    avg_gross_exposure: float = Field(default=0.0, ge=0.0)
+    zero_activity: bool = False
     duration_ms: float = Field(default=0.0, ge=0.0)
     error: str | None = None
 
@@ -387,7 +401,6 @@ CORE_OPTIMIZER_KEYS: tuple[str, ...] = (
     "timing.tsmom.lookback_fast",
     "timing.tsmom.lookback_slow",
     "timing.kama.window",
-    "timing.carry_filter.min_carry_bps",
     "timing.mean_reversion.rsi_period",
     "timing.mean_reversion.oversold_threshold",
     "timing.mean_reversion.overbought_threshold",
@@ -603,7 +616,6 @@ def _fallback_default_ranges(config: StrategyConfig) -> list[ParameterRange]:
             ("lookback_slow", "int", 21.0, 504.0, 1.0),
         ),
         "kama": (("window", "int", 2.0, 50.0, 1.0),),
-        "carry_filter": (("min_carry_bps", "float", -2000.0, 2000.0, 10.0),),
         "mean_reversion": (
             ("rsi_period", "int", 2.0, 50.0, 1.0),
             ("oversold_threshold", "float", 1.0, 49.0, 1.0),
@@ -887,6 +899,76 @@ def _extract_oos_metrics(report: WalkForwardReport) -> dict[str, float]:
         "return_on_margin": _mean_aggregate_metric(report, "return_on_max_initial_margin"),
         "max_drawdown": _mean_aggregate_metric(report, "max_drawdown"),
     }
+
+
+def _finite_float(value: object, default: float = 0.0) -> float:
+    """Best-effort finite float coercion."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    number = float(value)
+    return number if math.isfinite(number) else default
+
+
+def _avg_gross_exposure_from_result(result: object) -> float:
+    """Mean ``gross_exposure / equity`` over a result's equity curve (or 0.0)."""
+    equity_curve = getattr(result, "equity_curve", None)
+    if not isinstance(equity_curve, pl.DataFrame):
+        return 0.0
+    columns = set(equity_curve.columns)
+    if not {"equity", "gross_exposure"} <= columns:
+        return 0.0
+    equities = equity_curve.get_column("equity").to_numpy().astype(np.float64)
+    gross = equity_curve.get_column("gross_exposure").to_numpy().astype(np.float64)
+    if equities.size == 0 or gross.size != equities.size:
+        return 0.0
+    valid = np.isfinite(equities) & np.isfinite(gross) & (equities > 0.0) & (gross >= 0.0)
+    if not bool(np.any(valid)):
+        return 0.0
+    return max(0.0, float(np.mean(gross[valid] / equities[valid])))
+
+
+def _trade_count_from_report(report: object) -> int:
+    """Total executed trades in a walk-forward report (robust to fake reports)."""
+    total = getattr(report, "total_trades", None)
+    if isinstance(total, int) and not isinstance(total, bool):
+        return max(0, total)
+    folds = getattr(report, "folds", ())
+    if isinstance(folds, Sequence) and not isinstance(folds, (str, bytes)):
+        summed = 0
+        for fold in folds:
+            value = getattr(fold, "n_trades", None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                summed += max(0, value)
+        if summed:
+            return summed
+    combined = getattr(report, "combined_result", None)
+    value = getattr(combined, "n_trades", None) if combined is not None else None
+    return max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _activity_from_report(report: object) -> tuple[int, float]:
+    """``(n_trades, avg_gross_exposure)`` for a walk-forward report."""
+    n_trades = _trade_count_from_report(report)
+    direct = getattr(report, "avg_gross_exposure", None)
+    if isinstance(direct, (int, float)) and not isinstance(direct, bool):
+        exposure = _finite_float(direct)
+        if exposure > 0.0:
+            return n_trades, max(0.0, exposure)
+    combined = getattr(report, "combined_result", None)
+    if combined is not None:
+        return n_trades, _avg_gross_exposure_from_result(combined)
+    return n_trades, max(0.0, _finite_float(direct))
+
+
+def _activity_from_backtest_result(result: object) -> tuple[int, float]:
+    """``(n_trades, avg_gross_exposure)`` for a single ``BacktestResult``."""
+    raw_trades = getattr(result, "n_trades", None)
+    n_trades = (
+        max(0, raw_trades)
+        if isinstance(raw_trades, int) and not isinstance(raw_trades, bool)
+        else 0
+    )
+    return n_trades, _avg_gross_exposure_from_result(result)
 
 
 def _sanitize_study_id(study_id: str) -> str:
@@ -1199,7 +1281,6 @@ _CURATED_DEFAULT_BOUNDS: Mapping[str, tuple[float | None, float | None]] = {
     "lookback_fast": (None, 63.0),
     "lookback_slow": (64.0, 252.0),
     "window": (5.0, 30.0),
-    "min_carry_bps": (-200.0, 200.0),
     "trailing_stop_pct": (0.03, 0.30),
 }
 
@@ -1487,8 +1568,20 @@ class WalkForwardOptimizer:
                 (trial.error for trial in trials if trial.error is not None), "unknown error"
             )
             raise RuntimeError(f"all {len(trials)} optimization trials failed: {first_error}")
-        best = max(completed, key=lambda trial: (trial.objective_value, -trial.trial_number))
-        best_config = apply_parameters(self._config, best.params, allow_new_params=True)
+        # Flat/low-exposure trials must never be crowned as best. If every
+        # completed trial is inactive we still persist the study (for diagnosis)
+        # with best_trial_number=None and empty best_params/best_strategy_config.
+        active = [trial for trial in completed if not trial.zero_activity]
+        best = (
+            max(active, key=lambda trial: (trial.objective_value, -trial.trial_number))
+            if active
+            else None
+        )
+        best_config = (
+            apply_parameters(self._config, best.params, allow_new_params=True)
+            if best is not None
+            else None
+        )
         importances = self._param_importances(trials, optuna_study)
         duration_ms = (time.perf_counter() - started) * 1000.0
         artifact_path = str(self._output_dir / f"{self._study_id}.json") if self._persist else None
@@ -1499,16 +1592,18 @@ class WalkForwardOptimizer:
             n_trials=self._request.n_trials,
             completed_trials=len(completed),
             failed_trials=len(trials) - len(completed),
-            best_trial_number=best.trial_number,
-            best_params=dict(best.params),
-            best_value=best.objective_value,
-            best_raw_value=best.raw_objective,
-            best_strategy_config=best_config.model_dump(mode="json"),
+            best_trial_number=best.trial_number if best is not None else None,
+            best_params=dict(best.params) if best is not None else {},
+            best_value=best.objective_value if best is not None else None,
+            best_raw_value=best.raw_objective if best is not None else None,
+            best_strategy_config=(
+                best_config.model_dump(mode="json") if best_config is not None else {}
+            ),
             trials=tuple(trials),
             param_importances=importances,
             drawdown_penalty_threshold=self._request.drawdown_penalty_threshold,
             walk_forward=self._request.walk_forward,
-            fold_count=best.fold_count,
+            fold_count=best.fold_count if best is not None else 0,
             backend=self._backend,
             seed=self._seed,
             created_at=datetime.now(UTC),
@@ -1527,7 +1622,11 @@ class WalkForwardOptimizer:
         if bars is None and states is None:
             from src.backtest import engine as engine_module
 
-            bars = engine_module._offline_bars(self._config, self._instrument_master)
+            bars = engine_module._offline_bars(
+                self._config,
+                self._instrument_master,
+                periods=self._offline_bar_periods(),
+            )
         if states is None and bars is not None:
             states = build_states_from_bars(
                 bars,
@@ -1535,6 +1634,33 @@ class WalkForwardOptimizer:
                 initial_equity=self._initial_equity(),
             )
         return bars, states
+
+    def _warmup_periods(self) -> int:
+        """Indicator warm-up required before the first OOS test bar."""
+        warmup = _MIN_INDICATOR_WARMUP_BARS
+        for parameter in self._request.search_space:
+            if parameter.type == "categorical" or parameter.high is None:
+                continue
+            leaf = parameter.param_path.split(".")[-1].lower()
+            if "lookback" in leaf or leaf == "window":
+                warmup = max(warmup, int(parameter.high))
+        return max(1, warmup)
+
+    def _offline_bar_periods(self) -> int:
+        """Offline bar count for optimisation: >=750, enough folds and warm-up.
+
+        Uses the v1.5.3 formula ``max(750, 150*wf_splits + 2*(purge+embargo) + 300)``
+        and additionally guarantees the derived walk-forward training block is at
+        least one indicator warm-up long (``purge + (splits+1)*warmup``), so
+        lookback indicators are warm across the train->test boundary. In-sample
+        studies keep the previous 260-bar offline behaviour.
+        """
+        if not self._request.walk_forward:
+            return max(260, _MIN_INDICATOR_WARMUP_BARS)
+        splits = self._request.wf_splits
+        bars = 150 * splits + 2 * (self._request.purge_bars + self._request.embargo_bars) + 300
+        warmup_window = self._request.purge_bars + (splits + 1) * self._warmup_periods()
+        return max(MIN_OFFLINE_BARS, 260, bars, warmup_window)
 
     def _run_deterministic(self) -> list[TrialSummary]:
         parameter_sets = deterministic_lhs_parameter_sets(
@@ -1604,7 +1730,7 @@ class WalkForwardOptimizer:
         started = time.perf_counter()
         try:
             trial_config = apply_parameters(self._config, params, allow_new_params=True)
-            metrics, fold_count = self._evaluate_config(trial_config)
+            metrics, fold_count, n_trades, avg_gross_exposure = self._evaluate_config(trial_config)
         except Exception as exc:
             return TrialSummary(
                 trial_number=trial_number,
@@ -1622,11 +1748,17 @@ class WalkForwardOptimizer:
             )
             * self._penalty_coefficient
         )
+        zero_activity = (
+            n_trades < self._request.min_trades
+            or avg_gross_exposure < self._request.min_avg_gross_exposure
+        )
         return TrialSummary(
             trial_number=trial_number,
             params=dict(params),
             state=TrialState.COMPLETE,
-            objective_value=raw_objective - penalty,
+            # Flat/low-exposure trials get a hard constant objective and are
+            # excluded from best-trial selection (raw metrics are still recorded).
+            objective_value=HARD_INVALID_OBJECTIVE if zero_activity else raw_objective - penalty,
             raw_objective=raw_objective,
             oos_sharpe=metrics["sharpe"],
             oos_sortino=metrics["sortino"],
@@ -1636,15 +1768,20 @@ class WalkForwardOptimizer:
             oos_return_on_margin=metrics["return_on_margin"],
             max_dd=metrics["max_drawdown"],
             fold_count=fold_count,
+            n_trades=n_trades,
+            avg_gross_exposure=avg_gross_exposure,
+            zero_activity=zero_activity,
             duration_ms=(time.perf_counter() - started) * 1000.0,
         )
 
-    def _evaluate_config(self, config: StrategyConfig) -> tuple[dict[str, float], int]:
+    def _evaluate_config(self, config: StrategyConfig) -> tuple[dict[str, float], int, int, float]:
         if self._request.walk_forward:
             return self._evaluate_walk_forward(config)
         return self._evaluate_in_sample(config)
 
-    def _evaluate_walk_forward(self, config: StrategyConfig) -> tuple[dict[str, float], int]:
+    def _evaluate_walk_forward(
+        self, config: StrategyConfig
+    ) -> tuple[dict[str, float], int, int, float]:
         """Score a trial ONLY on purged/embargoed out-of-sample folds."""
         runner = self._backtest_runner if self._backtest_runner is not None else run_walk_forward
         report = runner(
@@ -1661,9 +1798,12 @@ class WalkForwardOptimizer:
             translator=self._translator,
             offline=self._offline,
         )
-        return _extract_oos_metrics(report), report.fold_count
+        n_trades, avg_gross_exposure = _activity_from_report(report)
+        return _extract_oos_metrics(report), report.fold_count, n_trades, avg_gross_exposure
 
-    def _evaluate_in_sample(self, config: StrategyConfig) -> tuple[dict[str, float], int]:
+    def _evaluate_in_sample(
+        self, config: StrategyConfig
+    ) -> tuple[dict[str, float], int, int, float]:
         """Opt-in in-sample evaluation (``walk_forward=False``; never the default)."""
         from src.analytics.metrics import compute_metrics_from_result
 
@@ -1677,15 +1817,21 @@ class WalkForwardOptimizer:
             mode=self._mode,
         )
         metrics = compute_metrics_from_result(result)
-        return {
-            "sharpe": metrics.sharpe,
-            "sortino": metrics.sortino,
-            "calmar": metrics.calmar,
-            "cagr": metrics.cagr,
-            "rachev": metrics.rachev_ratio_05,
-            "return_on_margin": metrics.return_on_max_initial_margin,
-            "max_drawdown": metrics.max_drawdown,
-        }, 1
+        n_trades, avg_gross_exposure = _activity_from_backtest_result(result)
+        return (
+            {
+                "sharpe": metrics.sharpe,
+                "sortino": metrics.sortino,
+                "calmar": metrics.calmar,
+                "cagr": metrics.cagr,
+                "rachev": metrics.rachev_ratio_05,
+                "return_on_margin": metrics.return_on_max_initial_margin,
+                "max_drawdown": metrics.max_drawdown,
+            },
+            1,
+            n_trades,
+            avg_gross_exposure,
+        )
 
     def _param_importances(
         self, trials: Sequence[TrialSummary], optuna_study: Any | None

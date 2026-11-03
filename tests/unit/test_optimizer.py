@@ -15,12 +15,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import polars as pl
 import pytest
 import src.backtest.optimizer as optimizer_module
 from configs.strategy import StrategyConfig, load_strategy_config
 from pydantic import ValidationError
 from src.backtest import optimizer as opt
 from src.backtest.optimizer import (
+    HARD_INVALID_OBJECTIVE,
     OBJECTIVE_METRICS,
     OptimizationRequest,
     ParameterRange,
@@ -86,6 +88,8 @@ def _fake_report(
     max_drawdown: float = 0.10,
     rachev: float = 1.5,
     fold_count: int = 4,
+    n_trades: int = 6,
+    avg_gross_exposure: float = 0.5,
 ) -> Any:
     aggregate: dict[str, Any] = {
         "sharpe": {"mean": sharpe, "std": 0.1},
@@ -96,8 +100,18 @@ def _fake_report(
         "max_drawdown": {"mean": max_drawdown, "std": 0.01},
         "n_folds": fold_count,
     }
-    folds = tuple(SimpleNamespace(metrics={"rachev_ratio_05": rachev}) for _ in range(fold_count))
-    return SimpleNamespace(aggregate=aggregate, folds=folds, fold_count=fold_count)
+    per_fold_trades = n_trades // max(1, fold_count)
+    folds = tuple(
+        SimpleNamespace(metrics={"rachev_ratio_05": rachev}, n_trades=per_fold_trades)
+        for _ in range(fold_count)
+    )
+    return SimpleNamespace(
+        aggregate=aggregate,
+        folds=folds,
+        fold_count=fold_count,
+        total_trades=n_trades,
+        avg_gross_exposure=avg_gross_exposure,
+    )
 
 
 class _SpyRunner:
@@ -129,6 +143,8 @@ def _request(
     embargo_bars: int = 2,
     wf_splits: int = 4,
     drawdown_penalty_threshold: float = 0.20,
+    min_trades: int = 3,
+    min_avg_gross_exposure: float = 0.01,
 ) -> OptimizationRequest:
     return OptimizationRequest(
         base_strategy_id=config.id,
@@ -139,6 +155,8 @@ def _request(
         purge_bars=purge_bars,
         embargo_bars=embargo_bars,
         drawdown_penalty_threshold=drawdown_penalty_threshold,
+        min_trades=min_trades,
+        min_avg_gross_exposure=min_avg_gross_exposure,
         search_space=space,
     )
 
@@ -537,7 +555,6 @@ def test_default_search_space_is_active_only(config: StrategyConfig) -> None:
         "timing.0.params.lookback_fast",
         "timing.0.params.lookback_slow",
         "timing.1.params.window",
-        "timing.2.params.min_carry_bps",
         "risk.0.params.trailing_stop_pct",
     ]
     assert len(paths) == len(set(paths))
@@ -626,8 +643,270 @@ def test_default_search_space_fallback_without_catalog(
         "timing.0.params.lookback_fast",
         "timing.0.params.lookback_slow",
         "timing.1.params.window",
-        "timing.2.params.min_carry_bps",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Zero-activity / flat-trial penalty + warm-up bars (v1.5.3)
+# ---------------------------------------------------------------------------
+
+
+def test_request_zero_activity_fields_and_validation(
+    config: StrategyConfig,
+    small_space: tuple[ParameterRange, ...],
+) -> None:
+    request = _request(config, small_space)
+    assert request.min_trades == 3
+    assert request.min_avg_gross_exposure == pytest.approx(0.01)
+    base: dict[str, Any] = {
+        "base_strategy_id": config.id,
+        "search_space": small_space,
+    }
+    with pytest.raises(ValidationError):
+        OptimizationRequest(**{**base, "min_trades": -1})
+    with pytest.raises(ValidationError):
+        OptimizationRequest(**{**base, "min_avg_gross_exposure": -0.1})
+    with pytest.raises(ValidationError):
+        OptimizationRequest(**{**base, "min_avg_gross_exposure": 1.5})
+
+
+def test_trial_summary_activity_defaults() -> None:
+    trial = TrialSummary(trial_number=0)
+    assert trial.n_trades == 0
+    assert trial.avg_gross_exposure == pytest.approx(0.0)
+    assert trial.zero_activity is False
+    payload = trial.to_dict()
+    assert payload["n_trades"] == 0
+    assert payload["avg_gross_exposure"] == pytest.approx(0.0)
+    assert payload["zero_activity"] is False
+
+
+def _flat_report(**overrides: Any) -> Any:
+    return _fake_report(n_trades=0, avg_gross_exposure=0.0, **overrides)
+
+
+def test_flat_trials_are_penalized_and_never_best(
+    config: StrategyConfig,
+    small_space: tuple[ParameterRange, ...],
+    tmp_path: Path,
+) -> None:
+    optimizer = _optimizer(
+        config,
+        small_space,
+        tmp_path,
+        runner=_SpyRunner(_flat_report()),
+        n_trials=3,
+    )
+    result = optimizer.optimize()
+    assert result.trials
+    for trial in result.trials:
+        assert trial.state is TrialState.COMPLETE
+        assert trial.zero_activity is True
+        assert trial.objective_value == pytest.approx(HARD_INVALID_OBJECTIVE)
+        assert trial.n_trades == 0
+        assert trial.avg_gross_exposure == pytest.approx(0.0)
+        # Raw metrics are still recorded for diagnosis.
+        assert trial.raw_objective == pytest.approx(0.5)
+    assert result.best_trial_number is None
+    assert result.best_params == {}
+    assert result.best_value is None
+    assert result.best_raw_value is None
+    assert result.best_strategy_config == {}
+    assert result.fold_count == 0
+    assert result.completed_trials == 3
+    assert result.failed_trials == 0
+    assert result.artifact_path is not None
+    persisted = load_optimization(result.artifact_path)
+    assert persisted.best_trial_number is None
+    assert all(trial.zero_activity for trial in persisted.trials)
+
+
+def test_low_exposure_trial_is_zero_activity(
+    config: StrategyConfig,
+    small_space: tuple[ParameterRange, ...],
+    tmp_path: Path,
+) -> None:
+    report = _fake_report(n_trades=10, avg_gross_exposure=0.001)
+    result = _optimizer(
+        config, small_space, tmp_path, runner=_SpyRunner(report), n_trials=2
+    ).optimize()
+    for trial in result.trials:
+        assert trial.n_trades == 10
+        assert trial.avg_gross_exposure == pytest.approx(0.001)
+        assert trial.zero_activity is True
+        assert trial.objective_value == pytest.approx(HARD_INVALID_OBJECTIVE)
+    assert result.best_trial_number is None
+
+
+def test_activity_thresholds_are_inclusive(
+    config: StrategyConfig,
+    small_space: tuple[ParameterRange, ...],
+    tmp_path: Path,
+) -> None:
+    report = _fake_report(n_trades=3, avg_gross_exposure=0.01)
+    result = _optimizer(
+        config,
+        small_space,
+        tmp_path,
+        runner=_SpyRunner(report),
+        n_trials=2,
+        min_trades=3,
+        min_avg_gross_exposure=0.01,
+    ).optimize()
+    for trial in result.trials:
+        assert trial.zero_activity is False
+        assert trial.objective_value == pytest.approx(0.5)
+    assert result.best_trial_number is not None
+
+
+class _SequenceRunner:
+    """Runner returning a scripted report per trial call."""
+
+    def __init__(self, reports: list[Any]) -> None:
+        self._reports = reports
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, config: StrategyConfig, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self._reports[min(len(self.calls) - 1, len(self._reports) - 1)]
+
+
+def test_active_trial_wins_over_higher_raw_flat_trial(
+    config: StrategyConfig,
+    small_space: tuple[ParameterRange, ...],
+    tmp_path: Path,
+) -> None:
+    runner = _SequenceRunner(
+        [
+            _fake_report(sharpe=0.10, n_trades=6, avg_gross_exposure=0.5),
+            _fake_report(sharpe=0.90, n_trades=0, avg_gross_exposure=0.0),
+        ]
+    )
+    result = _optimizer(config, small_space, tmp_path, runner=runner, n_trials=2).optimize()
+    assert [trial.zero_activity for trial in result.trials] == [False, True]
+    assert result.trials[1].raw_objective == pytest.approx(0.90)
+    assert result.trials[1].objective_value == pytest.approx(HARD_INVALID_OBJECTIVE)
+    assert result.best_trial_number == 0
+    assert result.best_value == pytest.approx(0.10)
+    assert result.trials[0].n_trades == 6
+
+
+def test_activity_falls_back_to_combined_result_equity_curve(
+    config: StrategyConfig,
+    small_space: tuple[ParameterRange, ...],
+    tmp_path: Path,
+) -> None:
+    combined = SimpleNamespace(
+        n_trades=8,
+        equity_curve=pl.DataFrame(
+            {
+                "equity": [1_000_000.0, 1_000_000.0, 1_000_000.0],
+                "gross_exposure": [500_000.0, 200_000.0, 500_000.0],
+            }
+        ),
+    )
+    report = SimpleNamespace(
+        aggregate={"sharpe": {"mean": 0.5, "std": 0.1}},
+        folds=(SimpleNamespace(metrics={"rachev_ratio_05": 1.5}, n_trades=4),) * 2,
+        fold_count=2,
+        combined_result=combined,
+    )
+    result = _optimizer(
+        config, small_space, tmp_path, runner=_SpyRunner(report), n_trials=2
+    ).optimize()
+    for trial in result.trials:
+        assert trial.n_trades == 8  # summed over folds when total_trades is absent
+        assert trial.avg_gross_exposure == pytest.approx((0.5 + 0.2 + 0.5) / 3.0)
+        assert trial.zero_activity is False
+
+
+def test_default_search_space_trials_plumb_activity(
+    config: StrategyConfig,
+    tmp_path: Path,
+) -> None:
+    report = _fake_report(n_trades=7, avg_gross_exposure=0.30)
+    result = _optimizer(
+        config,
+        default_search_space(config),
+        tmp_path,
+        runner=_SpyRunner(report),
+        n_trials=2,
+    ).optimize()
+    for trial in result.trials:
+        assert trial.n_trades == 7
+        assert trial.avg_gross_exposure == pytest.approx(0.30)
+        assert trial.zero_activity is False
+    assert result.best_trial_number is not None
+    payload = result.to_dict()
+    assert payload["trials"][0]["n_trades"] == 7
+    assert payload["trials"][0]["zero_activity"] is False
+
+
+def test_optuna_backend_flat_trials_not_best(
+    config: StrategyConfig,
+    small_space: tuple[ParameterRange, ...],
+    tmp_path: Path,
+) -> None:
+    if optimizer_module._load_optuna_module() is None:
+        pytest.skip("optuna is not installed in this environment")
+    optimizer = WalkForwardOptimizer(
+        config,
+        request=_request(config, small_space, n_trials=2),
+        backtest_runner=_SpyRunner(_flat_report()),
+        output_dir=tmp_path,
+        use_optuna=True,
+    )
+    result = optimizer.optimize()
+    assert result.backend.value == "optuna"
+    assert result.best_trial_number is None
+    assert result.best_params == {}
+    assert all(trial.zero_activity for trial in result.trials)
+    assert all(
+        trial.objective_value == pytest.approx(HARD_INVALID_OBJECTIVE) for trial in result.trials
+    )
+
+
+def test_offline_window_is_at_least_750_with_warmup(
+    config: StrategyConfig,
+    tmp_path: Path,
+) -> None:
+    optimizer = _optimizer(
+        config,
+        default_search_space(config),
+        tmp_path,
+        n_trials=2,
+    )
+    request = optimizer.request
+    periods = optimizer._offline_bar_periods()
+    formula = 150 * request.wf_splits + 2 * (request.purge_bars + request.embargo_bars) + 300
+    warmup_window = request.purge_bars + (request.wf_splits + 1) * 252
+    assert periods >= 750
+    assert periods >= formula
+    assert periods >= warmup_window
+    assert optimizer._warmup_periods() >= 252
+    bars, states = optimizer._prepare_window()
+    assert bars is not None and states is not None
+    timestamps = int(bars["timestamp_utc"].n_unique())
+    assert timestamps >= 750
+    assert len(states) == timestamps
+    # States are built over the full window (train->test warm-up), not truncated.
+    assert len({state.timestamp for state in states}) == timestamps
+
+
+def test_in_sample_offline_window_stays_compatible(
+    config: StrategyConfig,
+    small_space: tuple[ParameterRange, ...],
+    tmp_path: Path,
+) -> None:
+    request = _request(config, small_space, n_trials=2, walk_forward=False)
+    optimizer = WalkForwardOptimizer(
+        config,
+        request=request,
+        backtest_runner=_SpyRunner(),
+        output_dir=tmp_path,
+        use_optuna=False,
+    )
+    assert optimizer._offline_bar_periods() == 260
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +1022,10 @@ def test_in_sample_opt_in_uses_single_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sentinel = object()
+    sentinel = SimpleNamespace(
+        n_trades=6,
+        equity_curve=pl.DataFrame({"equity": [1_000_000.0], "gross_exposure": [500_000.0]}),
+    )
     monkeypatch.setattr(optimizer_module, "run_from_config", lambda *args, **kwargs: sentinel)
     fake_metrics = SimpleNamespace(
         sharpe=1.0,
@@ -994,6 +1276,7 @@ def test_result_json_contract(
     assert payload["best_strategy_config"]["id"] == config.id
     assert len(payload["trials"]) == 2
     assert payload["trials"][0]["state"] == "COMPLETE"
+    assert {"n_trades", "avg_gross_exposure", "zero_activity"} <= set(payload["trials"][0])
     assert set(payload["param_importances"]) == {parameter.param_path for parameter in small_space}
     rebuilt = opt.OptimizationResult.from_dict(payload)
     assert rebuilt.to_dict() == payload
