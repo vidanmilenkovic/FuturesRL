@@ -146,6 +146,9 @@ class TrialView(_StudyModel):
     oos_rachev: float | None = None
     oos_return_on_margin: float | None = None
     max_dd: float | None = None
+    n_trades: int = 0
+    avg_gross_exposure: float = 0.0
+    zero_activity: bool = False
     duration_ms: float | None = None
     fold_count: int | None = None
     error: str | None = None
