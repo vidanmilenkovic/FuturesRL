@@ -74,9 +74,15 @@ def get_optimization(study_id: str, optimize: OptimizeDep) -> OptimizationStudy:
     response_model=OptimizationApplyResponse,
     summary="Apply a study's best parameters as a new strategy",
     description=(
-        "Writes the tuned parameters over the base strategy into a new custom YAML "
-        "(``<base>_opt`` unless ``new_strategy_id`` is given), and optionally triggers "
-        "a verification walk-forward backtest through the existing backtest service."
+        "Writes the tuned parameters over the base strategy into a new visible strategy "
+        "YAML (``<base>_opt`` unless ``new_strategy_id`` is given; development/paper/live "
+        "write ``configs/strategies/<id>.yaml``, test/backtest write the artifacts "
+        "overlay), refreshes the in-memory catalog immediately, and always triggers + "
+        "persists a walk-forward verification backtest through the existing backtest "
+        "service (window defaults to the base strategy backtest block; override with "
+        "``start``/``end``). The response additively returns ``saved_strategy_id``, "
+        "``strategy_path`` and ``backtest_run_id``. Re-applying to an existing id returns "
+        "409; pass a unique ``new_strategy_id``."
     ),
     responses={
         404: {"description": "Unknown study/base strategy"},

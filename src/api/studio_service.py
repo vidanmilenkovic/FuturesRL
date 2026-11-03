@@ -61,6 +61,7 @@ __all__ = [
     "CatalogStage",
     "ParameterSpec",
     "ParameterType",
+    "SavedStrategy",
     "StrategyCatalogResponse",
     "StrategyPreset",
     "StrategyStudioError",
@@ -128,7 +129,8 @@ class ParameterSpec(_StudioModel):
     unit: str | None = None
     optuna_tunable: bool = False
     #: Additive v1.5.1 flag: true only for the curated parameters pre-selected in
-    #: the Studio's Optuna search-space defaults (exactly six on the live catalog).
+    #: the Studio's Optuna search-space defaults (exactly five on the live catalog;
+    #: v1.5.3 removed ``timing.carry_filter.min_carry_bps`` from the global preselect).
     optuna_default_selected: bool = False
     log_scale: bool = False
     yaml_encoding: str = "scalar"
@@ -516,7 +518,6 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             step=0.01,
             description="Hard margin cushion ceiling η_max.",
             optuna_tunable=True,
-            optuna_default_selected=True,
         ),
     ]
     return specs
@@ -1291,13 +1292,17 @@ def apply_dotted_params(
     params: Mapping[str, object],
     *,
     strategy_id: str | None = None,
+    allow_new_params: bool = False,
 ) -> StrategyConfig:
     """Apply ``{"timing.1.params.lookback": 90}`` style params and re-validate.
 
     Lists are addressed by integer segments (``timing.1.params``); scalar stages
     accept a direct stage prefix (``translator.max_margin_utilization``). Unknown
     paths raise :class:`StrategyStudioError` instead of silently dropping a tuned
-    parameter.
+    parameter. When ``allow_new_params`` is true, a leaf nested directly inside a
+    stage's ``params`` mapping may be created (the optimizer tunes catalog-default
+    parameters such as ``quant_risk.trailing_stop_pct`` that the committed YAML may
+    omit); unknown stages/indices and non-params paths still raise.
     """
     payload = _config_mapping(config)
     for path, value in params.items():
@@ -1320,6 +1325,9 @@ def apply_dotted_params(
                 raise StrategyStudioError(f"parameter path {path!r} does not exist")
             mapping = cast(dict[str, object], cursor)
             if segment not in mapping:
+                if allow_new_params and last and index > 0 and segments[index - 1] == "params":
+                    mapping[segment] = value
+                    break
                 raise StrategyStudioError(
                     f"parameter path {path!r} does not exist in the base strategy"
                 )
@@ -1340,6 +1348,26 @@ def apply_dotted_params(
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SavedStrategy:
+    """A validated strategy config persisted through the Studio service.
+
+    ``path`` is the exact YAML written: in test/backtest environments this is the
+    ``artifacts/strategies`` overlay, while development/paper/live environments
+    write new strategies to the committed ``configs/strategies`` tree so they are
+    visible in the Studio immediately.
+    """
+
+    view: StrategyConfigView
+    config: StrategyConfig
+    path: Path
+
+    @property
+    def strategy_id(self) -> str:
+        """Persisted strategy id (same as ``config.id``)."""
+        return self.config.id
 
 
 @dataclass(frozen=True, slots=True)
@@ -1652,8 +1680,17 @@ class StrategyStudioService:
         return self._write_config(config, builtin=builtin)
 
     def _write_config(self, config: StrategyConfig, *, builtin: bool) -> Path:
+        """Persist one config atomically and return its YAML path.
+
+        In development/paper/live the target is ``configs/strategies/<id>.yaml`` for
+        every write (including new Studio-authored/optimizer-applied strategies), so
+        saved strategies are visible in the committed config tree. Test/backtest
+        environments keep writing ``artifacts/strategies`` overlays (and never touch
+        committed built-ins).
+        """
         self.validate_strategy_id(config.id)
-        use_builtin = builtin and self._builtin_writes
+        _ = builtin  # target directory is environment-driven, not caller-driven
+        use_builtin = self._builtin_writes
         base = self._builtin_dir if use_builtin else self._custom_dir
         target = self._safe_target(base, config.id)
         serialised = yaml.safe_dump(
@@ -1679,7 +1716,7 @@ class StrategyStudioService:
 
     # -- optimization apply ----------------------------------------------------
 
-    def apply_best_params(
+    def save_best_params(
         self,
         base_strategy_id: str,
         best_params: Mapping[str, object],
@@ -1687,8 +1724,14 @@ class StrategyStudioService:
         strategy_id: str | None = None,
         suffix: str = "_opt",
         description: str | None = None,
-    ) -> tuple[StrategyConfigView, StrategyConfig]:
-        """Create a new strategy from ``best_params`` applied to the base strategy."""
+    ) -> SavedStrategy:
+        """Create + persist a new strategy from ``best_params`` over the base config.
+
+        Returns the typed view/config together with the exact YAML path written and
+        refreshes the in-memory strategy catalog immediately (so ``GET
+        /api/strategies`` and ``POST /api/backtests`` see the new id without a
+        restart). Existing ids are rejected with a clear 409 on repeat apply.
+        """
         base = self.core_config(base_strategy_id)
         if base is None:
             raise StrategyStudioError(
@@ -1697,7 +1740,9 @@ class StrategyStudioService:
         candidate_id = self.validate_strategy_id(strategy_id or f"{base.id}{suffix}")
         if self._find(candidate_id) is not None:
             raise StrategyStudioError(f"strategy {candidate_id!r} already exists", status_code=409)
-        tuned = apply_dotted_params(base, best_params, strategy_id=candidate_id)
+        tuned = apply_dotted_params(
+            base, best_params, strategy_id=candidate_id, allow_new_params=True
+        )
         tuned = tuned.model_copy(
             update={
                 "description": description
@@ -1707,7 +1752,26 @@ class StrategyStudioService:
         )
         target = self._write_config(tuned, builtin=False)
         self._refresh_catalog(tuned)
-        return self.view_for(tuned, target=target), tuned
+        return SavedStrategy(view=self.view_for(tuned, target=target), config=tuned, path=target)
+
+    def apply_best_params(
+        self,
+        base_strategy_id: str,
+        best_params: Mapping[str, object],
+        *,
+        strategy_id: str | None = None,
+        suffix: str = "_opt",
+        description: str | None = None,
+    ) -> tuple[StrategyConfigView, StrategyConfig]:
+        """Backwards-compatible wrapper around :meth:`save_best_params`."""
+        saved = self.save_best_params(
+            base_strategy_id,
+            best_params,
+            strategy_id=strategy_id,
+            suffix=suffix,
+            description=description,
+        )
+        return saved.view, saved.config
 
 
 def numeric_default(value: object, fallback: float) -> float:

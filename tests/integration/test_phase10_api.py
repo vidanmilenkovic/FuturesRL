@@ -17,12 +17,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from configs.settings import Settings
 from fastapi.testclient import TestClient
 from src.api.main import create_app
 from src.api.optimize_service import OptimizationError, OptimizationService, OptimizeRequest
 from src.api.routes.optimize import router as optimize_router
-from src.api.studio_service import StrategyStudioService
+from src.api.studio_service import (
+    StrategyStudioError,
+    StrategyStudioService,
+    apply_dotted_params,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -57,6 +62,11 @@ def _settings(tmp_path: Path) -> Settings:
         telemetry_interval_seconds=TELEMETRY_INTERVAL,
         api_cors_origins=("http://localhost:3080",),
     )
+
+
+def _development_settings(tmp_path: Path) -> Settings:
+    """Hermetic development-mode settings (new strategies persist to configs)."""
+    return _settings(tmp_path).model_copy(update={"environment": "development"})
 
 
 def _app(
@@ -121,17 +131,26 @@ def test_catalog_exposes_parameters_stages_and_five_presets(client: TestClient) 
     curated = sorted(
         parameter["key"] for parameter in parameters if parameter["optuna_default_selected"]
     )
-    assert len(curated) == 6, curated
+    assert len(curated) == 5, curated
     assert set(curated) == {
         "allocator.volatility_target.target_annual_volatility",
         "risk.quant_risk.trailing_stop_pct",
-        "timing.carry_filter.min_carry_bps",
         "timing.kama.window",
         "timing.tsmom.lookback_fast",
         "timing.tsmom.lookback_slow",
     }
     for key in curated:
         assert parameters_by_key[key]["optuna_tunable"] is True
+    # v1.5.3: carry_filter.min_carry_bps remains tunable with wider bounds but is
+    # no longer globally pre-selected (curated defaults are exactly five).
+    carry = parameters_by_key["timing.carry_filter.min_carry_bps"]
+    assert carry["optuna_default_selected"] is False
+    assert carry["optuna_tunable"] is True
+    assert carry["default"] == pytest.approx(-50.0)
+    assert carry["min"] == pytest.approx(-200.0)
+    assert carry["max"] == pytest.approx(50.0)
+    assert carry["step"] == pytest.approx(10.0)
+    assert carry["unit"] == "bps"
     hygiene_keys = [
         "universe.liquidity.min_avg_dollar_volume",
         "universe.liquidity.min_history_days",
@@ -474,6 +493,154 @@ def test_apply_optimization_creates_tuned_strategy(tmp_path: Path) -> None:
             f"/api/optimize/{study_id}/apply", json={"new_strategy_id": "../escape"}
         )
         assert traversal.status_code == 400
+
+
+def test_apply_saves_visible_strategy_and_verification_run_in_development(
+    tmp_path: Path,
+) -> None:
+    """v1.5.3: dev/paper/live saves land in configs/strategies and are immediately visible."""
+    settings = _development_settings(tmp_path)
+    assert settings.environment == "development"
+    with _app(settings) as client:
+        # POST /api/strategies in development writes configs/strategies (not the
+        # artifacts overlay) and is visible to GET /api/strategies without restart.
+        base_payload = yaml.safe_load(
+            (REPO_ROOT / "configs" / "strategies" / "tsmom_vol_target.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        base_payload = json.loads(json.dumps(base_payload, default=str))
+        base_payload["id"] = "dev_created_strategy"
+        base_payload["description"] = "Dev created strategy"
+        created = client.post("/api/strategies", json=base_payload)
+        assert created.status_code == 200, created.text
+        created_path = settings.configs_dir / "strategies" / "dev_created_strategy.yaml"
+        assert created_path.is_file()
+        assert not (settings.strategy_artifacts_dir / "dev_created_strategy.yaml").exists()
+        listed_ids = {row["id"] for row in client.get("/api/strategies").json()}
+        assert "dev_created_strategy" in listed_ids
+
+        # Real optimizer study -> apply with DEFAULT verification (flag omitted).
+        optimized = client.post("/api/optimize", json=_optimize_payload(trials=2, splits=2))
+        assert optimized.status_code == 200, optimized.text
+        study = optimized.json()
+        applied = client.post(
+            f"/api/optimize/{study['study_id']}/apply",
+            json={
+                "new_strategy_id": "dev_opt_verified",
+                "start": "2025-01-02",
+                "end": "2025-06-30",
+                "initial_equity": 1_000_000.0,
+            },
+        )
+        assert applied.status_code == 200, applied.text
+        body = applied.json()
+        assert body["saved_strategy_id"] == "dev_opt_verified"
+        strategy_path = Path(body["strategy_path"])
+        assert strategy_path == settings.configs_dir / "strategies" / "dev_opt_verified.yaml"
+        assert strategy_path.is_file()
+        assert not (settings.strategy_artifacts_dir / "dev_opt_verified.yaml").exists()
+        verification = body["verification_backtest"]
+        assert verification is not None
+        assert verification["status"] == "completed", verification
+        run_id = body["backtest_run_id"]
+        assert run_id == verification["run"]["id"]
+        assert verification["run"]["strategy_id"] == "dev_opt_verified"
+
+        # Saved strategy is immediately visible and runnable (no restart).
+        assert client.get("/api/strategies/dev_opt_verified").status_code == 200
+        assert "dev_opt_verified" in {row["id"] for row in client.get("/api/strategies").json()}
+        runs = client.get("/api/backtests").json()["runs"]
+        matching = [run for run in runs if run["id"] == run_id]
+        assert matching, run_id
+        assert matching[0]["strategy_id"] == "dev_opt_verified"
+        assert matching[0]["kind"] == "walk_forward"
+        rerun = client.post(
+            "/api/backtests",
+            json={
+                "strategy_id": "dev_opt_verified",
+                "start": "2025-01-02",
+                "end": "2025-03-31",
+                "initial_equity": 1_000_000.0,
+                "walk_forward": False,
+                "random_seed": 7,
+            },
+        )
+        assert rerun.status_code == 200, rerun.text
+        assert rerun.json()["strategy_id"] == "dev_opt_verified"
+
+        # The verification flag is backwards-compatible only: apply ALWAYS triggers
+        # the walk-forward verification even when a client sends false.
+        forced = client.post(
+            f"/api/optimize/{study['study_id']}/apply",
+            json={
+                "new_strategy_id": "dev_opt_forced_verification",
+                "verification_backtest": False,
+                "start": "2025-01-02",
+                "end": "2025-03-31",
+            },
+        )
+        assert forced.status_code == 200, forced.text
+        forced_body = forced.json()
+        assert forced_body["verification_backtest"]["status"] == "completed"
+        assert forced_body["backtest_run_id"] == forced_body["verification_backtest"]["run"]["id"]
+
+        # Repeat apply to the same target id stays a clear 409 (unique id required).
+        duplicate = client.post(
+            f"/api/optimize/{study['study_id']}/apply",
+            json={"new_strategy_id": "dev_opt_verified", "start": "2025-01-02"},
+        )
+        assert duplicate.status_code == 409
+
+
+def test_apply_real_optimizer_injectable_catalog_default(tmp_path: Path) -> None:
+    """Regression: optimizer curated defaults absent from the YAML must apply.
+
+    The optimizer intentionally tunes injectable catalog params (e.g.
+    ``risk.0.params.trailing_stop_pct``) that the committed TSMOM YAML omits; apply
+    must create that stage ``params`` leaf instead of returning 422.
+    """
+    settings = _settings(tmp_path)
+    with _app(settings) as client:
+        optimized = client.post(
+            "/api/optimize",
+            json={"base_strategy_id": "tsmom_vol_target", "n_trials": 2, "wf_splits": 3},
+        )
+        assert optimized.status_code == 200, optimized.text
+        study = optimized.json()
+        injectable_path = "risk.0.params.trailing_stop_pct"
+        assert injectable_path in study["best_params"], study["best_params"]
+        assert study["best_params"][injectable_path] == pytest.approx(0.3)
+
+        applied = client.post(
+            f"/api/optimize/{study['study_id']}/apply",
+            json={
+                "new_strategy_id": "injectable_default_applied",
+                "start": "2025-01-02",
+                "end": "2025-03-31",
+            },
+        )
+        assert applied.status_code == 200, applied.text
+        body = applied.json()
+        assert body["saved_strategy_id"] == "injectable_default_applied"
+        risk_params = [
+            stage["params"]
+            for stage in body["strategy"]["risk"]
+            if "trailing_stop_pct" in stage["params"]
+        ]
+        assert risk_params and risk_params[0]["trailing_stop_pct"] == pytest.approx(0.3)
+        saved_yaml = Path(body["strategy_path"]).read_text(encoding="utf-8")
+        assert "trailing_stop_pct: 0.3" in saved_yaml
+        assert body["verification_backtest"]["status"] == "completed"
+
+        # Strictness is preserved outside stage params blocks and for unrelated paths.
+        studio = StrategyStudioService(settings=settings, clock=lambda: FIXED_TIMESTAMP)
+        base = studio.core_config("tsmom_vol_target")
+        assert base is not None
+        with pytest.raises(StrategyStudioError):
+            apply_dotted_params(base, {injectable_path: 0.3})
+        with pytest.raises(StrategyStudioError):
+            apply_dotted_params(base, {"backtest.unexpected_leaf": 1.0}, allow_new_params=True)
 
 
 def test_optimization_accepts_catalog_parameter_keys(tmp_path: Path) -> None:

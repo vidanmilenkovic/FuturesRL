@@ -111,9 +111,13 @@ def get_strategy(strategy_id: str, studio: StudioDep) -> StrategyConfigView:
     description=(
         "Validates a complete StrategyConfig payload (universe/allocator required; "
         "stage names and parameters validated against the frozen config models) and "
-        "writes it atomically to ``artifacts/strategies/<id>.yaml``. Ids must be "
-        "strict slugs; traversal attempts, duplicates and invalid configs are "
-        "rejected (400/409/422) before any filesystem write."
+        "writes it atomically to ``configs/strategies/<id>.yaml`` in "
+        "development/paper/live or to the ``artifacts/strategies`` overlay in "
+        "test/backtest. The in-memory strategy catalog is refreshed immediately so the "
+        "new id is visible to ``GET /api/strategies`` and runnable via "
+        "``POST /api/backtests`` without a restart. Ids must be strict slugs; traversal "
+        "attempts, duplicates and invalid configs are rejected (400/409/422) before any "
+        "filesystem write."
     ),
     responses={
         400: {"description": "Unsafe/invalid strategy id"},

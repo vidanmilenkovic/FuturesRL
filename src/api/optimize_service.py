@@ -189,7 +189,9 @@ class OptimizationApplyRequest(_StudyModel):
     """``POST /api/optimize/{study_id}/apply`` body."""
 
     new_strategy_id: str | None = None
-    verification_backtest: bool = False
+    #: Kept for backwards compatibility; validation now defaults to on and apply
+    #: always triggers+persists a walk-forward verification when a runner exists.
+    verification_backtest: bool = True
     start: date | None = None
     end: date | None = None
     initial_equity: float | None = Field(default=None, gt=0.0)
@@ -203,6 +205,10 @@ class OptimizationApplyResponse(_StudyModel):
     best_params: dict[str, ScalarValue] = Field(default_factory=dict)
     verification_backtest: dict[str, object] | None = None
     message: str = ""
+    #: Additive v1.5.3 response fields: visible save + persisted verification run.
+    saved_strategy_id: str = ""
+    strategy_path: str = ""
+    backtest_run_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1057,7 +1063,7 @@ class OptimizationService:
         best = max(trials, key=lambda trial: trial.objective_value or -math.inf)
         best_config: dict[str, object] | None
         try:
-            tuned = apply_dotted_params(base, best.params)
+            tuned = apply_dotted_params(base, best.params, allow_new_params=True)
             best_config = tuned.model_dump(mode="json")
         except StrategyStudioError:
             best_config = None
@@ -1129,7 +1135,16 @@ class OptimizationService:
         ]
         | None = None,
     ) -> OptimizationApplyResponse:
-        """Apply a study's best parameters as a new strategy (hermetic YAML write)."""
+        """Apply best params as a new visible strategy and verify it end-to-end.
+
+        The tuned strategy is persisted (committed ``configs/strategies`` in
+        development/paper/live, ``artifacts/strategies`` overlay in test/backtest)
+        and the in-memory catalog is refreshed before the verification run, so the
+        new id is immediately visible via ``GET /api/strategies`` and runnable via
+        ``POST /api/backtests``. A walk-forward verification backtest is always
+        triggered when a runner is available (the request flag is retained only for
+        backwards compatibility) and its persisted run id is returned.
+        """
         resolved_request = request or OptimizationApplyRequest()
         study = self.get_study(study_id)
         if not study.best_params:
@@ -1137,39 +1152,78 @@ class OptimizationService:
                 f"optimization study {study_id!r} has no best parameters", status_code=409
             )
         try:
-            view, config = self._studio.apply_best_params(
+            saved = self._studio.save_best_params(
                 study.base_strategy_id,
                 study.best_params,
                 strategy_id=resolved_request.new_strategy_id,
             )
         except StrategyStudioError as exc:
             raise OptimizationError(str(exc), status_code=exc.status_code) from exc
+        view, config = saved.view, saved.config
         verification: Mapping[str, object] | None = None
         message = (
             f"applied {len(study.best_params)} best parameter(s) from {study.study_id} "
             f"to new strategy {config.id!r}"
         )
         runner = backtest_runner or self._backtest_runner
-        if resolved_request.verification_backtest and runner is not None:
+        if runner is None:
+            verification = {
+                "status": "skipped",
+                "message": "verification backtest runner unavailable",
+            }
+            message += "; verification walk-forward backtest skipped (no runner)"
+        else:
             try:
-                verification = runner(resolved_request, study, view)
-                if verification is not None:
-                    message += "; verification backtest started"
+                outcome = runner(resolved_request, study, view)
+                if outcome is None:
+                    verification = {
+                        "status": "skipped",
+                        "message": "verification backtest runner returned no result",
+                    }
+                    message += "; verification walk-forward backtest skipped (no result)"
+                else:
+                    verification = dict(outcome)
+                    status = str(verification.get("status") or "started")
+                    run_id = _verification_run_id(verification)
+                    message += f"; verification walk-forward backtest {status}"
+                    if run_id:
+                        message += f" (run {run_id})"
             except Exception as exc:
                 verification = {"error": f"{type(exc).__name__}: {exc}"}
-                message += "; verification backtest failed"
+                message += "; verification walk-forward backtest failed"
         return OptimizationApplyResponse(
             study_id=study.study_id,
             strategy=view,
             best_params=dict(study.best_params),
             verification_backtest=dict(verification) if verification is not None else None,
             message=message,
+            saved_strategy_id=config.id,
+            strategy_path=str(saved.path),
+            backtest_run_id=_verification_run_id(verification),
         )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _verification_run_id(verification: Mapping[str, object] | None) -> str | None:
+    """Extract the persisted backtest run id from a verification-runner payload."""
+    if verification is None:
+        return None
+    candidates: list[object] = []
+    run = verification.get("run")
+    if isinstance(run, Mapping):
+        run_mapping = cast(Mapping[str, object], run)
+        candidates.extend(
+            [run_mapping.get("id"), run_mapping.get("run_id"), run_mapping.get("backtest_run_id")]
+        )
+    candidates.extend([verification.get("backtest_run_id"), verification.get("run_id")])
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _result_payload(result: object) -> dict[str, object]:
