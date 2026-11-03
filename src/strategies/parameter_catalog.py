@@ -116,13 +116,15 @@ LOCATIONS: frozenset[str] = frozenset(
 )
 
 #: Curated core parameters pre-selected when the Studio opens the Optuna optimizer.
-#: Exactly these six are ``optuna_default_selected=True``; every other parameter is
-#: ``False`` so a fresh tuning run explores only the high-signal hypothesis space.
+#: Exactly these five are ``optuna_default_selected=True``; every other parameter
+#: is ``False`` so a fresh tuning run explores only the high-signal hypothesis
+#: space. v1.5.3: the carry floor is *not* pre-selected any more — it stays fully
+#: tunable (searched whenever the carry_filter overlay is active) but a generic
+#: trend-following run should not silently start trading the carry hypothesis.
 DEFAULT_SELECTED_PARAMETER_KEYS: tuple[str, ...] = (
     "timing.tsmom.lookback_fast",
     "timing.tsmom.lookback_slow",
     "timing.kama.window",
-    "timing.carry_filter.min_carry_bps",
     "allocator.volatility_target.target_annual_volatility",
     "risk.quant_risk.trailing_stop_pct",
 )
@@ -1814,12 +1816,13 @@ def _timing_specs(master: InstrumentsConfig) -> tuple[ParameterSpec, ...]:
             "carry_filter",
             "min_carry_bps",
             "Minimum carry (bps)",
-            "Annualised carry floor: legs below it are filtered out (zero mode) or scaled down "
-            "(scale mode).",
+            "Annualised carry floor in basis points. The -50 bps default keeps mildly "
+            "contangoed legs (small negative carry) in the book while filtering deep contango; "
+            "legs below the floor are zeroed (zero mode) or scaled down (scale mode).",
             ParameterType.FLOAT,
-            0.0,
-            min=-2_000.0,
-            max=2_000.0,
+            -50.0,
+            min=-200.0,
+            max=50.0,
             step=10.0,
             unit="bps",
         ),
@@ -2517,7 +2520,10 @@ def _preset_specs() -> tuple[PresetTemplate, ...]:
                     },
                 },
                 "timing": [
-                    {"name": "carry_filter", "params": {"min_carry_bps": 0.0, "carry_weight": 1.0}},
+                    {
+                        "name": "carry_filter",
+                        "params": {"min_carry_bps": -50.0, "carry_weight": 1.0},
+                    },
                     {
                         "name": "tsmom",
                         "params": {

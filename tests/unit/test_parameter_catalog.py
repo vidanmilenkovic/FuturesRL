@@ -816,13 +816,13 @@ def test_catalog_imports_without_gymnasium_sb3_or_torch() -> None:
 # v1.5.1 Fix 1: Optuna default selection + tunable hygiene + active filtering
 # ---------------------------------------------------------------------------
 
-#: Curated core hypotheses pre-selected in the Studio optimizer (v1.5.1 Fix 1).
+#: Curated core hypotheses pre-selected in the Studio optimizer (v1.5.3 Fix 1:
+#: five keys — the carry floor was removed from the global pre-selection).
 CURATED_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
         "timing.tsmom.lookback_fast",
         "timing.tsmom.lookback_slow",
         "timing.kama.window",
-        "timing.carry_filter.min_carry_bps",
         "allocator.volatility_target.target_annual_volatility",
         "risk.quant_risk.trailing_stop_pct",
     }
@@ -851,15 +851,17 @@ def test_optuna_default_selected_is_exactly_the_curated_core() -> None:
     catalog = parameter_catalog()
     selected = tuple(spec.key for spec in catalog.parameters if spec.optuna_default_selected)
     assert set(selected) == CURATED_DEFAULT_KEYS == set(DEFAULT_SELECTED_PARAMETER_KEYS)
-    assert len(tuple(DEFAULT_SELECTED_PARAMETER_KEYS)) == 6
+    assert len(tuple(DEFAULT_SELECTED_PARAMETER_KEYS)) == 5
+    # v1.5.3: the carry floor stays tunable but is no longer globally pre-selected.
+    assert catalog.get("timing.carry_filter.min_carry_bps").optuna_default_selected is False
     for key in selected:
         assert catalog.get(key).optuna_tunable is True
     # Payload: the additive flag exists on every entry, is always a bool, and only
-    # the six curated keys are True (False, not omitted/null, for all others).
+    # the five curated keys are True (False, not omitted/null, for all others).
     payload = catalog_dict()
     flags = [entry["optuna_default_selected"] for entry in payload["parameters"]]
     assert all(isinstance(flag, bool) for flag in flags)
-    assert sum(flags) == 6
+    assert sum(flags) == 5
     true_keys = {
         entry["key"] for entry in payload["parameters"] if entry["optuna_default_selected"]
     }
@@ -1094,3 +1096,54 @@ def test_preset_strategies_define_their_active_default_selected_parameters() -> 
             if isinstance(stage, dict) and stage["name"] == "quant_risk"
         )
         assert quant_risk["params"]["trailing_stop_pct"] == pytest.approx(0.10)
+
+
+def test_carry_filter_bounds_default_and_not_default_selected() -> None:
+    """v1.5.3 Fix 1: mild contango allowed by default; carry not pre-selected."""
+    catalog = parameter_catalog()
+    spec = catalog.get("timing.carry_filter.min_carry_bps")
+    assert spec.type is ParameterType.FLOAT
+    assert spec.default == pytest.approx(-50.0)
+    assert spec.min == pytest.approx(-200.0)
+    assert spec.max == pytest.approx(50.0)
+    assert spec.step == pytest.approx(10.0)
+    assert spec.unit == "bps"
+    assert "contango" in spec.description.lower()
+    # Still tunable (searched when the carry_filter overlay is active) ...
+    assert spec.optuna_tunable is True
+    assert spec.key in {item.key for item in catalog.tunable()}
+    # ... but never part of the global curated default selection.
+    assert spec.optuna_default_selected is False
+    assert spec.key not in set(DEFAULT_SELECTED_PARAMETER_KEYS)
+    payload_entry = next(
+        entry for entry in catalog_dict()["parameters"] if entry["key"] == spec.key
+    )
+    assert payload_entry["optuna_tunable"] is True
+    assert payload_entry["optuna_default_selected"] is False
+    assert payload_entry["default"] == pytest.approx(-50.0)
+    assert payload_entry["min"] == pytest.approx(-200.0)
+    assert payload_entry["max"] == pytest.approx(50.0)
+
+
+def test_default_selected_helper_never_returns_carry() -> None:
+    """Carry is active+tunable for a TSMOM config but is not pre-selected anywhere."""
+    catalog = parameter_catalog()
+    carry_key = "timing.carry_filter.min_carry_bps"
+    tsmom_strategy = load_strategy_config("configs/strategies/tsmom_vol_target.yaml").model_dump(
+        mode="json"
+    )
+    # The carry stage is active, so the parameter remains in the optimizer's pool.
+    assert carry_key in active_parameter_keys(tsmom_strategy)
+    assert carry_key not in default_selected_parameter_keys(tsmom_strategy)
+    assert set(default_selected_parameter_keys(tsmom_strategy)) == CURATED_DEFAULT_KEYS
+    # A preset that configures the carry overlay still does not pre-select it.
+    carry_preset = next(
+        preset for preset in catalog.presets if preset.id == "commodity_carry_term_structure"
+    )
+    assert carry_key in active_parameter_keys(carry_preset.strategy)
+    assert carry_key not in default_selected_parameter_keys(carry_preset.strategy)
+    # v1.5.3: no preset globally re-adds carry to the default selection.
+    for preset in catalog.presets:
+        assert carry_key not in default_selected_parameter_keys(preset.strategy)
+    # Catalog-wide invariant: the curated five contain no carry parameter at all.
+    assert all("carry" not in key for key in DEFAULT_SELECTED_PARAMETER_KEYS)
