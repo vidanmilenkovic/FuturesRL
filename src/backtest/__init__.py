@@ -9,6 +9,8 @@ Public API
 * :class:`MarginSimulator` -- daily MTM settlement and forced-liquidation logic.
 * :class:`PurgedWalkForwardSplit` -- leakage-free walk-forward folds.
 * :func:`run_from_config` / :func:`main` -- declarative runner and offline CLI.
+* :func:`run_walk_forward` / :class:`WalkForwardReport` -- purged/embargoed
+  walk-forward validation API for the Backtest Lab (same JSON as the CLI).
 
 The heavyweight engine exports are resolved lazily through PEP 562
 ``__getattr__``. This keeps ``import src.backtest`` cheap (no cost/engine
@@ -68,10 +70,12 @@ if TYPE_CHECKING:  # pragma: no cover - static typing surface only
         SimpleContractTranslator,
         StateBuilder,
         TradeRecord,
+        WalkForwardReport,
         build_states_from_bars,
         default_state_builder,
         main,
         run_from_config,
+        run_walk_forward,
     )
 
 #: Mapping of lazily-exported engine names to their defining module.
@@ -90,10 +94,12 @@ _ENGINE_EXPORTS: dict[str, str] = {
     "SimpleContractTranslator": "src.backtest.engine",
     "StateBuilder": "src.backtest.engine",
     "TradeRecord": "src.backtest.engine",
+    "WalkForwardReport": "src.backtest.engine",
     "build_states_from_bars": "src.backtest.engine",
     "default_state_builder": "src.backtest.engine",
     "main": "src.backtest.engine",
     "run_from_config": "src.backtest.engine",
+    "run_walk_forward": "src.backtest.engine",
 }
 
 __all__ = [
@@ -131,11 +137,13 @@ __all__ = [
     "TradeKind",
     "TradeRecord",
     "WalkForwardFold",
+    "WalkForwardReport",
     "build_states_from_bars",
     "default_fee_schedule",
     "default_state_builder",
     "main",
     "run_from_config",
+    "run_walk_forward",
 ]
 
 

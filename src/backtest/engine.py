@@ -2747,66 +2747,459 @@ def _combined_walk_forward_result(
     return result
 
 
-def _run_walk_forward(
-    *,
-    config: StrategyConfig,
-    bars: pl.DataFrame,
-    mode: BacktestMode,
-    initial_equity: float,
-    splits: int,
-    purge_bars: int | None,
-    embargo_bars: int | None,
-    engine_factory: Callable[[], BacktestEngine],
-    state_builder: StateBuilder | None,
-    output: Path | None,
-    html_output: Path | None,
-) -> dict[str, object]:
-    """Run the real purged/embargoed walk-forward validation and build its report.
+@dataclass(frozen=True, slots=True)
+class WalkForwardEquityCurve:
+    """Compounded walk-forward equity path (each fold's return chains to the next)."""
 
-    The point-in-time market states are built exactly once over the full runnable
-    window and then sliced to each fold's test segment, so the walk-forward run
-    stays O(window) in data-layer work instead of O(folds x window). The fold
-    indices still refer to bar timestamps, so every fold trades only its own
-    out-of-sample segment (the training segment is reserved for feature warm-up
-    and is never replayed as an outcome).
+    timestamps: tuple[str, ...]
+    equity: tuple[float, ...]
+    drawdown: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if not (len(self.timestamps) == len(self.equity) == len(self.drawdown)):
+            raise ValueError("walk-forward equity curve series must have equal lengths")
+        if not self.equity:
+            raise ValueError("walk-forward equity curve must not be empty")
+        for value in self.equity:
+            if not math.isfinite(value):
+                raise ValueError("walk-forward equity values must be finite")
+        for value in self.drawdown:
+            if not math.isfinite(value):
+                raise ValueError("walk-forward drawdown values must be finite")
+
+    @property
+    def final_equity(self) -> float:
+        """Equity at the end of the compounded walk-forward path."""
+        return float(self.equity[-1])
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable curve payload."""
+        return {
+            "timestamps": list(self.timestamps),
+            "equity": list(self.equity),
+            "drawdown": list(self.drawdown),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class WalkForwardRunMetadata:
+    """Run-level metadata of one walk-forward validation."""
+
+    run_id: str
+    strategy: str
+    mode: BacktestMode
+    initial_equity: float
+    generated_at: datetime
+    window_start: datetime
+    window_end: datetime
+    n_bars: int
+
+    def __post_init__(self) -> None:
+        if not self.run_id:
+            raise ValueError("run_id must be non-empty")
+        if not self.strategy:
+            raise ValueError("strategy must be non-empty")
+        if not isinstance(self.mode, BacktestMode):
+            raise TypeError("mode must be a BacktestMode")
+        for name in ("initial_equity",):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and strictly positive")
+        for name in ("generated_at", "window_start", "window_end"):
+            object.__setattr__(self, name, ensure_utc(getattr(self, name)))
+        if isinstance(self.n_bars, bool) or not isinstance(self.n_bars, int) or self.n_bars < 1:
+            raise ValueError("n_bars must be a positive int")
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable run metadata (matches the CLI report)."""
+        return {
+            "run_id": self.run_id,
+            "strategy": self.strategy,
+            "mode": self.mode.value,
+            "initial_equity": self.initial_equity,
+            "generated_at": self.generated_at.isoformat(),
+            "window_start": self.window_start.isoformat(),
+            "window_end": self.window_end.isoformat(),
+            "n_bars": self.n_bars,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class WalkForwardConfigSummary:
+    """Geometry of the walk-forward split used for the run."""
+
+    requested_splits: int
+    fold_count: int
+    purge_bars: int
+    embargo_bars: int
+    train_days: int
+    test_days: int
+    step_days: int
+    expanding: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "requested_splits",
+            "fold_count",
+            "purge_bars",
+            "embargo_bars",
+            "train_days",
+            "test_days",
+            "step_days",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an int")
+        if self.requested_splits < 2:
+            raise ValueError("requested_splits must be >= 2")
+        if self.fold_count < 1:
+            raise ValueError("fold_count must be >= 1")
+        if self.purge_bars < 0 or self.embargo_bars < 0:
+            raise ValueError("purge_bars and embargo_bars must be non-negative")
+        if self.train_days < 1 or self.test_days < 1 or self.step_days < 1:
+            raise ValueError("train/test/step days must be positive")
+        if not isinstance(self.expanding, bool):
+            raise TypeError("expanding must be a bool")
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable split geometry (matches the CLI report)."""
+        return {
+            "requested_splits": self.requested_splits,
+            "fold_count": self.fold_count,
+            "purge_bars": self.purge_bars,
+            "embargo_bars": self.embargo_bars,
+            "train_days": self.train_days,
+            "test_days": self.test_days,
+            "step_days": self.step_days,
+            "expanding": self.expanding,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class WalkForwardFoldReport:
+    """One out-of-sample walk-forward fold with its metrics and bookkeeping."""
+
+    fold: int
+    train_start: int
+    train_end: int
+    test_start: int
+    test_end: int
+    train_start_time: datetime
+    train_end_time: datetime | None
+    test_start_time: datetime
+    test_end_time: datetime
+    purge_gap: int
+    train_size: int
+    test_size: int
+    n_bars: int
+    return_pct: float
+    ending_equity: float
+    n_trades: int
+    n_rebalances: int
+    metrics: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "fold",
+            "train_start",
+            "train_end",
+            "test_start",
+            "test_end",
+            "purge_gap",
+            "train_size",
+            "test_size",
+            "n_bars",
+            "n_trades",
+            "n_rebalances",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an int")
+        if self.fold < 0:
+            raise ValueError("fold index must be non-negative")
+        if self.train_start > self.train_end:
+            raise ValueError("train_start must not exceed train_end")
+        if self.test_start > self.test_end:
+            raise ValueError("test_start must not exceed test_end")
+        if self.train_end > self.test_start:
+            raise ValueError("training data must end at or before the test window starts")
+        if self.train_size < 1 or self.test_size < 1:
+            raise ValueError("train_size and test_size must be positive")
+        if self.n_bars < 0 or self.n_trades < 0 or self.n_rebalances < 0:
+            raise ValueError("n_bars, n_trades and n_rebalances must be non-negative")
+        if not math.isfinite(self.return_pct) or not math.isfinite(self.ending_equity):
+            raise ValueError("fold return and ending equity must be finite")
+        for name in ("train_start_time", "test_start_time", "test_end_time"):
+            object.__setattr__(self, name, ensure_utc(getattr(self, name)))
+        if self.train_end_time is not None:
+            object.__setattr__(self, "train_end_time", ensure_utc(self.train_end_time))
+        frozen_metrics: dict[str, float] = {}
+        for key, value in self.metrics.items():
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError(f"metric {key!r} must be finite")
+            frozen_metrics[key] = numeric
+        object.__setattr__(self, "metrics", MappingProxyType(frozen_metrics))
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable fold payload (matches the CLI report shape)."""
+        return {
+            "fold": self.fold,
+            "train_start": self.train_start,
+            "train_end": self.train_end,
+            "test_start": self.test_start,
+            "test_end": self.test_end,
+            "train_start_time": self.train_start_time.isoformat(),
+            "train_end_time": (
+                self.train_end_time.isoformat() if self.train_end_time is not None else None
+            ),
+            "test_start_time": self.test_start_time.isoformat(),
+            "test_end_time": self.test_end_time.isoformat(),
+            "purge_gap": self.purge_gap,
+            "train_size": self.train_size,
+            "test_size": self.test_size,
+            "n_bars": self.n_bars,
+            "return": self.return_pct,
+            "ending_equity": self.ending_equity,
+            "n_trades": self.n_trades,
+            "n_rebalances": self.n_rebalances,
+            "metrics": dict(self.metrics),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class WalkForwardReport:
+    """Frozen walk-forward validation report for the Backtest Lab API.
+
+    ``to_dict()`` produces exactly the JSON document the CLI writes, while the
+    convenience properties (``mean_sharpe``, ``total_trades``,
+    ``total_rebalances``, ``fold_count``, ``final_equity``) give the API cheap
+    headline access without re-parsing the payload. ``combined_result`` keeps the
+    full compounded :class:`BacktestResult` for tear-sheet generation and is
+    excluded from the JSON payload / equality / repr.
+    """
+
+    run: WalkForwardRunMetadata
+    walk_forward: WalkForwardConfigSummary
+    folds: tuple[WalkForwardFoldReport, ...]
+    aggregate: Mapping[str, object]
+    combined_metrics: Mapping[str, object]
+    concatenated_equity_curve: WalkForwardEquityCurve
+    tearsheet_path: str | None = None
+    combined_result: BacktestResult | None = field(default=None, repr=False, compare=False)
+    report: str = "walk_forward"
+    schema_version: int = WALK_FORWARD_REPORT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.report != "walk_forward":
+            raise ValueError("report identifier must be 'walk_forward'")
+        if self.schema_version < 1:
+            raise ValueError("schema_version must be >= 1")
+        if len(self.folds) != self.walk_forward.fold_count:
+            raise ValueError("walk_forward.fold_count must equal the number of fold reports")
+        if self.folds and not self.folds[0].fold == 0:
+            raise ValueError("fold reports must start at index 0")
+        frozen_aggregate: dict[str, object] = {}
+        for key, value in self.aggregate.items():
+            if isinstance(value, Mapping):
+                frozen_aggregate[key] = MappingProxyType(dict(value))
+            else:
+                frozen_aggregate[key] = value
+        object.__setattr__(self, "aggregate", MappingProxyType(frozen_aggregate))
+        object.__setattr__(self, "combined_metrics", MappingProxyType(dict(self.combined_metrics)))
+        if self.tearsheet_path is not None and not isinstance(self.tearsheet_path, str):
+            raise TypeError("tearsheet_path must be a string or None")
+
+    # -- convenience properties (Backtest Lab headline contract) --------------
+
+    @property
+    def mean_sharpe(self) -> float:
+        """Mean walk-forward Sharpe ratio (``aggregate['sharpe']['mean']``)."""
+        stats = self.aggregate.get("sharpe")
+        if not isinstance(stats, Mapping):
+            return 0.0
+        mean = stats.get("mean")
+        return float(mean) if isinstance(mean, (int, float)) else 0.0
+
+    @property
+    def total_trades(self) -> int:
+        """Sum of executed trades across every out-of-sample fold."""
+        return sum(fold.n_trades for fold in self.folds)
+
+    @property
+    def total_rebalances(self) -> int:
+        """Sum of rebalances across every out-of-sample fold."""
+        return sum(fold.n_rebalances for fold in self.folds)
+
+    @property
+    def fold_count(self) -> int:
+        """Number of walk-forward folds in the report."""
+        return len(self.folds)
+
+    @property
+    def final_equity(self) -> float:
+        """Ending equity of the compounded walk-forward equity path."""
+        return self.concatenated_equity_curve.final_equity
+
+    # -- JSON payload ---------------------------------------------------------
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable report with the exact CLI report shape."""
+        aggregate_payload: dict[str, object] = {}
+        for key, value in self.aggregate.items():
+            aggregate_payload[key] = dict(value) if isinstance(value, Mapping) else value
+        return {
+            "report": self.report,
+            "schema_version": self.schema_version,
+            "run": self.run.to_dict(),
+            "walk_forward": self.walk_forward.to_dict(),
+            "folds": [fold.to_dict() for fold in self.folds],
+            "aggregate": aggregate_payload,
+            "combined_metrics": dict(self.combined_metrics),
+            "concatenated_equity_curve": self.concatenated_equity_curve.to_dict(),
+            "tearsheet_path": self.tearsheet_path,
+        }
+
+
+def _state_timestamps(states: Sequence[MarketState]) -> tuple[datetime, ...]:
+    """Sorted, unique decision timestamps implied by a sequence of market states."""
+    timestamps = tuple(sorted({ensure_utc(state.timestamp) for state in states}))
+    if len(timestamps) < 2:
+        raise ValueError(
+            "walk-forward requires at least two states in the runnable window, "
+            f"got {len(timestamps)}"
+        )
+    return timestamps
+
+
+def _states_by_timestamp(states: Sequence[MarketState]) -> dict[datetime, MarketState]:
+    """Map market states by timestamp, rejecting duplicates."""
+    mapping: dict[datetime, MarketState] = {}
+    for state in states:
+        if not isinstance(state, MarketState):
+            raise TypeError("states must contain MarketState instances")
+        timestamp = ensure_utc(state.timestamp)
+        if timestamp in mapping:
+            raise ValueError(f"duplicate MarketState timestamp {timestamp.isoformat()}")
+        mapping[timestamp] = state
+    return mapping
+
+
+def run_walk_forward(
+    config: StrategyConfig,
+    *,
+    bars: pl.DataFrame | None = None,
+    states: Sequence[MarketState] | None = None,
+    splits: int = 5,
+    purge_bars: int = 5,
+    embargo_bars: int = 5,
+    initial_equity: float | None = None,
+    mode: BacktestMode | None = None,
+    instrument_master: InstrumentsConfig | None = None,
+    pipeline: StrategyPipeline | None = None,
+    translator: ContractTranslatorProtocol | None = None,
+    offline: bool = False,
+) -> WalkForwardReport:
+    """Run purged/embargoed walk-forward validation and return a typed report.
+
+    Parameters
+    ----------
+    config:
+        Declarative strategy config (its ``backtest`` block supplies the default
+        initial equity, cost model and rebalance frequency).
+    bars:
+        Canonical Polars OHLCV frame for the runnable window. When omitted (and
+        ``states`` is also omitted) deterministic offline bars are generated.
+    states:
+        Optional prebuilt point-in-time ``MarketState`` sequence. When supplied
+        it is used instead of building states from ``bars``; if both are given,
+        ``bars`` supplies execution/roll context while ``states`` supplies the
+        signal path.
+    splits, purge_bars, embargo_bars:
+        Walk-forward fold count and leakage guards (purge before / embargo after
+        each test window, in bars).
+    initial_equity, mode, instrument_master:
+        Optional overrides; otherwise the config/engine defaults are used.
+    pipeline, translator:
+        Optional injected FinRL-X pipeline / contract translator. When omitted
+        the helper resolves them exactly like the CLI does (fresh instance per
+        fold so no overlay state can leak between folds).
+    offline:
+        Allow the CLI's deterministic offline fallbacks for pipeline/translator
+        resolution. Implied when neither ``bars`` nor ``states`` is supplied.
+
+    Each fold is backtested independently over its own test segment (flat start,
+    configured initial equity) with the training segment reserved for feature
+    warm-up only; the combined curve compounds the fold returns. The helper does
+    not write files — the CLI adds the tearsheet path and persists the report.
     """
     from src.analytics.metrics import compute_metrics_from_result
 
+    if isinstance(splits, bool) or not isinstance(splits, int) or splits < 2:
+        raise ValueError("splits must be an integer >= 2")
+    for name, value in (("purge_bars", purge_bars), ("embargo_bars", embargo_bars)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if mode is not None and not isinstance(mode, BacktestMode):
+        raise TypeError("mode must be a BacktestMode or None")
+    if not isinstance(offline, bool):
+        raise TypeError("offline must be a bool")
+    resolved_mode = mode if mode is not None else BacktestMode.VECTORIZED
+    master = instrument_master if instrument_master is not None else load_instruments()
     spec = config.backtest
-    wf_config = spec.walk_forward if spec is not None else None
-    resolved_purge = (
-        purge_bars
-        if purge_bars is not None
-        else (wf_config.purge_days if wf_config is not None else 5)
+    resolved_equity = (
+        initial_equity
+        if initial_equity is not None
+        else (spec.initial_equity if spec is not None else 1_000_000.0)
     )
-    resolved_embargo = (
-        embargo_bars
-        if embargo_bars is not None
-        else (wf_config.embargo_days if wf_config is not None else 5)
+    if not math.isfinite(resolved_equity) or resolved_equity <= 0.0:
+        raise ValueError("initial_equity must be finite and strictly positive")
+    cost_model = CostModel(
+        instrument_master=master,
+        commission_bps=spec.commission_bps if spec is not None else 0.0,
+        base_slippage_ticks=spec.slippage_ticks if spec is not None else 0.0,
     )
-    timestamps = _runnable_timestamps(bars)
+    schedule = (
+        RebalanceSchedule.from_frequency(spec.rebalance_frequency)
+        if spec is not None
+        else RebalanceSchedule.daily()
+    )
+    window_bars = bars
+    if window_bars is None and states is None:
+        # No input window: use the same deterministic offline source as the CLI.
+        window_bars = _offline_bars(config, master)
+        offline = True
+    if window_bars is not None:
+        timestamps = _runnable_timestamps(window_bars)
+    else:
+        if states is None:
+            raise ValueError("either bars or states must be supplied")
+        timestamps = _state_timestamps(states)
+    if states is not None:
+        state_by_timestamp = _states_by_timestamp(states)
+    else:
+        if window_bars is None:
+            raise ValueError("either bars or states must be supplied")
+        state_builder = _resolve_cli_state_builder(master)
+        all_states = _resolve_states(
+            window_bars,
+            None,
+            state_builder,
+            resolved_equity,
+            start=None,
+            end=None,
+        )
+        state_by_timestamp = _states_by_timestamp(all_states)
     splitter, folds = _build_walk_forward_folds(
         n_samples=len(timestamps),
         splits=splits,
-        purge_bars=resolved_purge,
-        embargo_bars=resolved_embargo,
+        purge_bars=purge_bars,
+        embargo_bars=embargo_bars,
     )
     run_id = f"{config.id}-walk-forward-{timestamps[0]:%Y%m%d}-{timestamps[-1]:%Y%m%d}"
-    # Build the full point-in-time state path exactly once (features use only
-    # past bars, so this is leak-free); each fold consumes only its own test
-    # slice, keeping walk-forward cost O(window) rather than O(folds x window).
-    all_states = _resolve_states(
-        bars,
-        None,
-        state_builder,
-        initial_equity,
-        start=None,
-        end=None,
-    )
-    state_by_timestamp = {state.timestamp: state for state in all_states}
     fold_results: list[tuple[WalkForwardFold, BacktestResult]] = []
     fold_metrics: list[PerformanceMetrics] = []
-    fold_payloads: list[dict[str, object]] = []
+    fold_reports: list[WalkForwardFoldReport] = []
     for fold in folds:
         test_start = timestamps[fold.test_start]
         test_end = timestamps[fold.test_end - 1]
@@ -2819,111 +3212,117 @@ def _run_walk_forward(
             raise ValueError(
                 f"walk-forward fold {fold.fold_index} has no market states in its test window"
             )
-        fold_engine = engine_factory()
-        fold_result = fold_engine.run(
-            bars=bars,
-            states=fold_states,
-            run_id=f"{run_id}-fold-{fold.fold_index}",
+        fold_pipeline = (
+            pipeline
+            if pipeline is not None
+            else _resolve_cli_pipeline(config, master, offline=offline)
         )
+        fold_translator = (
+            translator
+            if translator is not None
+            else _resolve_cli_translator(master, offline=offline)
+        )
+        fold_engine = BacktestEngine(
+            fold_pipeline,
+            fold_translator,
+            mode=resolved_mode,
+            instrument_master=master,
+            cost_model=cost_model,
+            initial_equity=resolved_equity,
+            rebalance_schedule=schedule,
+            state_builder=None,
+        )
+        fold_run_id = f"{run_id}-fold-{fold.fold_index}"
+        if window_bars is not None:
+            fold_result = fold_engine.run(
+                bars=window_bars,
+                states=fold_states,
+                run_id=fold_run_id,
+            )
+        else:
+            fold_result = fold_engine.run(states=fold_states, run_id=fold_run_id)
         fold_metric = compute_metrics_from_result(fold_result)
         fold_results.append((fold, fold_result))
         fold_metrics.append(fold_metric)
-        fold_payloads.append(
-            {
-                "fold": fold.fold_index,
-                "train_start": fold.train_start,
-                "train_end": fold.train_end,
-                "test_start": fold.test_start,
-                "test_end": fold.test_end,
-                "train_start_time": timestamps[fold.train_start].isoformat(),
-                "train_end_time": (
-                    timestamps[fold.train_end - 1].isoformat()
-                    if fold.train_end > fold.train_start
-                    else None
+        fold_reports.append(
+            WalkForwardFoldReport(
+                fold=fold.fold_index,
+                train_start=fold.train_start,
+                train_end=fold.train_end,
+                test_start=fold.test_start,
+                test_end=fold.test_end,
+                train_start_time=timestamps[fold.train_start],
+                train_end_time=(
+                    timestamps[fold.train_end - 1] if fold.train_end > fold.train_start else None
                 ),
-                "test_start_time": test_start.isoformat(),
-                "test_end_time": test_end.isoformat(),
-                "purge_gap": fold.purge_gap,
-                "train_size": fold.train_size,
-                "test_size": fold.test_size,
-                "n_bars": fold_result.n_bars,
-                "return": fold_result.total_return,
-                "ending_equity": fold_result.ending_equity,
-                "n_trades": fold_result.n_trades,
-                "metrics": _walk_forward_metric_payload(fold_metric),
-            }
+                test_start_time=test_start,
+                test_end_time=test_end,
+                purge_gap=fold.purge_gap,
+                train_size=fold.train_size,
+                test_size=fold.test_size,
+                n_bars=fold_result.n_bars,
+                return_pct=fold_result.total_return,
+                ending_equity=fold_result.ending_equity,
+                n_trades=fold_result.n_trades,
+                n_rebalances=fold_result.n_rebalances,
+                metrics=_walk_forward_metric_payload(fold_metric),
+            )
         )
     combined = _combined_walk_forward_result(
         run_id=run_id,
         strategy_id=config.id,
-        mode=mode,
-        initial_equity=initial_equity,
+        mode=resolved_mode,
+        initial_equity=resolved_equity,
         fold_results=fold_results,
         metadata={
             "strategy": config.id,
             "walk_forward": True,
             "folds": len(folds),
-            "purge_bars": resolved_purge,
-            "embargo_bars": resolved_embargo,
+            "purge_bars": purge_bars,
+            "embargo_bars": embargo_bars,
         },
     )
     combined_metrics = compute_metrics_from_result(combined)
-    tearsheet_path: str | None = None
-    if output is not None:
-        from src.analytics.tearsheet import build_tearsheet, write_tearsheet
-
-        tearsheet = build_tearsheet(
-            combined,
-            combined_metrics,
-            title=f"Walk-forward — {config.id}",
-            generated_at=combined.end,
-        )
-        tearsheet_file = output.with_name(f"{output.stem}_tearsheet.json")
-        write_tearsheet(tearsheet, tearsheet_file, fmt="json")
-        tearsheet_path = str(tearsheet_file)
-        if html_output is not None:
-            write_tearsheet(tearsheet, html_output, fmt="html")
     combined_curve = combined.equity_curve
-    concatenated_curve: dict[str, object] = {
-        "timestamps": [
+    concatenated_curve = WalkForwardEquityCurve(
+        timestamps=tuple(
             ensure_utc(cast(datetime, value)).isoformat()
             for value in combined_curve.get_column(TIMESTAMP_COLUMN).to_list()
-        ],
-        "equity": [float(value) for value in combined_curve.get_column("equity").to_list()],
-        "drawdown": [float(value) for value in combined_curve.get_column("drawdown").to_list()],
-    }
-    return {
-        "report": "walk_forward",
-        "schema_version": WALK_FORWARD_REPORT_VERSION,
-        "run": {
-            "run_id": run_id,
-            "strategy": config.id,
-            "mode": mode.value,
-            "initial_equity": initial_equity,
-            "generated_at": combined.end.isoformat(),
-            "window_start": timestamps[0].isoformat(),
-            "window_end": timestamps[-1].isoformat(),
-            "n_bars": len(timestamps),
-        },
-        "walk_forward": {
-            "requested_splits": splits,
-            "fold_count": len(folds),
-            "purge_bars": resolved_purge,
-            "embargo_bars": resolved_embargo,
-            "train_days": splitter.train_days,
-            "test_days": splitter.test_days,
-            "step_days": splitter.step_days,
-            "expanding": splitter.expanding,
-        },
-        "folds": fold_payloads,
-        "aggregate": _walk_forward_aggregate(
-            fold_metrics=fold_metrics,
-            fold_results=[result for _fold, result in fold_results],
         ),
-        "combined_metrics": combined_metrics.to_dict(),
-        "concatenated_equity_curve": concatenated_curve,
-        "tearsheet_path": tearsheet_path,
-    }
+        equity=tuple(float(value) for value in combined_curve.get_column("equity").to_list()),
+        drawdown=tuple(float(value) for value in combined_curve.get_column("drawdown").to_list()),
+    )
+    aggregate = _walk_forward_aggregate(
+        fold_metrics=fold_metrics,
+        fold_results=[result for _fold, result in fold_results],
+    )
+    return WalkForwardReport(
+        run=WalkForwardRunMetadata(
+            run_id=run_id,
+            strategy=config.id,
+            mode=resolved_mode,
+            initial_equity=resolved_equity,
+            generated_at=combined.end,
+            window_start=timestamps[0],
+            window_end=timestamps[-1],
+            n_bars=len(timestamps),
+        ),
+        walk_forward=WalkForwardConfigSummary(
+            requested_splits=splits,
+            fold_count=len(folds),
+            purge_bars=purge_bars,
+            embargo_bars=embargo_bars,
+            train_days=splitter.train_days,
+            test_days=splitter.test_days,
+            step_days=splitter.step_days,
+            expanding=splitter.expanding,
+        ),
+        folds=tuple(fold_reports),
+        aggregate=aggregate,
+        combined_metrics=combined_metrics.to_dict(),
+        concatenated_equity_curve=concatenated_curve,
+        combined_result=combined,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -3031,51 +3430,60 @@ def main(argv: Sequence[str] | None = None) -> int:
             else (spec.initial_equity if spec is not None else 1_000_000.0)
         )
         if args.walk_forward:
-
-            def _fresh_engine() -> BacktestEngine:
-                """Build a fresh engine per fold: no state can leak across folds."""
-                return BacktestEngine(
-                    _resolve_cli_pipeline(config, instrument_master, offline=args.offline),
-                    _resolve_cli_translator(instrument_master, offline=args.offline),
-                    mode=mode,
-                    instrument_master=instrument_master,
-                    cost_model=cost_model,
-                    initial_equity=initial_equity,
-                    rebalance_schedule=schedule,
-                    state_builder=None,
-                )
-
-            walk_forward_output = args.output or _default_walk_forward_path(config)
-            report = _run_walk_forward(
-                config=config,
-                bars=bars,
-                mode=mode,
-                initial_equity=initial_equity,
-                splits=args.wf_splits,
-                purge_bars=args.purge_bars,
-                embargo_bars=args.embargo_bars,
-                engine_factory=_fresh_engine,
-                state_builder=state_builder,
-                output=walk_forward_output,
-                html_output=args.html,
+            spec_wf = spec.walk_forward if spec is not None else None
+            resolved_purge = (
+                args.purge_bars
+                if args.purge_bars is not None
+                else (spec_wf.purge_days if spec_wf is not None else 5)
             )
+            resolved_embargo = (
+                args.embargo_bars
+                if args.embargo_bars is not None
+                else (spec_wf.embargo_days if spec_wf is not None else 5)
+            )
+            walk_forward_output = args.output or _default_walk_forward_path(config)
+            report = run_walk_forward(
+                config,
+                bars=bars,
+                splits=args.wf_splits,
+                purge_bars=resolved_purge,
+                embargo_bars=resolved_embargo,
+                initial_equity=initial_equity,
+                mode=mode,
+                instrument_master=instrument_master,
+                offline=args.offline,
+            )
+            tearsheet_path: str | None = None
+            if report.combined_result is not None:
+                from src.analytics.tearsheet import build_tearsheet, write_tearsheet
+
+                tearsheet = build_tearsheet(
+                    report.combined_result,
+                    title=f"Walk-forward — {config.id}",
+                    generated_at=report.combined_result.end,
+                )
+                tearsheet_file = walk_forward_output.with_name(
+                    f"{walk_forward_output.stem}_tearsheet.json"
+                )
+                write_tearsheet(tearsheet, tearsheet_file, fmt="json")
+                tearsheet_path = str(tearsheet_file)
+                if args.html is not None:
+                    write_tearsheet(tearsheet, args.html, fmt="html")
+            report = replace(report, tearsheet_path=tearsheet_path)
+            payload = report.to_dict()
             walk_forward_output.parent.mkdir(parents=True, exist_ok=True)
-            walk_forward_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            folds_payload = report.get("folds")
-            fold_count = len(folds_payload) if isinstance(folds_payload, list) else 0
-            run_section = report.get("run")
-            run_id = run_section.get("run_id") if isinstance(run_section, dict) else None
+            walk_forward_output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             print(
                 json.dumps(
                     {
                         "strategy": config.id,
                         "mode": mode.value,
-                        "report": "walk_forward",
-                        "folds": fold_count,
-                        "run_id": run_id,
+                        "report": report.report,
+                        "folds": report.fold_count,
+                        "run_id": report.run.run_id,
                         "output": str(walk_forward_output),
-                        "tearsheet_path": report.get("tearsheet_path"),
-                        "aggregate": report.get("aggregate"),
+                        "tearsheet_path": payload["tearsheet_path"],
+                        "aggregate": payload["aggregate"],
                     },
                     indent=2,
                 )
