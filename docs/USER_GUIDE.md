@@ -351,7 +351,92 @@ FUTURESRLX_RISK_STATE_STORE_URI=duckdb:   # durable intraday risk state
   --strategy configs/strategies/tsmom_vol_target.yaml
 ```
 
-This opens **no socket**: it validates settings, instrument master, strategy YAML, FX/base currency, state-store type and hydration configuration, and prints a JSON summary. Exit code `0` = ready.
+This opens **no socket**: it validates settings, instrument master, strategy YAML, FX/base currency, state-store type and hydration configuration, and prints a JSON summary. Exit code `0` = ready. Because it never connects, **no "incoming connection" prompt will appear in TWS** — use the live runner (or the `ib_async` handshake snippet below) to actually open the socket.
+
+### Running from WSL2 (TWS on the Windows host)
+
+This is the common failure mode when the platform runs in **WSL Ubuntu** and TWS/IB Gateway runs
+on Windows: `127.0.0.1:7497` from WSL is the *WSL VM's own loopback*, not the Windows loopback where
+TWS listens, so the connection never reaches TWS (and no approval prompt appears).
+
+Two supported setups:
+
+**A. WSL NAT mode (default) — use the Windows host IP**
+
+WSL reaches the Windows host through the default gateway of its virtual network:
+
+```bash
+# print the Windows host IP as seen from WSL (e.g. 172.20.16.1)
+./scripts/wsl_windows_host.sh
+# or: ip route show default | awk '{print $3}'
+```
+
+Set it in `.env` (or export it — shell exports take precedence over `.env`):
+
+```dotenv
+FUTURESRLX_ENVIRONMENT=paper
+FUTURESRLX_IBKR_HOST=172.20.16.1   # Windows host IP from above
+FUTURESRLX_IBKR_PORT=7497          # 4002 for IB Gateway
+```
+
+In TWS *Global Configuration → API → Settings*: enable *ActiveX and Socket Clients*, use port 7497,
+uncheck *Read-Only API* for trading, and either uncheck *Allow connections from localhost only*
+(add the WSL IP from `hostname -I` to *Trusted IPs*) or accept the incoming-connection prompt when
+it first appears. The NAT gateway IP can change after a WSL restart — rerun the helper.
+
+**B. WSL mirrored networking (recommended for stability)**
+
+On Windows 11 22H2+ with WSL 2.0+ (this machine: Windows 11 build 26300, WSL 3.0.3), make WSL share
+the Windows loopback. Create or edit `C:\Users\<You>\.wslconfig`:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+
+[experimental]
+hostAddressLoopback=true
+```
+
+then in Windows PowerShell:
+
+```powershell
+wsl --shutdown
+```
+
+Restart WSL (and this workspace). `127.0.0.1:7497` then reaches TWS directly, so keep
+`FUTURESRLX_IBKR_HOST=127.0.0.1` in `.env`, and add `127.0.0.1` to TWS *Trusted IPs* to skip the
+prompt.
+
+**Verify the socket explicitly** (this is what triggers TWS's approval prompt):
+
+```bash
+.venv/bin/python - <<'PY'
+import asyncio
+from ib_async import IB
+
+async def main():
+    ib = IB()
+    # NAT mode: Windows host IP. Mirrored mode: 127.0.0.1
+    await ib.connectAsync("172.20.16.1", 7497, clientId=42, timeout=12)
+    print("connected:", ib.managedAccounts(), "server:", ib.client.serverVersion())
+    ib.disconnect()
+
+asyncio.run(main())
+PY
+```
+
+If the connection is refused: TWS is not running/logged in, the API socket is disabled, the port is
+wrong (7497 paper TWS / 4002 paper Gateway / 7496 live TWS / 4001 live Gateway), or Windows
+Firewall blocks the WSL subnet. As Administrator:
+
+```powershell
+New-NetFirewallRule -DisplayName "IBKR API 7497" -Direction Inbound -Protocol TCP -LocalPort 7497 -Action Allow
+```
+
+Shell exports override `.env`: if you previously exported `FUTURESRLX_IBKR_HOST=127.0.0.1`, `unset`
+it or export the host IP in the current terminal. Alternatively run a headless **IB Gateway inside
+Docker in WSL** (`docker compose -f docker/docker-compose.yml up ib-gateway`) and use `127.0.0.1`
+with the Gateway port.
 
 ### IBKR nightly reset
 
