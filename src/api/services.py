@@ -101,6 +101,8 @@ from src.core.types import (
     ContractTargetSet,
     InstrumentId,
     MarketState,
+    OrderEvent,
+    OrderReceipt,
     OrderSide,
     OrderStatus,
     PipelineResult,
@@ -649,6 +651,10 @@ class SimulatedExecutionService:
         self._flatten_in_progress = False
         self._seed_book()
 
+    async def submit_orders(self, orders: Sequence[OrderEvent]) -> list[OrderReceipt]:
+        """Submit delta orders directly to the simulated matching engine."""
+        return [self._broker.place_order(order) for order in orders]
+
     async def flatten_all(self) -> FlattenAllResponse:
         """Market-close every position, cancel orders and lock execution."""
         self._flatten_in_progress = True
@@ -830,6 +836,13 @@ class FixtureExecutionService:
     def reset_paper_state(self) -> None:
         """Reset the arithmetic fixture paper latch (positions are stateless)."""
         self._kill_switch = _KillSwitchState(self._clock)
+
+    async def submit_orders(self, orders: Sequence[OrderEvent]) -> list[OrderReceipt]:
+        """Refuse execution honestly: the fixture adapter has no matching engine."""
+        del orders
+        raise RuntimeError(
+            "fixture execution adapter cannot submit orders; deploy the simulated broker"
+        )
 
     async def flatten_all(self) -> FlattenAllResponse:
         """Deterministically acknowledge a flatten without a broker."""
@@ -1280,6 +1293,10 @@ class IBKRExecutionService:
     def reset_kill_switch(self) -> None:
         """Release the OMS pre-trade kill switch and its persisted latch."""
         self._oms.reset_kill_switch()
+
+    async def submit_orders(self, orders: Sequence[OrderEvent]) -> list[OrderReceipt]:
+        """Submit delta orders through the live OMS (kill-switch/whatIf gated)."""
+        return list(await self._oms.submit_orders(list(orders)))
 
     async def flatten_all(self) -> FlattenAllResponse:
         """Kill switch: live OMS flatten (never a simulated fallback)."""

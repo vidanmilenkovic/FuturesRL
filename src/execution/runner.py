@@ -127,6 +127,7 @@ __all__ = [
     "OfflineMarketStateStreamer",
     "OfflineRunnerSession",
     "OfflineTargetBroker",
+    "RebalanceOnceResult",
     "RunnerConfigError",
     "RunnerNotHydratedError",
     "RunnerStatus",
@@ -164,6 +165,9 @@ OFFLINE_INITIAL_CASH: float = 1_000_000.0
 #: Number of replay states the offline streamer emits (live-loop window after the
 #: hydrated warm-up).
 OFFLINE_REPLAY_STATES: int = 30
+
+#: Hard margin-utilization cap used by the rebalance-once pre-trade projection.
+MARGIN_UTILIZATION_CAP: float = 0.60
 
 #: Default futures roots replayed by ``--offline`` (kept small for a fast demo).
 OFFLINE_DEFAULT_ROOTS: tuple[InstrumentId, ...] = ("ES", "NQ", "CL", "GC", "ZN")
@@ -246,6 +250,45 @@ class RunnerStatus:
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
             "roots": list(self.roots),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RebalanceOnceResult:
+    """Structured result of one ``--rebalance-once`` cycle (no tick stream opened)."""
+
+    mode: str
+    nlv: float | None
+    account_currency: str
+    dry_run: bool
+    halted: bool
+    positions: Mapping[InstrumentId, int]
+    target_contracts: Mapping[InstrumentId, int]
+    proposed_orders: tuple[Mapping[str, object], ...] = ()
+    submitted_orders: tuple[Mapping[str, object], ...] = ()
+    rejected_reasons: tuple[str, ...] = ()
+    margin_utilization: float | None = None
+    tracking_error_pct: float | None = None
+    bridge_published: bool = False
+    message: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        """JSON-serialisable CLI/API representation."""
+        return {
+            "mode": self.mode,
+            "nlv": self.nlv,
+            "account_currency": self.account_currency,
+            "dry_run": self.dry_run,
+            "halted": self.halted,
+            "positions": dict(self.positions),
+            "target_contracts": dict(self.target_contracts),
+            "proposed_orders": [dict(row) for row in self.proposed_orders],
+            "submitted_orders": [dict(row) for row in self.submitted_orders],
+            "rejected_reasons": list(self.rejected_reasons),
+            "margin_utilization": self.margin_utilization,
+            "tracking_error_pct": self.tracking_error_pct,
+            "bridge_published": self.bridge_published,
+            "message": self.message,
         }
 
 
@@ -696,6 +739,188 @@ class TradingRunner:
         receipts = await self._process_state(state)
         self._ended_at = self._clock()
         return receipts
+
+    async def run_rebalance_once(
+        self,
+        roots: Sequence[InstrumentId] | None = None,
+        *,
+        dry_run: bool | None = None,
+    ) -> RebalanceOnceResult:
+        """Hydrate, connect the broker/OMS only, rebalance once and disconnect.
+
+        No market-data streamer is connected or subscribed: the latest hydrated
+        ``MarketState`` is enriched with the live broker NLV/currency, the full
+        ``S_t -> A_t -> T_t -> R_t`` pipeline + translator run once, delta orders are
+        computed against the current book and submitted through the broker's
+        pre-trade-gated surface (unless ``dry_run``). The bridge snapshot is
+        refreshed and the broker session is cleanly closed; the structured result
+        never requires a streamed tick.
+        """
+        resolved_dry_run = self._dry_run if dry_run is None else bool(dry_run)
+        self._reset_counters()
+        self._started_at = self._clock()
+        positions: dict[InstrumentId, int] = {}
+        target_quantities: dict[InstrumentId, int] = {}
+        proposed: list[Mapping[str, object]] = []
+        submitted: list[Mapping[str, object]] = []
+        rejected: list[str] = []
+        margin_utilization: float | None = None
+        tracking_error_pct: float | None = None
+        bridge_published = False
+        message = ""
+        halted = False
+        nlv: float | None = None
+        try:
+            if not self._hydrated:
+                self.warm_start(roots)
+            hydration = self._hydration
+            if hydration is None or not hydration.states:
+                raise RunnerConfigError("rebalance-once requires hydrated market states")
+            self._load_persisted()
+            await self._maybe_connect(self._broker)
+            account_getter = getattr(self._broker, "get_account", None)
+            positions_getter = getattr(self._broker, "get_positions", None)
+            account: AccountSnapshot | None = None
+            broker_positions: Mapping[InstrumentId, Position] = {}
+            if callable(account_getter):
+                account = await cast("Callable[[], Awaitable[AccountSnapshot]]", account_getter)()
+            if callable(positions_getter):
+                broker_positions = await cast(
+                    "Callable[[], Awaitable[Mapping[InstrumentId, Position]]]",
+                    positions_getter,
+                )()
+            positions = {
+                instrument_id: int(position.quantity)
+                for instrument_id, position in broker_positions.items()
+                if int(position.quantity) != 0
+            }
+            nlv = float(account.net_liquidation) if account is not None else None
+            lock_reason = self._current_lock_reason()
+            if lock_reason is not None:
+                halted = True
+                message = f"kill switch engaged: {lock_reason}"
+            elif nlv is None:
+                halted = True
+                message = "broker account NLV unavailable; refusing to rebalance"
+            else:
+                state = replace(
+                    hydration.states[-1],
+                    equity=nlv,
+                    account_currency=self._settings.account_currency,
+                )
+                result = self._pipeline.run(state)
+                self._last_pipeline_result = result
+                self._last_positions = broker_positions
+                targets = result.targets
+                if targets is None and self._translator is not None:
+                    targets = self._translator.translate(result.final_weights, state, equity=nlv)
+                if targets is None:
+                    message = "pipeline produced no contract targets; nothing to rebalance"
+                else:
+                    target_quantities = dict(targets.quantities)
+                    from src.execution.oms import build_orders_from_targets
+
+                    orders = build_orders_from_targets(
+                        targets, positions, state.timestamp, tag="rebalance-once"
+                    )
+                    current_margin = float(account.initial_margin_used) if account else 0.0
+                    cumulative_margin = current_margin
+                    for order in orders:
+                        target = targets.get(order.instrument_id)
+                        impact = (
+                            float(target.initial_margin) * abs(order.quantity)
+                            if target is not None
+                            else 0.0
+                        )
+                        cumulative_margin += impact
+                        utilization = cumulative_margin / nlv
+                        passed = (
+                            not lock_reason
+                            and order.quantity <= self._settings.risk.max_order_contracts
+                            and utilization <= MARGIN_UTILIZATION_CAP
+                        )
+                        reason = None
+                        if not passed:
+                            reason = "pre-trade gate rejected the delta order"
+                        proposed.append(
+                            {
+                                "order_id": order.order_id,
+                                "symbol": target.contract_symbol
+                                if target is not None and target.contract_symbol
+                                else order.instrument_id,
+                                "instrument_id": order.instrument_id,
+                                "side": order.side.value,
+                                "quantity": order.quantity,
+                                "order_type": order.order_type.value,
+                                "est_price": order.limit_price
+                                or (target.price if target is not None else None),
+                                "est_margin_impact": round(impact, 6),
+                                "pre_trade_gate_passed": passed,
+                                "rejection_reason": reason,
+                            }
+                        )
+                        if not passed:
+                            rejected.append(
+                                f"{order.instrument_id}: pre-trade gate rejected the order"
+                            )
+                    margin_utilization = round(min(1.0, cumulative_margin / nlv), 6)
+                    achieved = sum(abs(target.signed_notional) for target in targets) / nlv
+                    target_gross = sum(
+                        abs(weight) for weight in result.final_weights.weights.values()
+                    )
+                    tracking_error_pct = round(abs(target_gross - achieved) * 50.0, 6)
+                    if resolved_dry_run:
+                        message = (
+                            f"dry run: {len(proposed)} delta order(s) proposed, none submitted"
+                        )
+                    else:
+                        receipts = await self._submit_targets(targets, positions, state.timestamp)
+                        for receipt in receipts:
+                            row = {
+                                "order_id": receipt.order_id,
+                                "status": receipt.status.value,
+                                "filled_quantity": receipt.filled_quantity,
+                                "message": receipt.message,
+                            }
+                            if receipt.status is OrderStatus.REJECTED:
+                                rejected.append(
+                                    f"{receipt.order_id}: {receipt.message or 'rejected'}"
+                                )
+                            else:
+                                submitted.append(row)
+                        accepted = len(receipts) - sum(
+                            1 for receipt in receipts if receipt.status is OrderStatus.REJECTED
+                        )
+                        self._orders_submitted += accepted
+                        self._orders_rejected += len(receipts) - accepted
+                        message = f"rebalance submitted {accepted} of {len(receipts)} order(s)"
+                self._write_bridge_snapshot(pipeline_result=result)
+                bridge_published = self._bridge_store is not None
+        except (HydrationError, RunnerConfigError):
+            raise
+        except Exception as exc:
+            halted = True
+            message = f"rebalance-once failed: {type(exc).__name__}: {exc}"
+            logger.exception("rebalance-once failed")
+        finally:
+            await self._disconnect(self._broker)
+            self._ended_at = self._clock()
+        return RebalanceOnceResult(
+            mode=str(self.mode),
+            nlv=nlv,
+            account_currency=self._settings.account_currency,
+            dry_run=resolved_dry_run,
+            halted=halted,
+            positions=positions,
+            target_contracts=target_quantities,
+            proposed_orders=tuple(proposed),
+            submitted_orders=tuple(submitted),
+            rejected_reasons=tuple(rejected),
+            margin_utilization=margin_utilization,
+            tracking_error_pct=tracking_error_pct,
+            bridge_published=bridge_published,
+            message=message,
+        )
 
     # -- account-equity enrichment / warm pipeline prime -----------------------
 
@@ -1744,6 +1969,11 @@ class OfflineRunnerSession:
                 break
         return self._runner.status
 
+    async def run_rebalance_once(self, *, dry_run: bool | None = None) -> RebalanceOnceResult:
+        """Warm-start (if needed) and execute one offline rebalance cycle."""
+        await self.warm_start()
+        return await self._runner.run_rebalance_once(self._roots, dry_run=dry_run)
+
     def snapshot(self) -> RunnerBridgeSnapshot | None:
         """Most recent bridge snapshot (in-memory, else the persisted file)."""
         snapshot = self._runner.last_bridge_snapshot
@@ -1850,6 +2080,19 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="stop after N streamed states (default: run until stopped)",
+    )
+    parser.add_argument(
+        "--rebalance-once",
+        action="store_true",
+        help=(
+            "hydrate, connect the broker/OMS only (no market-data stream), run one "
+            "full pipeline rebalance, publish the bridge snapshot and exit"
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="propose/validate orders without submitting them (rebalance-once)",
     )
     parser.add_argument("--log-level", default=None, help="override the configured log level")
     return parser
@@ -2138,7 +2381,9 @@ def _run_offline(settings: Settings, args: argparse.Namespace) -> RunnerStatus:
     return asyncio.run(_run())
 
 
-def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # pragma: no cover
+def _run_live(  # pragma: no cover - production wiring
+    settings: Settings, args: argparse.Namespace, *, rebalance_once: bool = False
+) -> RunnerStatus | RebalanceOnceResult:
     """Build the production IBKR/Databento wiring lazily and run until stopped."""
     from src.data.ibkr_data import IBKRMarketDataStreamer
     from src.execution.ibkr_client import IBKRConnectionManager
@@ -2199,7 +2444,11 @@ def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # 
         translator=translator,
         risk_overlays=overlays,
     )
-    streamer = IBKRMarketDataStreamer(settings, instrument_master=master)
+    streamer: MarketDataStreamer = (
+        _UnusedStreamer()
+        if rebalance_once
+        else IBKRMarketDataStreamer(settings, instrument_master=master)
+    )
     runner = TradingRunner(
         settings=settings,
         pipeline=pipeline,
@@ -2212,8 +2461,67 @@ def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # 
         state_store=state_store,
         prime_pipeline=True,
         bridge_store=bridge_store,
+        dry_run=bool(getattr(args, "dry_run", False)),
     )
+    if rebalance_once:
+        return asyncio.run(
+            runner.run_rebalance_once(
+                roots=_parse_roots(args.roots), dry_run=bool(getattr(args, "dry_run", False))
+            )
+        )
     return asyncio.run(runner.run(roots=_parse_roots(args.roots), max_states=args.max_states))
+
+
+def _run_rebalance_once(settings: Settings, args: argparse.Namespace) -> RebalanceOnceResult:
+    """One rebalance cycle: broker/OMS only, no tick stream, clean exit."""
+    if args.offline:
+        bridge_store = RunnerBridgeStore(settings) if settings.runner_bridge_enabled else None
+        session = OfflineRunnerSession(
+            settings,
+            strategy_path=_strategy_path(settings, args.strategy),
+            roots=_parse_roots(args.roots),
+            bridge_store=bridge_store,
+        )
+
+        async def _once() -> RebalanceOnceResult:
+            try:
+                return await session.run_rebalance_once(dry_run=bool(args.dry_run))
+            finally:
+                await session.close()
+
+        return asyncio.run(_once())
+    result = _run_live(settings, args, rebalance_once=True)
+    if isinstance(result, RebalanceOnceResult):
+        return result
+    raise RunnerConfigError("rebalance-once production path returned an unexpected status")
+
+
+class _UnusedStreamer:
+    """Placeholder streamer for ``--rebalance-once``: must never be subscribed.
+
+    ``TradingRunner`` requires a streamer at construction, but the rebalance-once
+    workflow only drives the broker/OMS; any attempt to connect/stream raises so a
+    regression that accidentally opens a tick subscription fails loudly.
+    """
+
+    @property
+    def is_connected(self) -> bool:
+        return False
+
+    async def connect(self) -> None:
+        raise RunnerConfigError(
+            "--rebalance-once must not connect the market-data streamer (no tick "
+            "subscriptions); only the broker/OMS is connected"
+        )
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def stream(self) -> AsyncIterator[MarketState]:  # pragma: no cover - guard only
+        raise RunnerConfigError(
+            "--rebalance-once must not stream market data; only the broker/OMS is used"
+        )
+        yield MarketState  # type: ignore[unreachable]  # pragma: no cover
 
 
 def _print_cli_failure(exc: BaseException) -> None:
@@ -2260,6 +2568,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"with --backfill-source={args.backfill_source}; use --backfill-source offline "
                 "or omit it"
             )
+        if args.rebalance_once:
+            result = _run_rebalance_once(settings, args)
+            json.dump(result.as_dict(), sys.stdout, indent=2, sort_keys=True, default=str)
+            sys.stdout.write("\n")
+            return 0 if not result.halted else 1
         status = _run_offline(settings, args) if args.offline else _run_live(settings, args)
     except (HydrationError, RunnerConfigError) as exc:
         _print_cli_failure(exc)

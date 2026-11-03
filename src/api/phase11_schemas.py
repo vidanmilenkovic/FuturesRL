@@ -1,0 +1,133 @@
+"""Phase-11A rebalance preview/execute REST contract (dashboard runner book)."""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Literal
+
+from pydantic import Field
+
+from src.api.schemas import APIModel, StrictModel
+
+__all__ = [
+    "RebalanceExecuteRequest",
+    "RebalanceExecuteResponse",
+    "RebalanceFillRow",
+    "RebalanceOrderRow",
+    "RebalancePositionRow",
+    "RebalancePreviewRequest",
+    "RebalancePreviewResponse",
+    "RebalanceTargetRow",
+]
+
+type RebalanceMode = Literal["ibkr-paper", "offline"]
+
+
+class RebalancePreviewRequest(StrictModel):
+    """``POST /api/runner/rebalance-preview`` body."""
+
+    strategy_id: str = Field(min_length=1, max_length=128)
+    roots: list[str] | None = None
+    dry_run: bool = True
+
+
+class RebalanceExecuteRequest(StrictModel):
+    """``POST /api/runner/rebalance-execute`` body."""
+
+    strategy_id: str = Field(min_length=1, max_length=128)
+    roots: list[str] | None = None
+    #: Mandatory confirmation; ``false`` returns 400 (no orders are submitted).
+    confirm: bool = True
+
+
+class RebalancePositionRow(APIModel):
+    """One current broker position."""
+
+    instrument_id: str
+    quantity: int
+    average_price: float
+    market_price: float
+    multiplier: float
+    signed_notional: float
+    initial_margin: float
+    contract_symbol: str | None = None
+
+
+class RebalanceTargetRow(APIModel):
+    """One discrete target contract leg produced by the translator."""
+
+    instrument_id: str
+    quantity: int
+    price: float
+    multiplier: float
+    initial_margin: float
+    signed_notional: float
+    contract_symbol: str | None = None
+    expiration: date | None = None
+
+
+class RebalanceOrderRow(APIModel):
+    """One proposed/executed delta order with its pre-trade gate verdict."""
+
+    order_id: str
+    symbol: str
+    instrument_id: str
+    side: Literal["BUY", "SELL"]
+    quantity: int
+    order_type: str = "MARKET"
+    est_price: float | None = None
+    est_margin_impact: float = 0.0
+    pre_trade_gate_passed: bool = True
+    rejection_reason: str | None = None
+
+
+class RebalanceFillRow(APIModel):
+    """One execution report returned by ``/rebalance-execute``."""
+
+    order_id: str
+    instrument_id: str
+    side: Literal["BUY", "SELL"]
+    quantity: int
+    price: float
+    commission: float = 0.0
+    status: str = "FILLED"
+    timestamp: datetime | None = None
+
+
+class RebalancePreviewResponse(APIModel):
+    """``POST /api/runner/rebalance-preview`` response (submits nothing)."""
+
+    strategy_id: str
+    account_nlv: float
+    account_currency: str
+    current_positions: list[RebalancePositionRow] = Field(default_factory=list)
+    target_contracts: list[RebalanceTargetRow] = Field(default_factory=list)
+    proposed_orders: list[RebalanceOrderRow] = Field(default_factory=list)
+    projected_margin_utilization: float = 0.0
+    margin_utilization_cap: float = 0.60
+    tracking_error_pct: float = 0.0
+    mode: RebalanceMode = "offline"
+    generated_at: datetime
+    strategy_roots: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class RebalanceExecuteResponse(APIModel):
+    """``POST /api/runner/rebalance-execute`` response."""
+
+    strategy_id: str
+    mode: RebalanceMode = "offline"
+    status: Literal["submitted", "no-op", "idempotent-replay"] = "submitted"
+    submitted_order_ids: list[str] = Field(default_factory=list)
+    orders: list[RebalanceOrderRow] = Field(default_factory=list)
+    fills: list[RebalanceFillRow] = Field(default_factory=list)
+    rejected_orders: list[RebalanceOrderRow] = Field(default_factory=list)
+    account_nlv: float
+    account_currency: str
+    projected_margin_utilization: float = 0.0
+    margin_utilization_cap: float = 0.60
+    tracking_error_pct: float = 0.0
+    updated_positions: list[RebalancePositionRow] = Field(default_factory=list)
+    bridge_updated: bool = False
+    message: str = ""
+    generated_at: datetime

@@ -2,13 +2,55 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from typing import Annotated, cast
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from src.api.deps import LiveDep
 from src.api.live import RunnerSessionUnavailableError
+from src.api.phase11_schemas import (
+    RebalanceExecuteRequest,
+    RebalanceExecuteResponse,
+    RebalancePreviewRequest,
+    RebalancePreviewResponse,
+)
+from src.api.rebalance_service import RebalanceError, RebalanceService
 from src.api.schemas import RunnerStatusResponse, RunnerStepRequest, RunnerStepResponse
 
 router = APIRouter(tags=["runner"])
+
+
+def get_rebalance_service(request: Request) -> RebalanceService:
+    """Return (and cache) the Phase-11A rebalance preview/execute service.
+
+    Tests can inject ``app.state.rebalance_service`` with fakes; production builds
+    it from the live container (settings/market/catalog/execution/clock).
+    """
+    injected = getattr(request.app.state, "rebalance_service", None)
+    if (
+        injected is not None
+        and callable(getattr(injected, "preview", None))
+        and callable(getattr(injected, "execute", None))
+    ):
+        return cast(RebalanceService, injected)
+    container = getattr(request.app.state, "container", None)
+    if container is None:  # pragma: no cover - create_app always builds a container
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="service container is unavailable",
+        )
+    service = RebalanceService(
+        settings=cast("object", container.settings),  # type: ignore[arg-type]
+        market=container.market,
+        catalog=container.strategies,
+        execution=container.execution,
+        clock=container.clock,
+    )
+    request.app.state.rebalance_service = service
+    return service
+
+
+RebalanceDep = Annotated[RebalanceService, Depends(get_rebalance_service)]
 
 
 @router.get(
@@ -63,3 +105,59 @@ async def runner_step(payload: RunnerStepRequest, live: LiveDep) -> RunnerStepRe
 async def runner_reset(live: LiveDep) -> RunnerStatusResponse:
     """Close the offline runner session and return the status."""
     return await live.runner_reset()
+
+
+@router.post(
+    "/runner/rebalance-preview",
+    response_model=RebalancePreviewResponse,
+    summary="Preview the next runner rebalance (no orders submitted)",
+    description=(
+        "Hydrates the latest state with the current broker NLV/currency/positions, runs "
+        "the full S->A->T->R pipeline + contract translator, computes delta orders against "
+        "the current book and reports the per-order pre-trade gate verdict, projected "
+        "margin utilization (60% cap), tracking error and mode (``ibkr-paper`` when a "
+        "connected IBKR paper adapter is active, else ``offline``). Never submits orders."
+    ),
+    responses={
+        404: {"description": "Unknown strategy id"},
+        422: {"description": "Invalid strategy/roots payload"},
+        503: {"description": "Execution book unavailable"},
+    },
+)
+async def rebalance_preview(
+    payload: RebalancePreviewRequest, rebalance: RebalanceDep
+) -> RebalancePreviewResponse:
+    """Run the full pipeline and return proposed delta orders (no submission)."""
+    try:
+        return await rebalance.preview(payload)
+    except RebalanceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post(
+    "/runner/rebalance-execute",
+    response_model=RebalanceExecuteResponse,
+    summary="Execute the next runner rebalance (paper/offline only)",
+    description=(
+        "Recomputes the preview plan and submits ONLY gate-approved delta orders through "
+        "the active paper OMS (IBKR paper when connected) or the simulated broker, "
+        "refreshes the book and publishes a RunnerBridgeStore snapshot. ``confirm=true`` "
+        "is required. Returns 409 in the live environment, for unsafe/unconnected IBKR "
+        "sessions, or when a fixture-only offline adapter cannot execute; repeated "
+        "identical executions are idempotent (no duplicate submission)."
+    ),
+    responses={
+        400: {"description": "Missing confirmation"},
+        404: {"description": "Unknown strategy id"},
+        409: {"description": "Live/unsafe execution or no executable adapter"},
+        422: {"description": "Invalid strategy/roots payload"},
+    },
+)
+async def rebalance_execute(
+    payload: RebalanceExecuteRequest, rebalance: RebalanceDep
+) -> RebalanceExecuteResponse:
+    """Execute the approved rebalance delta through the active safe adapter."""
+    try:
+        return await rebalance.execute(payload)
+    except RebalanceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
