@@ -30,7 +30,7 @@ import inspect
 import logging
 import math
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from typing import Any, Protocol, cast
@@ -49,6 +49,7 @@ from src.core.types import (
 )
 from src.data import schema as s
 from src.data.contracts import next_contract_expiration, parse_contract_symbol
+from src.data.ibkr_contracts import FrontFuture, build_front_contract, qualify_front_future
 from src.data.schema import validate_roots
 
 __all__ = ["IBKRHistoricalBarFetcher", "IBKRMarketDataStreamer"]
@@ -65,6 +66,31 @@ MARKET_DEPTH_LEVELS: int = 10
 DEFAULT_STREAM_ROOTS: tuple[InstrumentId, ...] = ("ES", "NQ", "CL", "GC", "ZN")
 
 type SleepFunction = Callable[[float], Awaitable[None]]
+
+#: Injectable delayed/historical fallback feed for roots whose real-time
+#: subscriptions are not permitted: (roots, start, end) -> bar-like rows/frame.
+type DelayedBarSource = Callable[[Sequence[InstrumentId], datetime, datetime], Awaitable[object]]
+
+#: IBKR error codes meaning "no/insufficient market-data permission" for the
+#: requested tick/depth subscriptions (10189 no permissions, 10090 partial
+#: subscription, 354 not subscribed).
+MARKET_DATA_PERMISSION_ERROR_CODES: frozenset[int] = frozenset({10189, 10090, 354})
+
+#: IBKR error strings that accompany the permission codes above.
+_MARKET_DATA_PERMISSION_TOKENS: tuple[str, ...] = (
+    "10189",
+    "10090",
+    "354",
+    "market data permission",
+    "market-data permission",
+    "not subscribed",
+    "no market data permissions",
+)
+
+#: Default interval (seconds) between delayed/historical fallback polls.
+DEFAULT_DELAYED_POLL_INTERVAL_SECONDS: float = 60.0
+_DELAYED_HISTORICAL_DURATION = "1 D"
+_DELAYED_HISTORICAL_BAR_SIZE = "1 min"
 
 
 class _IBClient(Protocol):
@@ -96,6 +122,10 @@ class _IBClient(Protocol):
         before any ``reqRealTimeBars``/``reqTickByTickData``/``reqMktData``/
         ``reqMktDepth`` call (unqualified IBKR contracts cannot be hashed).
         """
+        ...
+
+    def reqMarketDataType(self, market_data_type: int) -> None:  # noqa: N802
+        """Select the IBKR market-data type (1 live, 2 frozen, 3 delayed, 4 delayed-frozen)."""
         ...
 
     def reqRealTimeBars(  # noqa: N802
@@ -237,6 +267,9 @@ class IBKRMarketDataStreamer:
         contract_factory: Callable[[InstrumentId], object] | None = None,
         sleep: SleepFunction | None = None,
         queue_maxsize: int = 1024,
+        clock: Callable[[], datetime] | None = None,
+        delayed_poll_interval_seconds: float | None = DEFAULT_DELAYED_POLL_INTERVAL_SECONDS,
+        delayed_bar_source: DelayedBarSource | None = None,
     ) -> None:
         self._settings = settings if settings is not None else get_settings()
         self._roots = validate_roots(tuple(roots) if roots is not None else DEFAULT_STREAM_ROOTS)
@@ -250,9 +283,22 @@ class IBKRMarketDataStreamer:
         self._states: dict[InstrumentId, _BarState] = {root: _BarState() for root in self._roots}
         self._latest_state: MarketState | None = None
         self._contracts: dict[InstrumentId, object] = {}
+        self._front_futures: dict[InstrumentId, FrontFuture] = {}
         self._subscriptions: dict[InstrumentId, tuple[object, object, object, object]] = {}
         self._subscription_roots: dict[int, InstrumentId] = {}
         self._backoff_delays: list[float] = []
+        self._clock: Callable[[], datetime] = (
+            clock if clock is not None else lambda: datetime.now(UTC)
+        )
+        self._contract_cache: dict[tuple[str, str], FrontFuture] = {}
+        self._degraded_roots: set[InstrumentId] = set()
+        self._fallback_reasons: dict[InstrumentId, str] = {}
+        self._delayed_poll_interval = delayed_poll_interval_seconds
+        self._delayed_bar_source = delayed_bar_source
+        self._delayed_poll_task: asyncio.Task[None] | None = None
+        self._delayed_polling_unsupported = False
+        self._requested_market_data_type: int | None = None
+        self._market_data_type_error: str | None = None
 
     # -- introspection ---------------------------------------------------------
 
@@ -282,6 +328,47 @@ class IBKRMarketDataStreamer:
         return tuple(self._backoff_delays)
 
     @property
+    def fallback_active(self) -> bool:
+        """Whether any root is degraded to delayed/historical polling."""
+        return bool(self._degraded_roots)
+
+    @property
+    def fallback_roots(self) -> tuple[InstrumentId, ...]:
+        """Roots currently served through the delayed/historical fallback."""
+        return tuple(sorted(self._degraded_roots))
+
+    def diagnostics(self) -> dict[str, object]:
+        """JSON-friendly market-data diagnostics (fallback status, market-data type)."""
+        polling = self._delayed_poll_task is not None and not self._delayed_poll_task.done()
+        return {
+            "connected": self.is_connected,
+            "market_data_type": {
+                "configured": int(self._settings.ibkr_market_data_type),
+                "requested": self._requested_market_data_type,
+                "error": self._market_data_type_error,
+            },
+            "market_data_fallback": {
+                "active": bool(self._degraded_roots),
+                "roots": sorted(self._degraded_roots),
+                "reasons": dict(self._fallback_reasons),
+                "polling": polling,
+                "poll_interval_seconds": self._delayed_poll_interval,
+                "unsupported": self._delayed_polling_unsupported,
+            },
+            "subscriptions": sorted(self._subscriptions),
+            "qualified_contracts": {
+                root: front.to_dict() for root, front in sorted(self._front_futures.items())
+            },
+        }
+
+    def _now(self) -> datetime:
+        """Current timestamp from the injectable clock, normalised to UTC."""
+        moment = self._clock()
+        if not isinstance(moment, datetime):
+            raise TypeError(f"clock must return a datetime, got {type(moment)!r}")
+        return ensure_utc(moment)
+
+    @property
     def instrument_master(self) -> InstrumentsConfig:
         """Instrument master used for IBKR exchange/currency resolution."""
         if self._master is None:
@@ -299,19 +386,27 @@ class IBKRMarketDataStreamer:
         client = self._client if self._client is not None else self._create_client()
         await self._connect_with_backoff(client)
         self._client = client
+        self._reset_fallback_state()
+        self._front_futures.clear()
+        await self._request_market_data_type(client)
+        # Attach error handlers before subscribing so asynchronous IBKR permission
+        # errors emitted during subscription setup are already routed to fallback.
+        self._attach_events(client)
         try:
             await self._subscribe(client)
         except Exception:
             # A subscription failure must not leave a half-initialised session:
             # tear the connection down so a later retry/heartbeat starts cleanly.
+            self._stop_fallback_polling()
+            self._reset_fallback_state()
             self._client = None
             self._contracts.clear()
+            self._front_futures.clear()
             self._subscriptions.clear()
             self._subscription_roots.clear()
             with contextlib.suppress(Exception):
                 client.disconnect()
             raise
-        self._attach_events(client)
         self._stream_closed = False
         # A previous disconnect may have enqueued the termination sentinel.
         while not self._queue.empty():
@@ -351,6 +446,9 @@ class IBKRMarketDataStreamer:
 
     async def reconnect(self) -> None:
         """Tear down the current session (if any) and reconnect with backoff."""
+        self._stop_fallback_polling()
+        self._reset_fallback_state()
+        self._front_futures.clear()
         if self._client is not None:
             self._cancel_subscriptions(self._client)
             with contextlib.suppress(Exception):
@@ -363,6 +461,9 @@ class IBKRMarketDataStreamer:
 
     async def disconnect(self) -> None:
         """Cancel every subscription and close the session (terminates ``stream``)."""
+        self._stop_fallback_polling()
+        self._reset_fallback_state()
+        self._front_futures.clear()
         client = self._client
         if client is not None:
             self._cancel_subscriptions(client)
@@ -395,117 +496,363 @@ class IBKRMarketDataStreamer:
 
     # -- subscriptions / event plumbing ---------------------------------------
 
-    def _contract_for(self, root: InstrumentId) -> object:
-        """Resolve the IBKR contract for ``root`` (injected or real ``ib_async.Future``)."""
-        if self._contract_factory is not None:
-            return self._contract_factory(root)
-        try:
-            import ib_async
-        except ImportError as exc:  # pragma: no cover - SDK installed in CI
-            raise RuntimeError(
-                "The ib_async SDK is not installed; install the optional live extra "
-                "(`pip install 'futuresrl-x[live]'`) or inject a contract_factory."
-            ) from exc
-        spec = self._spec_or_none(root)
-        exchange = spec.ibkr_exchange if spec is not None else "CME"
-        currency = spec.currency if spec is not None else "USD"
-        return ib_async.Future(symbol=root, exchange=exchange, currency=currency)
+    def _contract_for(self, root: InstrumentId, *, reference: datetime | None = None) -> object:
+        """Resolve the explicit front-month IBKR contract for ``root``.
+
+        Never returns a bare ``Future``: the contract always carries an explicit
+        ``lastTradeDateOrContractMonth`` derived from the instrument roll rules
+        (or the injected ``contract_factory`` for tests/legacy adapters).
+        """
+        contract, _month, _expiration = build_front_contract(
+            root,
+            reference=reference if reference is not None else self._now(),
+            instrument_master=self._master,
+            raw_contract_factory=self._contract_factory,
+        )
+        return contract
 
     async def _subscribe(self, client: _IBClient) -> None:
-        """Qualify every contract, then subscribe to bars/ticks/L1/L2 market data.
+        """Qualify every front-month contract first, then subscribe per root.
 
-        IBKR market-data requests can only be issued with a **qualified**
-        contract (one carrying a ``conId``); the unqualified contract would raise
-        ``ValueError: Contract ... can't be hashed because no 'conId' value
-        exists``. Each root is therefore resolved with
-        ``await client.qualifyContractsAsync(contract)`` first and only the
-        returned qualified contract is used for subscription, cancellation and
-        event attribution. A root that cannot be resolved is skipped with a
-        warning; if no root resolves, an aggregate actionable error is raised and
-        no subscription is made.
+        Contracts are resolved through :func:`src.data.ibkr_contracts.qualify_front_future`
+        (explicit contract month + conId verification + per-month cache), never a
+        bare ``Future``. If a root cannot be qualified it is skipped with an
+        actionable warning; if no root qualifies an aggregate error is raised.
+
+        Real-time tick/depth requests may be rejected for account/market-data
+        permission reasons (synchronous exceptions or asynchronous IBKR error
+        codes 10189/10090/354). Those roots are **not** allowed to crash the
+        streamer: their paid subscriptions are cancelled, the root is marked
+        degraded and served through delayed/historical polling instead while the
+        remaining roots keep their real-time subscriptions.
         """
         failures: list[str] = []
+        qualified: dict[InstrumentId, FrontFuture] = {}
         for root in self._roots:
-            raw_contract = self._contract_for(root)
-            qualified = await self._qualify_contract(client, root, raw_contract)
-            if qualified is None:
-                failure = self._qualification_error(root, raw_contract)
-                logger.warning("%s; skipping market-data subscription", failure)
-                failures.append(failure)
+            try:
+                front = await qualify_front_future(
+                    client,
+                    root,
+                    reference=self._now(),
+                    cache=self._contract_cache,
+                    instrument_master=self._master,
+                    raw_contract_factory=self._contract_factory,
+                )
+            except RuntimeError as exc:
+                failures.append(str(exc))
+                logger.warning("%s; skipping market-data subscription", exc)
                 continue
-            self._contracts[root] = qualified
-            bars = client.reqRealTimeBars(qualified, BAR_INTERVAL_SECONDS, "TRADES", False)
-            ticks = client.reqTickByTickData(qualified, "AllLast", 0, False)
-            quotes = client.reqMktData(qualified, "", False, False)
-            depth = client.reqMktDepth(qualified, MARKET_DEPTH_LEVELS, False)
+            qualified[root] = front
+            self._front_futures[root] = front
+            self._contracts[root] = front.contract
+        if not qualified:
+            raise RuntimeError(
+                "IBKR could not qualify any market-data contract; no subscriptions were "
+                "made. " + " | ".join(failures)
+            )
+        for root, front in qualified.items():
+            created: list[tuple[str, object]] = []
+            try:
+                bars = client.reqRealTimeBars(front.contract, BAR_INTERVAL_SECONDS, "TRADES", False)
+                created.append(("bars", bars))
+                ticks = client.reqTickByTickData(front.contract, "AllLast", 0, False)
+                created.append(("ticks", ticks))
+                quotes = client.reqMktData(front.contract, "", False, False)
+                created.append(("quotes", quotes))
+                depth = client.reqMktDepth(front.contract, MARKET_DEPTH_LEVELS, False)
+                created.append(("depth", depth))
+            except Exception as exc:
+                self._cancel_created_subscriptions(client, root, created)
+                reason = (
+                    f"market-data permission denied for {root!r}: {exc}"
+                    if _is_market_data_permission_error(exc)
+                    else f"market-data subscription failed for {root!r}: {exc}"
+                )
+                logger.warning("%s; switching %r to delayed/historical polling", reason, root)
+                self._degrade_root(root, reason)
+                continue
             self._subscriptions[root] = (bars, ticks, quotes, depth)
             for subscription in (bars, ticks, quotes, depth):
                 req_id = getattr(subscription, "reqId", None)
                 if isinstance(req_id, int):
                     self._subscription_roots[req_id] = root
-        if failures and len(failures) == len(self._roots):
-            raise RuntimeError(
-                "IBKR could not qualify any market-data contract; no subscriptions were "
-                "made. " + " | ".join(failures)
-            )
+        if self._degraded_roots:
+            self._ensure_fallback_polling()
 
-    async def _qualify_contract(
-        self, client: _IBClient, root: InstrumentId, contract: object
-    ) -> object | None:
-        """Resolve ``contract`` to a qualified conId-bearing contract (or ``None``).
-
-        Real ``ib_async.IB`` clients expose ``qualifyContractsAsync`` (preferred);
-        a synchronous ``qualifyContracts`` is awaited if returned; duck-typed
-        legacy/fake clients without either method keep the raw contract so the
-        offline test harness remains usable.
-        """
-        async_method = getattr(client, "qualifyContractsAsync", None)
-        method = (
-            async_method if callable(async_method) else getattr(client, "qualifyContracts", None)
-        )
-        if not callable(method):
+    async def _request_market_data_type(self, client: _IBClient) -> None:
+        """Request the configured IBKR market-data type on connect (fake-safe)."""
+        configured = int(self._settings.ibkr_market_data_type)
+        setter = getattr(client, "reqMarketDataType", None)
+        self._market_data_type_error = None
+        if not callable(setter):
             logger.debug(
-                "IBKR client has no contract-qualification API; using the raw contract for "
-                "root %r (duck-typed legacy/fake client)",
-                root,
+                "IBKR client has no reqMarketDataType support; keeping the session default"
             )
-            return contract
+            self._requested_market_data_type = configured
+            return
         try:
-            result = method(contract)
+            result = setter(configured)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            self._market_data_type_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("IBKR reqMarketDataType(%d) failed: %s", configured, exc)
+            return
+        self._requested_market_data_type = configured
+
+    # -- delayed / historical fallback polling --------------------------------
+
+    async def poll_delayed_roots(
+        self, roots: Sequence[InstrumentId] | None = None
+    ) -> dict[str, int]:
+        """Poll one delayed/historical snapshot per degraded root.
+
+        Each polled bar is fed through the existing :meth:`ingest_bar` /
+        :meth:`ingest_quote` path, so degraded roots keep producing
+        :class:`~src.core.types.MarketState` updates without real-time
+        subscriptions. Returns ``{root: rows_ingested}``.
+        """
+        client = self._client
+        if client is None:
+            return {}
+        targets = tuple(sorted(self._degraded_roots)) if roots is None else tuple(roots)
+        ingested: dict[str, int] = {}
+        for root in targets:
+            try:
+                rows = await self._fetch_delayed_rows(client, root)
+            except Exception as exc:
+                logger.warning("IBKR delayed fallback poll failed for %r: %s", root, exc)
+                continue
+            latest = _latest_delayed_row(rows)
+            if latest is None:
+                ingested[root] = 0
+                continue
+            self._ingest_delayed_row(root, latest)
+            ingested[root] = 1
+        return ingested
+
+    async def _fetch_delayed_rows(self, client: _IBClient, root: InstrumentId) -> list[object]:
+        """Fetch delayed/historical rows for ``root`` (injected feed or IBKR history)."""
+        end = self._now()
+        start = end - timedelta(days=1)
+        if self._delayed_bar_source is not None:
+            result = await self._delayed_bar_source((root,), start, end)
+            return _normalise_delayed_rows(result)
+        contract = self._contracts.get(root)
+        if contract is None:
+            front = self._front_futures.get(root)
+            contract = front.contract if front is not None else self._contract_for(root)
+        history = getattr(client, "reqHistoricalDataAsync", None)
+        if not callable(history):
+            if not self._delayed_polling_unsupported:
+                self._delayed_polling_unsupported = True
+                logger.warning(
+                    "IBKR delayed fallback for %r is unavailable: the client has no "
+                    "reqHistoricalDataAsync and no delayed_bar_source was injected",
+                    root,
+                )
+            return []
+        try:
+            result = history(
+                contract,
+                end,
+                _DELAYED_HISTORICAL_DURATION,
+                _DELAYED_HISTORICAL_BAR_SIZE,
+                "TRADES",
+                False,
+                2,
+                False,
+            )
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
-            logger.warning("IBKR contract qualification failed for root %r: %s", root, exc)
-            return None
-        return _first_qualified_contract(result)
+            logger.warning("IBKR delayed history request failed for %r: %s", root, exc)
+            return []
+        return _normalise_delayed_rows(result)
 
-    def _qualification_error(self, root: InstrumentId, contract: object) -> str:
-        """Actionable error text for one unqualifiable root."""
-        spec = self._spec_or_none(root)
-        exchange = (
-            spec.ibkr_exchange
-            if spec is not None
-            else (getattr(contract, "exchange", None) or "unknown exchange")
+    def _ingest_delayed_row(self, root: InstrumentId, row: object) -> None:
+        """Feed one delayed/historical row through the existing ingest path."""
+        timestamp = _bar_timestamp(_row_field(row, "timestamp_utc", "timestamp", "date", "time"))
+        timestamp = timestamp if timestamp is not None else self._now()
+        close = _positive_float(_row_field(row, "close", "price", "last"))
+        if close is None:
+            return
+        bid = _positive_float(_row_field(row, "bid_px", "bid", "bidPrice"))
+        ask = _positive_float(_row_field(row, "ask_px", "ask", "askPrice"))
+        if bid is not None and ask is not None and bid <= ask:
+            self.ingest_quote(
+                root,
+                timestamp=timestamp,
+                bid=bid,
+                ask=ask,
+                bid_size=_finite_float(_row_field(row, "bid_sz", "bidSize")) or 0.0,
+                ask_size=_finite_float(_row_field(row, "ask_sz", "askSize")) or 0.0,
+            )
+        open_price = _positive_float(_row_field(row, "open")) or close
+        high = max(_positive_float(_row_field(row, "high")) or close, open_price, close)
+        low = min(_positive_float(_row_field(row, "low")) or close, open_price, close)
+        volume = _finite_float(_row_field(row, "volume")) or 0.0
+        try:
+            self.ingest_bar(
+                root,
+                timestamp=timestamp,
+                open=open_price,
+                high=high,
+                low=low,
+                close=close,
+                volume=max(volume, 0.0),
+            )
+        except ValueError as exc:
+            logger.debug("ignoring unusable delayed bar for %r: %s", root, exc)
+
+    def _degrade_root(self, root: InstrumentId, reason: str) -> None:
+        """Mark ``root`` degraded, cancel its subscriptions and start fallback polling."""
+        self._fallback_reasons.setdefault(root, reason)
+        if root in self._degraded_roots:
+            return
+        self._degraded_roots.add(root)
+        client = self._client
+        if client is not None:
+            self._cancel_root_subscriptions(client, root)
+        logger.warning(
+            "IBKR market data degraded for root %r (%s); serving it via delayed/historical polling",
+            root,
+            reason,
         )
-        return (
-            f"IBKR could not resolve a conId for root {root!r} on {exchange}; "
-            "check the contract month/exchange and TWS market-data subscriptions"
+        self._ensure_fallback_polling()
+
+    def _reset_fallback_state(self) -> None:
+        """Reset degraded/fallback state (called on connect/disconnect)."""
+        self._stop_fallback_polling()
+        self._degraded_roots.clear()
+        self._fallback_reasons.clear()
+        self._delayed_polling_unsupported = False
+        self._requested_market_data_type = None
+        self._market_data_type_error = None
+
+    def _ensure_fallback_polling(self) -> None:
+        """Start the background delayed/historical polling loop when possible."""
+        interval = self._delayed_poll_interval
+        if not self._degraded_roots or interval is None or interval <= 0.0:
+            return
+        if self._delayed_poll_task is not None and not self._delayed_poll_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._delayed_poll_task = loop.create_task(self._delayed_poll_loop())
+
+    async def _delayed_poll_loop(self) -> None:
+        """Background loop polling degraded roots until disconnect/recovery."""
+        interval = float(self._delayed_poll_interval or 0.0)
+        try:
+            while self._client is not None and self._degraded_roots:
+                try:
+                    await self.poll_delayed_roots()
+                except Exception as exc:
+                    logger.warning("IBKR delayed fallback poll loop error: %s", exc)
+                await self._sleep(interval)
+        finally:
+            self._delayed_poll_task = None
+
+    def _stop_fallback_polling(self) -> None:
+        """Cancel the background delayed/historical polling task (idempotent)."""
+        task = self._delayed_poll_task
+        self._delayed_poll_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _cancel_created_subscriptions(
+        self,
+        client: _IBClient,
+        root: InstrumentId,
+        created: Sequence[tuple[str, object]],
+    ) -> None:
+        """Best-effort cancellation of subscriptions created before a failure."""
+        front = self._front_futures.get(root)
+        contract = self._contracts.get(root) or (
+            front.contract if front is not None else self._contract_for(root)
         )
+        for kind, handle in created:
+            with contextlib.suppress(Exception):
+                if kind == "bars":
+                    client.cancelRealTimeBars(handle)
+                elif kind == "ticks":
+                    client.cancelTickByTickData(contract, "AllLast")
+                elif kind == "quotes":
+                    client.cancelMktData(contract)
+                elif kind == "depth":
+                    client.cancelMktDepth(contract, False)
+
+    def _cancel_root_subscriptions(self, client: _IBClient, root: InstrumentId) -> None:
+        """Cancel every real-time subscription of one degraded root."""
+        subscriptions = self._subscriptions.pop(root, None)
+        if subscriptions is not None:
+            front = self._front_futures.get(root)
+            contract = self._contracts.get(root) or (
+                front.contract if front is not None else self._contract_for(root)
+            )
+            self._cancel_handles(client, subscriptions, contract)
+        for req_id, mapped_root in list(self._subscription_roots.items()):
+            if mapped_root == root:
+                self._subscription_roots.pop(req_id, None)
+
+    def _cancel_handles(
+        self,
+        client: _IBClient,
+        subscriptions: tuple[object, object, object, object],
+        contract: object,
+    ) -> None:
+        """Cancel the four real-time subscriptions of one root (best effort)."""
+        bars = subscriptions[0]
+        cancellations: list[Callable[[], None]] = [
+            partial(client.cancelRealTimeBars, bars),
+            partial(client.cancelTickByTickData, contract, "AllLast"),
+            partial(client.cancelMktData, contract),
+            partial(client.cancelMktDepth, contract, False),
+        ]
+        for cancel in cancellations:
+            with contextlib.suppress(Exception):
+                cancel()
+
+    def _on_error_event(self, *args: object) -> None:
+        """Handle IBKR ``errorEvent`` permission errors by degrading the root.
+
+        ``ib_async`` emits ``errorEvent(reqId, errorCode, errorString, contract)``;
+        codes 10189/10090/354 mean the tick/depth subscription is not permitted and
+        must switch that root to the delayed/historical fallback instead of
+        crashing the streamer.
+        """
+        if len(args) < 2:
+            return
+        if len(args) >= 3:
+            req_id_raw, code_raw, message = args[0], args[1], args[2]
+            contract = args[3] if len(args) > 3 else None
+        else:
+            req_id_raw, code_raw, message, contract = None, args[0], args[1], None
+        try:
+            code = int(cast(int, code_raw))
+        except (TypeError, ValueError):
+            return
+        if code not in MARKET_DATA_PERMISSION_ERROR_CODES:
+            return
+        req_id = req_id_raw if isinstance(req_id_raw, int) else None
+        root = self._subscription_roots.get(req_id) if req_id is not None else None
+        if root is None and contract is not None:
+            root = self._root_for(contract)
+        if root is None or root not in self._states:
+            return
+        self._degrade_root(root, f"IBKR error {code}: {message}")
 
     def _cancel_subscriptions(self, client: _IBClient) -> None:
         """Best-effort cancellation of every subscription of ``client``."""
-        for root, subscriptions in self._subscriptions.items():
-            bars = subscriptions[0]
-            contract = self._contracts.get(root) or self._contract_for(root)
-            cancellations: list[Callable[[], None]] = [
-                partial(client.cancelRealTimeBars, bars),
-                partial(client.cancelTickByTickData, contract, "AllLast"),
-                partial(client.cancelMktData, contract),
-                partial(client.cancelMktDepth, contract, False),
-            ]
-            for cancel in cancellations:
-                with contextlib.suppress(Exception):
-                    cancel()
+        for root, subscriptions in list(self._subscriptions.items()):
+            front = self._front_futures.get(root)
+            contract = self._contracts.get(root) or (
+                front.contract if front is not None else self._contract_for(root)
+            )
+            self._cancel_handles(client, subscriptions, contract)
 
     def _attach_events(self, client: _IBClient) -> None:
         """Attach the ib_async event handlers (no-op for clients without events)."""
@@ -515,6 +862,8 @@ class IBKRMarketDataStreamer:
             ("pendingTickersEvent", self._on_pending_tickers_event),
             ("updateMktDepthEvent", self._on_market_depth_event),
             ("updateMktDepthL2Event", self._on_market_depth_event),
+            ("errorEvent", self._on_error_event),
+            ("error", self._on_error_event),
         )
         for name, handler in handlers:
             signal = getattr(client, name, None)
@@ -842,6 +1191,64 @@ def _imbalance(bid_size: float, ask_size: float) -> float:
     return (bid_size - ask_size) / total
 
 
+def _row_field(row: object, *names: str) -> object:
+    """Read the first non-null field from a mapping or object row."""
+    if isinstance(row, Mapping):
+        for name in names:
+            value = row.get(name)
+            if value is not None:
+                return value
+        return None
+    for name in names:
+        value = getattr(row, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalise_delayed_rows(result: object) -> list[object]:
+    """Normalise a delayed/historical polling result into a list of row objects."""
+    if result is None:
+        return []
+    if isinstance(result, pl.DataFrame):
+        return list(result.iter_rows(named=True))
+    if isinstance(result, (list, tuple)):
+        return list(result)
+    try:
+        return list(cast(Iterable[object], result))
+    except TypeError:
+        return [result]
+
+
+def _latest_delayed_row(rows: Sequence[object]) -> object | None:
+    """Return the newest parseable row of a delayed/historical poll (or ``None``)."""
+    latest: object | None = None
+    latest_timestamp: datetime | None = None
+    for row in rows:
+        timestamp = _bar_timestamp(_row_field(row, "timestamp_utc", "timestamp", "date", "time"))
+        if timestamp is None:
+            if latest is None:
+                latest = row
+            continue
+        if latest_timestamp is None or timestamp >= latest_timestamp:
+            latest = row
+            latest_timestamp = timestamp
+    return latest
+
+
+def _is_market_data_permission_error(exc: BaseException) -> bool:
+    """Whether an IBKR subscription failure is a market-data permission error."""
+    code = getattr(exc, "code", None)
+    if (
+        isinstance(code, int)
+        and not isinstance(code, bool)
+        and code in MARKET_DATA_PERMISSION_ERROR_CODES
+    ):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(token.lower() in text for token in _MARKET_DATA_PERMISSION_TOKENS)
+
+
 # ---------------------------------------------------------------------------
 # Historical daily bars (Phase 8 cold-start hydration fallback)
 # ---------------------------------------------------------------------------
@@ -1015,22 +1422,20 @@ class IBKRHistoricalBarFetcher:
             ) from exc
         return cast("_HistoricalIBClient", ib_async.IB())
 
-    def _contract_for(self, root: InstrumentId) -> object:
-        """Resolve the IBKR contract for ``root`` (injected or continuous future)."""
-        factory = self._contract_factory
-        if factory is not None:
-            return factory(root)
-        try:
-            import ib_async
-        except ImportError as exc:  # pragma: no cover - SDK installed in CI
-            raise RuntimeError(
-                "The ib_async SDK is not installed; install the optional live extra "
-                "(`pip install 'futuresrl-x[live]'`) or inject a contract_factory."
-            ) from exc
-        spec = self._spec_or_none(root)
-        exchange = spec.ibkr_exchange if spec is not None else "CME"
-        currency = spec.currency if spec is not None else "USD"
-        return ib_async.ContFuture(symbol=root, exchange=exchange, currency=currency)
+    def _contract_for(self, root: InstrumentId, *, reference: datetime | None = None) -> object:
+        """Resolve the explicit front-month IBKR contract for historical data.
+
+        Never uses a continuous/bare ``ContFuture``: the contract carries an
+        explicit ``lastTradeDateOrContractMonth`` derived from the roll rules (or
+        the injected ``contract_factory`` for tests).
+        """
+        contract, _month, _expiration = build_front_contract(
+            root,
+            reference=reference if reference is not None else self._clock(),
+            instrument_master=self._master,
+            raw_contract_factory=self._contract_factory,
+        )
+        return contract
 
     async def _qualify(self, client: _HistoricalIBClient, contract: object) -> object:
         """Qualify the contract when the client supports it (best effort)."""
@@ -1158,7 +1563,9 @@ class IBKRHistoricalBarFetcher:
                     ) from exc
                 connected_here = True
             for root in normalised:
-                contract = await self._qualify(client, self._contract_for(root))
+                contract = await self._qualify(
+                    client, self._contract_for(root, reference=self._clock())
+                )
                 expiration = self._expiration_for(root, start)
                 for window in self._windows(start, end):
                     bars = await client.reqHistoricalDataAsync(

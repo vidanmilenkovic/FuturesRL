@@ -119,6 +119,12 @@ class Settings(BaseSettings):
     ibkr_heartbeat_interval_seconds: float = 5.0
     ibkr_nightly_reset_start_hour_et: int = 23
     ibkr_nightly_reset_end_hour_et: int = 0
+    #: IBKR market-data type requested on connect:
+    #: 1 = live, 2 = frozen, 3 = delayed (default), 4 = delayed-frozen.
+    #: ``3`` lets paper/live dashboards stream delayed quotes without paid
+    #: tick-by-tick market-data subscriptions (permission failures then fall back
+    #: to historical/delayed polling instead of crashing the streamer).
+    ibkr_market_data_type: int = Field(default=3, ge=1, le=4)
 
     # -- LLM risk provider (Tier-A Live inference switch) ---------------------------
     #: "offline" = deterministic fixture assessments; other values use the real

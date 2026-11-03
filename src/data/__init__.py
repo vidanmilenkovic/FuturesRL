@@ -30,6 +30,11 @@ Research features
 Live/paper
     :class:`~src.data.ibkr_data.IBKRMarketDataStreamer` — ``ib_async`` 5-second
     bars, ticks and L1/L2 depth folded into ``MarketState`` snapshots.
+    :func:`~src.data.ibkr_contracts.front_contract_month` — pure, non-network
+    front-month ``YYYYMM`` resolution from the instrument roll rules (used for
+    runner/API rebalance previews); :func:`~src.data.ibkr_contracts.qualify_front_future`
+    resolves and caches the qualified (conId) IBKR contract used by the streamer
+    and OMS.
 
 Live news / macro headlines
     :class:`~src.data.news_ingestor.NewsIngestor` — pluggable RSS -> IBKR ->
@@ -64,6 +69,13 @@ from src.data.databento_loader import (
     synthetic_reference_price,
 )
 from src.data.feature_processor import FeatureProcessor
+from src.data.ibkr_contracts import (
+    FrontFuture,
+    build_front_contract,
+    clear_front_future_cache,
+    front_contract_month,
+    qualify_front_future,
+)
 from src.data.ibkr_data import IBKRMarketDataStreamer
 from src.data.market_state_builder import MarketStateBuilder
 from src.data.news_ingestor import NewsHeadline, NewsIngestor, Severity, SourceKind
@@ -84,6 +96,7 @@ __all__ = [
     "DatabentoLoader",
     "DatabentoNativeRollSchedule",
     "FeatureProcessor",
+    "FrontFuture",
     "IBKRMarketDataStreamer",
     "MarketStateBuilder",
     "NativeRollCrossCheck",
@@ -100,7 +113,11 @@ __all__ = [
     "TermStructureCurve",
     "VolumeOICrossoverRollSchedule",
     "WriteMode",
+    "build_front_contract",
+    "clear_front_future_cache",
+    "front_contract_month",
     "offline_term_structure_metadata",
+    "qualify_front_future",
     "schema",
     "synthetic_reference_price",
 ]
