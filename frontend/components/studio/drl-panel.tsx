@@ -60,6 +60,7 @@ export function DrlPanel({
   const [training, setTraining] = useState(false);
   const [binding, setBinding] = useState(false);
   const [message, setMessage] = useState<{ text: string; tone: Tone } | null>(null);
+  const [syncNotice, setSyncNotice] = useState<{ text: string; tone: Tone } | null>(null);
 
   useEffect(() => {
     if (!baseId && strategies.length > 0) {
@@ -118,6 +119,9 @@ export function DrlPanel({
   const bind = async (model: DrlModel | null) => {
     if (!model || !baseStrategy) return;
     setBinding(true);
+    setSyncNotice(null);
+    const roots = (Array.isArray(model.universe) ? model.universe : []).filter(Boolean);
+    const metadataAvailable = model.metadata_available !== false && roots.length > 0;
     const result = await bindDrlModel(baseStrategy, model);
     setBinding(false);
     setMessage({
@@ -127,7 +131,24 @@ export function DrlPanel({
           : `UI fallback: ${model.name} bound to ${baseStrategy.id} in memory.`,
       tone: result.source === "live" ? "gain" : "warn",
     });
-    onNotify(`Bound ${model.name} → ${baseStrategy.id}`, result.source === "live" ? "gain" : "warn");
+    setSyncNotice(
+      metadataAvailable
+        ? {
+            text: `Universe synced (${roots.length} roots) · top ${roots.length} · universe.params.roots updated.`,
+            tone: result.source === "live" ? "gain" : "warn",
+          }
+        : {
+            text:
+              "Warning: checkpoint metadata unavailable — universe not synced. The DRL allocator was bound without changing roots/top_n.",
+            tone: "warn",
+          },
+    );
+    onNotify(
+      metadataAvailable
+        ? `Universe synced (${roots.length} roots) · ${model.name} bound to ${baseStrategy.id}`
+        : `Bound ${model.name} → ${baseStrategy.id} · checkpoint metadata unavailable`,
+      result.source === "live" && metadataAvailable ? "gain" : "warn",
+    );
     onStrategiesChanged();
   };
 
@@ -275,6 +296,20 @@ export function DrlPanel({
               </span>
             ) : null}
           </div>
+          {syncNotice ? (
+            <div
+              role="status"
+              data-testid="drl-universe-sync-notice"
+              className={cn(
+                "mt-2 rounded-md border px-2.5 py-2 text-[11px] leading-4",
+                syncNotice.tone === "gain"
+                  ? "border-gain/30 bg-gain-soft/30 text-emerald-300"
+                  : "border-warn/30 bg-warn-soft/30 text-amber-300",
+              )}
+            >
+              {syncNotice.text}
+            </div>
+          ) : null}
         </Panel>
 
         <Panel

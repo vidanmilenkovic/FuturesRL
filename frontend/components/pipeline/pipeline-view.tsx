@@ -3,6 +3,7 @@
 import { useMemo, type CSSProperties } from "react";
 
 import { StageGroupedBars, type StageBar } from "@/components/charts/plots";
+import { RebalanceBar } from "@/components/rebalance/rebalance-bar";
 import {
   Badge,
   EmptyState,
@@ -196,7 +197,14 @@ export function PipelineView() {
   const selectedCount = data.instruments.filter((row) => row.selected).length;
 
   return (
-    <div className="grid min-h-full grid-rows-[minmax(0,1fr)] grid-cols-12 gap-3">
+    <div className="grid min-h-full grid-rows-[auto_minmax(0,1fr)] grid-cols-12 gap-3">
+      <RebalanceBar
+        className="col-span-12"
+        onExecuted={() => {
+          pipeline.reload();
+          terms.reload();
+        }}
+      />
       {/* ------------------------------------------------------- left column */}
       <div className="col-span-12 flex min-h-0 flex-col gap-3 xl:col-span-7">
         <Panel

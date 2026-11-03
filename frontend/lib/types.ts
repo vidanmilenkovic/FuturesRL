@@ -736,6 +736,13 @@ export interface DrlBindResult {
   strategy_id: string;
   bound: boolean;
   message: string;
+  /** Phase 11A add-on: universe sync applied with the checkpoint metadata. */
+  universe_synced?: boolean;
+  synced_roots?: string[];
+  top_n?: number | null;
+  metadata_available?: boolean;
+  warning?: string | null;
+  strategy?: StrategyConfig | null;
 }
 
 export interface MetricsSet {
@@ -1027,4 +1034,80 @@ export interface PaperStateResetResult {
 export interface BacktestExportFormat {
   kind: "json" | "trades-csv";
   filename: string;
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 11A — Rebalance Book preview / execute
+// ---------------------------------------------------------------------------
+
+export interface RebalancePosition {
+  symbol: string;
+  quantity: number;
+}
+
+export type RebalanceOrderSide = "BUY" | "SELL" | string;
+
+export interface RebalanceOrderPreview {
+  symbol: string;
+  side: RebalanceOrderSide;
+  quantity: number;
+  order_type?: string | null;
+  est_price?: number | null;
+  est_margin_impact?: number | null;
+  pre_trade_gate_passed?: boolean | null;
+  rejection_reason?: string | null;
+}
+
+export interface RebalanceGateSummary {
+  passed: boolean;
+  reasons: string[];
+}
+
+export interface RebalancePreviewResponse {
+  strategy_id: string;
+  account_nlv: number;
+  account_currency: string;
+  current_positions: RebalancePosition[];
+  target_contracts: RebalancePosition[];
+  proposed_orders: RebalanceOrderPreview[];
+  projected_margin_utilization: number;
+  margin_utilization_cap?: number | null;
+  tracking_error_pct: number | null;
+  mode: "ibkr-paper" | "offline" | string;
+  message?: string | null;
+  warnings?: string[];
+  strategy_roots?: string[];
+  generated_at?: string | null;
+  gate?: RebalanceGateSummary | null;
+}
+
+export interface RebalanceFill {
+  order_id?: string | null;
+  symbol?: string | null;
+  side?: string | null;
+  quantity?: number | null;
+  price?: number | null;
+  status?: string | null;
+  message?: string | null;
+}
+
+export interface RebalanceExecuteResponse {
+  strategy_id: string;
+  applied: boolean;
+  mode: "ibkr-paper" | "offline" | string;
+  status?: string | null;
+  submitted_order_ids: string[];
+  submitted_orders: RebalanceOrderPreview[];
+  rejected_orders?: RebalanceOrderPreview[];
+  fills: RebalanceFill[];
+  errors: string[];
+  account_nlv?: number | null;
+  account_currency?: string | null;
+  projected_margin_utilization?: number | null;
+  margin_utilization_cap?: number | null;
+  tracking_error_pct?: number | null;
+  updated_positions?: RebalancePosition[];
+  bridge_updated?: boolean | null;
+  message?: string | null;
 }

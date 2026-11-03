@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { TimeSeriesChart } from "@/components/charts/time-series";
+import { RebalanceBar } from "@/components/rebalance/rebalance-bar";
 import { BulletBars, ExposureBars, WeightBar, type BulletRow } from "@/components/charts/plots";
 import { useAccount } from "@/components/providers/account-provider";
 import { useTelemetry } from "@/components/providers/telemetry-provider";
@@ -99,7 +100,7 @@ const BOOK_TABS: { value: BookTab; label: string }[] = [
 ];
 
 export function CommandCenterView() {
-  const { account, positions, loading, source, dataMode, stale, staleReason } = useAccount();
+  const { account, positions, loading, source, dataMode, stale, staleReason, reload } = useAccount();
   const { events, latest, health } = useTelemetry();
   const risk = useAsyncData(getRiskState);
   const thresholds = risk.data?.thresholds ?? FALLBACK_THRESHOLDS;
@@ -354,7 +355,8 @@ export function CommandCenterView() {
   }
 
   return (
-    <div className="grid min-h-full grid-cols-12 grid-rows-[auto_auto_1fr] gap-3">
+    <div className="grid min-h-full grid-cols-12 grid-rows-[auto_auto_auto_1fr] gap-3">
+      <RebalanceBar className="col-span-12" onExecuted={reload} />
       {/* ---------------------------------------------------------------- KPI strip */}
       <div className="col-span-12 grid grid-cols-12 gap-3">
       <KpiCard
@@ -1033,6 +1035,15 @@ function WorkingOrdersTab() {
     return () => clearInterval(timer);
   }, [reloadOrders, reloadRunner]);
 
+  useEffect(() => {
+    const handler = () => {
+      reloadOrders();
+      reloadRunner();
+    };
+    window.addEventListener("futuresrlx:refresh-execution", handler);
+    return () => window.removeEventListener("futuresrlx:refresh-execution", handler);
+  }, [reloadOrders, reloadRunner]);
+
   const step = async () => {
     setStepping(true);
     try {
@@ -1137,6 +1148,12 @@ function RecentFillsTab() {
   useEffect(() => {
     const timer = setInterval(() => reloadFills(), 5_000);
     return () => clearInterval(timer);
+  }, [reloadFills]);
+
+  useEffect(() => {
+    const handler = () => reloadFills();
+    window.addEventListener("futuresrlx:refresh-execution", handler);
+    return () => window.removeEventListener("futuresrlx:refresh-execution", handler);
   }, [reloadFills]);
 
   const rows: Fill[] = fillsData?.fills ?? [];

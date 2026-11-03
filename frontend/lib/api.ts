@@ -75,6 +75,10 @@ import type {
   OptimizationListResponse,
   OptimizationRequest,
   OptimizationStudy,
+  RebalanceExecuteResponse,
+  RebalancePreviewResponse,
+  RebalanceOrderPreview,
+  RebalancePosition,
   RunnerStatus,
   StudioCatalogResponse,
   StudioDraft,
@@ -310,6 +314,247 @@ export function runBacktest(config: BacktestRunConfig): Promise<ApiResult<Backte
     { method: "POST", body: JSON.stringify(config) },
     20_000,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11A — Rebalance Book (runner preview / execute)
+// ---------------------------------------------------------------------------
+
+function asRebalanceNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function asRebalanceArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeRebalancePositions(value: unknown): RebalancePosition[] {
+  if (Array.isArray(value)) {
+    return value.map((entry) => {
+      const row = isRecord(entry) ? entry : {};
+      return {
+        symbol: asMessage(row.symbol ?? row.instrument_id ?? row.root ?? row.contract ?? ""),
+        quantity: asRebalanceNumber(
+          row.quantity ?? row.qty ?? row.current_quantity ?? row.target_quantity ?? row.net_quantity,
+          0,
+        ),
+      };
+    });
+  }
+  if (isRecord(value)) {
+    return Object.entries(value).map(([symbol, quantity]) => ({
+      symbol,
+      quantity: asRebalanceNumber(quantity, 0),
+    }));
+  }
+  return [];
+}
+
+function normalizeRebalanceOrders(value: unknown): RebalanceOrderPreview[] {
+  return asRebalanceArray(value).map((entry) => {
+    const row = isRecord(entry) ? entry : {};
+    const rawSide = asMessage(row.side ?? row.action ?? "").toUpperCase();
+    return {
+      // Prefer the root/instrument id for the compact `BUY +2 ES` receipt;
+      // the backend's `symbol` may be the full dated contract symbol.
+      symbol: asMessage(row.instrument_id ?? row.root ?? row.symbol ?? ""),
+      side: rawSide,
+      quantity: asRebalanceNumber(row.quantity ?? row.qty ?? row.contracts, 0),
+      order_type: asMessage(row.order_type ?? row.type ?? "") || null,
+      est_price: typeof row.est_price === "number" ? row.est_price : null,
+      est_margin_impact:
+        typeof row.est_margin_impact === "number" ? row.est_margin_impact : null,
+      pre_trade_gate_passed:
+        typeof row.pre_trade_gate_passed === "boolean"
+          ? row.pre_trade_gate_passed
+          : typeof row.gate_passed === "boolean"
+            ? row.gate_passed
+            : typeof row.approved === "boolean"
+              ? row.approved
+              : null,
+      rejection_reason:
+        asMessage(row.rejection_reason ?? row.reason ?? row.gate_reason ?? "") || null,
+    };
+  });
+}
+
+function normalizeRebalancePreview(raw: unknown, strategyId: string): RebalancePreviewResponse {
+  const root = isRecord(raw) ? raw : {};
+  const proposedOrders = normalizeRebalanceOrders(root.proposed_orders ?? root.orders);
+  const rejected = proposedOrders.filter((order) => order.pre_trade_gate_passed === false);
+  const gateRoot = isRecord(root.pre_trade_gate)
+    ? root.pre_trade_gate
+    : isRecord(root.gate)
+      ? root.gate
+      : null;
+  const gateReasons = gateRoot
+    ? asRebalanceArray(gateRoot.reasons ?? gateRoot.rejection_reasons)
+        .map((reason) => asMessage(reason))
+        .filter(Boolean)
+    : rejected.map((order) => order.rejection_reason).filter(Boolean) as string[];
+  const gatePassed =
+    gateRoot && typeof gateRoot.passed === "boolean"
+      ? gateRoot.passed
+      : rejected.length === 0 && proposedOrders.every((order) => order.pre_trade_gate_passed !== false);
+  const trackingRaw = root.tracking_error_pct ?? root.tracking_error;
+  return {
+    strategy_id: asMessage(root.strategy_id) || strategyId,
+    account_nlv: asRebalanceNumber(root.account_nlv ?? root.nlv, 0),
+    account_currency: asMessage(root.account_currency ?? root.currency ?? "USD") || "USD",
+    current_positions: normalizeRebalancePositions(root.current_positions ?? root.positions),
+    target_contracts: normalizeRebalancePositions(root.target_contracts ?? root.targets),
+    proposed_orders: proposedOrders,
+    projected_margin_utilization: asRebalanceNumber(
+      root.projected_margin_utilization ?? root.margin_utilization,
+      0,
+    ),
+    margin_utilization_cap:
+      typeof root.margin_utilization_cap === "number" ? root.margin_utilization_cap : null,
+    tracking_error_pct:
+      typeof trackingRaw === "number" && Number.isFinite(trackingRaw) ? trackingRaw : null,
+    mode: asMessage(root.mode ?? root.execution_mode ?? "offline") || "offline",
+    message: asMessage(root.message ?? "") || null,
+    warnings: asRebalanceArray(root.warnings).map((warning) => asMessage(warning)).filter(Boolean),
+    strategy_roots: asRebalanceArray(root.strategy_roots).map((root) => asMessage(root)).filter(Boolean),
+    generated_at: asMessage(root.generated_at ?? "") || null,
+    gate: gateRoot || rejected.length > 0
+      ? {
+          passed: gatePassed,
+          reasons: gateReasons as string[],
+        }
+      : null,
+  };
+}
+
+function fallbackRebalancePreview(strategyId: string): RebalancePreviewResponse {
+  return {
+    strategy_id: strategyId,
+    account_nlv: 0,
+    account_currency: "USD",
+    current_positions: [],
+    target_contracts: [],
+    proposed_orders: [],
+    projected_margin_utilization: 0,
+    tracking_error_pct: null,
+    mode: "offline",
+    message: "Runner bridge unavailable — no rebalance preview could be computed.",
+    gate: null,
+  };
+}
+
+export function previewRebalance(
+  strategyId: string,
+  roots?: string[],
+): Promise<ApiResult<RebalancePreviewResponse>> {
+  return withFallback<unknown>(
+    "/api/runner/rebalance-preview",
+    () => fallbackRebalancePreview(strategyId),
+    {
+      method: "POST",
+      body: JSON.stringify({
+        strategy_id: strategyId,
+        ...(roots && roots.length > 0 ? { roots } : {}),
+        dry_run: true,
+      }),
+    },
+    60_000,
+  ).then((result) => ({
+    ...result,
+    data: normalizeRebalancePreview(result.data, strategyId),
+  }));
+}
+
+function fallbackRebalanceExecute(strategyId: string): RebalanceExecuteResponse {
+  return {
+    strategy_id: strategyId,
+    applied: false,
+    mode: "offline",
+    submitted_order_ids: [],
+    submitted_orders: [],
+    fills: [],
+    errors: ["Execute requires the runner API — offline preview cannot submit orders."],
+    message: "Execute requires the runner API.",
+  };
+}
+
+export function executeRebalance(
+  strategyId: string,
+  roots?: string[],
+): Promise<ApiResult<RebalanceExecuteResponse>> {
+  return withFallback<unknown>(
+    "/api/runner/rebalance-execute",
+    () => fallbackRebalanceExecute(strategyId),
+    {
+      method: "POST",
+      body: JSON.stringify({
+        strategy_id: strategyId,
+        ...(roots && roots.length > 0 ? { roots } : {}),
+        confirm: true,
+      }),
+    },
+    120_000,
+  ).then((result) => {
+    if (result.source !== "live") {
+      return { ...result, data: fallbackRebalanceExecute(strategyId) };
+    }
+    const root = isRecord(result.data) ? result.data : {};
+    const submittedOrders = normalizeRebalanceOrders(root.submitted_orders ?? root.orders);
+    const ids = asRebalanceArray(root.submitted_order_ids ?? root.order_ids)
+      .map((id) => asMessage(id))
+      .filter(Boolean);
+    if (ids.length === 0) {
+      ids.push(
+        ...submittedOrders
+          .map((order) => asMessage((order as unknown as Record<string, unknown>).order_id))
+          .filter(Boolean),
+      );
+    }
+    const fills = asRebalanceArray(root.fills).map((entry) => {
+      const row = isRecord(entry) ? entry : {};
+      return {
+        order_id: asMessage(row.order_id ?? row.id ?? "") || null,
+        symbol: asMessage(row.symbol ?? row.instrument_id ?? "") || null,
+        side: asMessage(row.side ?? "") || null,
+        quantity: typeof row.quantity === "number" ? row.quantity : null,
+        price: typeof row.price === "number" ? row.price : null,
+        status: asMessage(row.status ?? "") || null,
+        message: asMessage(row.message ?? "") || null,
+      };
+    });
+    return {
+      ...result,
+      data: {
+        strategy_id: asMessage(root.strategy_id) || strategyId,
+        applied:
+          typeof root.applied === "boolean"
+            ? root.applied
+            : Boolean(root.executed ?? root.success ?? ids.length > 0),
+        mode: asMessage(root.mode ?? root.execution_mode ?? "offline") || "offline",
+        submitted_order_ids: ids,
+        submitted_orders: submittedOrders,
+        rejected_orders: normalizeRebalanceOrders(root.rejected_orders),
+        fills,
+        errors: asRebalanceArray(root.errors)
+          .map((error) => asMessage(error))
+          .filter(Boolean),
+        account_nlv: typeof root.account_nlv === "number" ? root.account_nlv : null,
+        account_currency: asMessage(root.account_currency ?? "") || null,
+        status: asMessage(root.status ?? "") || null,
+        projected_margin_utilization:
+          typeof root.projected_margin_utilization === "number"
+            ? root.projected_margin_utilization
+            : null,
+        margin_utilization_cap:
+          typeof root.margin_utilization_cap === "number" ? root.margin_utilization_cap : null,
+        tracking_error_pct:
+          typeof root.tracking_error_pct === "number" ? root.tracking_error_pct : null,
+        updated_positions: normalizeRebalancePositions(root.updated_positions),
+        bridge_updated:
+          typeof root.bridge_updated === "boolean" ? root.bridge_updated : null,
+        message: asMessage(root.message ?? "") || null,
+      },
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -929,8 +1174,33 @@ export function bindDrlModel(
   strategy: StrategyConfig,
   model: DrlModel,
 ): Promise<ApiResult<DrlBindResult>> {
+  // Phase 11A: the checkpoint's .meta.json universe is the source of truth for
+  // the strategy universe on bind. Preserve every other universe parameter and
+  // only apply roots/top_n when the metadata is actually available.
+  const modelRoots = (Array.isArray(model.universe) ? model.universe : [])
+    .map((root) => String(root).trim())
+    .filter(Boolean);
+  const metadataAvailable = model.metadata_available !== false && modelRoots.length > 0;
+  const universe = metadataAvailable
+    ? {
+        ...strategy.universe,
+        params: {
+          ...strategy.universe.params,
+          roots: modelRoots.join(","),
+          top_n: modelRoots.length,
+        },
+      }
+    : strategy.universe;
+  // Strip UI-only metadata returned by GET /api/strategies; the PUT contract
+  // accepts the strategy stages/params only.
+  const baseStrategy: StrategyConfig = { ...strategy };
+  delete baseStrategy.builtin;
+  delete baseStrategy.path;
+  delete baseStrategy.strategy_path;
+  delete baseStrategy.source;
   const payload: StrategyConfig = {
-    ...strategy,
+    ...baseStrategy,
+    universe,
     allocator: {
       name: "drl",
       params: {
@@ -945,18 +1215,40 @@ export function bindDrlModel(
     `/api/strategies/${encodeURIComponent(strategy.id)}`,
     () => mockDrlBind(model, strategy.id),
     { method: "PUT", body: JSON.stringify(payload) },
-  ).then((result) => ({
-    ...result,
-    data:
-      result.source === "live"
-        ? {
-            model: model.name,
-            strategy_id: strategy.id,
-            bound: true,
-            message: `Bound ${model.name} to ${strategy.id}.`,
-          }
-        : (result.data as DrlBindResult),
-  }));
+  ).then((result) => {
+    const universeSynced = result.source === "live" && metadataAvailable;
+    return {
+      ...result,
+      data:
+        result.source === "live"
+          ? {
+              model: model.name,
+              strategy_id: strategy.id,
+              bound: true,
+              message: universeSynced
+                ? `Bound ${model.name} to ${strategy.id} · universe synced (${modelRoots.length} roots).`
+                : `Bound ${model.name} to ${strategy.id}${metadataAvailable ? "" : " · checkpoint metadata unavailable, universe unchanged."}`,
+              universe_synced: universeSynced,
+              synced_roots: metadataAvailable ? modelRoots : [],
+              top_n: metadataAvailable ? modelRoots.length : null,
+              metadata_available: metadataAvailable,
+              warning: metadataAvailable
+                ? null
+                : "Checkpoint metadata unavailable — universe sync was skipped.",
+              strategy: payload,
+            }
+          : {
+              ...(result.data as DrlBindResult),
+              universe_synced: false,
+              synced_roots: metadataAvailable ? modelRoots : [],
+              top_n: metadataAvailable ? modelRoots.length : null,
+              metadata_available: metadataAvailable,
+              warning: metadataAvailable
+                ? "UI fallback — bind is in-memory only."
+                : "Checkpoint metadata unavailable — universe sync was skipped.",
+            },
+    };
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
