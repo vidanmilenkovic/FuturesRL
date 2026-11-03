@@ -215,9 +215,15 @@ def run_cli(
     timeout: float = 240.0,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``python -m src.execution.runner`` with ``-W error::RuntimeWarning``."""
+    # Run from the temporary data directory (not the repo root) so a developer's
+    # real repo-root ``.env`` cannot leak into these hermetic CLI subprocess tests;
+    # ``PYTHONPATH`` keeps the repo importable and every configured path is
+    # absolute/tmp-scoped.
+    data_dir = env.get("FUTURESRLX_DATA_DIR")
+    cwd = str(Path(data_dir).parent) if data_dir else str(REPO_ROOT)
     return subprocess.run(
         [sys.executable, "-W", "error::RuntimeWarning", "-m", "src.execution.runner", *args],
-        cwd=REPO_ROOT,
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
