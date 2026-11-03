@@ -610,3 +610,37 @@ best trial (293 trades, 0.83 avg gross exposure) and forced-flat studies never s
 apply visibility confirmed end-to-end (strategy + verification run immediately in API). Frontend
 `tsc`/`lint`/`build` clean; headless 1440/1920 apply modal/spinner/banner/list-refresh/5-default/
 flat-study checks pass with zero page errors.
+
+
+---
+
+## v1.6.0 — QoL, artifact management, exports and operator controls
+
+- **IBKR conId fix.** `IBKRMarketDataStreamer` qualifies every contract via
+  `qualifyContractsAsync` before real-time bars/tick-by-tick/L1/L2 subscriptions and uses the
+  conId-bearing contract for subscriptions/cancellation/events; unresolved roots raise actionable
+  errors naming root/exchange (and are skipped in multi-root loops) instead of the `Contract ... can't
+  be hashed` ValueError. Fake/legacy clients without qualification keep working; reconnect
+  re-qualifies on the new client.
+- **Artifact management.** DELETE endpoints for persisted optimization studies, backtests and
+  custom/tuned strategies (built-ins protected, 404/409 semantics); strategy Clone/Rename/YAML
+  download; durable `artifacts/strategies/.custom_ids.json` registry so custom strategies remain
+  deletable/renamable across API restarts.
+- **Backtest sharing & diffing.** Per-run `strategy_config` snapshots and `trades` persisted in
+  summaries/tearsheets/artifacts; `GET /api/backtests/{id}/export.json` and `/trades.csv`
+  attachments; comparison Parameter Diff consumes snapshots (legacy runs show an honest
+  unavailable note).
+- **Operator safety.** Additive risk-state kill-switch fields; guarded `POST /api/risk/reset-lock`
+  (exact confirmation phrase + optional operator token/header) clears execution and persisted
+  kill-switch/daily/HWM state while preserving OMS rate-limits; paper/backtest-only
+  `POST /api/maintenance/reset-paper-state` clears the runner bridge, persisted risk store and paper
+  session safely with receipts; live environments are refused.
+- **Studio/Backtest/Command Center UX.** Delete/confirm actions and list refreshes; inline Clone/
+  Rename/Download; Apply/Save success toast with direct `?run=` tear-sheet deep link; global Universe
+  search across all sectors; Backtest export dropdown; parameter-diff accordion; guarded risk-lock
+  reset modal; operator drawer (clear paper state / reset bridge). Studio-saved explicit
+  `universe.params.roots` are honoured by liquidity/regime/composite selectors (unknown roots raise,
+  state-absent roots intersect).
+- **Verification** — hostile-env quality gate green with 0 warnings/94 %+ coverage; independent QoL
+  verification (artifact delete/clone/rename/exports/diff/reset + conId qualification), focused API
+  suites and frontend `tsc`/`lint`/`build` + headless 1440/1920 interaction checks.

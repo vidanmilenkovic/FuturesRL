@@ -480,6 +480,25 @@ python -m src.backtest.optimizer \
 | `GET /api/optimize/{study_id}` | full trials, importances, best params/config |
 | `POST /api/optimize/{study_id}/apply` | save best params as `<id>_opt` (optional verification backtest) |
 
+**Artifact & strategy management.** From the Studio/Backtest Lab/Optuna tables you can delete
+persisted studies, backtest runs and custom/tuned strategies (`DELETE /api/optimize/{id}`,
+`DELETE /api/backtests/{id}`, `DELETE /api/strategies/{id}`; committed built-ins are protected).
+The Studio header also offers **Clone**, **Rename**, **Download YAML** and (custom-only) **Delete**;
+a durable custom-strategy registry keeps API-created/tuned strategies deletable across restarts, and
+Studio-saved `universe.params.roots` allow-lists are honoured by the liquidity/regime/composite
+selectors.
+
+**Sharing backtests.** Backtest Lab's Export menu downloads **Trades CSV**
+(`GET /api/backtests/{id}/trades.csv`) or the **Full Tear Sheet JSON**
+(`GET /api/backtests/{id}/export.json`). Runs persist a strategy-config snapshot, so selecting two
+runs shows a **Parameter Diff** accordion with changed dotted paths and Run A/Run B values.
+
+**Risk-lock reset & operator controls.** When a kill switch is active the Command Center risk-budget
+drawer shows **Reset Risk Lock / Resume Execution** (double confirmation, plus
+`FUTURESRLX_OPERATOR_RESET_TOKEN` when set: `POST /api/risk/reset-lock`). The operator drawer can
+**Clear Paper State** (`POST /api/maintenance/reset-paper-state`, paper/backtest only) and reset the
+runner bridge; both are guarded, idempotent and return receipts.
+
 **DRL API** — `GET /api/drl/models` lists checkpoints and parsed `.meta.json`
 (algorithm/timesteps/universe/features/created/git commit/reward-curve summary);
 `POST /api/drl/train` accepts `{strategy_id, algorithm, timesteps, learning_rate, gamma,

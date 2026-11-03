@@ -386,6 +386,25 @@ both engines produce identical targets and deltas for identical market states.
   positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
   book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
+### v1.6.0 artifact management, exports & operator controls
+
+- **Artifact management.** Persisted Optuna studies, Backtest Lab runs and custom/tuned strategies
+  can be deleted from the UI (DELETE `/api/optimize/{id}`, `/api/backtests/{id}`,
+  `/api/strategies/{id}`); committed built-ins stay protected. Strategies also support inline
+  **Clone**, **Rename** and **Download YAML** (durable custom-strategy registry survives restarts).
+- **Backtest sharing.** Export a run's **trades CSV** or **full tear sheet JSON** from Backtest Lab;
+  every run persists a strategy-config snapshot so the comparison drawer can show a **Parameter
+  Diff** (Run A vs Run B values).
+- **Operational safety.** Command Center exposes a guarded **Reset Risk Lock / Resume Execution**
+  when a kill switch is active (confirmation + optional `FUTURESRLX_OPERATOR_RESET_TOKEN`), and an
+  operator drawer can **Clear Paper State** / **Reset Runner Bridge** safely (paper/backtest only,
+  double-confirmed, receipts returned).
+- **IBKR market data.** Contracts are qualified (`conId`) before tick-by-tick/realtime/market-depth
+  subscriptions; unresolved roots produce actionable errors naming root/exchange instead of the
+  `Contract ... can't be hashed because no 'conId' value exists` traceback.
+- **Studio polish.** Global Universe search across all 45 roots, toast with direct **View Tear
+  Sheet** deep-link after Apply/Save & Run, and selector support for explicit Studio `roots` filters.
+
 ### v1.5.3 Optuna integrity & apply visibility
 
 - **Flat trials can no longer win.** Walk-forward optimizer trials now record `n_trades` and
