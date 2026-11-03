@@ -116,7 +116,15 @@ class RebalanceService:
 
     @property
     def instrument_master(self) -> InstrumentsConfig:
-        return cast(InstrumentsConfig, getattr(self._market, "instrument_master", None))
+        master = getattr(self._market, "instrument_master", None)
+        if isinstance(master, InstrumentsConfig):
+            return master
+        # Some market-data adapters (notably the engine service used by the live
+        # container) expose only ``latest_state()``. Load the declared instrument
+        # master from settings instead of failing with ``NoneType.has``.
+        from configs.instruments import load_instruments
+
+        return load_instruments(self._settings.instruments_path)
 
     def _ibkr_enabled(self) -> bool:
         return bool(getattr(self._execution, "ibkr_enabled", False))
@@ -397,7 +405,9 @@ class RebalanceService:
             account_currency=book.currency,
             current_positions=self._position_rows(book.positions),
             target_contracts=target_rows,
-            proposed_orders=[row for row in order_rows if row.pre_trade_gate_passed],
+            # Every delta order is returned with its gate verdict; the UI shows
+            # rejected rows and their rejection_reason instead of silently hiding them.
+            proposed_orders=order_rows,
             projected_margin_utilization=projected_util,
             margin_utilization_cap=cap,
             tracking_error_pct=tracking_error,

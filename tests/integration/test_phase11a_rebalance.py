@@ -174,6 +174,36 @@ def test_rebalance_preview_offline_contract(tmp_path: Path) -> None:
         assert service._execution.submit_calls == 0  # type: ignore[attr-defined]
 
 
+def test_rebalance_preview_tolerates_masterless_market_adapter(tmp_path: Path) -> None:
+    """Live container market services may expose only latest_state(); preview must load the master."""
+    settings = _settings(tmp_path)
+    with _app(settings) as client:
+        container = client.app.state.container
+        inner = container.market
+
+        class _MasterlessMarket:
+            def latest_state(self):
+                return inner.latest_state()
+
+        service = RebalanceService(
+            settings=settings,
+            market=_MasterlessMarket(),  # type: ignore[arg-type]
+            catalog=container.strategies,
+            execution=FakeExecution(),
+            clock=lambda: FIXED_TIMESTAMP,
+        )
+        client.app.state.rebalance_service = service
+        response = client.post(
+            "/api/runner/rebalance-preview",
+            json={"strategy_id": "tsmom_vol_target", "roots": ["ES", "NQ"], "dry_run": True},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["strategy_id"] == "tsmom_vol_target"
+        assert body["mode"] == "offline"
+        assert isinstance(body["proposed_orders"], list)
+
+
 def test_rebalance_preview_unknown_strategy_is_404(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _app(settings) as client:
