@@ -3,7 +3,7 @@
 Verification-only suite (no production edits). It pins the v1.5.1 contracts after
 tasks 36/37/38/40:
 
-1. Catalog: exactly the six curated ``optuna_default_selected`` parameters, the
+1. Catalog: exactly the five curated ``optuna_default_selected`` parameters, the
    data-hygiene/structural parameters non-tunable, active-strategy filtering,
    preset/config root symbols all canonical (no delisted GE/ZQ/KE/BTC), and no
    "75 defaults" regression (6, never 75).
@@ -73,13 +73,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_DIR = REPO_ROOT / "configs" / "strategies"
 INSTRUMENTS_PATH = REPO_ROOT / "configs" / "instruments.yaml"
 
-#: The v1.5.1 curated Optuna pre-selection (exactly six keys, never 75).
+#: The v1.5.3 curated Optuna pre-selection (exactly five keys, never 75).
+#: ``timing.carry_filter.min_carry_bps`` stays tunable but is no longer pre-selected.
 CURATED_DEFAULT_SELECTED: frozenset[str] = frozenset(
     {
         "timing.tsmom.lookback_fast",
         "timing.tsmom.lookback_slow",
         "timing.kama.window",
-        "timing.carry_filter.min_carry_bps",
         "allocator.volatility_target.target_annual_volatility",
         "risk.quant_risk.trailing_stop_pct",
     }
@@ -154,13 +154,13 @@ def offline_client(tmp_path_factory: pytest.TempPathFactory) -> TestClient:
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_has_exactly_six_curated_defaults() -> None:
+def test_catalog_has_exactly_five_curated_defaults() -> None:
     catalog = parameter_catalog()
     selected = tuple(spec.key for spec in catalog.parameters if spec.optuna_default_selected)
     assert set(selected) == CURATED_DEFAULT_SELECTED, (
         f"curated Optuna defaults changed; got {sorted(selected)!r}"
     )
-    assert len(selected) == 6, f"expected exactly 6 curated defaults, got {len(selected)}"
+    assert len(selected) == 5, f"expected exactly 5 curated defaults, got {len(selected)}"
     for spec in catalog.parameters:
         assert isinstance(spec.optuna_default_selected, bool)
         if spec.optuna_default_selected:
@@ -446,7 +446,7 @@ def test_api_catalog_preserves_optuna_fields(offline_client: TestClient) -> None
         assert isinstance(entry["optuna_default_selected"], bool)
     selected = {entry["key"] for entry in parameters if entry["optuna_default_selected"] is True}
     assert selected == CURATED_DEFAULT_SELECTED
-    assert len(selected) == 6, f"API must expose exactly 6 curated defaults, got {len(selected)}"
+    assert len(selected) == 5, f"API must expose exactly 5 curated defaults, got {len(selected)}"
     by_key = {entry["key"]: entry for entry in parameters}
     for key in HYGIENE_NON_TUNABLE:
         assert by_key[key]["optuna_tunable"] is False, f"API {key} must be non-tunable"

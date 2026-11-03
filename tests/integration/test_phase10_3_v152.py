@@ -81,8 +81,8 @@ FIXED_CLOCK = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)
 TELEMETRY_INTERVAL = 0.01
 FLAT_EQUITY = 1_000_000.0
 
-#: Curated v1.5.1 search-space paths (still the valid v1.5.2 default space).
-EXPECTED_CURATED_COUNT = 6
+#: Curated Optuna default-space size (v1.5.3 removed carry -> exactly five).
+EXPECTED_CURATED_COUNT = 5
 
 
 # ---------------------------------------------------------------------------
