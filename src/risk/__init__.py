@@ -13,7 +13,8 @@ Typical usage
 
 from __future__ import annotations
 
-from src.risk.contract_translator import ContractTranslator
+from src.risk.contract_translator import ContractTranslator, DiscretizationReport, MicroRoute
+from src.risk.llm_clients import OfflineLLMClient, build_llm_client
 from src.risk.llm_risk_overlay import (
     DEFAULT_LLM_SYSTEM_PROMPT,
     AnthropicClient,
@@ -45,6 +46,7 @@ __all__ = [
     "AsyncLLMRiskCacheWorker",
     "ContractTranslator",
     "DeepSeekClient",
+    "DiscretizationReport",
     "LLMClientError",
     "LLMResponseError",
     "LLMRiskAssessmentBatch",
@@ -54,12 +56,15 @@ __all__ = [
     "LLMRiskResponse",
     "MacroEvent",
     "MacroEventCalendar",
+    "MicroRoute",
+    "OfflineLLMClient",
     "OpenAIClient",
     "PersistedRiskState",
     "QuantRiskConfig",
     "QuantRiskOverlay",
     "RiskStateStore",
     "VLLMClient",
+    "build_llm_client",
     "build_risk_prompt",
     "extract_json_payload",
     "semantic_risk_penalty",

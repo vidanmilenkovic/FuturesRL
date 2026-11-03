@@ -77,9 +77,10 @@ Design notes
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from configs.instruments import InstrumentsConfig, InstrumentSpec, load_instruments
@@ -99,7 +100,7 @@ from src.core.types import (
 if TYPE_CHECKING:
     from configs.strategy import TranslatorConfig
 
-__all__ = ["ContractTranslator"]
+__all__ = ["ContractTranslator", "DiscretizationReport", "MicroRoute"]
 
 #: Iteration cap for the proportional margin-scaling loop.
 _MARGIN_SCALING_ITERATIONS: int = 64
@@ -126,6 +127,86 @@ class _Leg:
     @property
     def initial_margin(self) -> float:
         return self.spec.margins.initial
+
+
+@dataclass(frozen=True, slots=True)
+class MicroRoute:
+    """One achieved standard/micro family decomposition.
+
+    A standard root and its paired micro contract reference the same underlying,
+    so the translator may express one requested notional as a standard leg plus a
+    micro residual. ``family`` is always the standard root key (e.g. ``"ES"``) so
+    telemetry can group both legs of the same exposure into one route.
+    """
+
+    family: InstrumentId
+    standard_root: InstrumentId
+    standard_quantity: int
+    micro_root: InstrumentId
+    micro_quantity: int
+
+    def __post_init__(self) -> None:
+        for name in ("family", "standard_root", "micro_root"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string")
+        for name in ("standard_quantity", "micro_quantity"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an int, got {type(value)!r}")
+
+
+def _freeze_report_weights(values: Mapping[InstrumentId, float]) -> Mapping[InstrumentId, float]:
+    """Validate, copy and freeze an instrument -> weight mapping."""
+    frozen: dict[InstrumentId, float] = {}
+    for instrument_id, value in values.items():
+        if not isinstance(instrument_id, str) or not instrument_id:
+            raise ValueError("report weight keys must be non-empty strings")
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"report weight[{instrument_id!r}] must be finite")
+        frozen[instrument_id] = number
+    return MappingProxyType(frozen)
+
+
+@dataclass(frozen=True, slots=True)
+class DiscretizationReport:
+    """Notional tracking quality of a discrete :class:`ContractTargetSet`.
+
+    The report compares the *continuous* target weights with the weights actually
+    achievable from the emitted integer contracts::
+
+        w_actual_i    = N_i * P_i^USD * M_i / E_t^USD
+        tracking_error = sum_i |w_target_i - w_actual_i| / 2
+
+    The half-L1 convention is the standard "fraction of the book mis-traded"
+    metric: it is ``0.0`` for a perfect discrete replication and bounded by one
+    for fully-invested portfolios. ``tracking_error_pct`` is the same quantity in
+    percent. ``target_weights`` and ``achieved_weights`` always share the same key
+    set (the union of roots present on either side; a missing leg contributes
+    ``0.0``), and ``micro_routes`` groups every standard/micro family pair.
+    """
+
+    tracking_error: float
+    tracking_error_pct: float
+    target_weights: Mapping[InstrumentId, float]
+    achieved_weights: Mapping[InstrumentId, float]
+    micro_routes: tuple[MicroRoute, ...] = ()
+    margin_utilization: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("tracking_error", "tracking_error_pct", "margin_utilization"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be a finite non-negative number")
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "target_weights", _freeze_report_weights(self.target_weights))
+        object.__setattr__(self, "achieved_weights", _freeze_report_weights(self.achieved_weights))
+        routes = tuple(self.micro_routes)
+        for route in routes:
+            if not isinstance(route, MicroRoute):
+                raise TypeError(f"micro_routes must contain MicroRoute values, got {type(route)!r}")
+        object.__setattr__(self, "micro_routes", routes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +386,91 @@ class ContractTranslator:
         currency = self._stateless_account_currency(account_currency)
         rates = self._stateless_fx_rates(fx_rates)
         return targets.total_initial_margin / (value * self._usd_rate(currency, rates))
+
+    def discretization_report(
+        self,
+        weights: WeightVector,
+        targets: ContractTargetSet,
+        state: MarketState,
+        *,
+        equity: float | None = None,
+        account_currency: str | None = None,
+        fx_rates: Mapping[str, float] | None = None,
+    ) -> DiscretizationReport:
+        """Quantify the notional tracking error of a discrete target set.
+
+        For every root present on either side (the requested ``weights`` and the
+        emitted ``targets``)::
+
+            w_actual_i     = N_i * P_i^USD * M_i / E_t^USD
+            tracking_error = sum_i |w_target_i - w_actual_i| / 2
+
+        A requested root with no achieved contract counts as ``w_actual = 0``; an
+        achieved micro leg counts as ``w_target = 0`` unless it was explicitly
+        weighted. Equity and contract marks use exactly the same FX / account
+        currency resolution as :meth:`translate` (per-call > constructor > state >
+        USD), so the report is consistent with the sizing that produced
+        ``targets``. ``margin_utilization`` is ``IM_proj / E_t^USD``.
+
+        An empty weight vector with an empty target set returns an all-zero report
+        without requiring equity or FX data (mirroring :meth:`translate`).
+
+        Raises
+        ------
+        ValueError
+            If a target references a root missing from the instrument master, or
+            equity is unavailable for a non-empty reconciliation.
+        KeyError
+            If a non-USD account or contract settlement currency has no usable FX
+            rate (the same fail-closed contract as :meth:`translate`).
+        """
+        master = self._instrument_master()
+        target_weights = self._normalise_weights(weights, master)
+        if not target_weights and len(targets) == 0:
+            return DiscretizationReport(
+                tracking_error=0.0,
+                tracking_error_pct=0.0,
+                target_weights={},
+                achieved_weights={},
+                micro_routes=(),
+                margin_utilization=0.0,
+            )
+        resolved_equity = self._resolve_equity(equity, state)
+        rates = self.effective_fx_rates(state, fx_rates=fx_rates)
+        currency = self.effective_account_currency(state, account_currency=account_currency)
+        equity_usd = resolved_equity * self._usd_rate(currency, rates)
+
+        achieved_weights: dict[InstrumentId, float] = {}
+        quantities: dict[InstrumentId, int] = {}
+        for target in targets:
+            try:
+                spec = master.get(target.instrument_id)
+            except KeyError as exc:
+                raise ValueError(
+                    f"unknown futures root {target.instrument_id!r}: not declared in the "
+                    "instrument master"
+                ) from exc
+            price_usd = self._usd_price(target.price, spec, rates)
+            achieved_weights[target.instrument_id] = (
+                target.quantity * price_usd * target.multiplier / equity_usd
+            )
+            quantities[target.instrument_id] = target.quantity
+
+        order: list[InstrumentId] = list(target_weights)
+        order.extend(root for root in achieved_weights if root not in target_weights)
+        reconciled_targets = {root: target_weights.get(root, 0.0) for root in order}
+        reconciled_achieved = {root: achieved_weights.get(root, 0.0) for root in order}
+        tracking_error = 0.5 * math.fsum(
+            abs(reconciled_targets[root] - reconciled_achieved[root]) for root in order
+        )
+        return DiscretizationReport(
+            tracking_error=tracking_error,
+            tracking_error_pct=tracking_error * 100.0,
+            target_weights=reconciled_targets,
+            achieved_weights=reconciled_achieved,
+            micro_routes=self._micro_routes(order, quantities, master),
+            margin_utilization=targets.total_initial_margin / equity_usd,
+        )
 
     # -- FX resolution helpers -------------------------------------------------
 
@@ -880,3 +1046,35 @@ class ContractTranslator:
         if expiration is None:
             return root
         return f"{root}_{expiration.strftime('%Y%m%d')}"
+
+    @staticmethod
+    def _micro_routes(
+        order: Sequence[InstrumentId],
+        quantities: Mapping[InstrumentId, int],
+        master: InstrumentsConfig,
+    ) -> tuple[MicroRoute, ...]:
+        """Group every achieved standard/micro family pair into a ``MicroRoute``."""
+        routes: list[MicroRoute] = []
+        seen_families: set[InstrumentId] = set()
+        for root in order:
+            spec = master.get(root)
+            family = spec.standard_root if spec.standard_root is not None else spec.root
+            if family in seen_families:
+                continue
+            seen_families.add(family)
+            micro_root = master.get(family).micro_root
+            if micro_root is None:
+                continue
+            micro_quantity = quantities.get(micro_root, 0)
+            if micro_quantity == 0:
+                continue
+            routes.append(
+                MicroRoute(
+                    family=family,
+                    standard_root=family,
+                    standard_quantity=quantities.get(family, 0),
+                    micro_root=micro_root,
+                    micro_quantity=micro_quantity,
+                )
+            )
+        return tuple(routes)
