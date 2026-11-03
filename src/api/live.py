@@ -76,6 +76,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing-only imports
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MIN_LIVE_CURVE_DAYS",
     "BridgeSnapshot",
     "LiveEquityHistoryStore",
     "LiveStateService",
@@ -84,6 +85,8 @@ __all__ = [
     "RunnerSessionUnavailable",
     "RunnerSessionUnavailableError",
     "ex_ante_portfolio_volatility",
+    "history_distinct_utc_days",
+    "history_intraday_points",
     "load_optional_module",
 ]
 
@@ -95,6 +98,10 @@ EQUITY_HISTORY_FILE_NAME: str = "ibkr_equity_history.json"
 
 #: Minimum number of real IBKR NLV points before the curve is labelled live.
 MIN_LIVE_CURVE_POINTS: int = 5
+
+#: Minimum number of DISTINCT UTC calendar days of real IBKR history before the
+#: multi-day curve is labelled ``ibkr-live`` (intraday points alone are not enough).
+MIN_LIVE_CURVE_DAYS: int = 5
 
 #: Bound on the persisted live NLV history (newest wins).
 MAX_EQUITY_HISTORY_POINTS: int = 5000
@@ -196,6 +203,14 @@ class LiveEquityHistoryStore:
         with self._lock, contextlib.suppress(FileNotFoundError):
             self._path.unlink()
 
+    def distinct_utc_days(self) -> int:
+        """Number of distinct UTC calendar days covered by the persisted points."""
+        return history_distinct_utc_days(self.load())
+
+    def intraday_points(self) -> list[EquityPoint]:
+        """Real points of the latest recorded UTC day (for the 1D chart)."""
+        return history_intraday_points(self.load())
+
     # -- internals -------------------------------------------------------------
 
     def _load_locked(self) -> list[EquityPoint]:
@@ -283,6 +298,31 @@ class LiveEquityHistoryStore:
         )
         with contextlib.suppress(OSError):
             self._path.replace(target)
+
+
+# ---------------------------------------------------------------------------
+# Live-equity history provenance helpers
+# ---------------------------------------------------------------------------
+
+
+def history_distinct_utc_days(points: Sequence[EquityPoint]) -> int:
+    """Distinct UTC calendar days covered by the real IBKR NLV observations."""
+    return len({point.time.astimezone(UTC).date() for point in points})
+
+
+def history_intraday_points(points: Sequence[EquityPoint]) -> list[EquityPoint]:
+    """Real points of the latest recorded UTC day (deterministic 1D curve).
+
+    The latest *recorded* day is used rather than the wall clock so a replay or a
+    test clock behaves deterministically; with no history the list is empty.
+    """
+    ordered = sorted(points, key=lambda point: point.time)
+    if not ordered:
+        return []
+    latest_day = ordered[-1].time.astimezone(UTC).date()
+    return [
+        point.model_copy() for point in ordered if point.time.astimezone(UTC).date() == latest_day
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1266,13 +1306,23 @@ class LiveStateService:
             return None
 
     def _enrich_ibkr_account(self, snapshot: AccountSnapshotResponse) -> AccountSnapshotResponse:
-        """Attach real-curve provenance and ex-ante book volatility for IBKR."""
+        """Attach real-curve provenance and ex-ante book volatility for IBKR.
+
+        The multi-day curve only becomes ``ibkr-live`` once the persisted history
+        spans at least :data:`MIN_LIVE_CURVE_DAYS` distinct UTC calendar days; a
+        burst of same-day points stays ``simulated-backfill`` (the 1D chart uses
+        ``equity_curve_intraday`` instead).
+        """
         points = self._live_equity_points()
+        live_days = history_distinct_utc_days(points)
         updates: dict[str, object] = {
             "equity_curve_live_points": len(points),
+            "equity_curve_live_days": live_days,
+            "equity_curve_intraday": history_intraday_points(points),
             "equity_curve_source": "simulated-backfill",
         }
-        if len(points) >= MIN_LIVE_CURVE_POINTS:
+        if live_days >= MIN_LIVE_CURVE_DAYS:
+            # Real recorded points only -- never prepend the synthetic spline.
             updates["equity_curve"] = [point.model_copy() for point in points]
             updates["equity_curve_source"] = "ibkr-live"
         weights = {

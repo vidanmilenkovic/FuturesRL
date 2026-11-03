@@ -158,6 +158,12 @@ class AccountSnapshotResponse(APIModel):
     equity_curve_source: EquityCurveSource = "fixture"
     #: Number of persisted real IBKR NLV points available for this book.
     equity_curve_live_points: int = Field(default=0, ge=0)
+    #: Number of DISTINCT UTC calendar days covered by the live IBKR history.
+    #: ``ibkr-live`` requires at least 5 distinct days (not merely 5 intraday points).
+    equity_curve_live_days: int = Field(default=0, ge=0)
+    #: Live recorded IBKR points for 1D plotting (latest recorded UTC day), even
+    #: while the multi-day curve is still badged ``simulated-backfill``.
+    equity_curve_intraday: list[EquityPoint] = Field(default_factory=list)
     #: Annualised ex-ante portfolio volatility (fraction, e.g. 0.119) from the
     #: live book weights x market-state covariance. ``0.0`` for a flat IBKR book,
     #: ``None`` when unavailable (never a synthetic period vol).
@@ -723,22 +729,38 @@ class RunnerStepResponse(APIModel):
 
 
 class PnlTelemetryPayload(APIModel):
-    """Tick PnL frame."""
+    """Tick PnL frame.
+
+    The additive attribution fields let the dashboard render the risk budget from
+    the same enriched IBKR book as ``GET /api/positions`` instead of re-deriving it
+    from a synthetic chart. For a flat IBKR book they are exactly ``0.0``/``0``.
+    """
 
     net_liquidation: float
     day_pnl: float
     day_pnl_pct: float
     point: EquityPoint
+    #: Ex-ante book volatility (annualised fraction); ``0.0`` for a flat IBKR book,
+    #: ``None`` when unavailable/offline.
+    portfolio_volatility: float | None = None
+    initial_margin_used: float | None = None
+    margin_utilization: float | None = None
+    #: Number of open positions in the book driving this frame.
+    open_positions: int = 0
 
 
 class MarginTelemetryPayload(APIModel):
-    """Margin-utilisation frame."""
+    """Margin-utilisation frame with additive live-book attribution."""
 
     initial_margin_used: float
     maintenance_margin_used: float
     margin_utilization: float
     warning_threshold: float
     critical_threshold: float
+    #: Ex-ante book volatility (annualised fraction); ``0.0`` for a flat IBKR book.
+    portfolio_volatility: float | None = None
+    #: Number of open positions in the book driving this frame.
+    open_positions: int = 0
 
 
 class PositionsTelemetryPayload(APIModel):

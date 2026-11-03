@@ -2246,19 +2246,23 @@ def build_container(
         catalog=catalog,
         clock=resolved_clock,
     )
-    telemetry = TelemetryBroadcaster(
-        settings=resolved_settings,
-        clock=resolved_clock,
-        execution=execution,
-        risk=risk,
-        market=market_service,
-    )
+    # LiveStateService is built first so the telemetry broadcaster consumes the
+    # SAME enriched account as GET /api/positions (IBKR last-known-good book plus
+    # curve/volatility attribution, and no demo jitter in live mode).
     live = LiveStateService(
         settings=resolved_settings,
         clock=resolved_clock,
         execution=execution,
         instrument_master=master,
         market=market_service,
+    )
+    telemetry = TelemetryBroadcaster(
+        settings=resolved_settings,
+        clock=resolved_clock,
+        execution=execution,
+        risk=risk,
+        market=market_service,
+        account_provider=live.account,
     )
     warnings.extend(live.warnings)
     offline_mode = not isinstance(execution, IBKRExecutionService)

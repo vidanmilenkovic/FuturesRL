@@ -21,6 +21,12 @@ Phase-10 guarantee: once IBKR is enabled the broadcaster consumes only the IBKR
 adapter's live or last-known-good (``stale``) book. A failed account refresh keeps
 the previous book and an absent book degrades the frame to a heartbeat -- simulated
 positions are never published into a live session.
+
+v1.5.2 state-sync guarantee: for an IBKR-enabled process the account-driven frames
+are built from the **same enriched account as ``GET /api/positions``** (injectable
+``account_provider`` -> ``LiveStateService.account``): last-known-good/live IBKR
+book, real curve/volatility attribution, and no demo PnL jitter. Offline frames keep
+their deterministic jitter and previous behaviour.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import asyncio
 import contextlib
 import logging
 import math
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 from configs.settings import Settings
@@ -86,10 +93,14 @@ class TelemetryBroadcaster:
         execution: ExecutionService,
         risk: RiskService,
         market: MarketDataService,
+        account_provider: Callable[[], Awaitable[AccountSnapshotResponse]] | None = None,
     ) -> None:
         self._settings = settings
         self._clock = clock
         self._execution = execution
+        #: Same enriched account as ``GET /api/positions`` (``LiveStateService.account``).
+        #: Used for IBKR frames so WS attribution can never disagree with REST.
+        self._account_provider = account_provider
         self._risk = risk
         self._market = market
         self._bus: EventBus[TelemetryEvent] = EventBus()
@@ -176,17 +187,22 @@ class TelemetryBroadcaster:
 
     # -- frame construction ----------------------------------------------------
 
+    def _ibkr_enabled(self) -> bool:
+        """Whether the execution adapter is the real IBKR engine."""
+        return bool(getattr(self._execution, "ibkr_enabled", False))
+
     async def _account(self) -> AccountSnapshotResponse | None:
         """Latest account snapshot, or ``None`` when no honest book exists yet.
 
         For a pure offline/simulated process the snapshot is fetched once (the
         deterministic broker never changes its own book). For an IBKR-enabled
-        process every account-frame refreshes the adapter at a bounded cadence and
-        a fetch failure falls back to the **last-known-good IBKR book** -- the
-        telemetry stream must never replace a live book with simulated data.
+        process every account-frame uses the injected enriched provider (the same
+        ``LiveStateService.account`` as ``GET /api/positions``) at a bounded
+        cadence; a fetch failure falls back to the **last-known-good IBKR book** --
+        the telemetry stream must never replace a live book with simulated data.
         """
         now = self._clock()
-        if not bool(getattr(self._execution, "ibkr_enabled", False)):
+        if not self._ibkr_enabled():
             if self._account_cache is None:
                 self._account_cache = await self._execution.account()
                 self._account_refreshed_at = now
@@ -199,7 +215,11 @@ class TelemetryBroadcaster:
         ):
             return self._account_cache
         try:
-            account = await self._execution.account()
+            provider = self._account_provider
+            if provider is not None:
+                account = await provider()
+            else:
+                account = await self._execution.account()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -234,9 +254,22 @@ class TelemetryBroadcaster:
                 # IBKR enabled but no live/last-good book yet: never fall back to
                 # simulated positions (the dashboard keeps its last REST snapshot).
                 return self._heartbeat_envelope(now, sequence)
+        ibkr_enabled = self._ibkr_enabled()
+        open_positions = len(account.positions) if account is not None else 0
+        # IBKR flat book: margin utilisation and book volatility are exactly 0.0 by
+        # definition, even if a stale/non-enriched adapter row carries leftover
+        # margin figures (the bug this frame contract fixes).
+        flat_ibkr_book = ibkr_enabled and open_positions == 0
         if kind == "pnl":
             assert account is not None
-            jitter = _DEMO_PNL_JITTER_USD * math.sin(sequence * 0.7)
+            initial_margin = 0.0 if flat_ibkr_book else account.initial_margin_used
+            margin_utilization = 0.0 if flat_ibkr_book else account.margin_utilization
+            book_volatility = account.portfolio_volatility
+            if flat_ibkr_book and book_volatility is None:
+                book_volatility = 0.0
+            # Live IBKR frames carry the real book untouched (no demo jitter), so
+            # the WS attribution can never disagree with GET /api/positions.
+            jitter = 0.0 if ibkr_enabled else _DEMO_PNL_JITTER_USD * math.sin(sequence * 0.7)
             net_liquidation = account.net_liquidation + jitter
             day_pnl = account.day_pnl + jitter
             return TelemetryEnvelope(
@@ -248,20 +281,31 @@ class TelemetryBroadcaster:
                     day_pnl=round(day_pnl, 2),
                     day_pnl_pct=round(day_pnl / net_liquidation, 8) if net_liquidation else 0.0,
                     point=EquityPoint(time=now, value=round(net_liquidation, 2)),
+                    portfolio_volatility=book_volatility,
+                    initial_margin_used=initial_margin,
+                    margin_utilization=margin_utilization,
+                    open_positions=open_positions,
                 ),
             )
         if kind == "margin":
             assert account is not None
+            margin_volatility = account.portfolio_volatility
+            if flat_ibkr_book and margin_volatility is None:
+                margin_volatility = 0.0
             return TelemetryEnvelope(
                 kind="margin",
                 timestamp=now,
                 sequence=sequence,
                 payload=MarginTelemetryPayload(
-                    initial_margin_used=account.initial_margin_used,
-                    maintenance_margin_used=account.maintenance_margin_used,
-                    margin_utilization=account.margin_utilization,
+                    initial_margin_used=0.0 if flat_ibkr_book else account.initial_margin_used,
+                    maintenance_margin_used=0.0
+                    if flat_ibkr_book
+                    else account.maintenance_margin_used,
+                    margin_utilization=0.0 if flat_ibkr_book else account.margin_utilization,
                     warning_threshold=self._settings.risk.margin_warning_threshold,
                     critical_threshold=self._settings.risk.margin_critical_threshold,
+                    portfolio_volatility=margin_volatility,
+                    open_positions=open_positions,
                 ),
             )
         if kind == "positions":
@@ -326,11 +370,17 @@ class TelemetryBroadcaster:
                 net_liquidation=payload.net_liquidation,
                 day_pnl=payload.day_pnl,
                 day_pnl_pct=payload.day_pnl_pct,
+                portfolio_volatility=payload.portfolio_volatility,
+                initial_margin_used=payload.initial_margin_used,
+                margin_utilization=payload.margin_utilization,
+                open_positions=payload.open_positions,
             )
         elif isinstance(payload, MarginTelemetryPayload):
             values.update(
                 margin_utilization=payload.margin_utilization,
                 initial_margin_used=payload.initial_margin_used,
+                portfolio_volatility=payload.portfolio_volatility,
+                open_positions=payload.open_positions,
             )
         elif isinstance(payload, PositionsTelemetryPayload):
             values.update(

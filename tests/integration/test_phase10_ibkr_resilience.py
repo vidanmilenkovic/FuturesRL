@@ -13,7 +13,7 @@ import time
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import src.execution.ibkr_client as ibkr_client_module
@@ -22,6 +22,7 @@ from configs.settings import Settings
 from fastapi.testclient import TestClient
 from src.api.live import (
     EQUITY_HISTORY_FILE_NAME,
+    MIN_LIVE_CURVE_DAYS,
     MIN_LIVE_CURVE_POINTS,
     LiveEquityHistoryStore,
 )
@@ -255,9 +256,10 @@ def test_single_probe_interval_never_busy_loops(
         assert fake_manager.ensure_calls >= 1
 
 
-def test_live_equity_attribution_end_to_end(fake_manager: FakeIBKRManager, tmp_path: Path) -> None:
-    """Real IBKR NLV points persist, become an ``ibkr-live`` curve, and the
-    portfolio volatility comes from the live book (never the synthetic period)."""
+def test_same_day_live_points_stay_backfilled_with_intraday_curve(
+    fake_manager: FakeIBKRManager, tmp_path: Path
+) -> None:
+    """42 same-day live NLV points must NOT promote the 6M chart to live."""
     settings = _settings(tmp_path).model_copy(update={"telemetry_interval_seconds": 3600.0})
     history_path = settings.data_dir / EQUITY_HISTORY_FILE_NAME
     seed_store = LiveEquityHistoryStore(history_path, clock=lambda: FIXED_TIMESTAMP)
@@ -269,25 +271,121 @@ def test_live_equity_attribution_end_to_end(fake_manager: FakeIBKRManager, tmp_p
         fake_manager.fail_connect = False
         assert _wait_for(lambda: client.get("/health").json()["ibkr_connected"] is True)
 
-        first = client.get("/api/positions").json()
-        # 3 seeded points + this fetch are below the live threshold: the synthetic
-        # backfill curve is kept but honestly badged as simulated.
-        assert 1 <= first["equity_curve_live_points"] < MIN_LIVE_CURVE_POINTS
-        assert first["equity_curve_source"] == "simulated-backfill"
+        body = client.get("/api/positions").json()
+        # Same UTC day only: the synthetic 6M backfill curve is kept (badged), while
+        # the 1D chart receives the real intraday points.
+        assert body["equity_curve_source"] == "simulated-backfill"
+        assert body["equity_curve_live_days"] == 1
+        assert 1 <= body["equity_curve_live_points"] < MIN_LIVE_CURVE_POINTS
+        assert body["equity_curve_intraday"]
+        assert len(body["equity_curve_intraday"]) == body["equity_curve_live_points"]
+        assert all(
+            item["value"] == pytest.approx(LIVE_NLV) for item in body["equity_curve_intraday"]
+        )
 
-        body = first
-        for _ in range(MIN_LIVE_CURVE_POINTS):
+        # Even many more same-day observations never flip the multi-day curve live.
+        for _ in range(MIN_LIVE_CURVE_POINTS * 3):
             body = client.get("/api/positions").json()
+        assert body["equity_curve_live_days"] == 1
+        assert body["equity_curve_source"] == "simulated-backfill"
         assert body["equity_curve_live_points"] >= MIN_LIVE_CURVE_POINTS
+        assert len(body["equity_curve_intraday"]) == body["equity_curve_live_points"]
+
+
+def test_multi_day_live_history_promotes_real_curve(
+    fake_manager: FakeIBKRManager, tmp_path: Path
+) -> None:
+    """>=5 distinct UTC days promote the curve to real recorded points only."""
+    settings = _settings(tmp_path).model_copy(update={"telemetry_interval_seconds": 3600.0})
+    history_path = settings.data_dir / EQUITY_HISTORY_FILE_NAME
+    seed_store = LiveEquityHistoryStore(history_path, clock=lambda: FIXED_TIMESTAMP)
+    for days_ago in range(6, 0, -1):
+        seed_store.append(
+            EquityPoint(time=FIXED_TIMESTAMP - timedelta(days=days_ago), value=LIVE_NLV)
+        )
+    with TestClient(create_app(settings, clock=lambda: FIXED_TIMESTAMP)) as client:
+        fake_manager.fail_connect = False
+        assert _wait_for(lambda: client.get("/health").json()["ibkr_connected"] is True)
+
+        body = client.get("/api/positions").json()
         assert body["equity_curve_source"] == "ibkr-live"
+        assert body["equity_curve_live_days"] >= MIN_LIVE_CURVE_DAYS
+        assert body["equity_curve_live_points"] >= 7
+        # Live mode = real recorded points only (no synthetic spline prepended).
         assert len(body["equity_curve"]) == body["equity_curve_live_points"]
         assert all(item["value"] == pytest.approx(LIVE_NLV) for item in body["equity_curve"])
-        # The curve is chronologically ordered.
         curve_times = [item["time"] for item in body["equity_curve"]]
         assert curve_times == sorted(curve_times)
+        # 1D curve only contains the latest recorded UTC day (today's fetch).
+        intraday = body["equity_curve_intraday"]
+        assert intraday
+        latest_day = curve_times[-1][:10]
+        assert all(item["time"][:10] == latest_day for item in intraday)
 
         # Portfolio volatility is ex-ante from the live book weights/covariance.
         assert body["portfolio_volatility_source"] in {"ex-ante-book", "unavailable"}
         if body["portfolio_volatility_source"] == "ex-ante-book":
             assert body["portfolio_volatility"] is not None
             assert 0.0 < body["portfolio_volatility"] < 1.0
+
+
+def _assert_same_optional_float(left: object, right: object) -> None:
+    if right is None:
+        assert left is None
+        return
+    assert left is not None
+    assert float(cast(float, left)) == pytest.approx(float(cast(float, right)), rel=1e-9, abs=1e-9)
+
+
+def test_websocket_ibkr_frames_match_rest_enriched_book(
+    fake_manager: FakeIBKRManager, tmp_path: Path
+) -> None:
+    """WS pnl/margin frames must carry the same enriched IBKR book as REST (no jitter)."""
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings, clock=lambda: FIXED_TIMESTAMP)) as client:
+        fake_manager.fail_connect = False
+        assert _wait_for(lambda: client.get("/health").json()["ibkr_connected"] is True)
+        rest = client.get("/api/positions").json()
+        assert rest["source"] == "engine"
+
+        seen: dict[str, dict[str, object]] = {}
+        with client.websocket_connect("/ws/telemetry") as websocket:
+            websocket.receive_json()  # immediate heartbeat
+            for _ in range(240):
+                frame = websocket.receive_json()
+                if frame.get("type") != "telemetry":
+                    continue
+                kind = str(frame.get("kind"))
+                if kind in {"pnl", "margin", "positions"}:
+                    seen.setdefault(kind, frame["payload"])
+                if {"pnl", "margin", "positions"} <= set(seen):
+                    break
+    assert {"pnl", "margin", "positions"} <= set(seen), "telemetry cycle incomplete"
+    pnl = seen["pnl"]
+    margin = seen["margin"]
+    positions_frame = seen["positions"]
+
+    # No demo jitter: the frame NLV/point match the REST IBKR book exactly.
+    assert float(cast(float, pnl["net_liquidation"])) == pytest.approx(
+        rest["net_liquidation"], abs=0.01
+    )
+    point = cast(dict[str, object], pnl["point"])
+    assert float(cast(float, point["value"])) == pytest.approx(rest["net_liquidation"], abs=0.01)
+    assert int(cast(int, pnl["open_positions"])) == len(rest["positions"])
+    _assert_same_optional_float(pnl["portfolio_volatility"], rest["portfolio_volatility"])
+
+    # Margin frame matches the same enriched book (flat-book values are exact 0.0).
+    assert float(cast(float, margin["initial_margin_used"])) == pytest.approx(
+        rest["initial_margin_used"]
+    )
+    assert float(cast(float, margin["margin_utilization"])) == pytest.approx(
+        rest["margin_utilization"]
+    )
+    assert int(cast(int, margin["open_positions"])) == len(rest["positions"])
+    _assert_same_optional_float(margin["portfolio_volatility"], rest["portfolio_volatility"])
+
+    # Position frame carries the same book rows as REST.
+    ws_positions = cast(list[dict[str, object]], positions_frame["positions"])
+    assert [(row["instrument_id"], row["quantity"]) for row in ws_positions] == [
+        (row["instrument_id"], row["quantity"]) for row in rest["positions"]
+    ]

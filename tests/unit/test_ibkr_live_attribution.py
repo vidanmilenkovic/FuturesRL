@@ -19,13 +19,15 @@ from configs.settings import Settings
 from src.api import fixtures
 from src.api.live import (
     EQUITY_HISTORY_FILE_NAME,
+    MIN_LIVE_CURVE_DAYS,
     MIN_LIVE_CURVE_POINTS,
     LiveEquityHistoryStore,
     LiveStateService,
     ex_ante_portfolio_volatility,
 )
 from src.api.schemas import AccountSnapshotResponse, EquityPoint, PositionRow
-from src.api.services import IBKRExecutionService
+from src.api.services import IBKRBookUnavailableError, IBKRExecutionService
+from src.api.telemetry import TelemetryBroadcaster
 from src.core.types import AssetClass
 from src.execution.ibkr_client import IBKRConnectionManager
 
@@ -69,6 +71,10 @@ class FakeMarket:
 
 def _point(minutes: int, value: float = 1_000_000.0) -> EquityPoint:
     return EquityPoint(time=FIXED_TIMESTAMP + timedelta(minutes=minutes), value=value)
+
+
+def _daily_point(days_ago: int, value: float = 1_000_000.0) -> EquityPoint:
+    return EquityPoint(time=FIXED_TIMESTAMP - timedelta(days=days_ago), value=value)
 
 
 def _position_row(
@@ -191,6 +197,9 @@ def test_history_append_reload_and_dedupe(tmp_path: Path) -> None:
     assert payload["version"] == 1
     assert len(payload["points"]) == 2
     assert not list(tmp_path.glob("*.tmp"))
+    # Same UTC day -> one distinct day; intraday view returns that day's points.
+    assert store.distinct_utc_days() == 1
+    assert [point.value for point in store.intraday_points()] == [point.value for point in points]
 
 
 def test_history_is_bounded_by_point_count(tmp_path: Path) -> None:
@@ -294,13 +303,40 @@ async def test_below_threshold_curve_is_marked_simulated_backfill(settings: Sett
 
     assert response.equity_curve_source == "simulated-backfill"
     assert response.equity_curve_live_points == len(live_points)
+    assert response.equity_curve_live_days == 1
+    assert len(response.equity_curve_intraday) == len(live_points)
     # The existing synthetic backfill curve is kept (never relabelled live).
     assert [point.value for point in response.equity_curve] == [point.value for point in backfill]
 
 
-async def test_threshold_curve_is_marked_ibkr_live(settings: Settings) -> None:
+async def test_same_day_burst_does_not_promote_the_live_curve(settings: Settings) -> None:
+    """42 same-day live points are NOT enough: the 6M curve stays backfilled."""
     backfill = [_point(-180), _point(-120), _point(-60)]
-    live_points = [_point(index, 1_200_000.0 + index) for index in range(MIN_LIVE_CURVE_POINTS + 2)]
+    live_points = [_point(minutes, 1_200_000.0 + minutes) for minutes in range(42)]
+    service = _live_service(
+        settings,
+        FakeIBKRExecution(_snapshot(curve=backfill), live_points),
+        make_market_state(),
+    )
+
+    response = await service.account()
+
+    assert response.equity_curve_source == "simulated-backfill"
+    assert response.equity_curve_live_points == 42
+    assert response.equity_curve_live_days == 1
+    # 1D plotting gets all 42 real intraday points even though the 6M curve is backfilled.
+    assert len(response.equity_curve_intraday) == 42
+    assert [point.value for point in response.equity_curve_intraday] == [
+        point.value for point in live_points
+    ]
+    # The synthetic backfill curve is preserved.
+    assert [point.value for point in response.equity_curve] == [point.value for point in backfill]
+
+
+async def test_five_distinct_days_promote_the_live_curve(settings: Settings) -> None:
+    backfill = [_point(-180), _point(-120), _point(-60)]
+    live_points = [_daily_point(days_ago, 1_200_000.0 + days_ago) for days_ago in range(5, 0, -1)]
+    live_points.append(_point(1, 1_300_000.0))  # today's first intraday point
     service = _live_service(
         settings,
         FakeIBKRExecution(_snapshot(curve=backfill), live_points),
@@ -311,10 +347,15 @@ async def test_threshold_curve_is_marked_ibkr_live(settings: Settings) -> None:
 
     assert response.equity_curve_source == "ibkr-live"
     assert response.equity_curve_live_points == len(live_points)
+    assert response.equity_curve_live_days == MIN_LIVE_CURVE_DAYS + 1
+    # Live mode plots the real recorded points only (no synthetic spline prepended).
     assert len(response.equity_curve) == len(live_points)
     assert [point.value for point in response.equity_curve] == [
         point.value for point in live_points
     ]
+    # Intraday curve is the latest recorded UTC day only.
+    assert len(response.equity_curve_intraday) == 1
+    assert response.equity_curve_intraday[0].value == pytest.approx(1_300_000.0)
 
 
 async def test_flat_ibkr_book_has_zero_portfolio_volatility(settings: Settings) -> None:
@@ -409,3 +450,118 @@ async def test_market_provider_failure_marks_volatility_unavailable(settings: Se
     response = await service.account()
     assert response.portfolio_volatility is None
     assert response.portfolio_volatility_source == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# v1.5.2 WS telemetry: IBKR frames use the enriched book, no demo jitter
+# ---------------------------------------------------------------------------
+
+
+def _broadcaster(
+    settings: Settings,
+    execution: FakeIBKRExecution,
+    provider: object | None,
+) -> TelemetryBroadcaster:
+    return TelemetryBroadcaster(
+        settings=settings,
+        clock=lambda: FIXED_TIMESTAMP,
+        execution=cast(Any, execution),
+        risk=cast(Any, object()),
+        market=cast(Any, object()),
+        account_provider=cast(Any, provider),
+    )
+
+
+async def test_telemetry_ibkr_frames_use_enriched_flat_book_without_jitter(
+    settings: Settings,
+) -> None:
+    enriched = _snapshot(positions=[], curve=[]).model_copy(
+        update={
+            "portfolio_volatility": 0.0,
+            "portfolio_volatility_source": "ex-ante-book",
+            # Deliberately leftover/stale margin figures: a flat IBKR book must
+            # still publish exactly 0.0 margin/util/volatility in the frames.
+            "initial_margin_used": 3_000.0,
+            "maintenance_margin_used": 2_700.0,
+            "margin_utilization": 0.003,
+            "equity_curve_source": "simulated-backfill",
+            "equity_curve_live_points": 42,
+            "equity_curve_live_days": 1,
+            "equity_curve_intraday": [_point(minutes) for minutes in range(42)],
+        }
+    )
+    execution = FakeIBKRExecution(_snapshot())  # raw fallback must NOT be used
+    provider_calls: list[int] = []
+
+    async def provider() -> AccountSnapshotResponse:
+        provider_calls.append(1)
+        return enriched
+
+    broadcaster = _broadcaster(settings, execution, provider)
+
+    pnl = await broadcaster._build_envelope("pnl")
+    assert pnl.kind == "pnl"
+    # No demo jitter: the frame carries the exact enriched book values.
+    assert pnl.payload.net_liquidation == pytest.approx(enriched.net_liquidation)
+    assert pnl.payload.day_pnl == pytest.approx(enriched.day_pnl)
+    assert pnl.payload.point.value == pytest.approx(enriched.net_liquidation)
+    assert pnl.payload.portfolio_volatility == 0.0
+    assert pnl.payload.initial_margin_used == 0.0
+    assert pnl.payload.margin_utilization == 0.0
+    assert pnl.payload.open_positions == 0
+
+    margin = await broadcaster._build_envelope("margin")
+    assert margin.kind == "margin"
+    assert margin.payload.initial_margin_used == 0.0
+    assert margin.payload.maintenance_margin_used == 0.0
+    assert margin.payload.margin_utilization == 0.0
+    assert margin.payload.portfolio_volatility == 0.0
+    assert margin.payload.open_positions == 0
+    assert provider_calls, "IBKR frames must read the enriched LiveStateService account"
+
+
+async def test_telemetry_ibkr_frames_carry_open_positions_count(settings: Settings) -> None:
+    positions = [_position_row("ES", weight=0.3), _position_row("NQ", weight=-0.2)]
+    enriched = _snapshot(positions=positions).model_copy(
+        update={"portfolio_volatility": 0.137, "portfolio_volatility_source": "ex-ante-book"}
+    )
+
+    async def provider() -> AccountSnapshotResponse:
+        return enriched
+
+    broadcaster = _broadcaster(settings, FakeIBKRExecution(_snapshot()), provider)
+    pnl = await broadcaster._build_envelope("pnl")
+    margin = await broadcaster._build_envelope("margin")
+    assert pnl.payload.open_positions == 2
+    assert pnl.payload.portfolio_volatility == pytest.approx(0.137)
+    assert margin.payload.open_positions == 2
+    assert margin.payload.portfolio_volatility == pytest.approx(0.137)
+
+
+async def test_telemetry_ibkr_without_book_emits_heartbeat(settings: Settings) -> None:
+    execution = FakeIBKRExecution(_snapshot())
+
+    async def unavailable() -> AccountSnapshotResponse:
+        raise IBKRBookUnavailableError("IBKR session unavailable; no live account book")
+
+    broadcaster = _broadcaster(settings, execution, unavailable)
+    for kind in ("pnl", "margin", "positions"):
+        envelope = await broadcaster._build_envelope(kind)
+        assert envelope.kind == "heartbeat"
+
+
+async def test_telemetry_offline_frames_keep_jitter_and_default_attribution(
+    settings: Settings,
+) -> None:
+    snapshot = _snapshot()
+    execution = FakeIBKRExecution(snapshot, ibkr_enabled=False)
+    broadcaster = _broadcaster(settings, execution, None)
+
+    pnl = await broadcaster._build_envelope("pnl")
+    margin = await broadcaster._build_envelope("margin")
+    assert pnl.kind == "pnl"
+    # Offline deterministic demo jitter is unchanged.
+    assert pnl.payload.net_liquidation != pytest.approx(snapshot.net_liquidation)
+    assert pnl.payload.portfolio_volatility is None
+    assert pnl.payload.open_positions == 0
+    assert margin.payload.portfolio_volatility is None
