@@ -386,6 +386,27 @@ both engines produce identical targets and deltas for identical market states.
   positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
   book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
+### v1.7.0 paper execution without tick subscriptions
+
+- **Qualified front-month contracts.** IBKR market data, historical bars and order previews resolve
+  the active front month from the instrument roll rules and qualify it
+  (`reqContractDetailsAsync`/`qualifyContractsAsync`, `conId > 0`) before use, with per-root/month
+  caching. No bare `Future` reaches tick/market-data calls.
+- **Zero-subscription market data.** `FUTURESRLX_IBKR_MARKET_DATA_TYPE` (default `3` = delayed) is
+  requested on connect. If the account lacks paid tick bundles (IBKR 10189/10090/354), the streamer
+  cancels paid subscriptions, degrades the affected roots, and polls historical/delayed bars through
+  the normal ingest path instead of crashing.
+- **One-shot paper rebalance.** `python -m src.execution.runner --rebalance-once` hydrates, connects
+  the broker/OMS only (never a tick stream), enriches the latest state with live NLV/FX, runs
+  `S→A→T→R→N`, gates delta orders with `whatIfOrder`, submits approved paper orders, publishes the
+  runner bridge snapshot and exits. Command Center and Pipeline & Weights expose a **Rebalance Book**
+  bar with `Preview Rebalance (whatIf)` and **Execute Paper Rebalance**, showing current vs target
+  contracts, delta orders, margin vs the 60% cap and per-order pre-trade gate status.
+- **DRL universe guard.** Binding a checkpoint reads its `.meta.json` universe, syncs the target
+  strategy's `universe.params.roots`/`top_n`, and `DRLAllocator` aligns observations/actions to the
+  checkpoint's trained root order (padding missing roots flat, ignoring extras) instead of crashing on
+  shape mismatch.
+
 ### v1.6.0 artifact management, exports & operator controls
 
 - **Artifact management.** Persisted Optuna studies, Backtest Lab runs and custom/tuned strategies

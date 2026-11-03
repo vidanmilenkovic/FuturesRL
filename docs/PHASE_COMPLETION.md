@@ -644,3 +644,37 @@ flat-study checks pass with zero page errors.
 - **Verification** — hostile-env quality gate green with 0 warnings/94 %+ coverage; independent QoL
   verification (artifact delete/clone/rename/exports/diff/reset + conId qualification), focused API
   suites and frontend `tsc`/`lint`/`build` + headless 1440/1920 interaction checks.
+
+
+---
+
+## v1.7.0 — Phase 11A: IBKR paper execution without tick subscriptions
+
+- **Front-month qualification.** `src/data/ibkr_contracts.py` resolves the active contract month from
+  the instrument master roll rules (`contract_months`, `days_before_fnd`), builds an explicit
+  `Future(..., lastTradeDateOrContractMonth=YYYYMM, includeExpired=False)` and qualifies it via
+  `reqContractDetailsAsync`/`qualifyContractsAsync`, enforcing `conId > 0` and caching per
+  `(root, month)`. The market-data streamer and historical fetcher never pass bare futures to IBKR.
+- **Zero-subscription data fallback.** `FUTURESRLX_IBKR_MARKET_DATA_TYPE` (default 3) is requested
+  with `reqMarketDataType` on connect. Paid tick/L1/L2 permission failures (10189/10090/354, sync or
+  async) cancel the affected root's paid subscriptions, mark it degraded, and poll
+  historical/delayed bars into the existing ingest path; diagnostics expose fallback roots/reasons and
+  qualified conIds. All-roots qualification failure remains an actionable aggregate error.
+- **One-shot rebalance.** `TradingRunner.run_rebalance_once()` + CLI `--rebalance-once` hydrate the
+  lookback, connect the broker/OMS only (no market-data stream), enrich the latest state with live
+  NLV/currency/FX and broker positions, run `S→A→T→R→N`, gate delta orders through
+  `PreTradeRiskGate`/`whatIfOrder`, submit approved paper orders, publish the runner bridge snapshot
+  and exit cleanly. Dry-run reports without submitting.
+- **Dashboard rebalance.** `POST /api/runner/rebalance-preview` returns account/positions/targets,
+  delta orders with per-order gate status/reasons, projected margin vs the 60% cap, tracking error and
+  `mode=ibkr-paper|offline` without submitting; `POST /api/runner/rebalance-execute` submits approved
+  deltas via the connected paper OMS or simulated broker, is idempotent on repeat, updates the bridge
+  and refuses live/unsafe environments with 409. Command Center and Pipeline & Weights add a
+  Rebalance Book bar + preview/execute modal with refresh of positions/orders/fills.
+- **DRL universe guard.** Checkpoint `.meta.json` metadata is loaded (universe, feature order,
+  observation/action shape); observations/actions align to the trained root order (missing roots flat,
+  extra roots ignored) with actionable dimension errors; Bind to Strategy syncs the target
+  `universe.params.roots`/`top_n` and surfaces a sync notice.
+- **Verification** — front-month qualification/fallback, runner-once, API preview/execute and DRL
+  alignment covered by unit + integration tests; hostile-env quality gate green with 0 warnings and
+  94%+ coverage; frontend `tsc`/`lint`/`build` and headless 1440/1920 rebalance/DRL flows verified.

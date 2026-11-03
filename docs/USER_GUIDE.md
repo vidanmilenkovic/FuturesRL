@@ -480,6 +480,27 @@ python -m src.backtest.optimizer \
 | `GET /api/optimize/{study_id}` | full trials, importances, best params/config |
 | `POST /api/optimize/{study_id}/apply` | save best params as `<id>_opt` (optional verification backtest) |
 
+**Paper rebalance from the dashboard.** Open **Command Center** or **Pipeline & Weights** and use
+the **Rebalance Book** bar: pick a strategy, click **Preview Rebalance (whatIf)** to see current vs
+target contracts, delta orders, projected initial margin against the 60% cap, tracking error and
+per-order pre-trade gate status. **Execute Paper Rebalance** (checkbox confirmation) submits only
+gate-approved deltas through the connected IBKR Paper OMS, or the simulated broker when offline,
+then refreshes positions/working orders/fills and the runner bridge. `python -m
+src.execution.runner --strategy ... --roots ... --backfill-source ibkr --rebalance-once` performs the
+same one-shot cycle from the console without opening a market-data stream.
+
+**IBKR delayed data / contract resolution.** `FUTURESRLX_IBKR_MARKET_DATA_TYPE` defaults to `3`
+(delayed). The streamer resolves each root's active front month and qualifies its `conId` before any
+subscription; if TWS reports no paid tick bundle (10189/10090/354) it falls back to delayed/historical
+polling and exposes diagnostics instead of crashing. Set the variable to `1` only when the account has
+live tick/L1/L2 permissions.
+
+**DRL checkpoint binding.** **Bind to Strategy** in the DRL Neural Trainer reads the checkpoint's
+`.meta.json` universe, updates the target strategy's `universe.params.roots` and `top_n`, and shows a
+“Universe synced (N roots)” notice. At runtime the allocator aligns observations to the checkpoint's
+trained root order (missing roots flat, extras ignored); checkpoints without metadata keep legacy
+behavior with a warning.
+
 **Artifact & strategy management.** From the Studio/Backtest Lab/Optuna tables you can delete
 persisted studies, backtest runs and custom/tuned strategies (`DELETE /api/optimize/{id}`,
 `DELETE /api/backtests/{id}`, `DELETE /api/strategies/{id}`; committed built-ins are protected).
