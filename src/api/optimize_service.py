@@ -210,6 +210,272 @@ class OptimizationApplyResponse(_StudyModel):
 # ---------------------------------------------------------------------------
 
 
+#: Parameter names that are structural/data-hygiene (never tunable). Used by the
+#: graceful fallback validator when ``src.backtest.optimizer``'s legacy validator
+#: is not importable (e.g. partially deployed package).
+_STRUCTURAL_PARAM_NAMES: frozenset[str] = frozenset(
+    {
+        "min_avg_dollar_volume",
+        "min_open_interest",
+        "top_n",
+        "min_history_days",
+        "min_universe",
+        "filter_negative_trend",
+        "require_both",
+        "risk_off_roots",
+        "risk_off_sectors",
+        "mode",
+        "components",
+        "normalize_observations",
+        "volatility_targeting_enabled",
+        "daily_loss_kill_switch_enabled",
+        "sample_count",
+        "cache_ttl_seconds",
+        "macro_lockout_minutes_before",
+        "macro_lockout_minutes_after",
+        "macro_lockout_action",
+        "macro_lockout_leverage_cap",
+        "rounding_mode",
+        "rebalance_buffer_contracts",
+        "enable_micro_routing",
+        "min_micro_notional_ratio",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantinedStudy:
+    """One persisted study moved to ``<optimizations>/legacy/`` at startup."""
+
+    study_id: str
+    source_path: Path
+    quarantine_path: Path
+    reasons: tuple[str, ...]
+
+
+def _path_value(definition: object, path: str) -> tuple[bool, object]:
+    """Walk a dotted path (dict keys / list indices) and report whether it exists."""
+    cursor: object = definition
+    for segment in path.split("."):
+        if isinstance(cursor, list):
+            if not segment.isdigit() or int(segment) >= len(cursor):
+                return (False, None)
+            cursor = cursor[int(segment)]
+            continue
+        if not isinstance(cursor, Mapping):
+            return (False, None)
+        mapping = cast(Mapping[str, object], cursor)
+        if segment not in mapping:
+            return (False, None)
+        cursor = mapping[segment]
+    return (True, cursor)
+
+
+def _parameter_paths(payload: Mapping[str, object]) -> tuple[str, ...]:
+    """Collect every tuned/search-space parameter path mentioned by a study payload."""
+    paths: list[str] = []
+
+    def add(value: object) -> None:
+        if isinstance(value, str) and value.strip() and value.strip() not in paths:
+            paths.append(value.strip())
+
+    best_params = payload.get("best_params")
+    if isinstance(best_params, Mapping):
+        for key in cast(Mapping[object, object], best_params):
+            add(key)
+    request = payload.get("request")
+    if isinstance(request, Mapping):
+        search_space = cast(Mapping[str, object], request).get("search_space")
+        for entry in _sequence_items(search_space):
+            mapping = _mapping_items(entry)
+            add(mapping.get("param_path"))
+    trials = payload.get("trials")
+    for entry in _sequence_items(trials):
+        mapping = _mapping_items(entry)
+        params = mapping.get("params")
+        if isinstance(params, Mapping):
+            for key in cast(Mapping[object, object], params):
+                add(key)
+        for key in ("search_space", "param_path"):
+            value = mapping.get(key)
+            if isinstance(value, str):
+                add(value)
+    return tuple(paths)
+
+
+def _sequence_items(value: object) -> list[object]:
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return list(cast(Sequence[object], value))
+    return []
+
+
+def _mapping_items(value: object) -> Mapping[str, object]:
+    return cast(Mapping[str, object], value) if isinstance(value, Mapping) else {}
+
+
+def _base_stage_names(definition: Mapping[str, object]) -> Mapping[str, frozenset[str]]:
+    universe = _mapping_items(definition.get("universe"))
+    allocator = _mapping_items(definition.get("allocator"))
+    timing = [
+        str(_mapping_items(stage).get("name") or "")
+        for stage in _sequence_items(definition.get("timing"))
+    ]
+    risk = [
+        str(_mapping_items(stage).get("name") or "")
+        for stage in _sequence_items(definition.get("risk"))
+    ]
+    return {
+        "universe": frozenset({str(universe.get("name") or "")}),
+        "allocator": frozenset({str(allocator.get("name") or "")}),
+        "timing": frozenset(name for name in timing if name),
+        "risk": frozenset(name for name in risk if name),
+    }
+
+
+def _catalog_key_for_path(path: str) -> str | None:
+    """Best-effort mapping of a concrete dotted path to the catalog's key format."""
+    parts = path.split(".")
+    if not parts:
+        return None
+    head = parts[0]
+    if head in {"universe", "allocator"}:
+        if len(parts) == 2:
+            return f"{head}.{parts[1]}"
+        if len(parts) >= 3 and parts[1] == "params":
+            return None  # needs the active overlay name from the strategy config
+        if len(parts) >= 3:
+            return f"{head}.{parts[1]}.{parts[2]}"
+        return None
+    if head in {"timing", "risk"}:
+        if len(parts) >= 4 and parts[2] == "params":
+            return f"{head}.{parts[1]}.{parts[3]}"
+        if len(parts) >= 3:
+            return f"{head}.{parts[1]}.{parts[2]}"
+        return None
+    if head == "translator":
+        return f"translator.{parts[1]}" if len(parts) >= 2 else None
+    if head == "drl":
+        return f"allocator.drl.{parts[1]}" if len(parts) >= 2 else None
+    return None
+
+
+def _catalog_validation_context(
+    definition: Mapping[str, object],
+) -> tuple[frozenset[str] | None, frozenset[str]]:
+    """``(active_parameter_keys, non_tunable_keys)`` from the strategy catalog."""
+    try:
+        import importlib
+
+        module = importlib.import_module("src.strategies.parameter_catalog")
+    except Exception:
+        return (None, _STRUCTURAL_PARAM_NAMES)
+    active_keys: frozenset[str] | None = None
+    active_builder = getattr(module, "active_parameter_keys", None)
+    if callable(active_builder):
+        try:
+            keys = active_builder(dict(definition))
+        except Exception:
+            keys = None
+        if keys is not None:
+            active_keys = frozenset(str(key) for key in keys)
+    non_tunable = getattr(module, "NON_TUNABLE_PARAMETER_KEYS", None)
+    if non_tunable is not None:
+        try:
+            return (active_keys, frozenset(str(key) for key in non_tunable))
+        except TypeError:  # pragma: no cover - defensive adapter
+            pass
+    return (active_keys, _STRUCTURAL_PARAM_NAMES)
+
+
+def fallback_legacy_reasons(
+    payload: Mapping[str, object],
+    base_definition: Mapping[str, object] | None,
+) -> tuple[str, ...]:
+    """Fallback legacy classifier used when the optimizer validator is unavailable.
+
+    Mirrors the optimizer helper's contract: a study is legacy when it tunes a
+    parameter that is inactive for its base strategy (e.g. ``equal_weight`` or
+    ``mean_variance`` params on a TSMOM/DRL base), structural/data-hygiene
+    (``top_n``/``sample_count``/...), or impossible for the resolved base config;
+    unknown/unresolvable base strategies are legacy too.
+    """
+    base_id = payload.get("base_strategy_id")
+    if not isinstance(base_id, str) or not base_id.strip():
+        return ("missing base_strategy_id",)
+    if base_definition is None:
+        return (f"unknown base strategy {base_id!r}",)
+    stage_names = _base_stage_names(base_definition)
+    active_keys, non_tunable_keys = _catalog_validation_context(base_definition)
+    structural_names = _STRUCTURAL_PARAM_NAMES | {
+        key.rsplit(".", 1)[-1] for key in non_tunable_keys if "." in key
+    }
+    reasons: list[str] = []
+    for path in _parameter_paths(payload):
+        exists, _value = _path_value(base_definition, path)
+        last_param = path.rsplit(".", 1)[-1]
+        if exists:
+            if last_param in structural_names:
+                reasons.append(f"non-tunable structural parameter {path!r}")
+            continue
+        catalog_key = _catalog_key_for_path(path)
+        if catalog_key is not None and catalog_key in non_tunable_keys:
+            reasons.append(f"non-tunable structural parameter {path!r}")
+            continue
+        if catalog_key is not None and active_keys is not None and catalog_key in active_keys:
+            continue
+        if last_param in structural_names:
+            reasons.append(f"non-tunable structural parameter {path!r}")
+            continue
+        # Inactive overlay detection: stage token present but not selected.
+        parts = path.split(".")
+        stage = parts[0]
+        if stage in {"timing", "risk"} and len(parts) >= 4 and parts[2] == "params":
+            # ``timing.<index>.params.<param>``: index exists but param absent.
+            reasons.append(f"inactive or unknown parameter {path!r}")
+            continue
+        if stage in {"universe", "allocator"} and len(parts) >= 3:
+            overlay = parts[1]
+            if overlay not in stage_names.get(stage, frozenset()):
+                reasons.append(f"inactive {stage} overlay {overlay!r} in {path!r}")
+                continue
+        if stage in {"timing", "risk"} and len(parts) == 3:
+            overlay = parts[1]
+            if overlay not in stage_names.get(stage, frozenset()):
+                reasons.append(f"inactive {stage} overlay {overlay!r} in {path!r}")
+                continue
+        reasons.append(f"unknown or inactive parameter path {path!r}")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _normalise_validation_outcome(outcome: object) -> tuple[str, ...] | None:
+    """Normalise the optimizer validator's return value (``None`` = unknown shape)."""
+    if outcome is None:
+        return ()
+    if isinstance(outcome, bool):
+        return () if outcome else ("legacy study flagged by the optimizer validator",)
+    if isinstance(outcome, str):
+        return (outcome,)
+    if isinstance(outcome, Sequence) and not isinstance(outcome, str | bytes | bytearray):
+        return tuple(str(item) for item in cast(Sequence[object], outcome) if str(item))
+    reasons_attr = getattr(outcome, "reasons", None)
+    if reasons_attr is not None:
+        return _normalise_validation_outcome(reasons_attr)
+    valid_attr = getattr(outcome, "valid", None)
+    if isinstance(valid_attr, bool):
+        return () if valid_attr else ("legacy study flagged by the optimizer validator",)
+    mapping = _mapping_items(outcome)
+    if mapping:
+        for key in ("reasons", "legacy_reasons", "errors"):
+            if key in mapping:
+                return _normalise_validation_outcome(mapping[key])
+        for key in ("valid", "is_valid"):
+            if isinstance(mapping.get(key), bool):
+                return () if mapping[key] else ("legacy study flagged by the optimizer validator",)
+        if "is_legacy" in mapping and mapping["is_legacy"] is True:
+            return ("legacy study flagged by the optimizer validator",)
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class _OptimizerOutcome:
     payload: Mapping[str, object]
@@ -243,7 +509,9 @@ class OptimizationService:
         self._optimizer_provider = optimizer_provider
         self._backtest_runner = backtest_runner
         self._studies: dict[str, OptimizationStudy] = {}
+        self._quarantined: list[QuarantinedStudy] = []
         self._warnings: list[str] = []
+        self._legacy_dir = self._output_dir / "legacy"
         self.reload()
 
     # -- introspection ---------------------------------------------------------
@@ -252,6 +520,21 @@ class OptimizationService:
     def warnings(self) -> tuple[str, ...]:
         """Non-fatal study-store warnings (corrupt files, write failures)."""
         return tuple(self._warnings)
+
+    @property
+    def quarantined_count(self) -> int:
+        """Number of legacy/invalid studies quarantined during the last reload."""
+        return len(self._quarantined)
+
+    @property
+    def quarantined_studies(self) -> tuple[QuarantinedStudy, ...]:
+        """Details (source/quarantine path + reasons) of the last startup purge."""
+        return tuple(self._quarantined)
+
+    @property
+    def legacy_dir(self) -> Path:
+        """Directory receiving legacy/invalid study artifacts."""
+        return self._legacy_dir
 
     @property
     def studio(self) -> StrategyStudioService:
@@ -287,12 +570,29 @@ class OptimizationService:
         return target
 
     def reload(self) -> int:
-        """(Re)load persisted studies from disk; corrupt files are quarantined."""
+        """(Re)load persisted studies, quarantining legacy/invalid artifacts.
+
+        Every top-level ``<optimizations>/<study_id>.json`` (canonical engine
+        artifacts *and* API fixture studies) is validated against its base
+        strategy's active/tunable parameter space. Invalid/legacy studies are
+        atomically moved to ``<optimizations>/legacy/`` with the reasons logged and
+        exposed via :attr:`quarantined_studies`; they are excluded from
+        list/detail/apply. Canonical v1.5.1 artifacts are never rewritten (their
+        bytes stay identical). The pass is idempotent and never raises on corrupt
+        or legacy files.
+        """
         self._studies.clear()
+        self._quarantined.clear()
         directory = self._output_dir
         if not directory.is_dir():
             return 0
+        loaded = 0
         for path in sorted(directory.glob("*.json")):
+            if path.name.endswith(".legacy.json"):
+                # Already-quarantined single-file variant from an older deployment.
+                continue
+            if path.is_dir():  # pragma: no cover - defensive: glob returns files
+                continue
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
@@ -301,20 +601,129 @@ class OptimizationService:
             if not isinstance(payload, Mapping):
                 self._quarantine(path, ValueError("study payload is not a JSON object"))
                 continue
-            candidate = dict(payload)
+            raw = cast(Mapping[str, object], payload)
+            candidate = dict(raw)
             if "provenance" not in candidate:
                 # Optimizer-canonical artifacts carry ``request``/``seed`` and no API
                 # provenance tag; the API marks them as real-engine studies.
                 candidate["provenance"] = (
                     "engine" if ("request" in candidate or "seed" in candidate) else "fixture"
                 )
+            reasons = self._legacy_reasons(raw)
+            if reasons:
+                self._quarantine_legacy(path, reasons)
+                continue
             try:
                 study = OptimizationStudy.model_validate(candidate)
             except (ValidationError, TypeError) as exc:
                 self._quarantine(path, exc)
                 continue
             self._studies[study.study_id] = study
-        return len(self._studies)
+            loaded += 1
+        if self._quarantined:
+            logger.warning(
+                "optimization startup: quarantined %d legacy study artifact(s), loaded %d "
+                "valid from %s; reasons: %s",
+                len(self._quarantined),
+                loaded,
+                directory,
+                "; ".join(f"{item.study_id}: {item.reasons[0]}" for item in self._quarantined[:5]),
+            )
+        else:
+            logger.info(
+                "optimization startup: loaded %d optimization study artifact(s) from %s",
+                loaded,
+                directory,
+            )
+        return loaded
+
+    @staticmethod
+    def _is_fixture_study(payload: Mapping[str, object]) -> bool:
+        """Whether a payload is an API fixture study (engine validator skips those)."""
+        if "provenance" in payload:
+            return True
+        backend = str(payload.get("backend") or "")
+        if backend and backend not in {"optuna", "deterministic"}:
+            return True
+        return "request" not in payload and "seed" not in payload
+
+    def _legacy_reasons(self, payload: Mapping[str, object]) -> tuple[str, ...]:
+        """Validate one persisted study against its base strategy's active space."""
+        base_id = payload.get("base_strategy_id")
+        base_definition: Mapping[str, object] | None = None
+        base_config: StrategyConfig | None = None
+        if isinstance(base_id, str) and base_id.strip():
+            definition = self._studio.strategy_definition(base_id.strip())
+            if definition is not None:
+                base_definition = definition
+            base_config = self._studio.core_config(base_id.strip())
+        module = self._optimizer_module()
+        validator = (
+            getattr(module, "validate_persisted_optimization", None) if module is not None else None
+        )
+        # The optimizer helper deliberately returns [] for API fixture payloads
+        # (``provenance`` / non-canonical backend / no request+seed). The API owns
+        # fixture hygiene, so fixtures always use the API-side validator below.
+        if callable(validator) and not self._is_fixture_study(payload):
+            outcome: object = None
+            attempts: tuple[tuple[tuple[object, ...], dict[str, object]], ...] = (
+                ((payload,), {"config": base_config}),
+                ((payload,), {}),
+                ((payload, base_config), {}),
+            )
+            for args, kwargs in attempts:
+                try:
+                    outcome = validator(*args, **kwargs)
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    logger.warning("optimizer legacy validator failed for %s: %s", base_id, exc)
+                    outcome = None
+                break
+            reasons = _normalise_validation_outcome(outcome)
+            if reasons is not None:
+                return reasons
+        return fallback_legacy_reasons(payload, base_definition)
+
+    def _quarantine_legacy(self, path: Path, reasons: Sequence[str]) -> QuarantinedStudy:
+        """Move one legacy study into ``<optimizations>/legacy/`` (atomic, unique)."""
+        legacy_dir = self._legacy_dir
+        target = legacy_dir / path.name
+        try:
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            if target.exists() or target.resolve() == path.resolve():
+                stamp = int(self._clock().timestamp())
+                target = legacy_dir / f"{path.stem}.legacy-{stamp}{path.suffix}"
+                counter = 1
+                while target.exists():
+                    counter += 1
+                    target = legacy_dir / f"{path.stem}.legacy-{stamp}-{counter}{path.suffix}"
+            path.replace(target)
+        except OSError as exc:  # pragma: no cover - best-effort quarantine
+            warning = f"could not quarantine legacy optimization artifact {path.name}: {exc}"
+            logger.exception(warning)
+            self._warnings.append(warning)
+            return QuarantinedStudy(
+                study_id=path.stem,
+                source_path=path,
+                quarantine_path=path,
+                reasons=tuple(reasons),
+            )
+        study_id = path.stem
+        item = QuarantinedStudy(
+            study_id=study_id,
+            source_path=path,
+            quarantine_path=target,
+            reasons=tuple(reasons),
+        )
+        warning = (
+            f"legacy optimization artifact {path.name} quarantined to {target.name}: "
+            + "; ".join(reasons[:3])
+        )
+        logger.warning(warning)
+        self._warnings.append(warning)
+        self._quarantined.append(item)
+        return item
 
     def _quarantine(self, path: Path, exc: BaseException) -> None:
         warning = f"corrupt optimization artifact {path.name}: {type(exc).__name__}: {exc}; skipped"

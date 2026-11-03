@@ -20,7 +20,7 @@ import pytest
 from configs.settings import Settings
 from fastapi.testclient import TestClient
 from src.api.main import create_app
-from src.api.optimize_service import OptimizationService
+from src.api.optimize_service import OptimizationError, OptimizationService, OptimizeRequest
 from src.api.routes.optimize import router as optimize_router
 from src.api.studio_service import StrategyStudioService
 
@@ -619,6 +619,131 @@ def test_mixed_artifact_directory_keeps_provenance_separate(tmp_path: Path) -> N
         optimizer_module.load_optimization(
             fixture_study["study_id"], output_dir=settings.optimization_artifacts_dir
         )
+
+
+# ---------------------------------------------------------------------------
+# Legacy optimization artifact quarantine (v1.5.2 state sync)
+# ---------------------------------------------------------------------------
+
+
+def _legacy_canonical_payload(clean_payload: dict[str, Any], study_id: str) -> dict[str, Any]:
+    payload = copy.deepcopy(clean_payload)
+    payload["study_id"] = study_id
+    payload["best_params"] = {
+        "allocator.equal_weight.gross_leverage": 1.5,
+        "allocator.mean_variance.covariance_lookback_days": 60,
+        "universe.params.top_n": 5,
+    }
+    payload.pop("provenance", None)
+    payload.pop("message", None)
+    request = payload.get("request")
+    if isinstance(request, dict):
+        request["search_space"] = [
+            {
+                "param_path": "allocator.equal_weight.gross_leverage",
+                "type": "float",
+                "low": 1.0,
+                "high": 2.0,
+                "step": 0.1,
+            },
+            {
+                "param_path": "universe.params.top_n",
+                "type": "int",
+                "low": 2,
+                "high": 10,
+                "step": 1,
+            },
+        ]
+    return payload
+
+
+def _legacy_fixture_payload(clean_payload: dict[str, Any], study_id: str) -> dict[str, Any]:
+    payload = copy.deepcopy(clean_payload)
+    payload["study_id"] = study_id
+    payload["provenance"] = "fixture"
+    payload["backend"] = "deterministic-fixture"
+    payload["message"] = "legacy offline fixture study"
+    payload["best_params"] = {
+        "allocator.mean_variance.expected_return_window": 63,
+        "universe.params.top_n": 5,
+    }
+    for key in ("request", "seed"):
+        payload.pop(key, None)
+    return payload
+
+
+def test_legacy_optimization_artifacts_quarantined_on_startup(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    studio = StrategyStudioService(settings=settings, clock=lambda: FIXED_TIMESTAMP)
+    service = OptimizationService(settings=settings, studio=studio, clock=lambda: FIXED_TIMESTAMP)
+    clean = service.run(
+        OptimizeRequest(
+            base_strategy_id="tsmom_vol_target",
+            n_trials=2,
+            wf_splits=2,
+            search_space=[
+                {
+                    "param_path": "allocator.params.target_annual_volatility",
+                    "type": "float",
+                    "low": 0.08,
+                    "high": 0.16,
+                    "step": 0.02,
+                }
+            ],
+        )
+    )
+    clean_path = settings.optimization_artifacts_dir / f"{clean.study_id}.json"
+    assert clean_path.is_file()
+    clean_bytes = clean_path.read_bytes()
+    clean_payload = json.loads(clean_bytes)
+    assert "request" in clean_payload  # canonical v1.5.1 engine artifact
+
+    legacy_canonical = _legacy_canonical_payload(clean_payload, "opt-legacy-tsmom")
+    legacy_fixture = _legacy_fixture_payload(clean_payload, "opt-legacy-fixture")
+    legacy_canonical_path = settings.optimization_artifacts_dir / "opt-legacy-tsmom.json"
+    legacy_fixture_path = settings.optimization_artifacts_dir / "opt-legacy-fixture.json"
+    legacy_canonical_path.write_text(json.dumps(legacy_canonical), encoding="utf-8")
+    legacy_fixture_path.write_text(json.dumps(legacy_fixture), encoding="utf-8")
+
+    restarted = OptimizationService(settings=settings, studio=studio, clock=lambda: FIXED_TIMESTAMP)
+    listed = {study.study_id for study in restarted.list_studies()}
+    assert listed == {clean.study_id}
+    assert restarted.quarantined_count == 2
+    reasons = " ".join(reason for item in restarted.quarantined_studies for reason in item.reasons)
+    assert "inactive" in reasons.lower() or "non-tunable" in reasons.lower(), reasons
+    for legacy_id in ("opt-legacy-tsmom", "opt-legacy-fixture"):
+        with pytest.raises(OptimizationError) as excinfo:
+            restarted.get_study(legacy_id)
+        assert excinfo.value.status_code == 404
+    # Canonical v1.5.1 artifacts stay byte-identical and reloadable.
+    assert clean_path.read_bytes() == clean_bytes
+    assert restarted.get_study(clean.study_id).study_id == clean.study_id
+    # Legacy files were atomically moved into <optimizations>/legacy/.
+    legacy_dir = settings.optimization_artifacts_dir / "legacy"
+    assert sorted(path.name for path in legacy_dir.glob("*.json")) == [
+        "opt-legacy-fixture.json",
+        "opt-legacy-tsmom.json",
+    ]
+    assert not legacy_canonical_path.exists()
+    assert not legacy_fixture_path.exists()
+
+    # Idempotent across restarts: no re-quarantine, same visible studies/files.
+    again = OptimizationService(settings=settings, studio=studio, clock=lambda: FIXED_TIMESTAMP)
+    assert again.quarantined_count == 0
+    assert {study.study_id for study in again.list_studies()} == {clean.study_id}
+    assert sorted(path.name for path in legacy_dir.glob("*.json")) == [
+        "opt-legacy-fixture.json",
+        "opt-legacy-tsmom.json",
+    ]
+
+    # HTTP surface: quarantined ids disappear from list/detail/apply (404).
+    with _app(settings) as client:
+        listed_ids = {row["study_id"] for row in client.get("/api/optimize").json()}
+        assert listed_ids == {clean.study_id}
+        assert client.get("/api/optimize/opt-legacy-tsmom").status_code == 404
+        assert client.get("/api/optimize/opt-legacy-fixture").status_code == 404
+        applied = client.post("/api/optimize/opt-legacy-fixture/apply", json={})
+        assert applied.status_code == 404
 
 
 # ---------------------------------------------------------------------------
