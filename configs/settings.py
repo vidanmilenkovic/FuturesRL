@@ -125,6 +125,8 @@ class Settings(BaseSettings):
     #: async provider adapters in src/risk/llm_clients.py.
     llm_provider: Literal["offline", "openai", "anthropic", "deepseek", "vllm"] = "offline"
     llm_model: str = "gpt-4o-mini"
+    #: Optional custom endpoint (vLLM/OpenAI-compatible proxy); empty = adapter default.
+    llm_base_url: str = ""
     llm_api_key: SecretStr | None = None
 
     # -- Live news / macro headline ingestion --------------------------------------
@@ -140,7 +142,16 @@ class Settings(BaseSettings):
     # -- API / telemetry -----------------------------------------------------------
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8000, ge=1, le=65535)
-    api_cors_origins: tuple[str, ...] = ("http://localhost:3000", "http://127.0.0.1:3000")
+    api_cors_origins: tuple[str, ...] = (
+        # Local dashboard (next dev/start runs on 3100) and compose mapping (3080).
+        "http://localhost:3100",
+        "http://127.0.0.1:3100",
+        "http://localhost:3080",
+        "http://127.0.0.1:3080",
+        # Legacy/alternative dashboard port kept for backward compatibility.
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    )
     telemetry_interval_seconds: float = Field(default=1.0, gt=0.0)
 
     # -- Phase-7 production hardening -------------------------------------------------
@@ -176,6 +187,14 @@ class Settings(BaseSettings):
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("llm_model must be a non-empty model identifier")
+        return cleaned
+
+    @field_validator("llm_base_url")
+    @classmethod
+    def _valid_llm_base_url(cls, value: str) -> str:
+        cleaned = value.strip()
+        if cleaned and not (cleaned.startswith("https://") or cleaned.startswith("http://")):
+            raise ValueError("llm_base_url must be an http(s) URL (or empty for the default)")
         return cleaned
 
     @field_validator("llm_api_key", mode="before")
@@ -283,6 +302,11 @@ class Settings(BaseSettings):
     def llm_provider_value(self) -> str:
         """Lower-case provider id (``offline`` = deterministic fixture mode)."""
         return self.llm_provider
+
+    @property
+    def llm_base_url_value(self) -> str | None:
+        """Configured custom LLM endpoint, or ``None`` for the adapter default."""
+        return self.llm_base_url or None
 
     @property
     def llm_api_key_value(self) -> str | None:

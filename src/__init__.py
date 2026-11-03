@@ -6,4 +6,4 @@ remaining packages implement the FinRL-X pipeline, risk overlays, backtesting,
 IBKR execution, analytics and the FastAPI telemetry API.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.3.0"
