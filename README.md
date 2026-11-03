@@ -270,7 +270,8 @@ REST surface: `/health`, `/api/positions`, `/api/pipeline/latest`, `/api/risk/st
 `PUT /api/risk/thresholds`, `POST /api/risk/flatten-all`, `/api/term-structure`,
 `/api/strategies[/{id}]`, `/api/backtests[ POST, /{id}, /{id}/tearsheet]`, `/api/telemetry/status`,
 `/api/orders/working`, `/api/fills/recent`, `/api/runner/status`, `POST /api/runner/step`,
-plus `WS /ws/telemetry`. The backend runs **offline by default** (`/health.offline_mode=true`,
+`/api/strategies/schema/catalog`, `POST/PUT /api/strategies[ /{id}]`, `/api/optimize[ POST, /{id}, /{id}/apply]`,
+`/api/drl/models`, `POST /api/drl/train`, plus `WS /ws/telemetry`. The backend runs **offline by default** (`/health.offline_mode=true`,
 deterministic fixtures, `data_source` recorded on every pipeline/backtest payload); set
 `FUTURESRLX_API_ENABLE_IBKR=1` to attach a real IBKR paper/live session. The dashboard shows a
 visible `DEMO DATA` indicator whenever it is not talking to a live backend.
@@ -346,6 +347,44 @@ both engines produce identical targets and deltas for identical market states.
    A neural policy can never override the hard projection: risk is enforced post-hoc.
 
 ---
+
+## Strategy Studio, Optuna optimizer & DRL trainer (Phase 10)
+
+- **Strategy Studio (`/studio`).** A 6th dashboard view with three sub-modes: a manual 5-stage
+  pipeline builder (Universe → Allocator → Timing → Risk/LLM → Translator) with live YAML preview,
+  an Optuna walk-forward optimizer with trial history/parameter importances and one-click apply, and
+  a DRL trainer with a checkpoint registry and reward-curve inspector. Presets: trend following,
+  commodity carry/term structure, panic mean-reversion, seasonal commodity cycle, DRL + LLM risk.
+- **Parameter catalog.** `GET /api/strategies/schema/catalog` returns every configurable parameter
+  (121 across S/A/T/R/translator; 104 Optuna-tunable) with plain-English hypothesis, bounds, defaults,
+  YAML encoding and 5 complete preset templates. `src/strategies/parameter_catalog.py` is importable
+  without gymnasium/SB3. `POST /api/strategies` / `PUT /api/strategies/{id}` persist validated YAML
+  (built-ins are immutable in test/backtest environments: edits land as artifact overlays).
+- **Walk-forward Optuna optimizer.** `src/backtest/optimizer.py::WalkForwardOptimizer` with optuna and
+  a deterministic Latin-Hypercube fallback. Every trial with `walk_forward=True` (the default) is
+  scored only on purged/embargoed **out-of-sample** folds; a drawdown penalty suppresses overfit
+  trials. Studies persist to `artifacts/optimizations/<study_id>.json` and reload on API startup.
+  CLI: `python -m src.backtest.optimizer --strategy configs/strategies/tsmom_vol_target.yaml
+  --trials 20 --objective sharpe --offline --output artifacts/opt_tsmom.json`.
+- **DRL trainer API + registry.** `POST /api/drl/train` (PPO/CPPO/SAC/TD3/A2C, timesteps, learning
+  rate, γ, LLM reward-penalty λ, checkpoint name; offline deterministic) writes
+  `artifacts/models/<name>.zip`, `.zip.meta.json` (hyperparameters, universe, features, observation
+  shape/bounds, git commit) and a bounded reward curve; `GET /api/drl/models` lists checkpoints
+  newest-first and tolerates missing/corrupt sidecars. `Python -m src.strategies.train_drl` remains
+  the CLI equivalent.
+- **New timing overlays.** `MeanReversionTiming` (Wilder RSI + Bollinger fade with turbulence veto)
+  and `SeasonalityTiming` (UTC-month bias curves, active-month scaling) selectable by name from
+  strategy YAML, alongside TSMOM/KAMA/carry.
+- **Runner bridge parity & offline realism.** Bridge snapshots now include the full per-instrument
+  weight matrix (`w_base/w_timing/w_risk/weight_actual/target_contracts/notional/driver/regime`,
+  `tracking_error_pct`, `micro_routing*`) so `/api/pipeline/latest` renders identically for
+  `source="runner-bridge"`. Offline data emits deterministic roll-aware F1/F2 synthetic term
+  structures, so offline DRL training/hydration have non-zero `term_slope`/`carry_annualized` and
+  `feature_fallbacks == []`.
+- **IBKR resilience.** The API now reconnects automatically after TWS restarts (health:
+  `ibkr_enabled/ibkr_reconnecting/ibkr_last_error`), never replaces a live book with simulated
+  positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
+  book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
 ## Live runner ↔ API bridge, DRL training, live news (Phase 9)
 
@@ -456,6 +495,7 @@ boundary. Detailed per-phase deliverables, gates and verification numbers are re
 | 7 | `feat/phase-7-production-hardening` | `v1.1.0` | cold-start hydration, durable risk state, open-order reconciliation, async LLM cache, FX normalisation |
 | 8 | `feat/phase-8-production-polish` | `v1.2.0` | hermetic test env, multi-source hydration + offline runner, walk-forward CLI, lazy imports, finite gym bounds, institutional dashboard redesign |
 | 9 | `feat/phase-9-live-bridge-and-drl` | `v1.3.0` | live runner↔API bridge, orders/fills endpoints, persisted backtests, walk-forward runs, DRL training CLI, live news + LLM provider switch, UI telemetry fixes |
+| 10 | `feat/phase-10-strategy-studio-optuna` | `v1.4.0` | Strategy Studio UI, purged walk-forward Optuna optimizer, DRL trainer + checkpoint registry API, parameter catalog, mean-reversion/seasonality overlays, full bridge weight matrix, offline synthetic term structure |
 
 ---
 

@@ -391,6 +391,84 @@ when only USD/currency-less rows are accepted) and `/api/positions` degrades to 
 actionable message. The API reads the ledger via `reqAccountUpdates` with an `accountSummary`
 fallback, so either streaming path is sufficient.
 
+### Strategy Studio (`/studio`), Optuna & DRL trainer (Phase 10)
+
+![Strategy Studio — manual pipeline builder](screenshots/phase10-strategy-studio.png)
+
+The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
+
+1. **Manual Strategy Builder** — pick a preset (trend following TSMOM+KAMA, commodity carry & term
+   structure, panic mean-reversion, seasonal commodity cycle, DRL + LLM risk) or an existing YAML;
+   edit every Universe/Allocator/Timing/Risk/Translator parameter with sliders/toggles/pills and a
+   plain-English hypothesis subtitle; the right pane shows live YAML plus validation. **Save YAML**
+   calls `POST /api/strategies` (new id) or `PUT /api/strategies/{id}`; **Save & Run** additionally
+   launches a Backtest Lab run on the new id. Built-ins are immutable in test/backtest environments
+   (edits persist as `artifacts/strategies/<id>.yaml` overlays); development/paper/live can update
+   `configs/strategies/<id>.yaml`.
+2. **Optuna Auto-Optimizer** — choose the base strategy, objective (OOS Sharpe/Sortino/Calmar/CAGR/
+   Rachev/Return-on-Margin), trials (2–200), purged walk-forward folds (locked ON; amber data-snooping
+   warning if you try to disable), and editable tunable bounds. Results show the trial-vs-objective
+   history with a best-so-far frontier, parameter importances, a sortable trial table with the winner
+   highlighted, and **Apply Best Parameters**, which saves `<id>_opt.yaml` and (optionally) runs a
+   verification backtest.
+3. **DRL Neural Trainer** — choose PPO/CPPO/SAC/TD3/A2C, universe/strategy, timesteps, learning rate,
+   γ, LLM semantic-risk penalty λ and a checkpoint name; **Train Neural Agent** calls
+   `POST /api/drl/train` (offline deterministic; synchronous, bounded to 20k timesteps). The registry
+   lists `artifacts/models/*.zip` with parsed metadata, reward curve and a **Bind to Strategy** action
+   that sets `allocator: drl` + `model_path`.
+
+**Parameter catalog API** — `GET /api/strategies/schema/catalog` returns
+`{version, stages[], parameters[], presets[]}`. Each parameter has `key`, `stage`, `label`,
+`description` (market hypothesis), `type`, `default`, `min`, `max`, `step`, `choices`,
+`optuna_tunable` and `yaml_encoding`; use the encoding helpers in
+`src/strategies/parameter_catalog.py` (`encode/decode_parameter_value`,
+`apply_parameter_overrides`) before POSTing UI-native multiselect values.
+
+![Optuna walk-forward optimizer](screenshots/phase10-optuna-optimizer.png)
+
+**Optimizer CLI / API** — every trial is scored only on out-of-sample purged/embargoed folds when
+`walk_forward=True` (default); studies persist under `artifacts/optimizations/` and reload on API
+startup.
+
+```bash
+python -m src.backtest.optimizer \
+  --strategy configs/strategies/tsmom_vol_target.yaml \
+  --trials 20 --objective sharpe --offline \
+  --output artifacts/opt_tsmom.json
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/optimize` | run a study (sync; engine `WalkForwardOptimizer` or deterministic fixture fallback) |
+| `GET /api/optimize` | list persisted studies |
+| `GET /api/optimize/{study_id}` | full trials, importances, best params/config |
+| `POST /api/optimize/{study_id}/apply` | save best params as `<id>_opt` (optional verification backtest) |
+
+**DRL API** — `GET /api/drl/models` lists checkpoints and parsed `.meta.json`
+(algorithm/timesteps/universe/features/created/git commit/reward-curve summary);
+`POST /api/drl/train` accepts `{strategy_id, algorithm, timesteps, learning_rate, gamma,
+llm_reward_penalty_lambda, checkpoint_name, seed, device, periods, offline:true}` and writes
+`.zip` + `.zip.meta.json` + `.zip.reward_curve.json`. Offline training uses deterministic synthetic
+F1/F2 term structures, so `feature_fallbacks` is empty and term/carry features are non-zero.
+
+**Part-A fixes in this release:** `/api/pipeline/latest` now shows the full Weight matrix from a
+fresh runner bridge (same columns as the engine waterfall, including `weight_actual`, `driver`,
+`regime`, `tracking_error_pct`, `micro_routing`); offline DRL training has real synthetic carry; and
+the Backtest Lab `WF · N folds` badge binds the actual `n_folds`/`wf_splits`.
+
+### IBKR reconnects, stale books and the data-mode badge
+
+When `FUTURESRLX_API_ENABLE_IBKR=1`, the backend now reports dynamic liveness:
+`/health` gains `ibkr_enabled`, `ibkr_reconnecting` and `ibkr_last_error`; `offline_mode` is true only
+while the broker session is unavailable. Restarting/logging back into TWS is picked up automatically
+(heartbeat + 5 s liveness probe) and the ribbon returns to `PAPER · IBKR`/`LIVE · IBKR`; while
+reconnecting it shows an amber `IBKR · RECONNECTING` state.
+
+The API **never falls back to simulated positions** once IBKR is enabled. A lost session serves the
+last-known-good book with `stale=true` and a `stale_reason` (so a bought MES position does not
+disappear), and before the first successful fetch `/api/positions` returns `503` with an actionable
+message. Telemetry position frames use the same last-good book.
+
 ### Running from WSL2 (TWS on the Windows host)
 
 This is the common failure mode when the platform runs in **WSL Ubuntu** and TWS/IB Gateway runs
@@ -759,6 +837,10 @@ Useful subsets:
 | `margin utilization` -> `whatIf` rejection | Order would exceed `η_max` after margin impact; reduce gross/target or raise `RISK__MAX_MARGIN_UTILIZATION` deliberately. |
 | `kill switch engaged: ...` on startup | Persisted lock (daily loss/drawdown/operator). Review `/api/risk/state`, fix the cause, then `oms.reset_kill_switch()` / API reset. |
 | `reconciliation drift` | OMS/broker mismatch, or open orders older than the grace window. Check `/api/positions`, TWS positions, working orders; `approve_drift`/`resume` only after manual verification. |
+| `/api/positions` 503 while TWS is down/logging in | Expected: IBKR is enabled but no live book exists yet (never simulated). Check `/health.ibkr_last_error`, finish TWS login/API settings; the API reconnects automatically. |
+| Dashboard stuck on `IBKR · RECONNECTING` | TWS/IB Gateway not listening on the configured host/port (WSL NAT vs mirrored — see §7) or account not logged in; inspect `/health.ibkr_last_error`. |
+| Optimizer absent / slow | `optuna` is optional: install with `pip install -e ".[optimize]"` or rely on the deterministic fallback; use fewer trials/folds for quick studies. |
+| DRL train request times out | Training is synchronous and bounded to 20k timesteps; PPO enforces a 2048-step first rollout, so tiny budgets still take seconds. Use `timesteps>=256` and prefer `device=cpu` for smoke runs. |
 | Dashboard shows `UI FALLBACK` with the API running | Browser origin not in CORS (defaults include :3100/:3080) or wrong `NEXT_PUBLIC_API_BASE_URL`; check the API `/health` and browser console. |
 | Orders/fills empty while a runner is active | Runner and API must share `FUTURESRLX_DATA_DIR`; check `/api/runner/status` (bridge stale > 15 s means the runner stopped publishing) and `data/bridge/runner_state.json`. |
 | `POST /api/runner/step` returns 503 | `OfflineRunnerSession` unavailable (execution package import failed); check server logs/`pip install -e .`. |

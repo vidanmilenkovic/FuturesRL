@@ -373,3 +373,77 @@ setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, 
   restart and its tearsheet exposed 3 folds.
 - Frontend: `npx tsc --noEmit` clean, `npm run lint` zero warnings/errors, `npm run build` success
   (8/8 pages), production routes `/ /pipeline /risk /term-structure /backtests` all HTTP 200.
+
+
+---
+
+## Phase 10 — Strategy Studio, DRL trainer & Optuna optimizer (`v1.4.0`)
+
+**Branch:** `feat/phase-10-strategy-studio-optuna`
+
+### Part A — closed Phase-9 gaps
+1. **Full per-instrument runner-bridge rows** — `runner_bridge.py` publishes `instruments[]`
+   (`instrument_id/root/asset_class/selected/weight_base/weight_timing/weight_risk/weight_final/
+   weight_actual/delta_timing/delta_risk/target_contracts/notional/driver/reason/regime`),
+   `micro_routing[]`, `tracking_error_pct`, `tracking_error_source` (schema version stays 1, additive
+   and backwards compatible). `/api/pipeline/latest` renders the Weight matrix identically when
+   `source="runner-bridge"` via `src/api/bridge_pipeline.py`: parity-tested field-by-field against the
+   engine waterfall; old snapshots without rows degrade to a compact bridge summary (no fabrication).
+2. **Offline term structure/carry** — new `src/data/term_structure.py` + `OfflineBarSource` emits a
+   deterministic roll-aware F1+F2 pair per root/timestamp (contango/backwardation carry profiles +
+   calendar regime cycle; `term_structure=False` keeps legacy behaviour). `train_drl.build_training_data`
+   now reports `feature_fallbacks == ()`, finite non-zero `term_slope`/`carry_annualized`
+   (sign-opposite, two-sided per trained root at 512 bars; seed-independent). Hydrator coverage now
+   counts distinct decision timestamps (multi-expiration history fix); offline orders end-to-end is
+   tested via a temp strategy without the carry filter (the default carry filter correctly flattens an
+   all-contango universe).
+3. **Walk-forward fold badge** — Backtest Lab Run History binds `WF · N folds` from the actual
+   `n_folds`/`wf_splits` returned by `/api/backtests` (no more `—`).
+
+### Part B — Strategy Studio, optimizer, DRL API and UI
+1. **Timing & selector expansion** — `MeanReversionTiming` (Wilder RSI + Bollinger fade, turbulence
+   veto, reversion strength; RSI/Bollinger helpers) and `SeasonalityTiming` (UTC-month root bias
+   curves, active months, out-of-season scaling) registered in `TIMING_REGISTRY` and YAML-selectable;
+   5 hypothesis presets. New `src/strategies/parameter_catalog.py`: 121 parameters across
+   universe/allocator/timing/risk/translator, 104 Optuna-tunable, full metadata (plain-English
+   description, type, default/bounds/step, yaml_encoding, location) with validation/encoding/binding
+   helpers and `GET /api/strategies/schema/catalog`.
+2. **Walk-forward Optuna optimizer** — `src/backtest/optimizer.py::WalkForwardOptimizer` with optuna
+   (+ deterministic Latin-Hypercube fallback), strict OOS-only trial evaluation through the public
+   purged/embargoed `run_walk_forward` (default `walk_forward=True`), drawdown penalty, trial
+   summaries/importances/best config, atomic `artifacts/optimizations/<study_id>.json` persistence,
+   reload on API startup, CLI. API: `POST/GET /api/optimize`, detail, `POST /{id}/apply` (saves tuned
+   YAML and runs a verification backtest via the refreshed in-memory catalog).
+3. **FastAPI endpoints** — Strategy Studio CRUD (`GET /api/strategies/schema/catalog`,
+   `POST /api/strategies`, `PUT /api/strategies/{id}` with safe path validation/immutable built-ins in
+   test envs), optimization endpoints, DRL `GET /api/drl/models` + `POST /api/drl/train` (bounded,
+   thread-pooled, algorithm/hyperparameter validation, reward curve + metadata), bridge pipeline
+   parity. Routers registered by the Lead; new services are lazy (`phase10_deps.py`), no Container
+   rewrites.
+4. **Strategy Studio UI** — new 6th ribbon tab `/studio` (between Term Structure and Backtest Lab)
+   with Manual Builder (5-stage accordion, presets, live YAML + validation), Optuna Auto-Optimizer
+   (history chart/best-so-far, parameter-importance bars, sortable trials, apply), DRL Neural Trainer
+   (training form, checkpoint registry, reward curve/meta inspector, Bind to Strategy), plus the
+   `WF · N folds` fix and the new `IBKR · RECONNECTING` badge state.
+5. **IBKR resilience hotfix (Phase-9 bug reports)** — dynamic reconnect after TWS restarts
+   (`ensure_connected`, heartbeat one bound attempt/tick, 5 s liveness probe, request-path
+   invalidate), dynamic health (`ibkr_enabled/ibkr_reconnecting/ibkr_last_error`, offline_mode
+   derived), never-simulated book (last-known-good account/positions with `stale/stale_reason`,
+   explicit 503 before first live book, telemetry never publishes simulated positions, flatten returns
+   409 when unreachable), and additive frontend `IBKR · RECONNECTING` state. Hermetic conftest now
+   strips env and disables `.env` at import time (module-scoped fixtures included).
+
+### Verification (as merged)
+- Full quality gate with hostile env (`FUTURESRLX_ENVIRONMENT=paper
+  FUTURESRLX_RISK_STATE_STORE_URI=duckdb: ./scripts/quality_gate.sh --cov`):
+  ruff/format/mypy strict clean, **1553 passed, 0 warnings**, coverage `src/core`+`src/risk`
+  **94.24%** (translator 100%, quant risk 100%, llm risk 99%).
+- API: 49 tests across `test_api/test_api_ws/test_phase9_api/test_phase10_api`, 20 DRL API tests,
+  2 IBKR resilience end-to-end tests (startup-down 503 → TWS returns → live MES qty; flap → stale
+  last-good → heal); catalog source `src.strategies.parameter_catalog` (121 params/5 presets);
+  real optimizer + apply + verification backtest; bridge matrix parity.
+- A2: `tests/integration/test_phase10_offline_drl.py` 9 tests — empty fallbacks, non-zero two-sided
+  term/carry per root, deterministic, finite env bounds, tiny PPO smoke.
+- Frontend: `npx tsc --noEmit` clean, `npm run lint` zero warnings, `npm run build` success, routes
+  `/studio` + existing pages HTTP 200, headless `/studio` render with no page errors and live
+  studio API calls (catalog/optimizer/DRL).
