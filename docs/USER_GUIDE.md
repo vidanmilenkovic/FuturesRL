@@ -464,6 +464,17 @@ while the broker session is unavailable. Restarting/logging back into TWS is pic
 (heartbeat + 5 s liveness probe) and the ribbon returns to `PAPER · IBKR`/`LIVE · IBKR`; while
 reconnecting it shows an amber `IBKR · RECONNECTING` state.
 
+TWS also remembers API client ids across restarts: if a client id stays "accepted/disconnected"
+on the TWS side, reconnecting with the same id can be rejected or stop streaming the ledger. The API
+therefore rotates the client id within a bounded window on each (re)connect attempt, so a wedged id
+cannot block recovery. Link-level ledger reads are serialised and use `accountSummary` as the primary
+request/response source, with the streaming account updates as a fallback.
+
+If the broker reports the ledger in a different base currency than
+`FUTURESRLX_ACCOUNT_CURRENCY`, the API logs a warning and uses the broker's actual ledger currency
+instead of failing; set `FUTURESRLX_ACCOUNT_CURRENCY` and `FUTURESRLX_FX_RATES` to match so USD
+notional/risk sizing stays correct.
+
 The API **never falls back to simulated positions** once IBKR is enabled. A lost session serves the
 last-known-good book with `stale=true` and a `stale_reason` (so a bought MES position does not
 disappear), and before the first successful fetch `/api/positions` returns `503` with an actionable

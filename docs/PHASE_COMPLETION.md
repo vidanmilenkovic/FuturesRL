@@ -447,3 +447,21 @@ setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, 
 - Frontend: `npx tsc --noEmit` clean, `npm run lint` zero warnings, `npm run build` success, routes
   `/studio` + existing pages HTTP 200, headless `/studio` render with no page errors and live
   studio API calls (catalog/optimizer/DRL).
+
+
+### Phase 10 post-release hotfix — `v1.4.1`
+
+- **IBKR ledger after TWS reconnects** (`fix/ibkr-ledger-reconnect`): TWS can keep a stale
+  "accepted" API session for a client id, so reconnects either fail with "client id already in
+  use" or stream only static tags without `NetLiquidation`. `IBKRConnectionManager` now rotates the
+  client id within a bounded 8-id window on every connect attempt, the `ib_async` adapter serialises
+  ledger reads and uses `accountSummary` as the primary request/response source (streaming account
+  updates remain the fallback), and `IBKRExecutionService` serialises book refreshes so telemetry,
+  routes and the liveness probe cannot race the same client.
+- **Ledger currency auto-detection**: `fetch_account` no longer drops rows whose currency differs
+  from `FUTURESRLX_ACCOUNT_CURRENCY`; it uses the broker's actual ledger currency (with a warning)
+  so a EUR-base paper account still works when the config says USD. The operator's `.env` was
+  corrected to `FUTURESRLX_ACCOUNT_CURRENCY=EUR` + `FX_RATES={"EUR":1.1216}`.
+- Verified live against TWS paper (MES 1 position): `/health` connected, `/api/positions` 200 with
+  `NetLiquidation ≈ €1,003,691` and MES @ 7568.62, dashboard `PAPER · IBKR` with the position
+  visible and no "account snapshot unavailable"; full gate 1555 passed / 0 warnings.
