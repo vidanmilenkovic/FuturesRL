@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
+import polars as pl
 from configs.instruments import InstrumentsConfig
 from configs.settings import Settings
 from configs.strategy import StrategyConfig
@@ -44,6 +45,7 @@ from src.api.schemas import (
     BacktestListResponse,
     BacktestRunConfig,
     BacktestRunSummary,
+    CachedBarsSummary,
     MetricsSet,
     MonthlyReturn,
     SeriesPoint,
@@ -634,6 +636,23 @@ def fixture_backtest_config(config: StrategyConfig) -> StrategyConfig:
     return config.model_copy(update={"timing": (tsmom,)})
 
 
+class CachedDataUnavailableError(ValueError):
+    """Raised when ``data_mode="cached_real"`` has no sufficient real cache."""
+
+
+def _strategy_roots(config: StrategyConfig) -> tuple[str, ...] | None:
+    """Explicit roots configured on the strategy universe, or ``None`` for default."""
+    params = getattr(config.universe, "params", None) or {}
+    raw = params.get("roots") if isinstance(params, Mapping) else None
+    if isinstance(raw, str):
+        roots = tuple(part.strip().upper() for part in raw.split(",") if part.strip())
+        return roots or None
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        roots = tuple(str(item).strip().upper() for item in raw if str(item).strip())
+        return roots or None
+    return None
+
+
 def _strategy_config_snapshot(config: StrategyConfig) -> dict[str, object]:
     """JSON-safe snapshot of the exact validated config used for a run."""
     return config.model_dump(mode="json")
@@ -709,15 +728,31 @@ class EngineBacktestService:
         return self._tearsheets.get(run_id)
 
     def run(self, request: BacktestRunConfig) -> BacktestRunSummary:
-        """Execute one deterministic offline backtest (or walk-forward) and store it."""
+        """Execute one deterministic backtest/walk-forward with the requested data mode."""
         config = self._catalog.core_config(request.strategy_id)
         if config is None:
             raise KeyError(f"unknown strategy {request.strategy_id!r}")
+        cached_market: fixtures.OfflineMarket | None = None
+        cached_summary: CachedBarsSummary | None = None
+        if request.data_mode in ("auto", "cached_real"):
+            cached = self._cached_real_market(config, request)
+            if cached is None and request.data_mode == "cached_real":
+                raise CachedDataUnavailableError(
+                    f"no sufficient cached real ohlcv-1d bars for strategy "
+                    f"{request.strategy_id!r} roots in the requested window; ingest data "
+                    "via POST /api/data/ingest or use data_mode='auto'/'synthetic_offline'"
+                )
+            if cached is not None:
+                cached_market, cached_summary = cached
         if request.walk_forward:
-            return self._run_walk_forward(config, request)
+            return self._run_walk_forward(
+                config, request, market=cached_market, cached_bars=cached_summary
+            )
         started = time.perf_counter()
         try:
-            summary, tearsheet = self._execute_engine(config, request)
+            summary, tearsheet = self._execute_engine(
+                config, request, market=cached_market, cached_bars=cached_summary
+            )
             run_id = self._allocate_run_id()
             duration = time.perf_counter() - started
             stored = summary.model_copy(
@@ -737,8 +772,79 @@ class EngineBacktestService:
 
     # -- engine execution ------------------------------------------------------
 
-    def _execute_engine(
+    def _cached_real_market(
         self, config: StrategyConfig, request: BacktestRunConfig
+    ) -> tuple[fixtures.OfflineMarket, CachedBarsSummary] | None:
+        """Load real cached ``ohlcv-1d`` bars and build an offline market, if sufficient."""
+        from src.data.storage import ParquetRepository
+
+        roots = _strategy_roots(config)
+        if roots is None:
+            return None
+        master = self._master
+        selected = tuple(root for root in roots if master.has(root))
+        if not selected or len(selected) != len(roots):
+            return None
+        repository = ParquetRepository(self._settings)
+        start = datetime.combine(request.start - timedelta(days=520), dt_time.min, tzinfo=UTC)
+        end = datetime.combine(request.end, dt_time(23, 59, 59), tzinfo=UTC)
+        try:
+            frame = repository.read_bars(selected, start, end, schema="ohlcv-1d")
+        except Exception as exc:  # pragma: no cover - corrupt cache is a data error
+            logger.warning("cached_real read failed: %s", exc)
+            return None
+        if frame.is_empty():
+            return None
+        minimum = 200
+        for root in selected:
+            rows = frame.filter(pl.col("root_symbol") == root).height
+            if rows < minimum:
+                return None
+        timestamps = tuple(
+            sorted(
+                {
+                    value
+                    for value in frame.get_column("timestamp_utc").to_list()
+                    if isinstance(value, datetime)
+                }
+            )
+        )
+        if not timestamps:
+            return None
+        latest = (
+            frame.sort("timestamp_utc")
+            .group_by("root_symbol")
+            .agg(pl.col("close").last().alias("close"))
+        )
+        prices = {
+            str(record["root_symbol"]): float(record["close"])
+            for record in latest.iter_rows(named=True)
+        }
+        summary = CachedBarsSummary.model_validate(
+            {
+                "roots": list(selected),
+                "bar_count": frame.height,
+                "start_date": timestamps[0].date(),
+                "end_date": timestamps[-1].date(),
+                "schema": "ohlcv-1d",
+            }
+        )
+        market = fixtures.OfflineMarket(
+            instrument_master=master,
+            bars=frame,
+            timestamps=timestamps,
+            prices=prices,
+            seed=request.random_seed,
+        )
+        return market, summary
+
+    def _execute_engine(
+        self,
+        config: StrategyConfig,
+        request: BacktestRunConfig,
+        *,
+        market: fixtures.OfflineMarket | None = None,
+        cached_bars: CachedBarsSummary | None = None,
     ) -> tuple[BacktestRunSummary, TearsheetResponse]:
         from src.api.services import build_pipeline_parts
         from src.backtest.engine import (
@@ -747,7 +853,7 @@ class EngineBacktestService:
             RebalanceSchedule,
         )
 
-        window = fixtures.build_window_market(
+        window = market or fixtures.build_window_market(
             self._master,
             request.start,
             request.end,
@@ -800,6 +906,9 @@ class EngineBacktestService:
             n_rebalances=result.n_rebalances,
             data_source="engine",
             strategy_config=_strategy_config_snapshot(config),
+            data_origin="real_parquet" if cached_bars is not None else "synthetic_fixture",
+            data_mode=request.data_mode,
+            cached_bars=cached_bars,
         )
         return summary, tearsheet
 
@@ -869,12 +978,19 @@ class EngineBacktestService:
     # -- walk-forward execution ------------------------------------------------
 
     def _run_walk_forward(
-        self, config: StrategyConfig, request: BacktestRunConfig
+        self,
+        config: StrategyConfig,
+        request: BacktestRunConfig,
+        *,
+        market: fixtures.OfflineMarket | None = None,
+        cached_bars: CachedBarsSummary | None = None,
     ) -> BacktestRunSummary:
         """Execute a purged/embargoed walk-forward run (fixture fallback on error)."""
         started = time.perf_counter()
         try:
-            summary, tearsheet = self._execute_walk_forward(config, request)
+            summary, tearsheet = self._execute_walk_forward(
+                config, request, market=market, cached_bars=cached_bars
+            )
             run_id = self._allocate_run_id()
             duration = time.perf_counter() - started
             stored = summary.model_copy(
@@ -895,11 +1011,16 @@ class EngineBacktestService:
             return self._fixture_walk_forward(config, request, reason=reason, started=started)
 
     def _execute_walk_forward(
-        self, config: StrategyConfig, request: BacktestRunConfig
+        self,
+        config: StrategyConfig,
+        request: BacktestRunConfig,
+        *,
+        market: fixtures.OfflineMarket | None = None,
+        cached_bars: CachedBarsSummary | None = None,
     ) -> tuple[BacktestRunSummary, TearsheetResponse]:
         from src.backtest.engine import run_walk_forward
 
-        window = fixtures.build_window_market(
+        window = market or fixtures.build_window_market(
             self._master,
             request.start,
             request.end,
@@ -973,6 +1094,9 @@ class EngineBacktestService:
             kind="walk_forward",
             n_folds=fold_count,
             strategy_config=_strategy_config_snapshot(config),
+            data_origin="real_parquet" if cached_bars is not None else "synthetic_fixture",
+            data_mode=request.data_mode,
+            cached_bars=cached_bars,
         )
         return summary, tearsheet
 
@@ -1106,6 +1230,8 @@ class EngineBacktestService:
             kind="walk_forward",
             n_folds=request.wf_splits,
             strategy_config=self._config_snapshot_for(request.strategy_id),
+            data_mode=request.data_mode,
+            data_origin="synthetic_fixture",
         )
         self._store_run(summary, tearsheet)
         return summary
@@ -1141,6 +1267,8 @@ class EngineBacktestService:
             data_source="fixture",
             kind="backtest",
             strategy_config=self._config_snapshot_for(request.strategy_id),
+            data_mode=request.data_mode,
+            data_origin="synthetic_fixture",
         )
         self._store_run(summary, tearsheet)
         return summary

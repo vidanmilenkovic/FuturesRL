@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from src.api.routes import (
     backtests,
+    data,
     drl,
     instruments,
     maintenance,
@@ -35,6 +36,7 @@ ROUTERS: tuple[APIRouter, ...] = (
     optimize.router,
     drl.router,
     instruments.router,
+    data.router,
 )
 
 __all__ = ["ROUTERS"]

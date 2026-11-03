@@ -567,6 +567,18 @@ class StrategyConfigUpdate(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class CachedBarsSummary(APIModel):
+    """Phase-11B metadata describing the real Parquet bars used by a run/study."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    roots: list[str] = Field(default_factory=list)
+    bar_count: int = Field(default=0, ge=0)
+    start_date: date | None = None
+    end_date: date | None = None
+    schema_name: str = Field(default="ohlcv-1d", alias="schema")
+
+
 class BacktestRunConfig(StrictModel):
     """Request body for ``POST /api/backtests``."""
 
@@ -580,6 +592,10 @@ class BacktestRunConfig(StrictModel):
     purge_bars: int = Field(default=5, ge=0)
     embargo_bars: int = Field(default=5, ge=0)
     random_seed: int = 7
+    #: Phase-11B data source selection: auto falls back to synthetic fixtures,
+    #: cached_real requires real cached Parquet bars, synthetic_offline never reads
+    #: the cache.
+    data_mode: Literal["auto", "cached_real", "synthetic_offline"] = "auto"
 
     @model_validator(mode="after")
     def _ordered_dates(self) -> BacktestRunConfig:
@@ -665,6 +681,10 @@ class BacktestRunSummary(APIModel):
     #: Additive QoL snapshot of the exact validated strategy config used for the run.
     #: ``None`` for legacy artifacts / old fixture seeds (clients tolerate null).
     strategy_config: dict[str, object] | None = None
+    #: Phase-11B data provenance (synthetic is the historical default/legacy value).
+    data_origin: Literal["real_parquet", "synthetic_fixture"] = "synthetic_fixture"
+    data_mode: Literal["auto", "cached_real", "synthetic_offline"] = "auto"
+    cached_bars: CachedBarsSummary | None = None
 
 
 class BacktestListResponse(APIModel):

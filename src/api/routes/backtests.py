@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Response, status
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+from src.api.backtests_service import CachedDataUnavailableError
 from src.api.deps import BacktestDep
 from src.api.qol_schemas import ArtifactDeleteResponse
 from src.api.schemas import (
@@ -73,6 +74,10 @@ async def create_backtest(
     """Run a backtest through the engine adapter (thread-pooled, non-blocking)."""
     try:
         return await run_in_threadpool(backtests.run, payload)
+    except CachedDataUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 

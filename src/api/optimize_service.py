@@ -40,7 +40,7 @@ from configs.settings import Settings
 from configs.strategy import StrategyConfig
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from src.api.schemas import StrategyConfigView
+from src.api.schemas import CachedBarsSummary, StrategyConfigView
 from src.api.studio_service import (
     StrategyStudioError,
     StrategyStudioService,
@@ -129,6 +129,7 @@ class OptimizeRequest(_StudyModel):
     drawdown_penalty_threshold: float = Field(default=0.20, ge=0.0, le=1.0)
     search_space: list[OptimizeParameterRange] = Field(default_factory=list)
     seed: int = 7
+    data_mode: Literal["auto", "cached_real", "synthetic_offline"] = "auto"
 
 
 class TrialView(_StudyModel):
@@ -178,6 +179,10 @@ class OptimizationStudySummary(_StudyModel):
     #: ``engine`` = real WalkForwardOptimizer; ``fixture`` = deterministic fallback.
     provenance: Literal["engine", "fixture"] = "fixture"
     message: str = ""
+    #: Phase-11B data provenance metadata.
+    data_origin: Literal["real_parquet", "synthetic_fixture"] = "synthetic_fixture"
+    data_mode: Literal["auto", "cached_real", "synthetic_offline"] = "auto"
+    cached_bars: CachedBarsSummary | None = None
 
 
 class OptimizationStudy(OptimizationStudySummary):
@@ -212,6 +217,50 @@ class OptimizationApplyResponse(_StudyModel):
     saved_strategy_id: str = ""
     strategy_path: str = ""
     backtest_run_id: str | None = None
+
+
+def _cached_real_bars(settings: Settings, config: StrategyConfig) -> CachedBarsSummary | None:
+    """Load real cached daily bars for a cached_real/auto optimization study."""
+    from datetime import datetime
+
+    import polars as pl
+
+    from src.data.storage import ParquetRepository
+
+    params = getattr(config.universe, "params", None) or {}
+    raw = params.get("roots") if isinstance(params, Mapping) else None
+    roots: tuple[str, ...] = ()
+    if isinstance(raw, str):
+        roots = tuple(part.strip().upper() for part in raw.split(",") if part.strip())
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        roots = tuple(str(item).strip().upper() for item in raw if str(item).strip())
+    if not roots:
+        return None
+    master = settings.instruments
+    if any(not master.has(root) for root in roots):
+        return None
+    repository = ParquetRepository(settings)
+    try:
+        frame = repository.read_bars(roots, schema="ohlcv-1d")
+    except Exception:
+        return None
+    if frame.is_empty():
+        return None
+    for root in roots:
+        if frame.filter(pl.col("root_symbol") == root).height < 200:
+            return None
+    timestamps = frame.get_column("timestamp_utc")
+    start_value = timestamps.min() if timestamps.len() else None
+    end_value = timestamps.max() if timestamps.len() else None
+    return CachedBarsSummary.model_validate(
+        {
+            "roots": list(roots),
+            "bar_count": frame.height,
+            "start_date": start_value.date() if isinstance(start_value, datetime) else None,
+            "end_date": end_value.date() if isinstance(end_value, datetime) else None,
+            "schema": "ohlcv-1d",
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +889,12 @@ class OptimizationService:
             raise OptimizationError(
                 f"unknown base strategy {request.base_strategy_id!r}", status_code=404
             )
+        if request.data_mode == "cached_real" and _cached_real_bars(self._settings, base) is None:
+            raise OptimizationError(
+                "no sufficient cached real ohlcv-1d bars for this strategy/window; "
+                "ingest data via POST /api/data/ingest or use data_mode='auto'",
+                status_code=422,
+            )
         base_definition = base.model_dump(mode="json")
         resolved_request = self._resolve_search_space(request, base_definition)
         study: OptimizationStudy | None = None
@@ -902,6 +957,28 @@ class OptimizationService:
         if not callable(optimizer_class):
             raise OptimizationError(f"{OPTIMIZER_MODULE} does not expose WalkForwardOptimizer")
         request_class = getattr(module, "OptimizationRequest", None)
+        cached_bars: CachedBarsSummary | None = None
+        real_bars = None
+        if request.data_mode in ("auto", "cached_real"):
+            cached_bars = _cached_real_bars(self._settings, config)
+            if cached_bars is None and request.data_mode == "cached_real":
+                raise OptimizationError(
+                    "no sufficient cached real ohlcv-1d bars for this strategy/window; "
+                    "ingest data via POST /api/data/ingest or use data_mode='auto'",
+                    status_code=422,
+                )
+            if cached_bars is not None:
+                from datetime import UTC, datetime, timedelta
+
+                from src.data.storage import ParquetRepository
+
+                end = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+                real_bars = ParquetRepository(self._settings).read_bars(
+                    list(cached_bars.roots),
+                    end - timedelta(days=900),
+                    end,
+                    schema=cached_bars.schema_name,
+                )
         payload = request.model_dump(mode="json")
         payload["base_strategy_id"] = config.id
         payload["objective_metric"] = _OBJECTIVE_ALIASES.get(
@@ -910,6 +987,7 @@ class OptimizationService:
         # The optimizer's request model is strict: numeric ranges must not carry
         # ``choices`` and it has no ``seed`` field (the seed is a constructor arg).
         payload.pop("seed", None)
+        payload.pop("data_mode", None)  # API-only Phase-11B selector, not an engine field
         payload["search_space"] = _engine_search_space(payload.get("search_space"))
         if not payload.get("search_space"):
             default_builder = getattr(module, "default_search_space", None)
@@ -944,6 +1022,8 @@ class OptimizationService:
             # may use its deterministic offline bars/pipeline fallbacks.
             "offline": True,
         }
+        if real_bars is not None:
+            candidates["bars"] = real_bars
         kwargs: dict[str, object] = {}
         if signature is not None:
             accepts_var_kwargs = any(
@@ -969,6 +1049,13 @@ class OptimizationService:
         result_payload = _result_payload(result)
         result_payload.setdefault("base_strategy_id", config.id)
         result_payload.setdefault("created_at", self._clock().isoformat())
+        result_payload.setdefault(
+            "data_origin", "real_parquet" if cached_bars is not None else "synthetic_fixture"
+        )
+        result_payload.setdefault("data_mode", request.data_mode)
+        result_payload.setdefault(
+            "cached_bars", cached_bars.model_dump(mode="json") if cached_bars else None
+        )
         artifact = result_payload.get("artifact_path")
         artifact_path = Path(str(artifact)) if isinstance(artifact, str) and artifact else None
         if artifact_path is None or not artifact_path.is_file():
@@ -1122,6 +1209,8 @@ class OptimizationService:
             schema_version=1,
             provenance="fixture",
             message=message,
+            data_origin="synthetic_fixture",
+            data_mode=request.data_mode,
             trials=trials,
             param_importances=importances,
             best_strategy_config=best_config,
