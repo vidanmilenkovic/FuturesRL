@@ -271,3 +271,16 @@ def test_get_settings_cached() -> None:
     clear_settings_cache()
     assert get_settings() is get_settings()
     clear_settings_cache()
+
+
+def test_llm_provider_key_requirements() -> None:
+    # Hosted providers need a key.
+    for provider in ("openai", "anthropic", "deepseek"):
+        with pytest.raises(ValueError, match="FUTURESRLX_LLM_API_KEY"):
+            Settings(_env_file=None, llm_provider=provider)
+    # Local vLLM is keyless by design.
+    settings = Settings(_env_file=None, llm_provider="vllm", llm_model="local-model")
+    assert settings.llm_provider == "vllm"
+    assert settings.llm_api_key is None
+    # Offline mode never needs a key.
+    assert Settings(_env_file=None, llm_provider="offline").llm_api_key is None

@@ -285,9 +285,10 @@ data/parquet/<dataset>/<schema>/<root>/part.parquet
 
    repo = ParquetRepository()
    loader = DatabentoLoader(repository=repo)
-   loader.ingest(["ES", "NQ", "CL", "GC", "ZN"],
-                 start="2023-01-01", end="2024-12-31", schema="ohlcv-1d")
-   loader.ingest_definitions(...)                     # contract specs / expiries
+   loader.ingest(
+       ["ES", "NQ", "CL", "GC", "ZN"], start="2023-01-01", end="2024-12-31", schema="ohlcv-1d"
+   )
+   loader.ingest_definitions(...)  # contract specs / expiries
    continuous = ContinuousContractBuilder().build_frame(bars, root="ES")
    ```
 
@@ -409,7 +410,7 @@ from src.backtest.engine import run_from_config
 from configs.strategy import load_strategy_config
 
 result = run_from_config(load_strategy_config("configs/strategies/tsmom_vol_target.yaml"))
-result.check_accounting_identity()          # Ending = Starting + PricePnL + RollPnL - costs
+result.check_accounting_identity()  # Ending = Starting + PricePnL + RollPnL - costs
 print(result.to_dict()["metrics"])
 ```
 
@@ -532,6 +533,10 @@ FUTURESRLX_LLM_MODEL=gpt-4o-mini
 FUTURESRLX_LLM_API_KEY=sk-...
 # FUTURESRLX_LLM_BASE_URL=http://vllm-host:8000/v1   # optional
 ```
+
+Hosted providers (`openai`, `anthropic`, `deepseek`) require `FUTURESRLX_LLM_API_KEY`.
+The local `vllm` provider is **keyless**: point `FUTURESRLX_LLM_BASE_URL` at the OpenAI-compatible
+vLLM server (default `http://localhost:8000/v1`) and leave `FUTURESRLX_LLM_API_KEY` empty.
 
 All LLM outputs remain subject to the confidence/variance filter and the deterministic circuit
 breaker; slow multi-sample calls are served from the async TTL cache and never block the pipeline.

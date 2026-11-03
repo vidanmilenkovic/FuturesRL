@@ -218,7 +218,7 @@ def test_empty_base_url_keeps_adapter_defaults() -> None:
     assert settings.llm_base_url_value is None
 
 
-@pytest.mark.parametrize("provider", sorted(PROVIDER_ADAPTERS))
+@pytest.mark.parametrize("provider", ["anthropic", "deepseek", "openai"])
 def test_missing_api_key_raises_actionable_error(provider: str) -> None:
     # ``model_construct`` bypasses the Settings validator so the factory's own
     # defensive check is exercised (production settings already fail closed).
@@ -227,6 +227,15 @@ def test_missing_api_key_raises_actionable_error(provider: str) -> None:
     )
     with pytest.raises(ValueError, match="FUTURESRLX_LLM_API_KEY"):
         build_llm_client(settings)
+
+
+def test_vllm_works_without_api_key() -> None:
+    """Local vLLM servers are keyless: the factory returns a None-key adapter."""
+    settings = Settings(llm_provider="vllm", llm_model="local-model")
+    assert settings.llm_api_key_value is None
+    client = build_llm_client(settings)
+    assert isinstance(client, VLLMClient)
+    assert client.base_url == "http://localhost:8000/v1"
 
 
 def test_settings_requires_api_key_for_non_offline_provider() -> None:

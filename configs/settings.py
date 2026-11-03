@@ -251,10 +251,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _llm_provider_requires_key(self) -> Settings:
-        if self.llm_provider != "offline" and self.llm_api_key is None:
+        # Local vLLM servers are normally keyless; hosted providers need a key.
+        if self.llm_provider in {"openai", "anthropic", "deepseek"} and self.llm_api_key is None:
             raise ValueError(
                 f"llm_provider={self.llm_provider!r} requires FUTURESRLX_LLM_API_KEY "
-                "(use llm_provider=offline for deterministic fixture assessments)"
+                "(use llm_provider=offline for deterministic fixture assessments, or "
+                "llm_provider=vllm for a keyless local server)"
             )
         return self
 

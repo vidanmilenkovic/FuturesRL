@@ -176,12 +176,18 @@ def build_llm_client(settings: Settings) -> AsyncLLMClient:
     if provider == "offline":
         return OfflineLLMClient()
     api_key = settings.llm_api_key_value
+    base_url = settings.llm_base_url_value
+    if provider == "vllm":
+        # Local vLLM servers are normally keyless: the adapter accepts api_key=None.
+        if base_url is None:
+            return VLLMClient(model=model, api_key=api_key)
+        return VLLMClient(model=model, api_key=api_key, base_url=base_url)
     if not api_key:
         raise ValueError(
             f"llm_provider={provider!r} requires an API key: set FUTURESRLX_LLM_API_KEY "
-            "(or use llm_provider='offline' for deterministic fixture assessments)"
+            "(or use llm_provider='offline' for deterministic fixture assessments, or "
+            "llm_provider='vllm' for a keyless local server)"
         )
-    base_url = settings.llm_base_url_value
     if provider == "openai":
         if base_url is None:
             return OpenAIClient(api_key, model=model)
@@ -194,6 +200,7 @@ def build_llm_client(settings: Settings) -> AsyncLLMClient:
         if base_url is None:
             return DeepSeekClient(api_key, model=model)
         return DeepSeekClient(api_key, model=model, base_url=base_url)
+    # Local vLLM servers are normally keyless: the adapter accepts api_key=None.
     if base_url is None:
         return VLLMClient(model=model, api_key=api_key)
     return VLLMClient(model=model, api_key=api_key, base_url=base_url)
