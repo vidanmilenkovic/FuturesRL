@@ -35,12 +35,19 @@ from src.strategies import (
     validate_parameter_value,
 )
 from src.strategies.parameter_catalog import (
+    DEFAULT_SELECTED_PARAMETER_KEYS,
+    NON_TUNABLE_PARAMETER_KEYS,
     UNIVERSE_SECTOR_GROUPS,
+    active_parameter_keys,
     clear_parameter_catalog_cache,
+    default_selected_parameter_keys,
+    parameters_for_strategy,
     refresh_parameter_catalog,
+    strategy_root_symbols,
     universe_metadata,
     universe_roots,
     universe_sectors,
+    validate_strategy_roots,
 )
 from src.strategies.timing import ALL_MONTHS, DEFAULT_ROOT_MONTH_BIASES
 
@@ -113,6 +120,7 @@ def test_catalog_json_is_serialisable_and_well_formed() -> None:
         "choices",
         "unit",
         "optuna_tunable",
+        "optuna_default_selected",
         "log_scale",
         "yaml_encoding",
         "min_items",
@@ -142,6 +150,8 @@ def test_catalog_parameter_invariants() -> None:
     for spec in catalog.parameters:
         assert spec.label and spec.description
         assert spec.description.strip()
+        if spec.optuna_default_selected:
+            assert spec.optuna_tunable
         if spec.type in {ParameterType.INT, ParameterType.FLOAT}:
             assert not spec.choices
             if spec.default is not None:
@@ -800,3 +810,287 @@ def test_catalog_imports_without_gymnasium_sb3_or_torch() -> None:
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+# ---------------------------------------------------------------------------
+# v1.5.1 Fix 1: Optuna default selection + tunable hygiene + active filtering
+# ---------------------------------------------------------------------------
+
+#: Curated core hypotheses pre-selected in the Studio optimizer (v1.5.1 Fix 1).
+CURATED_DEFAULT_KEYS: frozenset[str] = frozenset(
+    {
+        "timing.tsmom.lookback_fast",
+        "timing.tsmom.lookback_slow",
+        "timing.kama.window",
+        "timing.carry_filter.min_carry_bps",
+        "allocator.volatility_target.target_annual_volatility",
+        "risk.quant_risk.trailing_stop_pct",
+    }
+)
+
+#: Root tokens that must never appear as tradable roots (delisted/non-canonical).
+DELISTED_ROOT_TOKENS: frozenset[str] = frozenset({"GE", "ZQ", "KE", "BTC"})
+
+
+def _synthetic_strategy(**overrides: object) -> StrategyConfig:
+    from configs.strategy import StageConfig
+
+    payload: dict[str, object] = {
+        "id": "active_filter_synthetic",
+        "universe": StageConfig(name="liquidity", params={}),
+        "allocator": StageConfig(name="volatility_target", params={}),
+        "timing": (StageConfig(name="tsmom", params={}),),
+        "risk": (),
+        "translator": TranslatorConfig(),
+    }
+    payload.update(overrides)
+    return StrategyConfig.model_validate(payload)
+
+
+def test_optuna_default_selected_is_exactly_the_curated_core() -> None:
+    catalog = parameter_catalog()
+    selected = tuple(spec.key for spec in catalog.parameters if spec.optuna_default_selected)
+    assert set(selected) == CURATED_DEFAULT_KEYS == set(DEFAULT_SELECTED_PARAMETER_KEYS)
+    assert len(tuple(DEFAULT_SELECTED_PARAMETER_KEYS)) == 6
+    for key in selected:
+        assert catalog.get(key).optuna_tunable is True
+    # Payload: the additive flag exists on every entry, is always a bool, and only
+    # the six curated keys are True (False, not omitted/null, for all others).
+    payload = catalog_dict()
+    flags = [entry["optuna_default_selected"] for entry in payload["parameters"]]
+    assert all(isinstance(flag, bool) for flag in flags)
+    assert sum(flags) == 6
+    true_keys = {
+        entry["key"] for entry in payload["parameters"] if entry["optuna_default_selected"]
+    }
+    assert true_keys == CURATED_DEFAULT_KEYS
+    assert payload["version"] == 1  # additive field only; contract version unchanged
+
+
+def test_structural_and_hygiene_parameters_are_not_tunable() -> None:
+    catalog = parameter_catalog()
+    # Explicit Lead-listed hygiene keys must all be present and non-tunable.
+    listed = {
+        "universe.liquidity.min_avg_dollar_volume",
+        "universe.liquidity.min_open_interest",
+        "universe.liquidity.min_history_days",
+        "universe.liquidity.top_n",
+        "universe.regime.top_n",
+        "risk.llm_risk.sample_count",
+        "risk.llm_risk.cache_ttl_seconds",
+        "risk.llm_risk.macro_lockout_minutes_before",
+        "risk.llm_risk.macro_lockout_minutes_after",
+        "risk.llm_risk.macro_lockout_action",
+        "risk.llm_risk.macro_lockout_leverage_cap",
+    }
+    assert listed <= set(NON_TUNABLE_PARAMETER_KEYS)
+    for key in listed:
+        spec = catalog.get(key)
+        assert spec.optuna_tunable is False, key
+        assert spec.optuna_default_selected is False, key
+    # The full structural/hygiene policy is enforced on every catalog entry.
+    for key in NON_TUNABLE_PARAMETER_KEYS:
+        spec = catalog.get(key)
+        assert spec.optuna_tunable is False, key
+        assert spec.optuna_default_selected is False, key
+    # Structural non-tunables are excluded from the optimizer candidate pool.
+    tunable_keys = {spec.key for spec in catalog.tunable()}
+    assert NON_TUNABLE_PARAMETER_KEYS.isdisjoint(tunable_keys)
+    assert tunable_keys >= CURATED_DEFAULT_KEYS
+
+
+def test_active_filtering_for_tsmom_config() -> None:
+    strategy = load_strategy_config("configs/strategies/tsmom_vol_target.yaml").model_dump(
+        mode="json"
+    )
+    keys = active_parameter_keys(strategy)
+    specs = parameters_for_strategy(strategy)
+    assert tuple(spec.key for spec in specs) == keys
+    assert all(spec.optuna_tunable for spec in specs)
+    # Active overlays/stages are included.
+    for key in (
+        "timing.tsmom.lookback_fast",
+        "timing.tsmom.lookback_slow",
+        "timing.kama.window",
+        "timing.carry_filter.min_carry_bps",
+        "allocator.volatility_target.target_annual_volatility",
+        "risk.quant_risk.trailing_stop_pct",
+        "risk.llm_risk.confidence_threshold",
+    ):
+        assert key in keys, key
+    # Inactive selector/overlays and non-tunable params are excluded.
+    inactive_or_structural = (
+        "universe.regime.shock_z_threshold",  # liquidity selector active, regime not
+        "universe.liquidity.top_n",  # active selector but structural/non-tunable
+        "allocator.risk_parity.target_annual_volatility",
+        "allocator.equal_weight.gross_leverage",
+        "allocator.drl.total_timesteps",
+        "timing.mean_reversion.rsi_period",
+        "timing.seasonality.out_of_season_scale",
+        "translator.rebalance_buffer_contracts",
+    )
+    for key in inactive_or_structural:
+        assert key not in keys, key
+    # The TSMOM YAML activates all six curated defaults.
+    assert set(default_selected_parameter_keys(strategy)) == CURATED_DEFAULT_KEYS
+
+
+def test_active_filtering_for_panic_mean_reversion_preset() -> None:
+    preset = next(p for p in parameter_catalog().presets if p.id == "panic_mean_reversion")
+    keys = active_parameter_keys(preset.strategy)
+    for key in (
+        "timing.mean_reversion.rsi_period",
+        "timing.mean_reversion.turbulence_veto_threshold",
+        "allocator.risk_parity.target_annual_volatility",
+        "risk.quant_risk.trailing_stop_pct",
+    ):
+        assert key in keys, key
+    for key in (
+        "timing.tsmom.lookback_fast",
+        "timing.kama.window",
+        "timing.carry_filter.min_carry_bps",
+        "allocator.volatility_target.target_annual_volatility",
+    ):
+        assert key not in keys, key
+    # Only the curated default that this preset's active stages expose is selected.
+    assert set(default_selected_parameter_keys(preset.strategy)) == {
+        "risk.quant_risk.trailing_stop_pct"
+    }
+
+
+def test_active_filtering_expands_composite_timing_components() -> None:
+    from configs.strategy import StageConfig
+
+    composite = _synthetic_strategy(
+        timing=(StageConfig(name="composite", params={"components": "tsmom,kama"}),)
+    )
+    strategy = composite.model_dump(mode="json")
+    keys = active_parameter_keys(strategy)
+    assert "timing.tsmom.lookback_fast" in keys
+    assert "timing.kama.window" in keys
+    # Non-composited overlays and the composite plumbing itself are excluded.
+    assert "timing.carry_filter.min_carry_bps" not in keys
+    assert "timing.mean_reversion.rsi_period" not in keys
+    assert all(not key.startswith("timing.composite.") for key in keys)
+    assert set(default_selected_parameter_keys(composite)) == {
+        "allocator.volatility_target.target_annual_volatility",
+        "timing.tsmom.lookback_fast",
+        "timing.tsmom.lookback_slow",
+        "timing.kama.window",
+    }
+
+
+def test_active_filtering_for_drl_config_excludes_non_selected_allocators() -> None:
+    strategy = load_strategy_config("configs/strategies/drl_ppo_llm_risk.yaml").model_dump(
+        mode="json"
+    )
+    keys = active_parameter_keys(strategy)
+    assert "allocator.drl.total_timesteps" in keys
+    assert "allocator.drl.risk_penalty_lambda" in keys
+    for key in (
+        "allocator.volatility_target.target_annual_volatility",
+        "allocator.risk_parity.gross_leverage",
+        "allocator.equal_weight.gross_leverage",
+        "allocator.mean_variance.risk_aversion",
+        "allocator.drl.algorithm",  # active but structural/non-tunable
+        "timing.kama.window",  # not in this strategy's timing list
+        "timing.carry_filter.min_carry_bps",
+    ):
+        assert key not in keys, key
+    assert set(default_selected_parameter_keys(strategy)) == {
+        "timing.tsmom.lookback_fast",
+        "timing.tsmom.lookback_slow",
+        "risk.quant_risk.trailing_stop_pct",
+    }
+
+
+def test_active_filtering_accepts_validated_config_objects() -> None:
+    config = load_strategy_config("configs/strategies/tsmom_vol_target.yaml")
+    assert active_parameter_keys(config) == active_parameter_keys(config.model_dump(mode="json"))
+    # Order follows catalog order (allocator before timing before risk).
+    assert set(default_selected_parameter_keys(config)) == set(DEFAULT_SELECTED_PARAMETER_KEYS)
+
+
+def test_presets_and_configs_reference_only_master_roots() -> None:
+    master = load_instruments()
+    canonical = set(master.roots())
+    catalog = parameter_catalog()
+    referenced: set[str] = set()
+    for preset in catalog.presets:
+        roots = validate_strategy_roots(preset.strategy, master)
+        assert set(roots) <= canonical
+        referenced.update(roots)
+        serialized = json.dumps(preset.strategy).upper()
+        for token in DELISTED_ROOT_TOKENS:
+            assert f'"{token}"' not in serialized, f"preset {preset.id} references {token}"
+    for config in discover_strategy_configs("configs/strategies").values():
+        strategy = config.model_dump(mode="json")
+        roots = validate_strategy_roots(strategy, master)
+        assert set(roots) <= canonical
+        referenced.update(roots)
+        serialized = json.dumps(strategy).upper()
+        for token in DELISTED_ROOT_TOKENS:
+            assert f'"{token}"' not in serialized, f"{config.id} references {token}"
+    assert DELISTED_ROOT_TOKENS.isdisjoint(referenced)
+    # The one preset that configures seasons uses canonical roots only.
+    seasonal = next(p for p in catalog.presets if p.id == "seasonal_commodity_cycle")
+    assert set(strategy_root_symbols(seasonal.strategy)) == {"CL", "GC"}
+
+
+def test_strategy_root_symbols_extracts_regime_and_seasonality_roots() -> None:
+    from configs.strategy import StageConfig
+
+    strategy = _synthetic_strategy(
+        universe=StageConfig(
+            name="regime", params={"risk_off_roots": "CL,GC", "risk_off_sectors": "energy,metals"}
+        ),
+        timing=(
+            StageConfig(
+                name="seasonality",
+                params={"root_month_biases": '{"ZC": {"1": 0.2}, "ZS": {"9": -0.1}}'},
+            ),
+        ),
+    )
+    symbols = strategy_root_symbols(strategy)
+    assert symbols == ("CL", "GC", "ZC", "ZS")
+    assert validate_strategy_roots(strategy) == symbols
+    # Non-root lists are ignored.
+    assert "energy" not in symbols and "metals" not in symbols
+
+
+def test_validate_strategy_roots_rejects_delisted_roots() -> None:
+    from configs.strategy import StageConfig
+
+    strategy = _synthetic_strategy(
+        universe=StageConfig(name="regime", params={"risk_off_roots": "CL,GE,ZQ,KE,BTC"})
+    )
+    with pytest.raises(ValueError, match=r"GE|ZQ|KE|BTC"):
+        validate_strategy_roots(strategy)
+    symbols = strategy_root_symbols(strategy)
+    assert DELISTED_ROOT_TOKENS & set(symbols) == {"GE", "ZQ", "KE", "BTC"}
+
+
+def test_preset_strategies_define_their_active_default_selected_parameters() -> None:
+    """Every curated default the optimizer may pre-select must exist in the preset.
+
+    v1.5.1 consistency guard: the optimizer samples the active default-selected
+    keys; each of those must already be present in the preset strategy's stage
+    params (no silent ``allow_new_params`` injection for generated presets).
+    """
+    catalog = parameter_catalog()
+    for preset in catalog.presets:
+        active_defaults = default_selected_parameter_keys(preset.strategy)
+        for key in active_defaults:
+            # ``get_parameter_value`` raises KeyError when the stage param is absent.
+            value = get_parameter_value(preset.strategy, key)
+            assert value is not None, (preset.id, key)
+    # The curated quant-risk default is explicit in every preset's quant_risk stage.
+    for preset in catalog.presets:
+        risk_stages = preset.strategy.get("risk")
+        assert isinstance(risk_stages, list)
+        quant_risk = next(
+            stage
+            for stage in risk_stages
+            if isinstance(stage, dict) and stage["name"] == "quant_risk"
+        )
+        assert quant_risk["params"]["trailing_stop_pct"] == pytest.approx(0.10)

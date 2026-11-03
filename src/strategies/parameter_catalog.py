@@ -40,6 +40,21 @@ The payload also carries the Studio's universe explorer and stage dropdowns:
 sector groups All/Equities/Rates/Energy/Metals/FX/Agri/Crypto) and per-stage
 ``choices`` (universe selectors, allocators, timing overlays, risk overlays).
 
+Optuna selection & active-stage filtering
+-----------------------------------------
+Each parameter carries ``optuna_tunable`` (may it be sampled at all) and
+``optuna_default_selected`` (pre-checked in the Studio optimizer). Exactly
+:data:`DEFAULT_SELECTED_PARAMETER_KEYS` (six curated core hypotheses) are
+pre-selected; structural/data-hygiene parameters in
+:data:`NON_TUNABLE_PARAMETER_KEYS` (universe composition/history, regime
+switches, macro-lockout plumbing, risk enable toggles, translator execution
+details) are never tunable. :func:`active_parameter_keys`,
+:func:`parameters_for_strategy` and :func:`default_selected_parameter_keys`
+filter to the *active* stage choices/overlays of a concrete strategy (inactive
+selectors/overlays are excluded), and :func:`validate_strategy_roots` /
+:func:`strategy_root_symbols` guard root lists (regime/seasonality/universe)
+against roots that are not in the instrument master.
+
 Helper API (also the contract reported to the API/optimizer owners)
 -------------------------------------------------------------------
 * :func:`parameter_catalog` — cached :class:`ParameterCatalog` singleton
@@ -71,7 +86,7 @@ import copy
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -98,6 +113,53 @@ LOCATION_TRANSLATOR: str = "translator"
 LOCATION_DRL_BLOCK: str = "drl_block"
 LOCATIONS: frozenset[str] = frozenset(
     {LOCATION_STAGE_PARAMS, LOCATION_TRANSLATOR, LOCATION_DRL_BLOCK}
+)
+
+#: Curated core parameters pre-selected when the Studio opens the Optuna optimizer.
+#: Exactly these six are ``optuna_default_selected=True``; every other parameter is
+#: ``False`` so a fresh tuning run explores only the high-signal hypothesis space.
+DEFAULT_SELECTED_PARAMETER_KEYS: tuple[str, ...] = (
+    "timing.tsmom.lookback_fast",
+    "timing.tsmom.lookback_slow",
+    "timing.kama.window",
+    "timing.carry_filter.min_carry_bps",
+    "allocator.volatility_target.target_annual_volatility",
+    "risk.quant_risk.trailing_stop_pct",
+)
+
+#: Structural / data-hygiene parameters that must never enter an Optuna search
+#: space: universe composition and history filters, regime enable/logic switches,
+#: macro-lockout plumbing, risk enable toggles and translator execution details.
+#: Tuning these would overfit data availability/execution plumbing instead of
+#: strategy hypotheses (and they are not a source of alpha).
+NON_TUNABLE_PARAMETER_KEYS: frozenset[str] = frozenset(
+    {
+        "universe.liquidity.min_avg_dollar_volume",
+        "universe.liquidity.min_open_interest",
+        "universe.liquidity.top_n",
+        "universe.liquidity.min_history_days",
+        "universe.regime.top_n",
+        "universe.regime.min_universe",
+        "universe.regime.filter_negative_trend",
+        "universe.regime.require_both",
+        "universe.regime.risk_off_roots",
+        "universe.regime.risk_off_sectors",
+        "universe.composite.mode",
+        "universe.composite.components",
+        "allocator.drl.normalize_observations",
+        "risk.quant_risk.volatility_targeting_enabled",
+        "risk.quant_risk.daily_loss_kill_switch_enabled",
+        "risk.llm_risk.sample_count",
+        "risk.llm_risk.cache_ttl_seconds",
+        "risk.llm_risk.macro_lockout_minutes_before",
+        "risk.llm_risk.macro_lockout_minutes_after",
+        "risk.llm_risk.macro_lockout_action",
+        "risk.llm_risk.macro_lockout_leverage_cap",
+        "translator.rounding_mode",
+        "translator.rebalance_buffer_contracts",
+        "translator.enable_micro_routing",
+        "translator.min_micro_notional_ratio",
+    }
 )
 
 type CatalogScalar = int | float | bool | str | None
@@ -358,6 +420,7 @@ class ParameterSpec:
     choices: tuple[CatalogScalar, ...] = ()
     unit: str | None = None
     optuna_tunable: bool = True
+    optuna_default_selected: bool = False
     log_scale: bool = False
     yaml_encoding: str = ENCODING_SCALAR
     min_items: int | None = None
@@ -381,6 +444,7 @@ class ParameterSpec:
             "choices": list(self.choices),
             "unit": self.unit,
             "optuna_tunable": self.optuna_tunable,
+            "optuna_default_selected": self.optuna_default_selected,
             "log_scale": self.log_scale,
             "yaml_encoding": self.yaml_encoding,
             "min_items": self.min_items,
@@ -528,6 +592,26 @@ class ParameterCatalog:
                 raise ValueError("the universe stage must expose selector choices")
             if stage.id == "allocator" and not stage.choices:
                 raise ValueError("the allocator stage must expose allocator choices")
+        selected_keys = {spec.key for spec in self.parameters if spec.optuna_default_selected}
+        expected_selected = set(DEFAULT_SELECTED_PARAMETER_KEYS)
+        if selected_keys != expected_selected:
+            raise ValueError(
+                "optuna_default_selected must be exactly "
+                f"{sorted(expected_selected)!r}, got {sorted(selected_keys)!r}"
+            )
+        known_keys = {spec.key for spec in self.parameters}
+        missing_hygiene = sorted(NON_TUNABLE_PARAMETER_KEYS - known_keys)
+        if missing_hygiene:
+            raise ValueError(f"non-tunable hygiene keys are not catalogued: {missing_hygiene!r}")
+        for spec in self.parameters:
+            if spec.optuna_default_selected and not spec.optuna_tunable:
+                raise ValueError(
+                    f"{spec.key}: optuna_default_selected requires optuna_tunable=True"
+                )
+            if spec.key in NON_TUNABLE_PARAMETER_KEYS and spec.optuna_tunable:
+                raise ValueError(
+                    f"{spec.key}: structural/data-hygiene parameter must not be tunable"
+                )
         metadata = self.universe_metadata()
         root_ids = {root.root for root in metadata.roots}
         if not root_ids:
@@ -2317,6 +2401,10 @@ _QUANT_RISK_DEFAULTS: dict[str, object] = {
     "max_sector_weight": 0.40,
     "drawdown_limit_pct": 0.20,
     "daily_max_loss_pct": 0.03,
+    # v1.5.1: make the curated default-selected quant-risk parameter explicit in
+    # generated preset strategies (it was catalogued but omitted from the stage
+    # params, so the optimizer had to inject it as a new parameter).
+    "trailing_stop_pct": 0.10,
 }
 _LLM_RISK_DEFAULTS: dict[str, object] = {
     "confidence_threshold": 0.70,
@@ -2782,13 +2870,46 @@ def _master_fingerprint(master: InstrumentsConfig) -> MasterFingerprint:
     )
 
 
+def _apply_optuna_selection(
+    parameters: tuple[ParameterSpec, ...],
+) -> tuple[ParameterSpec, ...]:
+    """Apply the curated default-selection and structural non-tunable policy.
+
+    Centralised here (instead of per-row flags) so the policy is one auditable
+    list: exactly :data:`DEFAULT_SELECTED_PARAMETER_KEYS` are pre-selected and
+    every :data:`NON_TUNABLE_PARAMETER_KEYS` entry is excluded from Optuna search
+    spaces even if a row declared ``tunable=True``. Unknown/overlapping keys raise
+    immediately (a typo can never silently widen the search space).
+    """
+    known = {spec.key for spec in parameters}
+    curated = frozenset(DEFAULT_SELECTED_PARAMETER_KEYS)
+    unknown = sorted((curated | NON_TUNABLE_PARAMETER_KEYS) - known)
+    if unknown:
+        raise ValueError(f"optuna selection policy references unknown parameter keys: {unknown!r}")
+    conflicts = sorted(curated & NON_TUNABLE_PARAMETER_KEYS)
+    if conflicts:
+        raise ValueError(
+            f"curated default parameters cannot be structural/non-tunable: {conflicts!r}"
+        )
+    adjusted: list[ParameterSpec] = []
+    for spec in parameters:
+        tunable = spec.optuna_tunable and spec.key not in NON_TUNABLE_PARAMETER_KEYS
+        selected = spec.key in curated
+        if selected and not tunable:  # pragma: no cover - guarded by the conflict check
+            raise ValueError(f"{spec.key}: curated default selection requires tunable=True")
+        adjusted.append(replace(spec, optuna_tunable=tunable, optuna_default_selected=selected))
+    return tuple(adjusted)
+
+
 def _build_catalog(master: InstrumentsConfig) -> ParameterCatalog:
-    parameters: tuple[ParameterSpec, ...] = (
-        *_universe_specs(master),
-        *_allocator_specs(),
-        *_timing_specs(master),
-        *_risk_specs(),
-        *_translator_specs(),
+    parameters: tuple[ParameterSpec, ...] = _apply_optuna_selection(
+        (
+            *_universe_specs(master),
+            *_allocator_specs(),
+            *_timing_specs(master),
+            *_risk_specs(),
+            *_translator_specs(),
+        )
     )
     stages = tuple(
         CatalogStage(
@@ -3038,6 +3159,202 @@ def get_parameter_value(strategy: Mapping[str, object], key: str) -> object:
 
 
 # ---------------------------------------------------------------------------
+# Active-strategy parameter filtering (Studio optimizer search space)
+# ---------------------------------------------------------------------------
+
+
+def _strategy_mapping(strategy: Mapping[str, object] | StrategyConfig) -> Mapping[str, object]:
+    """Accept either a strategy dict (YAML/JSON form) or a validated config."""
+    if isinstance(strategy, StrategyConfig):
+        return strategy.model_dump(mode="json")
+    return strategy
+
+
+def _lower_choice(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
+def _choice_names(value: object) -> tuple[str, ...]:
+    """Normalise a comma string / sequence param value into lowercase names."""
+    if isinstance(value, str):
+        return tuple(part.strip().lower() for part in value.split(",") if part.strip())
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return tuple(str(item).strip().lower() for item in value if str(item).strip())
+    return ()
+
+
+def _active_stage_choices(
+    strategy: Mapping[str, object] | StrategyConfig,
+) -> Mapping[str, tuple[str, ...]]:
+    """Stage id -> active implementation names for one concrete strategy."""
+    mapping = _strategy_mapping(strategy)
+    active: dict[str, set[str]] = {
+        "universe": set(),
+        "allocator": set(),
+        "timing": set(),
+        "risk": set(),
+        "translator": set(),
+    }
+    for stage_id in ("universe", "allocator"):
+        block = mapping.get(stage_id)
+        if isinstance(block, Mapping):
+            name = _lower_choice(block.get("name"))
+            if name is not None:
+                active[stage_id].add(name)
+    for stage_id in ("timing", "risk"):
+        entries = mapping.get(stage_id)
+        if not isinstance(entries, (list, tuple)):
+            continue
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            name = _lower_choice(entry.get("name"))
+            if name is None:
+                continue
+            active[stage_id].add(name)
+            if stage_id == "timing" and name == "composite":
+                params = entry.get("params")
+                if isinstance(params, Mapping):
+                    # A composite stage activates its configured components too.
+                    active[stage_id].update(_choice_names(params.get("components")))
+    if isinstance(mapping.get("translator"), Mapping):
+        active["translator"].add("translator")
+    return {stage_id: tuple(sorted(names)) for stage_id, names in active.items()}
+
+
+def parameters_for_strategy(
+    strategy: Mapping[str, object] | StrategyConfig,
+) -> tuple[ParameterSpec, ...]:
+    """Active, tunable parameter specs for one concrete strategy.
+
+    Only parameters of the strategy's *selected* universe selector/allocator and
+    the timing/risk stages actually present are returned (composite timing expands
+    to its components); inactive selectors/overlays and every non-tunable
+    structural parameter are excluded. This is the exact Optuna search-space
+    candidate set for the strategy.
+    """
+    active = _active_stage_choices(strategy)
+    return tuple(
+        spec
+        for spec in parameter_catalog().parameters
+        if spec.optuna_tunable and spec.stage_name in active.get(spec.stage, ())
+    )
+
+
+def active_parameter_keys(
+    strategy: Mapping[str, object] | StrategyConfig,
+) -> tuple[str, ...]:
+    """Catalog keys of :func:`parameters_for_strategy` (active + tunable)."""
+    return tuple(spec.key for spec in parameters_for_strategy(strategy))
+
+
+def default_selected_parameter_keys(
+    strategy: Mapping[str, object] | StrategyConfig,
+) -> tuple[str, ...]:
+    """Curated default-selected keys that are active and tunable for this strategy."""
+    catalog = parameter_catalog()
+    return tuple(
+        key for key in active_parameter_keys(strategy) if catalog.get(key).optuna_default_selected
+    )
+
+
+# ---------------------------------------------------------------------------
+# Root-symbol validation (presets/configs vs the instrument master)
+# ---------------------------------------------------------------------------
+
+#: Stage-parameter keys that carry root-symbol lists in strategy configs.
+ROOT_LIST_PARAMETER_KEYS: tuple[str, ...] = (
+    "roots",
+    "risk_off_roots",
+    "root_month_biases",
+)
+
+
+def _roots_from_value(value: object) -> tuple[str, ...]:
+    """Normalise a root-list param value (comma string, JSON object, sequence)."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        if text.startswith("{"):
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                return ()
+            return (
+                tuple(str(root).strip().upper() for root in payload)
+                if isinstance(payload, Mapping)
+                else ()
+            )
+        return tuple(part.strip().upper() for part in text.split(",") if part.strip())
+    if isinstance(value, Mapping):
+        return tuple(str(root).strip().upper() for root in value)
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return tuple(str(item).strip().upper() for item in value if str(item).strip())
+    return ()
+
+
+def strategy_root_symbols(
+    strategy: Mapping[str, object] | StrategyConfig,
+) -> tuple[str, ...]:
+    """Every root symbol referenced by a strategy dict's root lists.
+
+    Covers ``universe.params.{roots,risk_off_roots,root_month_biases}`` and the
+    same keys inside ``timing``/``risk`` stage params (e.g. the seasonality
+    overlay's ``root_month_biases``). Symbols are upper-cased, de-duplicated and
+    returned in first-reference order.
+    """
+    mapping = _strategy_mapping(strategy)
+    symbols: list[str] = []
+
+    def add(values: Sequence[str]) -> None:
+        for symbol in values:
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+
+    blocks: list[Mapping[str, object]] = []
+    for stage_id in ("universe", "allocator"):
+        block = mapping.get(stage_id)
+        if isinstance(block, Mapping):
+            blocks.append(block)
+    for stage_id in ("timing", "risk"):
+        entries = mapping.get(stage_id)
+        if isinstance(entries, (list, tuple)):
+            blocks.extend(entry for entry in entries if isinstance(entry, Mapping))
+    for block in blocks:
+        params = block.get("params")
+        if not isinstance(params, Mapping):
+            continue
+        for key in ROOT_LIST_PARAMETER_KEYS:
+            add(_roots_from_value(params.get(key)))
+    return tuple(symbols)
+
+
+def validate_strategy_roots(
+    strategy: Mapping[str, object] | StrategyConfig,
+    instrument_master: InstrumentsConfig | None = None,
+) -> tuple[str, ...]:
+    """Validate that every root a strategy references exists in the master.
+
+    Returns the referenced symbols; raises ``ValueError`` naming any delisted /
+    misspelt root. Presets, generated drafts and ``POST /api/strategies`` payloads
+    can call this before persisting a strategy.
+    """
+    master = instrument_master if instrument_master is not None else load_instruments()
+    symbols = strategy_root_symbols(strategy)
+    unknown = [symbol for symbol in symbols if not master.has(symbol)]
+    if unknown:
+        raise ValueError(
+            f"strategy references futures roots that are not in the instrument master: {unknown!r}"
+        )
+    return symbols
+
+
+# ---------------------------------------------------------------------------
 # Value validation / YAML <-> UI encoding
 # ---------------------------------------------------------------------------
 
@@ -3275,6 +3592,7 @@ __all__ = [
     "ASSET_CLASS_GROUPS",
     "CATALOG",
     "CATALOG_VERSION",
+    "DEFAULT_SELECTED_PARAMETER_KEYS",
     "ENCODING_COMMA_INTS",
     "ENCODING_COMMA_STRINGS",
     "ENCODING_JSON_OBJECT",
@@ -3282,6 +3600,8 @@ __all__ = [
     "LOCATION_DRL_BLOCK",
     "LOCATION_STAGE_PARAMS",
     "LOCATION_TRANSLATOR",
+    "NON_TUNABLE_PARAMETER_KEYS",
+    "ROOT_LIST_PARAMETER_KEYS",
     "SECTOR_GROUP_ALIASES",
     "STAGE_OPTION_LABELS",
     "UNIVERSE_SECTOR_GROUPS",
@@ -3296,18 +3616,23 @@ __all__ = [
     "UniverseMetadata",
     "UniverseRoot",
     "UniverseSector",
+    "active_parameter_keys",
     "apply_parameter_overrides",
     "catalog_dict",
     "clear_parameter_catalog_cache",
     "decode_parameter_value",
+    "default_selected_parameter_keys",
     "encode_parameter_value",
     "get_parameter_value",
     "parameter_catalog",
     "parameter_keys_for_strategy",
+    "parameters_for_strategy",
     "refresh_parameter_catalog",
     "resolve_param_path",
+    "strategy_root_symbols",
     "universe_metadata",
     "universe_roots",
     "universe_sectors",
     "validate_parameter_value",
+    "validate_strategy_roots",
 ]
