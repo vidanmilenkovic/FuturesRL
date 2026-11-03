@@ -15,8 +15,9 @@ tasks 36/37/38/40:
 4. IBKR attribution: persisted live-NLV history (append/dedupe/bounded/age/
    corrupt-safe), ``equity_curve_source``/``equity_curve_live_points``/
    ``portfolio_volatility``/``portfolio_volatility_source`` on
-   ``GET /api/positions``; flat IBKR book -> exactly 0.0 vol; <5 live points ->
-   simulated-backfill; >=5 -> ibkr-live; ex-ante covariance vol finite; offline
+   ``GET /api/positions``; flat IBKR book -> exactly 0.0 vol; <5 distinct UTC
+   days -> simulated-backfill; >=5 distinct days -> ibkr-live (v1.5.2 rule:
+   distinct days, not point count); ex-ante covariance vol finite; offline
    unchanged.
 5. Hostile-environment gate contract: the quality-gate script unsets
    ``FUTURESRLX_*`` and the app settings/state-store construct under
@@ -647,13 +648,32 @@ def _attribution_client(
 
 
 def _live_points(count: int) -> tuple[EquityPoint, ...]:
+    """``count`` real NLV points all on the SAME UTC calendar day."""
     return tuple(
         EquityPoint(time=FIXED_CLOCK - timedelta(minutes=count - index), value=1_000_000.0 + index)
         for index in range(count)
     )
 
 
+def _live_points_across_days(days: int, per_day: int = 2) -> tuple[EquityPoint, ...]:
+    """Real NLV points spanning ``days`` distinct UTC calendar days (v1.5.2 rule)."""
+    points: list[EquityPoint] = []
+    for day in range(days):
+        day_start = FIXED_CLOCK - timedelta(days=day)
+        for index in range(per_day):
+            points.append(
+                EquityPoint(
+                    time=day_start - timedelta(minutes=index),
+                    value=1_000_000.0 + day * 1_000.0 + index,
+                )
+            )
+    return tuple(sorted(points, key=lambda point: point.time))
+
+
 def test_positions_attribution_flat_ibkr_book_has_zero_volatility(tmp_path: Path) -> None:
+    # v1.5.2: five SAME-DAY points are not enough for the multi-day ``ibkr-live``
+    # badge (that needs >=5 distinct UTC calendar days), but the flat-book risk
+    # values and the 1D intraday provenance must still be exact.
     execution = _FakeIBKRExecution(snapshot=_account_snapshot([], curve=[]), points=_live_points(5))
     with _attribution_client(tmp_path, execution=execution) as client:
         response = client.get("/api/positions")
@@ -661,9 +681,14 @@ def test_positions_attribution_flat_ibkr_book_has_zero_volatility(tmp_path: Path
     body = response.json()
     assert body["portfolio_volatility"] == 0.0, "a flat IBKR book must report exactly 0.0 vol"
     assert body["portfolio_volatility_source"] == "ex-ante-book"
-    assert body["equity_curve_source"] == "ibkr-live"
+    assert body["equity_curve_source"] == "simulated-backfill"
     assert body["equity_curve_live_points"] == 5
-    assert len(body["equity_curve"]) == 5
+    assert body["equity_curve_live_days"] == 1
+    assert len(body["equity_curve_intraday"]) == 5
+    # The <5-day path keeps the snapshot's synthetic backfill curve (here the
+    # account helper's single default point), NOT the real intraday points.
+    assert [point["value"] for point in body["equity_curve"]] == [pytest.approx(1_000_000.0)]
+    assert len(body["equity_curve"]) != 5
 
 
 @pytest.mark.parametrize("live_count", [0, 1, 4])
@@ -688,14 +713,19 @@ def test_positions_attribution_backfill_when_few_live_points(
 def test_positions_attribution_live_curve_and_ex_ante_volatility(tmp_path: Path) -> None:
     state = make_market_state(roots=("ES", "NQ"))
     positions = [_position_row("ES", weight=0.3), _position_row("NQ", weight=0.2, quantity=2)]
-    execution = _FakeIBKRExecution(snapshot=_account_snapshot(positions), points=_live_points(6))
+    real_points = _live_points_across_days(days=5, per_day=2)
+    execution = _FakeIBKRExecution(snapshot=_account_snapshot(positions), points=real_points)
     with _attribution_client(tmp_path, execution=execution, market_state=state) as client:
         body = client.get("/api/positions").json()
+    # v1.5.2: live multi-day provenance now requires >=5 DISTINCT UTC days.
     assert body["equity_curve_source"] == "ibkr-live"
-    assert body["equity_curve_live_points"] == 6
+    assert body["equity_curve_live_points"] == len(real_points)
+    assert body["equity_curve_live_days"] == 5
     assert [point["value"] for point in body["equity_curve"]] == [
-        pytest.approx(point.value) for point in _live_points(6)
-    ]
+        pytest.approx(point.value) for point in real_points
+    ], "live mode must plot ONLY real recorded points (no synthetic spline prepended)"
+    intraday = [point["value"] for point in body["equity_curve_intraday"]]
+    assert intraday == [pytest.approx(point.value) for point in real_points[-2:]]
     volatility = body["portfolio_volatility"]
     assert isinstance(volatility, float) and math.isfinite(volatility) and volatility > 0.0
     assert body["portfolio_volatility_source"] == "ex-ante-book"
