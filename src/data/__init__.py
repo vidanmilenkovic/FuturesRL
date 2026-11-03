@@ -30,6 +30,12 @@ Research features
 Live/paper
     :class:`~src.data.ibkr_data.IBKRMarketDataStreamer` — ``ib_async`` 5-second
     bars, ticks and L1/L2 depth folded into ``MarketState`` snapshots.
+
+Live news / macro headlines
+    :class:`~src.data.news_ingestor.NewsIngestor` — pluggable RSS -> IBKR ->
+    deterministic-fixture headline resolution returning immutable
+    :class:`~src.data.news_ingestor.NewsHeadline` objects (root/severity/sentiment
+    classified) for the LLM Risk-First engine and the Risk Monitor live feed.
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ from src.data.databento_loader import (
 from src.data.feature_processor import FeatureProcessor
 from src.data.ibkr_data import IBKRMarketDataStreamer
 from src.data.market_state_builder import MarketStateBuilder
+from src.data.news_ingestor import NewsHeadline, NewsIngestor, Severity, SourceKind
 from src.data.storage import ParquetRepository, StorageError, WriteMode
 
 __all__ = [
@@ -64,9 +71,13 @@ __all__ = [
     "IBKRMarketDataStreamer",
     "MarketStateBuilder",
     "NativeRollCrossCheck",
+    "NewsHeadline",
+    "NewsIngestor",
     "OfflineBarSource",
     "ParquetRepository",
     "RollScheduleCalculator",
+    "Severity",
+    "SourceKind",
     "StorageError",
     "VolumeOICrossoverRollSchedule",
     "WriteMode",
