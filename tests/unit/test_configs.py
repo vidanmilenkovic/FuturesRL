@@ -284,3 +284,8 @@ def test_llm_provider_key_requirements() -> None:
     assert settings.llm_api_key is None
     # Offline mode never needs a key.
     assert Settings(_env_file=None, llm_provider="offline").llm_api_key is None
+
+
+def test_api_enable_ibkr_setting() -> None:
+    assert Settings(_env_file=None).api_enable_ibkr is False
+    assert Settings(_env_file=None, api_enable_ibkr=True).api_enable_ibkr is True

@@ -1809,7 +1809,10 @@ def _build_execution_service(
     clock: fixtures.Clock,
     warnings: list[str],
 ) -> ExecutionService:
-    if os.environ.get(IBKR_ENABLE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+    enabled = settings.api_enable_ibkr or (
+        os.environ.get(IBKR_ENABLE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    if enabled:
         try:
             return IBKRExecutionService(settings=settings, market=market, clock=clock)
         except Exception as exc:

@@ -143,6 +143,8 @@ class Settings(BaseSettings):
     runner_bridge_enabled: bool = True
 
     # -- API / telemetry -----------------------------------------------------------
+    #: Opt the FastAPI backend into a real IBKR paper/live execution session.
+    api_enable_ibkr: bool = False
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8000, ge=1, le=65535)
     api_cors_origins: tuple[str, ...] = (
