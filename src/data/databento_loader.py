@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
@@ -79,21 +80,60 @@ __all__ = [
     "synthetic_reference_price",
 ]
 
-#: Reference prices used by the deterministic synthetic source.
+#: Reference prices used by the deterministic synthetic source (every root).
 SYNTHETIC_REFERENCE_PRICES: dict[str, float] = {
+    # equity index
     "ES": 4_800.0,
     "MES": 4_800.0,
     "NQ": 16_800.0,
     "MNQ": 16_800.0,
     "YM": 38_000.0,
+    "MYM": 38_000.0,
     "RTY": 2_000.0,
+    "M2K": 2_000.0,
+    "NKD": 38_000.0,
+    # rates
+    "ZT": 102.75,
+    "ZF": 107.5,
+    "ZN": 111.5,
+    "TN": 114.5,
+    "ZB": 120.0,
+    "UB": 130.0,
+    "SR3": 95.0,
+    # energy
     "CL": 72.5,
     "MCL": 72.5,
+    "NG": 2.80,
+    "MNG": 2.80,
+    "RB": 2.40,
+    "HO": 2.60,
+    # metals
     "GC": 2_050.0,
     "MGC": 2_050.0,
-    "ZN": 111.5,
-    "ZT": 102.75,
+    "SI": 25.0,
+    "SIL": 25.0,
+    "HG": 4.10,
+    "MHG": 4.10,
+    "PL": 950.0,
+    "PA": 1_000.0,
+    # fx
     "6E": 1.095,
+    "6J": 0.0068,
+    "6B": 1.27,
+    "6A": 0.66,
+    "6C": 0.74,
+    "6S": 1.13,
+    # agriculture
+    "ZC": 480.0,
+    "ZS": 1_200.0,
+    "ZW": 600.0,
+    "ZM": 350.0,
+    "ZL": 45.0,
+    "LE": 180.0,
+    "HE": 85.0,
+    # crypto
+    "MBT": 65_000.0,
+    "MET": 3_200.0,
 }
 
 #: Annualised volatility per asset class for the synthetic GBM source.
@@ -106,6 +146,81 @@ SYNTHETIC_ANNUAL_VOL: dict[str, float] = {
     "agriculture": 0.25,
     "crypto": 0.60,
     "unknown": 0.15,
+}
+
+#: Optional per-root volatility overrides for the synthetic GBM source (the
+#: expanded universe has very different risk profiles inside one asset class,
+#: e.g. SOFR vs Ultra T-Bond, Micro Bitcoin vs Micro Ether, natural gas vs WTI).
+SYNTHETIC_ROOT_ANNUAL_VOL: dict[str, float] = {
+    "NKD": 0.20,
+    "SR3": 0.02,
+    "ZT": 0.03,
+    "ZF": 0.05,
+    "TN": 0.08,
+    "ZB": 0.10,
+    "UB": 0.11,
+    "NG": 0.50,
+    "MNG": 0.50,
+    "RB": 0.40,
+    "HO": 0.38,
+    "SI": 0.25,
+    "SIL": 0.25,
+    "HG": 0.22,
+    "MHG": 0.22,
+    "PL": 0.20,
+    "PA": 0.28,
+    "6J": 0.10,
+    "6B": 0.09,
+    "6A": 0.10,
+    "6C": 0.07,
+    "6S": 0.08,
+    "ZC": 0.24,
+    "ZS": 0.22,
+    "ZW": 0.26,
+    "ZM": 0.24,
+    "ZL": 0.22,
+    "LE": 0.15,
+    "HE": 0.22,
+    "MBT": 0.65,
+    "MET": 0.70,
+}
+
+#: Relative synthetic volume / open-interest scale per root (1.0 = legacy
+#: baseline 250k volume, 1.5M OI). The first 13 roots keep 1.0 so historical
+#: offline price/volume paths and strategy universes are byte-compatible.
+SYNTHETIC_VOLUME_SCALE: dict[str, float] = {
+    "NKD": 0.24,
+    "MYM": 0.32,
+    "M2K": 0.48,
+    "ZF": 1.60,
+    "TN": 1.00,
+    "ZB": 0.80,
+    "UB": 0.50,
+    "SR3": 2.40,
+    "NG": 0.70,
+    "MNG": 1.20,
+    "RB": 0.50,
+    "HO": 0.55,
+    "SI": 0.36,
+    "SIL": 0.60,
+    "HG": 0.32,
+    "MHG": 0.48,
+    "PL": 0.16,
+    "PA": 0.08,
+    "6J": 0.48,
+    "6B": 0.36,
+    "6A": 0.28,
+    "6C": 0.24,
+    "6S": 0.20,
+    "ZC": 1.20,
+    "ZS": 0.80,
+    "ZW": 0.50,
+    "ZM": 0.40,
+    "ZL": 0.40,
+    "LE": 0.24,
+    "HE": 0.20,
+    "MBT": 0.08,
+    "MET": 0.08,
 }
 
 _SYNTHETIC_ROOTS: tuple[str, ...] = ("ES", "NQ", "CL", "GC", "ZN")
@@ -632,6 +747,32 @@ class DatabentoLoader:
         return master.get(root) if master.has(root) else None
 
 
+@dataclass(frozen=True, slots=True)
+class _SyntheticPath:
+    """Deterministic price/volume path of one synthetic contract family.
+
+    A *family* is one underlying plus its paired micro contract (``ES``/``MES``,
+    ``CL``/``MCL``, ...). The paired roots share this single path so the
+    documented ``P_micro == P_standard`` invariant (used by the
+    ContractTranslator's family/micro sizing) always holds; only the root's own
+    volume/open-interest and contract identity (ids/expiries) differ.
+    """
+
+    root: str
+    opens: NDArray[np.float64]
+    highs: NDArray[np.float64]
+    lows: NDArray[np.float64]
+    closes: NDArray[np.float64]
+    volumes: NDArray[np.float64]
+    open_interest: NDArray[np.float64]
+    front_expirations: tuple[date, ...]
+    second_expirations: tuple[date, ...] = ()
+    second_opens: NDArray[np.float64] | None = None
+    second_highs: NDArray[np.float64] | None = None
+    second_lows: NDArray[np.float64] | None = None
+    second_closes: NDArray[np.float64] | None = None
+
+
 class OfflineBarSource:
     """Deterministic synthetic OHLCV source for offline backtests and CI.
 
@@ -818,7 +959,19 @@ class OfflineBarSource:
     def _annual_vol(self, spec: InstrumentSpec | None) -> float:
         if spec is None:
             return SYNTHETIC_ANNUAL_VOL["unknown"]
+        # A paired micro contract follows its standard contract's risk profile.
+        if spec.standard_root is not None:
+            standard = self._spec_or_none(spec.standard_root)
+            if standard is not None:
+                return self._annual_vol(standard)
+        if spec.root in SYNTHETIC_ROOT_ANNUAL_VOL:
+            return SYNTHETIC_ROOT_ANNUAL_VOL[spec.root]
         return SYNTHETIC_ANNUAL_VOL.get(str(spec.asset_class), SYNTHETIC_ANNUAL_VOL["unknown"])
+
+    @staticmethod
+    def _volume_scale(root: str) -> float:
+        """Relative synthetic volume / open-interest baseline for ``root``."""
+        return SYNTHETIC_VOLUME_SCALE.get(root.strip().upper(), 1.0)
 
     @staticmethod
     def _leg_frame(
@@ -850,6 +1003,125 @@ class OfflineBarSource:
             }
         )
 
+    def _family_root(self, root: str, spec: InstrumentSpec | None) -> str:
+        """Underlying family root for ``root`` (standard root for micros)."""
+        if spec is not None and spec.standard_root is not None:
+            return spec.standard_root
+        return root
+
+    def _build_path(
+        self,
+        root: str,
+        spec: InstrumentSpec | None,
+        *,
+        periods: int,
+        interval: timedelta,
+        timestamps: Sequence[datetime],
+        horizon_days: int,
+        reuse_prices: _SyntheticPath | None = None,
+    ) -> _SyntheticPath:
+        """Generate the deterministic path of one root (or reuse family prices).
+
+        ``reuse_prices`` is used for a paired micro root: the price columns (front
+        and second month, OHLC + settlement) are the standard contract's exact
+        path, while the micro keeps its own deterministic volume/open-interest and
+        its own contract ids/expiries.
+        """
+        bar_days = interval.total_seconds() / 86_400.0
+        # Single seeded draw order keeps the historical synthetic price path
+        # unchanged (chart/test baselines) while the term structure is layered
+        # on top purely from the calendar.
+        rng = np.random.default_rng(self._root_seed(root))
+        reference_price = synthetic_reference_price(root)
+        annual_vol = self._annual_vol(spec)
+        sigma = annual_vol * math.sqrt(max(bar_days, 1e-9) / 252.0)
+        returns = rng.normal(0.0, sigma, size=periods)
+        closes = reference_price * np.cumprod(1.0 + returns)
+        opens = np.concatenate([[reference_price], closes[:-1]])
+        intrabar = rng.uniform(0.0, sigma, size=periods)
+        highs = np.maximum(opens, closes) * (1.0 + intrabar)
+        lows = np.minimum(opens, closes) * (1.0 - intrabar)
+        volume_scale = self._volume_scale(root)
+        volumes = np.abs(
+            rng.normal(250_000.0 * volume_scale, 25_000.0 * volume_scale, size=periods)
+        )
+        open_interest = np.abs(
+            rng.normal(1_500_000.0 * volume_scale, 50_000.0 * volume_scale, size=periods)
+        )
+        if not self._term_structure_enabled:
+            expiration = self._front_expiration(spec)
+            front_expirations = tuple([expiration] * periods)
+            if reuse_prices is not None:
+                assert reuse_prices.second_closes is None
+                opens = reuse_prices.opens
+                highs = reuse_prices.highs
+                lows = reuse_prices.lows
+                closes = reuse_prices.closes
+            return _SyntheticPath(
+                root=root,
+                opens=opens,
+                highs=highs,
+                lows=lows,
+                closes=closes,
+                volumes=volumes,
+                open_interest=open_interest,
+                front_expirations=front_expirations,
+            )
+        model = self.term_structure_model
+        chain = model.expiration_chain(root, reference=timestamps[0], horizon_days=horizon_days)
+        front_expirations_list: list[date] = []
+        second_expirations_list: list[date] = []
+        second_ratios: list[float] = []
+        for timestamp in timestamps:
+            pair = model.pair_at(root, timestamp, chain)
+            if pair is None:  # pragma: no cover - chain always has >= 2 expiries
+                raise RuntimeError(f"synthetic term structure produced no expiry pair for {root!r}")
+            curve = model.curve(
+                root,
+                timestamp,
+                front_price=1.0,
+                front_expiration=pair[0],
+                second_expiration=pair[1],
+            )
+            front_expirations_list.append(pair[0])
+            second_expirations_list.append(pair[1])
+            second_ratios.append(curve.second_price / curve.front_price)
+        ratios = np.asarray(second_ratios, dtype=np.float64)
+        second_opens = opens * ratios
+        second_highs = highs * ratios
+        second_lows = lows * ratios
+        second_closes = closes * ratios
+        if reuse_prices is not None:
+            # Paired standard <-> micro shares one underlying: reuse the standard
+            # family's exact prices (front + second month) for both legs.
+            assert reuse_prices.second_opens is not None
+            assert reuse_prices.second_highs is not None
+            assert reuse_prices.second_lows is not None
+            assert reuse_prices.second_closes is not None
+            opens = reuse_prices.opens
+            highs = reuse_prices.highs
+            lows = reuse_prices.lows
+            closes = reuse_prices.closes
+            second_opens = reuse_prices.second_opens
+            second_highs = reuse_prices.second_highs
+            second_lows = reuse_prices.second_lows
+            second_closes = reuse_prices.second_closes
+        return _SyntheticPath(
+            root=root,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            volumes=volumes,
+            open_interest=open_interest,
+            front_expirations=tuple(front_expirations_list),
+            second_expirations=tuple(second_expirations_list),
+            second_opens=second_opens,
+            second_highs=second_highs,
+            second_lows=second_lows,
+            second_closes=second_closes,
+        )
+
     def _generate(
         self,
         roots: Sequence[InstrumentId],
@@ -859,93 +1131,79 @@ class OfflineBarSource:
     ) -> pl.DataFrame:
         """Generate the deterministic synthetic bar frame for ``roots``."""
         frames: list[pl.DataFrame] = []
-        bar_days = interval.total_seconds() / 86_400.0
         timestamps = [origin + interval * step for step in range(periods)]
         horizon_days = (
             math.ceil((timestamps[-1] - origin).total_seconds() / 86_400.0)
             + _EXPIRY_CHAIN_BUFFER_DAYS
         )
+        family_paths: dict[str, _SyntheticPath] = {}
         for root in roots:
             spec = self._spec_or_none(root)
-            # Single seeded draw order keeps the historical synthetic price path
-            # unchanged (chart/test baselines) while the term structure is layered
-            # on top purely from the calendar.
-            rng = np.random.default_rng(self._root_seed(root))
-            reference_price = synthetic_reference_price(root)
-            annual_vol = self._annual_vol(spec)
-            sigma = annual_vol * math.sqrt(max(bar_days, 1e-9) / 252.0)
-            returns = rng.normal(0.0, sigma, size=periods)
-            closes = reference_price * np.cumprod(1.0 + returns)
-            opens = np.concatenate([[reference_price], closes[:-1]])
-            intrabar = rng.uniform(0.0, sigma, size=periods)
-            highs = np.maximum(opens, closes) * (1.0 + intrabar)
-            lows = np.minimum(opens, closes) * (1.0 - intrabar)
-            volumes = np.abs(rng.normal(250_000.0, 25_000.0, size=periods))
-            open_interest = np.abs(rng.normal(1_500_000.0, 50_000.0, size=periods))
-            if not self._term_structure_enabled:
-                expiration = self._front_expiration(spec)
+            family_root = self._family_root(root, spec)
+            owner = family_paths.get(family_root)
+            if owner is None:
+                owner = self._build_path(
+                    family_root,
+                    self._spec_or_none(family_root),
+                    periods=periods,
+                    interval=interval,
+                    timestamps=timestamps,
+                    horizon_days=horizon_days,
+                )
+                family_paths[family_root] = owner
+            if root == family_root:
+                path = owner
+            else:
+                path = self._build_path(
+                    root,
+                    spec,
+                    periods=periods,
+                    interval=interval,
+                    timestamps=timestamps,
+                    horizon_days=horizon_days,
+                    reuse_prices=owner,
+                )
+                # A paired micro must share the standard contract's delivery
+                # cycle/roll config; otherwise price/expiry labels would disagree.
+                if (
+                    path.front_expirations != owner.front_expirations
+                    or path.second_expirations != owner.second_expirations
+                ):
+                    raise RuntimeError(
+                        f"synthetic family {family_root!r}: micro root {root!r} has a "
+                        "different delivery/roll calendar than its standard contract; "
+                        "align roll.contract_months/days_before_fnd/physical_delivery"
+                    )
+            frames.append(
+                self._leg_frame(
+                    root,
+                    timestamps,
+                    path.opens,
+                    path.highs,
+                    path.lows,
+                    path.closes,
+                    path.volumes,
+                    path.open_interest,
+                    path.front_expirations,
+                )
+            )
+            if path.second_closes is not None:
+                assert path.second_opens is not None
+                assert path.second_highs is not None
+                assert path.second_lows is not None
                 frames.append(
                     self._leg_frame(
                         root,
                         timestamps,
-                        opens,
-                        highs,
-                        lows,
-                        closes,
-                        volumes,
-                        open_interest,
-                        [expiration] * periods,
+                        path.second_opens,
+                        path.second_highs,
+                        path.second_lows,
+                        path.second_closes,
+                        path.volumes * _SECOND_MONTH_VOLUME_SCALE,
+                        path.open_interest * _SECOND_MONTH_OI_SCALE,
+                        path.second_expirations,
                     )
                 )
-                continue
-            model = self.term_structure_model
-            chain = model.expiration_chain(root, reference=origin, horizon_days=horizon_days)
-            front_expirations: list[date] = []
-            second_expirations: list[date] = []
-            second_ratios: list[float] = []
-            for timestamp in timestamps:
-                pair = model.pair_at(root, timestamp, chain)
-                if pair is None:  # pragma: no cover - chain always has >= 2 expiries
-                    raise RuntimeError(
-                        f"synthetic term structure produced no expiry pair for {root!r}"
-                    )
-                curve = model.curve(
-                    root,
-                    timestamp,
-                    front_price=1.0,
-                    front_expiration=pair[0],
-                    second_expiration=pair[1],
-                )
-                front_expirations.append(pair[0])
-                second_expirations.append(pair[1])
-                second_ratios.append(curve.second_price / curve.front_price)
-            frames.append(
-                self._leg_frame(
-                    root,
-                    timestamps,
-                    opens,
-                    highs,
-                    lows,
-                    closes,
-                    volumes,
-                    open_interest,
-                    front_expirations,
-                )
-            )
-            ratios = np.asarray(second_ratios, dtype=np.float64)
-            frames.append(
-                self._leg_frame(
-                    root,
-                    timestamps,
-                    opens * ratios,
-                    highs * ratios,
-                    lows * ratios,
-                    closes * ratios,
-                    volumes * _SECOND_MONTH_VOLUME_SCALE,
-                    open_interest * _SECOND_MONTH_OI_SCALE,
-                    second_expirations,
-                )
-            )
         frame = pl.concat(frames, how="vertical_relaxed")
         return s.ensure_bars_schema(frame, context="offline-generate").sort(
             [s.TIMESTAMP_COLUMN, s.ROOT_SYMBOL_COLUMN, s.EXPIRATION_COLUMN]

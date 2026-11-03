@@ -396,13 +396,28 @@ def test_build_training_data_reports_no_feature_fallbacks() -> None:
         assert np.isfinite(values).all(), feature
         assert np.abs(values).max() > 0.0, feature
     # Distinct carry/slope across the trained universe (not a single filler value).
+    # The trainer now sources every declared root (including paired micros), and a
+    # micro shares its standard contract's underlying curve, so distinctness is
+    # asserted per family rather than per root.
     slope_index = names.index(s.TERM_SLOPE)
     carry_index = names.index(s.CARRY_ANNUALIZED)
     slopes = np.nanmean(data.features[:, :, slope_index], axis=0)
     carries = np.nanmean(data.features[:, :, carry_index], axis=0)
-    assert len(np.unique(np.round(slopes, 12))) == len(data.instrument_ids)
-    assert len(np.unique(np.round(carries, 12))) == len(data.instrument_ids)
     assert np.abs(carries).min() > 0.0
+    families = {root: (instruments.get(root).standard_root or root) for root in data.instrument_ids}
+    assert len(families) == len(data.instrument_ids)  # one entry per trained root
+    assert len(set(families.values())) >= 5  # multiple sectors represented
+    family_slopes: dict[str, float] = {}
+    family_carries: dict[str, float] = {}
+    for index, root in enumerate(data.instrument_ids):
+        family = families[root]
+        family_slopes.setdefault(family, float(slopes[index]))
+        family_carries.setdefault(family, float(carries[index]))
+        # Paired standard/micro roots quote one underlying => identical curve.
+        assert slopes[index] == pytest.approx(family_slopes[family])
+        assert carries[index] == pytest.approx(family_carries[family])
+    assert len(set(np.round(list(family_slopes.values()), 12))) == len(family_slopes)
+    assert len(set(np.round(list(family_carries.values()), 12))) == len(family_carries)
 
 
 def test_offline_source_signature_is_trainer_compatible() -> None:

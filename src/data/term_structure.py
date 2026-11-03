@@ -62,19 +62,58 @@ type TermRegime = Literal["contango", "backwardation", "neutral"]
 
 #: Annualised roll yield for a long position per root (positive = backwardation).
 BASE_ANNUALIZED_CARRY: Mapping[str, float] = {
+    # equity index (dividend/financing basis -> mild contango)
     "ES": -0.0040,
     "MES": -0.0040,
     "NQ": -0.0030,
     "MNQ": -0.0030,
     "YM": -0.0040,
+    "MYM": -0.0040,
     "RTY": -0.0030,
-    "CL": 0.0300,
-    "MCL": 0.0280,
-    "GC": -0.0100,
-    "MGC": -0.0090,
-    "ZN": -0.0070,
+    "M2K": -0.0030,
+    "NKD": -0.0040,
+    # rates (coupon carry -> contango, SOFR near flat)
     "ZT": -0.0040,
+    "ZF": -0.0040,
+    "ZN": -0.0070,
+    "TN": -0.0080,
+    "ZB": -0.0090,
+    "UB": -0.0100,
+    "SR3": -0.0020,
+    # energy (crude/nat-gas backwardated, refined products contango)
+    "CL": 0.0300,
+    "MCL": 0.0300,
+    "NG": 0.0400,
+    "MNG": 0.0400,
+    "RB": -0.0100,
+    "HO": -0.0080,
+    # metals (gold/silver/platinum contango, copper backwardated)
+    "GC": -0.0100,
+    "MGC": -0.0100,
+    "SI": -0.0120,
+    "SIL": -0.0120,
+    "HG": 0.0100,
+    "MHG": 0.0100,
+    "PL": -0.0080,
+    "PA": -0.0060,
+    # fx (interest-rate differential basis; mixed signs)
     "6E": 0.0020,
+    "6J": -0.0200,
+    "6B": 0.0050,
+    "6A": -0.0100,
+    "6C": 0.0050,
+    "6S": -0.0050,
+    # agriculture (storage carry -> contango; livestock live-curve contango)
+    "ZC": -0.0300,
+    "ZS": -0.0250,
+    "ZW": -0.0280,
+    "ZM": -0.0200,
+    "ZL": -0.0180,
+    "LE": -0.0120,
+    "HE": -0.0200,
+    # crypto (spot/futures basis -> contango)
+    "MBT": -0.0500,
+    "MET": -0.0500,
 }
 
 #: Asset-class fallback when a root is not in :data:`BASE_ANNUALIZED_CARRY`.
@@ -233,11 +272,22 @@ class SyntheticTermStructure:
         return math.radians(checksum % 360)
 
     def carry_profile(self, root: InstrumentId) -> CarryProfile:
-        """Deterministic carry configuration for ``root``."""
+        """Deterministic carry configuration for ``root``.
+
+        A paired micro contract shares its standard contract's underlying curve
+        (base carry + cycle phase), so ``P_micro == P_standard`` also holds for
+        the synthetic second-month leg. The micro keeps its own delivery cycle /
+        roll-buffer configuration (aligned by the instrument master).
+        """
         normalised = root.strip().upper()
         if not normalised:
             raise ValueError("root must be a non-empty string")
         spec = self._spec_or_none(normalised)
+        family_root = normalised
+        family_spec = spec
+        if spec is not None and spec.standard_root is not None:
+            family_root = spec.standard_root
+            family_spec = self._spec_or_none(family_root)
         roll_days = (
             spec.roll.days_before_fnd + PHYSICAL_DELIVERY_ROLL_BUFFER_DAYS
             if spec is not None and spec.roll.physical_delivery
@@ -246,9 +296,9 @@ class SyntheticTermStructure:
         months = tuple(spec.roll.contract_months) if spec is not None else DEFAULT_CONTRACT_MONTHS
         return CarryProfile(
             root=normalised,
-            base_annualized_carry=self._base_carry(normalised, spec),
+            base_annualized_carry=self._base_carry(family_root, family_spec),
             regime_amplitude=self._amplitude,
-            cycle_phase=self._phase(normalised),
+            cycle_phase=self._phase(family_root),
             roll_days=roll_days,
             contract_months=months,
         )

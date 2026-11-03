@@ -68,9 +68,21 @@ def test_micro_routing_pairs(master: InstrumentsConfig) -> None:
 def test_asset_class_and_sector_queries(master: InstrumentsConfig) -> None:
     equity_roots = {spec.root for spec in master.by_asset_class(master.get("ES").asset_class)}
     assert {"ES", "MES", "NQ", "MNQ"}.issubset(equity_roots)
-    assert {spec.root for spec in master.by_sector("energy")} == {"CL", "MCL"}
+    energy = {spec.root for spec in master.by_sector("energy")}
+    assert {"CL", "MCL"} <= energy
+    assert energy == {"CL", "MCL", "NG", "MNG", "RB", "HO"}
     assert "equity" in master.sectors()
-    assert len(master.roots()) >= 10
+    # Phase-10 universe expansion: 45 roots across seven sectors.
+    assert len(master.roots()) >= 40
+    assert set(master.sectors()) == {
+        "equity",
+        "rates",
+        "energy",
+        "metals",
+        "fx",
+        "agri",
+        "crypto",
+    }
 
 
 def test_unknown_root_raises(master: InstrumentsConfig) -> None:

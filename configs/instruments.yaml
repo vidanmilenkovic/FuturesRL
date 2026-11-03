@@ -6,6 +6,12 @@ version: 1
 # metadata: contract multiplier, tick size, roll methodology, margin estimator
 # and the standard <-> micro routing pair used by the ContractTranslator.
 #
+# The Phase-10 universe spans 45 liquid CME Globex roots across 7 sector ids
+# consumed by the Strategy Studio / dashboard filter tabs:
+#   equity | rates | energy | metals | fx | agri | crypto
+# Nine roots have a paired micro contract (micro_root <-> standard_root) used by
+# the ContractTranslator's micro-routing; `agri` uses asset_class agriculture.
+#
 # Margins are conservative CME SPAN / IBKR initial & maintenance *estimates*.
 # They are configuration, not truth: the live Pre-Trade Risk Gate always
 # confirms the real margin requirement with IBKR `whatIfOrder` before transmit.
@@ -109,6 +115,7 @@ instruments:
     tick_size: 1.0
     databento_symbol: YM.FUT
     ibkr_exchange: CBOT
+    micro_root: MYM
     margins:
       initial: 15000.0
       maintenance: 13600.0
@@ -128,6 +135,7 @@ instruments:
     tick_size: 0.10
     databento_symbol: RTY.FUT
     ibkr_exchange: CME
+    micro_root: M2K
     margins:
       initial: 8000.0
       maintenance: 7300.0
@@ -276,4 +284,641 @@ instruments:
       days_before_fnd: 5
       use_volume_crossover: true
       contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  NKD:
+    name: Nikkei 225 (USD)
+    asset_class: equity_index
+    sector: equity
+    exchange: CME
+    multiplier: 5.0
+    tick_size: 5.0
+    price_precision: 0
+    databento_symbol: NKD.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 9000.0
+      maintenance: 8200.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  MYM:
+    name: Micro E-mini Dow Jones
+    asset_class: equity_index
+    sector: equity
+    exchange: CBOT
+    multiplier: 0.5
+    tick_size: 1.0
+    databento_symbol: MYM.FUT
+    ibkr_exchange: CBOT
+    standard_root: YM
+    margins:
+      initial: 1500.0
+      maintenance: 1360.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  M2K:
+    name: Micro E-mini Russell 2000
+    asset_class: equity_index
+    sector: equity
+    exchange: CME
+    multiplier: 5.0
+    tick_size: 0.1
+    databento_symbol: M2K.FUT
+    ibkr_exchange: CME
+    standard_root: RTY
+    margins:
+      initial: 800.0
+      maintenance: 730.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  ZF:
+    name: 5-Year T-Note
+    asset_class: rates
+    sector: rates
+    exchange: CBOT
+    multiplier: 1000.0
+    tick_size: 0.0078125
+    price_precision: 6
+    databento_symbol: ZF.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 1800.0
+      maintenance: 1640.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 10
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  TN:
+    name: Ultra 10-Year T-Note
+    asset_class: rates
+    sector: rates
+    exchange: CBOT
+    multiplier: 1000.0
+    tick_size: 0.015625
+    price_precision: 6
+    databento_symbol: TN.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 2800.0
+      maintenance: 2550.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 10
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  ZB:
+    name: 30-Year T-Bond
+    asset_class: rates
+    sector: rates
+    exchange: CBOT
+    multiplier: 1000.0
+    tick_size: 0.03125
+    price_precision: 6
+    databento_symbol: ZB.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 4200.0
+      maintenance: 3800.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 10
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  UB:
+    name: Ultra T-Bond
+    asset_class: rates
+    sector: rates
+    exchange: CBOT
+    multiplier: 1000.0
+    tick_size: 0.03125
+    price_precision: 6
+    databento_symbol: UB.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 4800.0
+      maintenance: 4400.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 10
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  SR3:
+    name: 3-Month SOFR
+    asset_class: rates
+    sector: rates
+    exchange: CME
+    multiplier: 25.0
+    tick_size: 0.0025
+    price_precision: 4
+    databento_symbol: SR3.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 1200.0
+      maintenance: 1100.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      physical_delivery: false
+
+  NG:
+    name: Henry Hub Natural Gas
+    asset_class: energy
+    sector: energy
+    exchange: NYMEX
+    multiplier: 10000.0
+    tick_size: 0.001
+    price_precision: 3
+    databento_symbol: NG.FUT
+    ibkr_exchange: NYMEX
+    micro_root: MNG
+    margins:
+      initial: 3200.0
+      maintenance: 2900.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      physical_delivery: true
+
+  MNG:
+    name: Micro Henry Hub Natural Gas
+    asset_class: energy
+    sector: energy
+    exchange: NYMEX
+    multiplier: 2500.0
+    tick_size: 0.001
+    price_precision: 3
+    databento_symbol: MNG.FUT
+    ibkr_exchange: NYMEX
+    standard_root: NG
+    margins:
+      initial: 800.0
+      maintenance: 730.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      physical_delivery: true
+
+  RB:
+    name: RBOB Gasoline
+    asset_class: energy
+    sector: energy
+    exchange: NYMEX
+    multiplier: 42000.0
+    tick_size: 0.0001
+    price_precision: 4
+    databento_symbol: RB.FUT
+    ibkr_exchange: NYMEX
+    margins:
+      initial: 4200.0
+      maintenance: 3800.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      physical_delivery: true
+
+  HO:
+    name: NY Harbor ULSD (Heating Oil)
+    asset_class: energy
+    sector: energy
+    exchange: NYMEX
+    multiplier: 42000.0
+    tick_size: 0.0001
+    price_precision: 4
+    databento_symbol: HO.FUT
+    ibkr_exchange: NYMEX
+    margins:
+      initial: 4200.0
+      maintenance: 3800.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      physical_delivery: true
+
+  SI:
+    name: Silver
+    asset_class: metals
+    sector: metals
+    exchange: COMEX
+    multiplier: 5000.0
+    tick_size: 0.005
+    price_precision: 3
+    databento_symbol: SI.FUT
+    ibkr_exchange: COMEX
+    micro_root: SIL
+    margins:
+      initial: 11000.0
+      maintenance: 10000.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 3, 5, 7, 9, 12]
+      physical_delivery: true
+
+  SIL:
+    name: Micro Silver
+    asset_class: metals
+    sector: metals
+    exchange: COMEX
+    multiplier: 1000.0
+    tick_size: 0.005
+    price_precision: 3
+    databento_symbol: SIL.FUT
+    ibkr_exchange: COMEX
+    standard_root: SI
+    margins:
+      initial: 2200.0
+      maintenance: 2000.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 3, 5, 7, 9, 12]
+      physical_delivery: true
+
+  HG:
+    name: Copper
+    asset_class: metals
+    sector: metals
+    exchange: COMEX
+    multiplier: 25000.0
+    tick_size: 0.0005
+    price_precision: 4
+    databento_symbol: HG.FUT
+    ibkr_exchange: COMEX
+    micro_root: MHG
+    margins:
+      initial: 6500.0
+      maintenance: 5900.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 3, 5, 7, 9, 12]
+      physical_delivery: true
+
+  MHG:
+    name: Micro Copper
+    asset_class: metals
+    sector: metals
+    exchange: COMEX
+    multiplier: 2500.0
+    tick_size: 0.0005
+    price_precision: 4
+    databento_symbol: MHG.FUT
+    ibkr_exchange: COMEX
+    standard_root: HG
+    margins:
+      initial: 650.0
+      maintenance: 590.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 3, 5, 7, 9, 12]
+      physical_delivery: true
+
+  PL:
+    name: Platinum
+    asset_class: metals
+    sector: metals
+    exchange: NYMEX
+    multiplier: 50.0
+    tick_size: 0.1
+    databento_symbol: PL.FUT
+    ibkr_exchange: NYMEX
+    margins:
+      initial: 4200.0
+      maintenance: 3800.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 4, 7, 10]
+      physical_delivery: true
+
+  PA:
+    name: Palladium
+    asset_class: metals
+    sector: metals
+    exchange: NYMEX
+    multiplier: 100.0
+    tick_size: 0.5
+    databento_symbol: PA.FUT
+    ibkr_exchange: NYMEX
+    margins:
+      initial: 4800.0
+      maintenance: 4400.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: true
+
+  6J:
+    name: Japanese Yen
+    asset_class: fx
+    sector: fx
+    exchange: CME
+    multiplier: 12500000.0
+    tick_size: 5e-07
+    price_precision: 7
+    databento_symbol: 6J.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 3000.0
+      maintenance: 2750.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  6B:
+    name: British Pound
+    asset_class: fx
+    sector: fx
+    exchange: CME
+    multiplier: 62500.0
+    tick_size: 0.0001
+    price_precision: 4
+    databento_symbol: 6B.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 2800.0
+      maintenance: 2550.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  6A:
+    name: Australian Dollar
+    asset_class: fx
+    sector: fx
+    exchange: CME
+    multiplier: 100000.0
+    tick_size: 0.0001
+    price_precision: 4
+    databento_symbol: 6A.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 2000.0
+      maintenance: 1850.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  6C:
+    name: Canadian Dollar
+    asset_class: fx
+    sector: fx
+    exchange: CME
+    multiplier: 100000.0
+    tick_size: 5e-05
+    price_precision: 5
+    databento_symbol: 6C.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 1500.0
+      maintenance: 1360.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  6S:
+    name: Swiss Franc
+    asset_class: fx
+    sector: fx
+    exchange: CME
+    multiplier: 125000.0
+    tick_size: 0.0001
+    price_precision: 4
+    databento_symbol: 6S.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 4200.0
+      maintenance: 3800.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 6, 9, 12]
+      physical_delivery: false
+
+  ZC:
+    name: Corn
+    asset_class: agriculture
+    sector: agri
+    exchange: CBOT
+    multiplier: 50.0
+    tick_size: 0.25
+    databento_symbol: ZC.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 2200.0
+      maintenance: 2000.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 5, 7, 9, 12]
+      physical_delivery: true
+
+  ZS:
+    name: Soybeans
+    asset_class: agriculture
+    sector: agri
+    exchange: CBOT
+    multiplier: 50.0
+    tick_size: 0.25
+    databento_symbol: ZS.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 3200.0
+      maintenance: 2900.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 3, 5, 7, 8, 9, 11]
+      physical_delivery: true
+
+  ZW:
+    name: Chicago SRW Wheat
+    asset_class: agriculture
+    sector: agri
+    exchange: CBOT
+    multiplier: 50.0
+    tick_size: 0.25
+    databento_symbol: ZW.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 2600.0
+      maintenance: 2350.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [3, 5, 7, 9, 12]
+      physical_delivery: true
+
+  ZM:
+    name: Soybean Meal
+    asset_class: agriculture
+    sector: agri
+    exchange: CBOT
+    multiplier: 100.0
+    tick_size: 0.1
+    databento_symbol: ZM.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 2800.0
+      maintenance: 2550.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 3, 5, 7, 8, 9, 10, 12]
+      physical_delivery: true
+
+  ZL:
+    name: Soybean Oil
+    asset_class: agriculture
+    sector: agri
+    exchange: CBOT
+    multiplier: 600.0
+    tick_size: 0.01
+    databento_symbol: ZL.FUT
+    ibkr_exchange: CBOT
+    margins:
+      initial: 2200.0
+      maintenance: 2000.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 3, 5, 7, 8, 9, 10, 12]
+      physical_delivery: true
+
+  LE:
+    name: Live Cattle
+    asset_class: agriculture
+    sector: agri
+    exchange: CME
+    multiplier: 400.0
+    tick_size: 0.025
+    price_precision: 3
+    databento_symbol: LE.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 2200.0
+      maintenance: 2000.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [2, 4, 6, 8, 10, 12]
+      physical_delivery: true
+
+  HE:
+    name: Lean Hogs
+    asset_class: agriculture
+    sector: agri
+    exchange: CME
+    multiplier: 400.0
+    tick_size: 0.025
+    price_precision: 3
+    databento_symbol: HE.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 2000.0
+      maintenance: 1800.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [2, 4, 5, 6, 7, 8, 10, 12]
+      physical_delivery: true
+
+  MBT:
+    name: Micro Bitcoin
+    asset_class: crypto
+    sector: crypto
+    exchange: CME
+    multiplier: 0.1
+    tick_size: 5.0
+    databento_symbol: MBT.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 2500.0
+      maintenance: 2250.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      physical_delivery: false
+
+  MET:
+    name: Micro Ether
+    asset_class: crypto
+    sector: crypto
+    exchange: CME
+    multiplier: 0.1
+    tick_size: 0.5
+    databento_symbol: MET.FUT
+    ibkr_exchange: CME
+    margins:
+      initial: 1400.0
+      maintenance: 1260.0
+    roll:
+      trigger: calendar_days_before_fnd
+      days_before_fnd: 5
+      use_volume_crossover: true
+      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
       physical_delivery: false
