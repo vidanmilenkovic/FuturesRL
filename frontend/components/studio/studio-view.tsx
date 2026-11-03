@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Tabs } from "@/components/ui/primitives";
 import { getStudioCatalog, listStrategies } from "@/lib/api";
 import { draftFromPreset, draftFromStrategy } from "@/lib/studio";
-import type { StrategyConfig, StudioDraft } from "@/lib/types";
+import type { StudioDraft } from "@/lib/types";
 import { useAsyncData } from "@/lib/use-async-data";
 
 import { DrlPanel } from "./drl-panel";
@@ -43,11 +43,20 @@ export function StudioView() {
   const notify = (text: string, tone: "accent" | "gain" | "warn" | "loss" | "neutral") =>
     setNotice({ text, tone });
 
-  const applyStrategy = (strategy: StrategyConfig) => {
-    setDraft(draftFromStrategy(strategy));
+  // Deep link: /studio?strategy=<id> loads a saved strategy into the Manual
+  // Builder (used by the Apply Best Parameters success banner and backtests).
+  const handledQueryId = useRef<string | null>(null);
+  useEffect(() => {
+    if (typeof window === "undefined" || !strategies.data) return;
+    const requested = new URLSearchParams(window.location.search).get("strategy");
+    if (!requested || handledQueryId.current === requested) return;
+    const match = strategies.data.find((strategy) => strategy.id === requested);
+    if (!match) return;
+    handledQueryId.current = requested;
+    setDraft(draftFromStrategy(match));
     setMode("builder");
-    notify(`Loaded ${strategy.id} into the Manual Builder`, "accent");
-  };
+    notify(`Loaded ${match.id} from the strategy link`, "accent");
+  }, [strategies.data]);
 
   const catalogBadge = useMemo((): { label: string; tone: "gain" | "warn" } => {
     if (catalog.source === "live") return { label: "Catalog live", tone: "gain" };
@@ -129,7 +138,7 @@ export function StudioView() {
         <OptimizerPanel
           catalog={catalog.data}
           strategies={strategiesList}
-          onApplied={applyStrategy}
+          onStrategiesChanged={strategies.reload}
           onNotify={notify}
         />
       ) : (

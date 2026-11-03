@@ -13,6 +13,7 @@ import {
   TextInput,
   type Tone,
 } from "@/components/ui/primitives";
+import { Modal } from "@/components/ui/dialog";
 import { applyOptimization, getOptimization, listOptimizations, runOptimization } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { formatInteger, formatNumber, formatPct } from "@/lib/format";
@@ -23,6 +24,7 @@ import {
   defaultOptunaSelection,
   formatObjectiveMetric,
   formatParamPath,
+  ID_PATTERN,
   importancePercent,
   isLegacyOptimizationStudy,
   structuralParametersForStrategy,
@@ -54,12 +56,12 @@ type SortKey = "trial" | "value" | "sharpe" | "cagr" | "dd";
 export function OptimizerPanel({
   catalog,
   strategies,
-  onApplied,
+  onStrategiesChanged,
   onNotify,
 }: {
   catalog: StudioCatalogResponse;
   strategies: StrategyConfig[];
-  onApplied: (strategy: StrategyConfig) => void;
+  onStrategiesChanged: () => void;
   onNotify: (message: string, tone: Tone) => void;
 }) {
   const studies = useAsyncData(listOptimizations);
@@ -75,6 +77,14 @@ export function OptimizerPanel({
   const [applying, setApplying] = useState(false);
   const [message, setMessage] = useState<{ text: string; tone: Tone } | null>(null);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
+  const [applyOpen, setApplyOpen] = useState(false);
+  const [applyTargetId, setApplyTargetId] = useState("");
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const [applyBanner, setApplyBanner] = useState<{
+    id: string;
+    strategyPath: string | null;
+    backtestRunId: string | null;
+  } | null>(null);
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "value", dir: "desc" });
 
   const baseStrategy = useMemo(
@@ -204,43 +214,81 @@ export function OptimizerPanel({
     onNotify(`Optimization complete · ${result.data.n_trials} trials`, result.source === "live" ? "gain" : "warn");
   };
 
+  const openApplyDialog = () => {
+    if (!study) return;
+    const base = baseStrategy?.id ?? study.base_strategy_id ?? "strategy";
+    setApplyTargetId(`${base}_opt`);
+    setApplyError(null);
+    setApplyOpen(true);
+  };
+
   const apply = async () => {
     if (!study) return;
-    setApplying(true);
-    const result = await applyOptimization(study.study_id);
-    setApplying(false);
-    const verification = result.data.verification_backtest;
-    const verificationNote =
-      verification && verification.status !== "completed"
-        ? ` · verification ${verification.status}${verification.message ? `: ${verification.message}` : ""}`
-        : "";
-    setMessage({
-      text:
-        (result.data.message || `Applied best parameters as ${result.data.strategy_id}.`) +
-        verificationNote,
-      tone: result.data.applied
-        ? verification && verification.status === "skipped"
-          ? "warn"
-          : "gain"
-        : "warn",
-    });
-    if (!result.data.applied) {
-      // Archived legacy study: refresh the clean list and do not navigate/apply.
-      setArchivedIds((current) => {
-        const next = new Set(current);
-        next.add(study.study_id);
-        return next;
-      });
-      setStudy(null);
-      studies.reload();
+    const targetId = applyTargetId.trim();
+    if (!ID_PATTERN.test(targetId)) {
+      setApplyError("Strategy ID must match ^[a-z][a-z0-9_]{0,63}$ (lowercase slug, no hyphens).");
       return;
     }
-    onNotify(`Applied ${study.study_id} → ${result.data.strategy_id}`, result.source === "live" ? "gain" : "warn");
-    if (result.data.strategy) onApplied(result.data.strategy);
-    const appliedId = result.data.strategy_id;
-    if (appliedId) {
-      studies.reload();
+    setApplying(true);
+    setApplyError(null);
+    const result = await applyOptimization(study.study_id, {
+      newStrategyId: targetId,
+      verificationBacktest: true,
+    });
+    setApplying(false);
+
+    if (result.source !== "live") {
+      const status = result.error ?? "";
+      if (/\b409\b/.test(status)) {
+        setApplyError(`Strategy ID "${targetId}" already exists — choose a different ID.`);
+      } else if (/\b422\b/.test(status)) {
+        setApplyError(
+          "The backend rejected the applied strategy (422 invalid configuration). Adjust the study or target ID and retry.",
+        );
+      } else if (/\b404\b/.test(status)) {
+        setApplyError("Legacy optimization run archived — pick a current study.");
+      } else {
+        setApplyError(
+          result.data.message ||
+            "Apply requires the FastAPI backend — offline preview cannot persist the strategy or run the verification backtest.",
+        );
+      }
+      return;
     }
+    if (!result.data.applied) {
+      setApplyError(
+        result.data.message ||
+          "The backend did not persist the strategy — no verification backtest was created.",
+      );
+      return;
+    }
+
+    const savedId =
+      result.data.saved_strategy_id ?? result.data.strategy_id ?? targetId;
+    const backtestRunId =
+      result.data.backtest_run_id ??
+      result.data.verification_backtest?.run?.id ??
+      null;
+    setApplyBanner({
+      id: savedId,
+      strategyPath: result.data.strategy_path ?? null,
+      backtestRunId,
+    });
+    setApplyOpen(false);
+    setMessage({
+      text: `Saved strategy "${savedId}"${
+        backtestRunId ? ` and created verification backtest ${backtestRunId}` : ""
+      }.`,
+      tone: "gain",
+    });
+    onNotify(
+      `Applied ${study.study_id} → ${savedId}${backtestRunId ? ` · ${backtestRunId}` : ""}`,
+      "gain",
+    );
+    // Refresh both the strategy catalog (Studio Load-existing / Backtest Lab
+    // navigation refreshes on mount) and the optimization study list.
+    onStrategiesChanged();
+    studies.reload();
   };
 
   const sortedTrials = useMemo(() => {
@@ -269,6 +317,13 @@ export function OptimizerPanel({
       current.key === key ? { key, dir: current.dir === "asc" ? "desc" : "asc" } : { key, dir: "desc" },
     );
   };
+
+  const hasActiveTrial = Boolean(study?.trials.some((trial) => !trial.zero_activity));
+  const canApplyStudy =
+    Boolean(study) &&
+    study?.status === "completed" &&
+    study?.best_trial_number !== null &&
+    Object.keys(study?.best_params ?? {}).length > 0;
 
   const history = study
     ? (() => {
@@ -517,6 +572,59 @@ export function OptimizerPanel({
 
       {/* ----------------------------------------------------------- results */}
       <div className="col-span-12 flex min-h-0 flex-col gap-3 xl:col-span-7">
+        {applyBanner ? (
+          <div
+            role="status"
+            data-testid="apply-success-banner"
+            data-strategy-id={applyBanner.id}
+            data-backtest-id={applyBanner.backtestRunId ?? ""}
+            className="shrink-0 rounded-md border border-gain/40 bg-gain-soft/40 px-3 py-2"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-[12px] leading-5 text-emerald-300">
+                Saved strategy <span className="font-mono text-emerald-200">&quot;{applyBanner.id}&quot;</span>
+                {applyBanner.backtestRunId ? (
+                  <>
+                    {" "}&amp; created verification backtest{" "}
+                    <span className="font-mono text-emerald-200">{applyBanner.backtestRunId}</span>
+                  </>
+                ) : (
+                  <> &amp; started the verification backtest</>
+                )}
+                .
+              </p>
+              <button
+                type="button"
+                aria-label="Dismiss apply confirmation"
+                onClick={() => setApplyBanner(null)}
+                className="focus-ring -mr-1 grid h-5 w-5 shrink-0 place-items-center rounded text-emerald-400/70 hover:bg-gain-soft hover:text-emerald-300"
+              >
+                ×
+              </button>
+            </div>
+            <div className="mt-1 flex flex-wrap items-center gap-3 text-[11px]">
+              <a
+                href={`/backtests?strategy=${encodeURIComponent(applyBanner.id)}`}
+                data-testid="apply-link-backtests"
+                className="font-medium text-emerald-300 underline decoration-emerald-500/40 underline-offset-2 hover:text-emerald-200"
+              >
+                View in Backtest Lab
+              </a>
+              <a
+                href={`/studio?strategy=${encodeURIComponent(applyBanner.id)}`}
+                data-testid="apply-link-builder"
+                className="font-medium text-emerald-300 underline decoration-emerald-500/40 underline-offset-2 hover:text-emerald-200"
+              >
+                Open in Manual Builder
+              </a>
+              {applyBanner.strategyPath ? (
+                <span className="truncate font-mono text-[10px] text-emerald-500/70" title={applyBanner.strategyPath}>
+                  {applyBanner.strategyPath}
+                </span>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
         <Panel
           title="Objective history"
           className="shrink-0"
@@ -537,16 +645,26 @@ export function OptimizerPanel({
               <Button
                 variant="primary"
                 size="xs"
-                onClick={() => void apply()}
-                disabled={!study || applying || study.status !== "completed"}
-                title="Persist the best parameters as a new strategy config"
+                onClick={openApplyDialog}
+                disabled={!canApplyStudy || applying}
+                title={
+                  canApplyStudy
+                    ? "Save the best parameters as a strategy and run a verification backtest"
+                    : "No active trial / best parameter set to apply"
+                }
+                testId="open-apply-dialog"
               >
-                {applying ? "Applying…" : "Apply Best Parameters"}
+                Apply Best Parameters
               </Button>
             </div>
           }
         >
-          {study && history ? (
+          {study && history && !hasActiveTrial ? (
+            <EmptyState
+              title="No active trial — flat study"
+              description="Every trial in this study was flat or below the activity thresholds (objective −10, zero activity). There is no best parameter set to apply; widen the walk-forward window or adjust the strategy and run a new study."
+            />
+          ) : study && history ? (
             <>
               <div className="mb-1 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-3 text-[10.5px] text-zinc-500">
@@ -628,14 +746,28 @@ export function OptimizerPanel({
                     <th className="w-20 text-right">Calmar</th>
                     <th className="w-20 text-right">Rachev</th>
                     <th className="w-24 text-right">Duration</th>
+                    <th className="w-20 text-right">Trades</th>
+                    <th className="w-24 text-right">Avg exp</th>
                     <th>Parameters</th>
                   </tr>
                 </thead>
                 <tbody>
                   {sortedTrials.map((trial) => (
-                    <tr key={trial.trial_number} className={trial.best ? "bg-gain-soft/25" : undefined}>
+                    <tr
+                      key={trial.trial_number}
+                      className={cn(
+                        trial.best ? "bg-gain-soft/25" : undefined,
+                        trial.zero_activity && "opacity-60",
+                      )}
+                    >
                       <td className="font-mono text-[11px] text-zinc-300">
-                        {trial.best ? <Badge tone="gain">best</Badge> : `#${trial.trial_number}`}
+                        {trial.zero_activity ? (
+                          <Badge tone="warn">flat</Badge>
+                        ) : trial.best ? (
+                          <Badge tone="gain">best</Badge>
+                        ) : (
+                          `#${trial.trial_number}`
+                        )}
                       </td>
                       <td className="num text-right text-zinc-200">{formatObjectiveValue(trial.value)}</td>
                       <td className="num text-right text-zinc-300">{formatNumber(trial.oos_sharpe, 2)}</td>
@@ -644,6 +776,14 @@ export function OptimizerPanel({
                       <td className="num text-right text-zinc-400">{formatNumber(trial.calmar, 2)}</td>
                       <td className="num text-right text-zinc-400">{formatNumber(trial.rachev, 2)}</td>
                       <td className="num text-right text-zinc-500">{formatInteger(trial.duration_ms)} ms</td>
+                      <td className="num text-right text-zinc-400">
+                        {typeof trial.n_trades === "number" ? formatInteger(trial.n_trades) : "—"}
+                      </td>
+                      <td className="num text-right text-zinc-400">
+                        {typeof trial.avg_gross_exposure === "number"
+                          ? `${(trial.avg_gross_exposure * 100).toFixed(1)}%`
+                          : "—"}
+                      </td>
                       <td className="max-w-[260px] truncate font-mono text-[10px] text-zinc-600" title={JSON.stringify(trial.params)}>
                         {Object.entries(trial.params)
                           .slice(0, 3)
@@ -660,12 +800,88 @@ export function OptimizerPanel({
           </div>
         </Panel>
       </div>
+      <Modal
+        open={applyOpen}
+        title="Apply best parameters"
+        description={
+          <span>
+            Saves the best parameters from <span className="font-mono text-zinc-300">{study?.study_id ?? "study"}</span> as a
+            new strategy and runs a persisted walk-forward verification backtest.
+          </span>
+        }
+        onClose={() => {
+          if (applying) return;
+          setApplyOpen(false);
+          setApplyError(null);
+        }}
+        busy={applying}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setApplyOpen(false);
+                setApplyError(null);
+              }}
+              disabled={applying}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              onClick={() => void apply()}
+              disabled={applying || !ID_PATTERN.test(applyTargetId.trim())}
+              testId="confirm-apply"
+            >
+              {applying ? (
+                <span className="flex items-center gap-1.5">
+                  <span
+                    aria-hidden
+                    className="h-3 w-3 animate-spin rounded-full border-2 border-white/30 border-t-white"
+                  />
+                  Saving &amp; Running Backtest...
+                </span>
+              ) : (
+                "Save & Run Backtest"
+              )}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-2">
+          <Field
+            label="Target strategy ID"
+            htmlFor="apply-strategy-id"
+            hint="A new YAML strategy is created from the study's best parameters."
+          >
+            <TextInput
+              id="apply-strategy-id"
+              value={applyTargetId}
+              onChange={(value) => setApplyTargetId(value.toLowerCase().replace(/\s+/g, "_"))}
+              disabled={applying}
+            />
+          </Field>
+          {applyError ? (
+            <div
+              role="alert"
+              data-testid="apply-error"
+              className="rounded-md border border-loss/40 bg-loss-soft/40 px-2.5 py-2 text-[11px] leading-4 text-rose-300"
+            >
+              {applyError}
+            </div>
+          ) : null}
+          <p className="text-[10.5px] leading-4 text-zinc-600">
+            The backend writes the strategy visible to the Studio and Backtest Lab, then auto-runs a verification
+            walk-forward backtest. You will get deep links to both.
+          </p>
+        </div>
+      </Modal>
     </div>
   );
 }
 
-function formatObjectiveValue(value: number): string {
-  return Number.isFinite(value) ? value.toFixed(3) : "—";
+function formatObjectiveValue(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(3) : "—";
 }
 
 function shortParam(path: string): string {

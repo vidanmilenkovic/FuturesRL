@@ -1453,8 +1453,8 @@ export function mockStudioCatalog(): StudioCatalogResponse {
       min: 5, max: 30, step: 1, group: "KAMA", optuna_tunable: true, optuna_default_selected: true,
     }),
     param("timing.carry_filter.enabled", "timing", "Carry / term-structure filter", "Tilt towards backwardated roots and penalise expensive contango.", "bool", true, { group: "Carry" }),
-    param("timing.carry_filter.params.min_carry_bps", "timing", "Min carry (bps)", "Minimum annualised roll yield required to keep a long position.", "float", 0, {
-      min: -50, max: 50, step: 5, group: "Carry", optuna_tunable: true, optuna_default_selected: true,
+    param("timing.carry_filter.params.min_carry_bps", "timing", "Min carry (bps)", "Minimum annualised roll yield required to keep a long position; the −50 bps default permits mild contango while filtering deep contango.", "float", -50, {
+      min: -200, max: 50, step: 10, unit: "bps", group: "Carry", optuna_tunable: true,
     }),
     param("timing.mean_reversion.enabled", "timing", "Mean reversion (RSI + Bollinger)", "Fade panic sell-offs when RSI or the lower Bollinger band is breached and turbulence is calm.", "bool", false, { group: "Mean reversion" }),
     param("timing.mean_reversion.params.rsi_period", "timing", "RSI period", "RSI window for oversold / overbought detection.", "int", 14, {
@@ -1826,17 +1826,22 @@ export function mockOptimizationList(): OptimizationListResponse {
 
 export function mockOptimizationApply(studyId: string): OptimizationApplyResult {
   const study = mockOptimizationList().studies.find((entry) => entry.study_id === studyId) ?? mockOptimizationStudy();
+  const savedId = `${study.base_strategy_id}_opt`;
   return {
     study_id: studyId,
-    strategy_id: `${study.base_strategy_id}_opt`,
+    strategy_id: savedId,
+    saved_strategy_id: savedId,
+    strategy_path: null,
     strategy: null,
     backtest_run_id: null,
-    applied: true,
+    applied: false,
     verification_backtest: {
       status: "skipped",
-      message: "UI FALLBACK: verification backtest skipped in offline preview.",
+      message: "UI FALLBACK: apply requires the FastAPI backend to persist the strategy and run verification.",
+      run: null,
     },
-    message: "UI FALLBACK: best parameters applied to an in-memory strategy config.",
+    message:
+      "Apply requires the FastAPI backend — offline preview cannot persist the strategy or run the verification backtest.",
   };
 }
 

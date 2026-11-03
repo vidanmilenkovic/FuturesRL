@@ -579,6 +579,10 @@ export interface OptimizationTrial {
   /** Objective value after the drawdown penalty (what Optuna maximised). */
   value: number;
   best: boolean;
+  /** v1.5.3 activity metrics (flat/low-exposure trials are marked inactive). */
+  n_trades?: number | null;
+  avg_gross_exposure?: number | null;
+  zero_activity?: boolean;
 }
 
 export interface OptimizationImportance {
@@ -596,7 +600,7 @@ export interface OptimizationStudy {
   status: "completed" | "running" | "failed" | string;
   created_at: string;
   duration_ms: number;
-  best_value: number;
+  best_value: number | null;
   best_trial_number: number | null;
   best_params: Record<string, number | string | boolean>;
   param_importances: OptimizationImportance[];
@@ -620,11 +624,15 @@ export interface OptimizationListResponse {
 export interface OptimizationVerificationBacktest {
   status: "completed" | "skipped" | string;
   message?: string;
+  run?: { id?: string; [key: string]: unknown } | null;
 }
 
 export interface OptimizationApplyResult {
   study_id: string;
   strategy_id: string;
+  /** v1.5.3 additive apply fields (task-49). */
+  saved_strategy_id?: string | null;
+  strategy_path?: string | null;
   strategy?: StrategyConfig | null;
   backtest_run_id?: string | null;
   applied: boolean;

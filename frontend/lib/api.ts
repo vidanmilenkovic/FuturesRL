@@ -538,23 +538,33 @@ export function runOptimization(
   });
 }
 
-export function applyOptimization(studyId: string): Promise<ApiResult<OptimizationApplyResult>> {
+export function applyOptimization(
+  studyId: string,
+  options: { newStrategyId?: string; verificationBacktest?: boolean } = {},
+): Promise<ApiResult<OptimizationApplyResult>> {
+  const body = {
+    new_strategy_id: options.newStrategyId,
+    verification_backtest: options.verificationBacktest !== false,
+  };
   return withFallback<unknown>(
     `/api/optimize/${encodeURIComponent(studyId)}/apply`,
     () => mockOptimizationApply(studyId),
-    { method: "POST", body: JSON.stringify({}) },
-    60_000,
+    { method: "POST", body: JSON.stringify(body) },
+    300_000,
   ).then((result) => {
     if (result.source === "demo" && /\b404\b/.test(result.error ?? "")) {
       return {
         data: {
           study_id: studyId,
           strategy_id: "",
+          saved_strategy_id: null,
+          strategy_path: null,
           strategy: null,
           backtest_run_id: null,
           applied: false,
           message:
             "Legacy optimization run archived — pick a current study (the API no longer serves it).",
+          verification_backtest: { status: "skipped", message: "archived" },
         },
         source: "live" as const,
         error: "archived",

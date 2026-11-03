@@ -1187,6 +1187,11 @@ function normalizeTrial(raw: unknown, index: number): OptimizationTrial | null {
     duration_ms: asNumber(raw.duration_ms ?? raw.duration, 0),
     value: Number.isFinite(value) ? value : 0,
     best: asBoolean(raw.best, false),
+    state: asString(raw.state, "") || null,
+    n_trades: typeof raw.n_trades === "number" ? raw.n_trades : null,
+    avg_gross_exposure:
+      typeof raw.avg_gross_exposure === "number" ? raw.avg_gross_exposure : null,
+    zero_activity: asBoolean(raw.zero_activity, false),
   };
 }
 
@@ -1232,11 +1237,19 @@ export function normalizeOptimizationStudy(raw: unknown): OptimizationStudy | nu
     .filter((trial): trial is OptimizationTrial => trial !== null);
   // GET /api/optimize returns summaries without trials; keep them selectable and
   // fetch the full study on demand.
+  const activeTrials = trials.filter((trial) => !trial.zero_activity);
   const bestTrial =
-    trials.length > 0
-      ? (trials.find((trial) => trial.best) ??
-        trials.reduce((best, trial) => (trial.value > best.value ? trial : best), trials[0] as OptimizationTrial))
+    activeTrials.length > 0
+      ? (activeTrials.find((trial) => trial.best) ??
+        activeTrials.reduce(
+          (best, trial) => (trial.value > best.value ? trial : best),
+          activeTrials[0] as OptimizationTrial,
+        ))
       : null;
+  const explicitBestValue =
+    typeof source.best_value === "number" ? source.best_value : undefined;
+  const explicitBestRaw =
+    typeof source.best_raw_value === "number" ? source.best_raw_value : undefined;
   const bestTrialNumberRaw = source.best_trial_number ?? source.best_trial;
   return {
     study_id: asString(source.study_id ?? source.id ?? source.name, `study_${Date.now()}`),
@@ -1250,8 +1263,8 @@ export function normalizeOptimizationStudy(raw: unknown): OptimizationStudy | nu
     status: asString(source.status, "completed"),
     created_at: asString(source.created_at ?? source.created, new Date().toISOString()),
     duration_ms: asNumber(source.duration_ms ?? source.duration, 0),
-    best_value: asNumber(source.best_value ?? source.best_objective, bestTrial?.value ?? 0),
-    best_raw_value: asNumber(source.best_raw_value ?? source.best_value, bestTrial?.value ?? 0),
+    best_value: explicitBestValue ?? bestTrial?.value ?? null,
+    best_raw_value: explicitBestRaw ?? explicitBestValue ?? bestTrial?.value ?? null,
     best_trial_number:
       typeof bestTrialNumberRaw === "number"
         ? bestTrialNumberRaw
@@ -1408,14 +1421,21 @@ export function normalizeOptimizationApply(raw: unknown, fallbackStudyId: string
         message: asString(root.verification_backtest.message, "") || undefined,
       }
     : null;
+  const savedStrategyId =
+    asString(root.saved_strategy_id, "") || asString(strategy?.id ?? root.strategy_id, "");
+  const backtestRunId =
+    asString(root.backtest_run_id, "") ||
+    (isRecord(root.verification_backtest) && isRecord(root.verification_backtest.run)
+      ? asString(root.verification_backtest.run.id, "")
+      : "");
   return {
     study_id: asString(root.study_id, fallbackStudyId),
-    strategy_id: asString(strategy?.id ?? root.strategy_id, "") || `${fallbackStudyId}_opt`,
+    strategy_id: savedStrategyId || `${fallbackStudyId}_opt`,
+    saved_strategy_id: savedStrategyId || null,
+    strategy_path: asString(root.strategy_path, "") || null,
     strategy,
-    backtest_run_id: isRecord(root.verification_backtest) && isRecord(root.verification_backtest.run)
-      ? asString(root.verification_backtest.run.id, "") || null
-      : null,
-    applied: true,
+    backtest_run_id: backtestRunId || null,
+    applied: root.applied === false ? false : true,
     best_params: isRecord(root.best_params)
       ? (root.best_params as Record<string, number | string | boolean>)
       : undefined,
@@ -1555,7 +1575,6 @@ export const OPTUNA_DEFAULT_KEYS = new Set<string>([
   "timing.tsmom.lookback_fast",
   "timing.tsmom.lookback_slow",
   "timing.kama.window",
-  "timing.carry_filter.min_carry_bps",
   "allocator.volatility_target.target_annual_volatility",
   "risk.quant_risk.trailing_stop_pct",
 ]);
