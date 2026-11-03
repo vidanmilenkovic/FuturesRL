@@ -5,13 +5,17 @@ from __future__ import annotations
 import dataclasses
 import math
 import sys
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
+from configs.instruments import load_instruments
+from configs.strategy import DRLSpec, StageConfig, StrategyConfig
 from src.core.interfaces import PortfolioAllocator
 from src.core.types import AssetClass, InstrumentSnapshot, MarketState, WeightVector
 from src.strategies._numeric import covariance_matrix, portfolio_volatility
+from src.strategies._observation import DEFAULT_OBSERVATION_FEATURES
 from src.strategies._params import ParamError
 from src.strategies.allocators import (
     ALLOCATOR_REGISTRY,
@@ -24,6 +28,7 @@ from src.strategies.allocators import (
     import_stable_baselines3,
 )
 from src.strategies.envs import FuturesTradingEnv
+from src.strategies.pipeline import build_pipeline
 
 from tests.fixtures.market import FIXED_TIMESTAMP, make_market_state, make_risk_assessment
 
@@ -450,16 +455,17 @@ def test_allocators_are_independent_of_instrument_master() -> None:
     assert weights["ES"] == pytest.approx(1.0)
 
 
-@pytest.mark.slow
-def test_drl_allocator_trains_ppo_on_futures_env_end_to_end() -> None:
-    """Train PPO for a tiny budget and allocate a finite, capped weight vector."""
-    pytest.importorskip("stable_baselines3")
-    feature_names = ("ret_1d", "vol_20d", "term_slope")
+#: Per-instrument observation features used by the tiny DRL fixtures.
+_DRL_FEATURE_NAMES: tuple[str, ...] = ("ret_1d", "vol_20d", "term_slope")
+
+
+def _tiny_drl_env(feature_names: tuple[str, ...] = _DRL_FEATURE_NAMES) -> FuturesTradingEnv:
+    """A tiny deterministic 3-asset futures env for DRL smoke tests."""
     rng = np.random.default_rng(7)
     steps = 32
     prices = 100.0 * np.cumprod(1.0 + rng.normal(0.0005, 0.004, (steps, 3)), axis=0)
     features = rng.normal(0.0, 0.01, (steps, 3, len(feature_names)))
-    env = FuturesTradingEnv(
+    return FuturesTradingEnv(
         prices=prices,
         instrument_ids=("ES", "NQ", "CL"),
         features=features,
@@ -473,15 +479,42 @@ def test_drl_allocator_trains_ppo_on_futures_env_end_to_end() -> None:
         drawdown_limit=1.0,
         bankruptcy_threshold=0.0,
     )
+
+
+def _train_tiny_ppo(
+    tmp_path: Path,
+    *,
+    feature_names: tuple[str, ...] = _DRL_FEATURE_NAMES,
+    gross_leverage: float = 2.0,
+) -> tuple[DRLAllocator, Path]:
+    """Train PPO for a tiny budget on the tiny env and save a checkpoint."""
+    allocator = DRLAllocator(
+        algorithm="PPO",
+        total_timesteps=64,
+        device="cpu",
+        feature_names=feature_names,
+        gross_leverage=gross_leverage,
+        seed=7,
+    )
+    model = allocator.train(_tiny_drl_env(feature_names), total_timesteps=64)
+    checkpoint = tmp_path / "drl_checkpoint.zip"
+    model.save(str(checkpoint))
+    return allocator, checkpoint
+
+
+@pytest.mark.slow
+def test_drl_allocator_trains_ppo_on_futures_env_end_to_end() -> None:
+    """Train PPO for a tiny budget and allocate a finite, capped weight vector."""
+    pytest.importorskip("stable_baselines3")
     allocator = DRLAllocator(
         algorithm="PPO",
         total_timesteps=128,
         device="cpu",
-        feature_names=feature_names,
+        feature_names=_DRL_FEATURE_NAMES,
         gross_leverage=2.0,
         seed=7,
     )
-    model = allocator.train(env, total_timesteps=128)
+    model = allocator.train(_tiny_drl_env(), total_timesteps=128)
     assert model is not None
     assert allocator.is_trained is True
     state = make_market_state(roots=("ES", "NQ", "CL"))
@@ -490,3 +523,116 @@ def test_drl_allocator_trains_ppo_on_futures_env_end_to_end() -> None:
     assert set(weights.as_dict()) == set(state.ids)
     assert all(np.isfinite(value) for value in weights.as_dict().values())
     assert weights.gross <= 2.0 + 1e-9
+
+
+@pytest.mark.slow
+def test_drl_allocator_loads_trained_checkpoint_from_model_path(tmp_path: Path) -> None:
+    """A saved SB3 checkpoint loads lazily via ``model_path`` and allocates."""
+    pytest.importorskip("stable_baselines3")
+    _, checkpoint = _train_tiny_ppo(tmp_path)
+    allocator = DRLAllocator(
+        algorithm="PPO",
+        model_path=checkpoint,
+        device="cpu",
+        feature_names=_DRL_FEATURE_NAMES,
+        gross_leverage=2.0,
+    )
+    assert allocator.model_path == str(checkpoint)
+    assert allocator.is_trained is False  # lazy: not loaded until first use
+    state = make_market_state(roots=("ES", "NQ", "CL"))
+    weights = allocator.allocate(state.ids, state)
+    assert allocator.is_trained is True
+    assert isinstance(weights, WeightVector)
+    assert set(weights.as_dict()) == set(state.ids)
+    assert all(np.isfinite(value) for value in weights.as_dict().values())
+    assert weights.gross <= 2.0 + 1e-9
+    # The loaded policy is deterministic and the checkpoint is only loaded once.
+    assert allocator.allocate(state.ids, state) == weights
+    with pytest.raises(ValueError, match="model must not be None"):
+        allocator.attach_model(None)
+
+
+def test_drl_allocator_missing_checkpoint_is_actionable(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.zip"
+    allocator = DRLAllocator(model_path=missing)
+    assert allocator.model_path == str(missing)
+    with pytest.raises(RuntimeError, match="checkpoint not found") as excinfo:
+        _ = allocator.model
+    assert str(missing) in str(excinfo.value)
+    with pytest.raises(RuntimeError, match="train_drl"):
+        allocator.allocate(("ES",), make_market_state(roots=("ES",)))
+
+
+def test_drl_allocator_checkpoint_requires_sb3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "model.zip"
+    checkpoint.write_bytes(b"placeholder")
+    monkeypatch.setitem(sys.modules, "stable_baselines3", None)
+    allocator = DRLAllocator(model_path=checkpoint)
+    with pytest.raises(RuntimeError, match="stable-baselines3"):
+        allocator.allocate(("ES",), make_market_state(roots=("ES",)))
+
+
+def test_drl_allocator_corrupt_checkpoint_is_actionable(tmp_path: Path) -> None:
+    pytest.importorskip("stable_baselines3")
+    checkpoint = tmp_path / "corrupt.zip"
+    checkpoint.write_bytes(b"not a zip file")
+    allocator = DRLAllocator(model_path=checkpoint)
+    with pytest.raises(RuntimeError, match="failed to load"):
+        _ = allocator.model
+
+
+def test_drl_allocator_rejects_bad_model_path() -> None:
+    with pytest.raises(ValueError, match="model_path"):
+        DRLAllocator(model_path="  ")
+    with pytest.raises(TypeError, match="model_path"):
+        DRLAllocator(model_path=123)  # type: ignore[arg-type]
+
+
+def test_build_allocator_passes_model_path(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.zip"
+    checkpoint.write_bytes(b"placeholder")
+    allocator = build_allocator("drl", {"algorithm": "PPO", "model_path": str(checkpoint)})
+    assert isinstance(allocator, DRLAllocator)
+    assert allocator.model_path == str(checkpoint)
+    assert allocator.is_trained is False  # loading is lazy
+
+
+@pytest.mark.slow
+def test_pipeline_uses_config_drl_model_path_fallback(tmp_path: Path) -> None:
+    """``drl.model_path`` in the strategy config backs a checkpoint-less allocator stage."""
+    pytest.importorskip("stable_baselines3")
+    _, checkpoint = _train_tiny_ppo(
+        tmp_path, feature_names=DEFAULT_OBSERVATION_FEATURES, gross_leverage=1.0
+    )
+    config = StrategyConfig(
+        id="drl_model_path_fallback",
+        universe=StageConfig(name="liquidity"),
+        allocator=StageConfig(name="drl", params={"algorithm": "PPO"}),
+        drl=DRLSpec(algorithm="PPO", model_path=str(checkpoint), total_timesteps=64),
+    )
+    pipeline = build_pipeline(config, load_instruments())
+    allocator = pipeline.allocator
+    assert isinstance(allocator, DRLAllocator)
+    assert allocator.model_path == str(checkpoint)
+    state = make_market_state(roots=("ES", "NQ", "CL"))
+    weights = allocator.allocate(state.ids, state)
+    assert set(weights.as_dict()) == set(state.ids)
+    assert all(np.isfinite(value) for value in weights.as_dict().values())
+    assert weights.gross <= 1.0 + 1e-9
+
+
+def test_pipeline_prefers_explicit_allocator_model_path(tmp_path: Path) -> None:
+    """An explicit allocator-stage ``model_path`` wins over ``drl.model_path``."""
+    explicit = tmp_path / "explicit.zip"
+    explicit.write_bytes(b"placeholder")
+    config = StrategyConfig(
+        id="drl_model_path_explicit",
+        universe=StageConfig(name="liquidity"),
+        allocator=StageConfig(name="drl", params={"model_path": str(explicit)}),
+        drl=DRLSpec(model_path=str(tmp_path / "fallback.zip")),
+    )
+    pipeline = build_pipeline(config, load_instruments())
+    assert isinstance(pipeline.allocator, DRLAllocator)
+    assert pipeline.allocator.model_path == str(explicit)

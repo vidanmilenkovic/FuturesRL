@@ -29,6 +29,7 @@ rather than hidden behind an import alias.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -82,11 +83,23 @@ class DRLAllocator:
     explicit CPU default avoids Stable-Baselines3's "auto device / no CUDA"
     warning in headless backtest and API processes. Pass ``device="auto"`` or
     ``device="cuda"`` to opt into GPU training or auto-detection.
+
+    Checkpoints
+    -----------
+    ``model_path`` points at a Stable-Baselines3 ``.zip`` checkpoint produced by
+    ``python -m src.strategies.train_drl`` (or any ``model.save()`` call). The
+    checkpoint is loaded lazily on the first :meth:`allocate`/:attr:`model` access
+    via ``algorithm_class.load(path, device=self._device)`` (a single attempt whose
+    result - success or failure - is cached), so importing/building a pipeline never
+    imports torch and a bad path fails with an actionable error at the point of use.
+    The configured ``algorithm`` must match the checkpoint's algorithm (``CPPO``
+    checkpoints are plain ``PPO`` and therefore load as ``PPO``).
     """
 
     __slots__ = (
         "_action_mode",
         "_algorithm",
+        "_checkpoint_error",
         "_confidence_threshold",
         "_device",
         "_feature_names",
@@ -95,6 +108,7 @@ class DRLAllocator:
         "_learning_rate",
         "_max_instrument_weight",
         "_model",
+        "_model_path",
         "_policy",
         "_risk_penalty_lambda",
         "_safe_risk_score",
@@ -121,6 +135,7 @@ class DRLAllocator:
         feature_names: Sequence[str] = DEFAULT_OBSERVATION_FEATURES,
         verbose: int = 0,
         device: str = "cpu",
+        model_path: str | Path | None = None,
         model: Any = None,
     ) -> None:
         normalised = algorithm.strip().upper()
@@ -156,6 +171,10 @@ class DRLAllocator:
             raise ValueError("feature_names must not be empty")
         if not device.strip():
             raise ValueError("device must be a non-empty Stable-Baselines3 device string")
+        if model_path is not None and not isinstance(model_path, (str, Path)):
+            raise TypeError("model_path must be a str, pathlib.Path or None")
+        if isinstance(model_path, str) and not model_path.strip():
+            raise ValueError("model_path must be a non-empty path when provided")
         self._algorithm = normalised
         self._policy = policy.strip()
         self._total_timesteps = int(total_timesteps)
@@ -171,6 +190,8 @@ class DRLAllocator:
         self._feature_names = tuple(feature_names)
         self._verbose = int(verbose)
         self._device = device.strip()
+        self._model_path: Path | None = None if model_path is None else Path(model_path)
+        self._checkpoint_error: Exception | None = None
         self._model: Any = model
 
     # -- introspection --------------------------------------------------------
@@ -210,19 +231,60 @@ class DRLAllocator:
         """Stable-Baselines3 device used for training (``cpu`` by default)."""
         return self._device
 
+    @property
+    def model_path(self) -> str | None:
+        """Configured SB3 checkpoint path (``None`` when no checkpoint is configured)."""
+        return None if self._model_path is None else str(self._model_path)
+
     def _require_model(self) -> Any:
-        if self._model is None:
+        """Return the attached/trained/loaded model, loading a checkpoint lazily.
+
+        A configured ``model_path`` is loaded at most once: the successful model (or
+        the failure) is cached, so repeated inference never re-reads the checkpoint
+        and never silently changes behaviour mid-run.
+        """
+        if self._model is not None:
+            return self._model
+        if self._model_path is not None:
+            if self._checkpoint_error is not None:
+                raise self._checkpoint_error
+            try:
+                self._model = self._load_checkpoint(self._model_path)
+            except Exception as exc:
+                self._checkpoint_error = exc
+                raise
+            return self._model
+        raise RuntimeError(
+            "DRLAllocator has no model: call train(env, total_timesteps) first, pass a "
+            "trained Stable-Baselines3 model as `model=`, or point `model_path=` at a "
+            "checkpoint produced by `python -m src.strategies.train_drl`."
+        )
+
+    def _load_checkpoint(self, path: Path) -> Any:
+        """Load one SB3 checkpoint from ``path`` (fails with actionable errors)."""
+        if not path.is_file():
             raise RuntimeError(
-                "DRLAllocator has no model: call train(env, total_timesteps) first, or "
-                "pass a trained Stable-Baselines3 model as `model=`."
+                f"DRL checkpoint not found: {path}; train one with "
+                f"`python -m src.strategies.train_drl --output {path}` or attach an "
+                "existing model via attach_model()."
             )
-        return self._model
+        framework = import_stable_baselines3()
+        algorithm_class = self._resolve_algorithm_class(framework)
+        try:
+            return algorithm_class.load(str(path), device=self._device)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to load DRL checkpoint {path} as {self._algorithm}: {exc}. "
+                "Ensure the .zip was saved by the same Stable-Baselines3 algorithm "
+                "(CPPO checkpoints are plain PPO)."
+            ) from exc
 
     def attach_model(self, model: Any) -> None:
         """Attach an externally trained SB3-compatible model."""
         if model is None:
             raise ValueError("model must not be None")
         self._model = model
+        self._checkpoint_error = None
 
     # -- training -------------------------------------------------------------
 
@@ -250,6 +312,7 @@ class DRLAllocator:
         )
         model.learn(total_timesteps=budget)
         self._model = model
+        self._checkpoint_error = None
         return model
 
     # -- inference ------------------------------------------------------------
@@ -343,6 +406,7 @@ def build_drl_allocator(params: Mapping[str, StageParam]) -> PortfolioAllocator:
         max_instrument_weight=reader.as_float("max_instrument_weight", 1.0),
         verbose=reader.as_int("verbose", 0),
         device=reader.as_str("device", "cpu"),
+        model_path=reader.as_optional_str("model_path"),
     )
     reader.check()
     return allocator

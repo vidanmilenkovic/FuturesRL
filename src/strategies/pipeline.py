@@ -37,7 +37,7 @@ import time
 from collections.abc import Sequence
 
 from configs.instruments import InstrumentsConfig
-from configs.strategy import StrategyConfig
+from configs.strategy import StageParam, StrategyConfig
 
 from src.core.interfaces import (
     ContractTranslatorProtocol,
@@ -401,6 +401,27 @@ def _resolve_risk_overlays(
     return tuple(matched), tuple(skipped), unused
 
 
+def _allocator_stage_params(config: StrategyConfig) -> dict[str, StageParam]:
+    """Allocator stage parameters, with the ``drl.model_path`` config fallback.
+
+    The optional DRL checkpoint provenance lives in the strategy's top-level
+    ``drl:`` block (:attr:`~configs.strategy.DRLSpec.model_path`) while the
+    allocator stage carries the runtime stage parameters. When the ``drl``
+    allocator stage does not set ``model_path`` explicitly, the
+    ``drl.model_path`` value is injected so a trained checkpoint is used without
+    duplicating the path in two places (an explicit stage parameter still wins).
+    """
+    params: dict[str, StageParam] = dict(config.allocator.params)
+    if (
+        config.allocator.name.strip().lower() == "drl"
+        and "model_path" not in params
+        and config.drl is not None
+        and config.drl.model_path
+    ):
+        params["model_path"] = config.drl.model_path
+    return params
+
+
 def build_pipeline(
     config: StrategyConfig,
     instruments: InstrumentsConfig,
@@ -416,7 +437,7 @@ def build_pipeline(
     that the final book was produced without it.
     """
     selector = build_selector(config.universe.name, config.universe.params, instruments)
-    allocator = build_allocator(config.allocator.name, config.allocator.params)
+    allocator = build_allocator(config.allocator.name, _allocator_stage_params(config))
     timing = tuple(build_timing(stage.name, stage.params) for stage in config.timing)
     provided = tuple(risk_overlays or ())
     risk, skipped, unused = _resolve_risk_overlays(
