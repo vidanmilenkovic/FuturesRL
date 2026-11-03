@@ -275,7 +275,7 @@ def test_get_settings_cached() -> None:
 
 def test_llm_provider_key_requirements() -> None:
     # Hosted providers need a key.
-    for provider in ("openai", "anthropic", "deepseek"):
+    for provider in ("openai", "anthropic", "deepseek", "gemini"):
         with pytest.raises(ValueError, match="FUTURESRLX_LLM_API_KEY"):
             Settings(_env_file=None, llm_provider=provider)
     # Local vLLM is keyless by design.

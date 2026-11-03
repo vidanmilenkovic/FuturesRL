@@ -22,6 +22,7 @@ from src.risk.llm_risk_overlay import (
     AnthropicClient,
     AsyncLLMClient,
     DeepSeekClient,
+    GeminiClient,
     LLMResponseError,
     LLMRiskAssessmentBatch,
     LLMRiskConfig,
@@ -41,6 +42,7 @@ PROVIDER_ADAPTERS: dict[str, tuple[type[object], str]] = {
     "openai": (OpenAIClient, "https://api.openai.com/v1"),
     "anthropic": (AnthropicClient, "https://api.anthropic.com/v1"),
     "deepseek": (DeepSeekClient, "https://api.deepseek.com/v1"),
+    "gemini": (GeminiClient, "https://generativelanguage.googleapis.com/v1beta/openai"),
     "vllm": (VLLMClient, "http://localhost:8000/v1"),
 }
 
@@ -218,7 +220,7 @@ def test_empty_base_url_keeps_adapter_defaults() -> None:
     assert settings.llm_base_url_value is None
 
 
-@pytest.mark.parametrize("provider", ["anthropic", "deepseek", "openai"])
+@pytest.mark.parametrize("provider", ["anthropic", "deepseek", "gemini", "openai"])
 def test_missing_api_key_raises_actionable_error(provider: str) -> None:
     # ``model_construct`` bypasses the Settings validator so the factory's own
     # defensive check is exercised (production settings already fail closed).
@@ -275,7 +277,7 @@ assert "httpx" not in sys.modules, "httpx imported by src.risk package import"
 offline = build_llm_client(Settings(llm_provider="offline"))
 assert isinstance(offline, OfflineLLMClient)
 assert "httpx" not in sys.modules, "offline construction imported httpx"
-for provider in ("openai", "anthropic", "deepseek", "vllm"):
+for provider in ("openai", "anthropic", "deepseek", "gemini", "vllm"):
     build_llm_client(
         Settings(llm_provider=provider, llm_model="unit-model", llm_api_key=SecretStr("k"))
     )

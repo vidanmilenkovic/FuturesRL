@@ -122,8 +122,11 @@ class Settings(BaseSettings):
 
     # -- LLM risk provider (Tier-A Live inference switch) ---------------------------
     #: "offline" = deterministic fixture assessments; other values use the real
-    #: async provider adapters in src/risk/llm_clients.py.
-    llm_provider: Literal["offline", "openai", "anthropic", "deepseek", "vllm"] = "offline"
+    #: async provider adapters in src/risk/llm_clients.py (openai, anthropic,
+    #: deepseek, gemini, vllm).
+    llm_provider: Literal["offline", "openai", "anthropic", "deepseek", "gemini", "vllm"] = (
+        "offline"
+    )
     llm_model: str = "gpt-4o-mini"
     #: Optional custom endpoint (vLLM/OpenAI-compatible proxy); empty = adapter default.
     llm_base_url: str = ""
@@ -180,6 +183,20 @@ class Settings(BaseSettings):
         if upper not in allowed:
             raise ValueError(f"log_level must be one of {sorted(allowed)}")
         return upper
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _normalise_llm_provider(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip().lower()
+        supported = {"offline", "openai", "anthropic", "deepseek", "gemini", "vllm"}
+        if cleaned and cleaned not in supported:
+            raise ValueError(
+                f"unsupported llm_provider {value!r}; supported providers: "
+                f"{sorted(supported)} (set FUTURESRLX_LLM_PROVIDER)"
+            )
+        return cleaned
 
     @field_validator("llm_model")
     @classmethod
@@ -252,7 +269,10 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _llm_provider_requires_key(self) -> Settings:
         # Local vLLM servers are normally keyless; hosted providers need a key.
-        if self.llm_provider in {"openai", "anthropic", "deepseek"} and self.llm_api_key is None:
+        if (
+            self.llm_provider in {"openai", "anthropic", "deepseek", "gemini"}
+            and self.llm_api_key is None
+        ):
             raise ValueError(
                 f"llm_provider={self.llm_provider!r} requires FUTURESRLX_LLM_API_KEY "
                 "(use llm_provider=offline for deterministic fixture assessments, or "

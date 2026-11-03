@@ -342,6 +342,12 @@ setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, 
 4. **E2E bug fixed during integration** — default API CORS origins now include the dashboard
    `:3100` and compose `:3080` origins (previously a browser at `127.0.0.1:3100` was blocked and
    showed `UI FALLBACK` even with the API up).
+5. **Post-release follow-ups** — Google **Gemini** is now a first-class LLM provider
+   (`GeminiClient` on Gemini's OpenAI-compatible endpoint, `FUTURESRLX_LLM_PROVIDER=gemini`,
+   key required, verified live against the Generative Language API); unknown provider ids now fail
+   with an actionable supported-provider message; keyless local `vllm` is supported. Subprocess CLI
+   tests now run from a temp cwd so a developer's real repo-root `.env` can never leak into the
+   hermetic test suite.
 
 **Verification (as merged)**
 - `FUTURESRLX_ENVIRONMENT=paper FUTURESRLX_RISK_STATE_STORE_URI=duckdb: ./scripts/quality_gate.sh --cov`

@@ -80,6 +80,7 @@ __all__ = [
     "AsyncLLMClient",
     "AsyncLLMRiskCacheWorker",
     "DeepSeekClient",
+    "GeminiClient",
     "LLMClientError",
     "LLMResponseError",
     "LLMRiskAssessmentBatch",
@@ -476,6 +477,37 @@ class DeepSeekClient(_OpenAICompatibleClient):
             base_url=base_url,
             api_key=api_key,
             provider="deepseek",
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            backoff_base_seconds=backoff_base_seconds,
+            httpx_loader=httpx_loader,
+        )
+
+
+class GeminiClient(_OpenAICompatibleClient):
+    """Async adapter for Google Gemini's OpenAI-compatible endpoint.
+
+    Gemini exposes an OpenAI-compatible Chat Completions API at
+    ``https://generativelanguage.googleapis.com/v1beta/openai/``; the API key is
+    sent as a bearer token, so the existing OpenAI transport is reused.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str = "gemini-2.5-flash",
+        base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai",
+        timeout_seconds: float = 30.0,
+        max_retries: int = 2,
+        backoff_base_seconds: float = 0.5,
+        httpx_loader: Callable[[], Any] | None = None,
+    ) -> None:
+        super().__init__(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            provider="gemini",
             timeout_seconds=timeout_seconds,
             max_retries=max_retries,
             backoff_base_seconds=backoff_base_seconds,

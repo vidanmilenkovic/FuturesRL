@@ -366,8 +366,9 @@ both engines produce identical targets and deltas for identical market states.
   `allocator.params.model_path` or `drl.model_path` in the strategy YAML.
 - **Pluggable news + LLM providers.** `src/data/news_ingestor.py` resolves RSS feeds → IBKR news →
   deterministic fixtures, and the LLM Risk-First engine switches from fixture to live inference via
-  `FUTURESRLX_LLM_PROVIDER` / `FUTURESRLX_LLM_MODEL` / `FUTURESRLX_LLM_API_KEY` (optional
-  `FUTURESRLX_LLM_BASE_URL` for vLLM/OpenAI-compatible endpoints).
+  `FUTURESRLX_LLM_PROVIDER` (`offline|openai|anthropic|deepseek|gemini|vllm`) /
+  `FUTURESRLX_LLM_MODEL` / `FUTURESRLX_LLM_API_KEY` (optional `FUTURESRLX_LLM_BASE_URL` for
+  vLLM/OpenAI-compatible endpoints; Gemini uses its OpenAI-compatible endpoint).
 - **Dashboard fixes.** Live WebSocket ticks update the last daily bar in place for daily timeframes
   (intraday points only on `1D`), real discretization tracking error + micro-routing are shown, the
   Backtest Lab overlays all selected runs with a Walk-Forward toggle, and the ribbon shows a

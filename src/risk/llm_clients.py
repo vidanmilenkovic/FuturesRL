@@ -45,6 +45,7 @@ from src.risk.llm_risk_overlay import (
     AnthropicClient,
     AsyncLLMClient,
     DeepSeekClient,
+    GeminiClient,
     OpenAIClient,
     VLLMClient,
 )
@@ -56,7 +57,14 @@ if TYPE_CHECKING:
 __all__ = ["OfflineLLMClient", "build_llm_client"]
 
 #: Providers accepted by :func:`build_llm_client` (mirrors ``Settings.llm_provider``).
-_SUPPORTED_PROVIDERS: tuple[str, ...] = ("offline", "openai", "anthropic", "deepseek", "vllm")
+_SUPPORTED_PROVIDERS: tuple[str, ...] = (
+    "offline",
+    "openai",
+    "anthropic",
+    "deepseek",
+    "gemini",
+    "vllm",
+)
 
 #: Upper-case token in the prompt; only tokens present in the instrument master
 #: are treated as futures roots (macro event names such as FOMC/CPI never match).
@@ -200,6 +208,10 @@ def build_llm_client(settings: Settings) -> AsyncLLMClient:
         if base_url is None:
             return DeepSeekClient(api_key, model=model)
         return DeepSeekClient(api_key, model=model, base_url=base_url)
+    if provider == "gemini":
+        if base_url is None:
+            return GeminiClient(api_key, model=model)
+        return GeminiClient(api_key, model=model, base_url=base_url)
     # Local vLLM servers are normally keyless: the adapter accepts api_key=None.
     if base_url is None:
         return VLLMClient(model=model, api_key=api_key)

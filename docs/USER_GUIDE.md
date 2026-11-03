@@ -199,7 +199,7 @@ Nested risk settings use a double underscore: `FUTURESRLX_RISK__MAX_MARGIN_UTILI
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FUTURESRLX_LLM_PROVIDER` | `offline` | `offline` (deterministic fixtures) / `openai` / `anthropic` / `deepseek` / `vllm` |
+| `FUTURESRLX_LLM_PROVIDER` | `offline` | `offline` (deterministic fixtures) / `openai` / `anthropic` / `deepseek` / `gemini` / `vllm` |
 | `FUTURESRLX_LLM_MODEL` | `gpt-4o-mini` | model identifier passed to the provider adapter |
 | `FUTURESRLX_LLM_BASE_URL` | _(empty)_ | optional custom endpoint (vLLM / OpenAI-compatible proxy); empty = adapter default |
 | `FUTURESRLX_LLM_API_KEY` | _(unset)_ | provider API key (secret; required for non-offline providers) |
@@ -528,15 +528,19 @@ reports provenance).
 To switch the LLM Risk-First engine from fixtures to real inference, set in `.env`:
 
 ```bash
-FUTURESRLX_LLM_PROVIDER=openai          # or anthropic / deepseek / vllm
+FUTURESRLX_LLM_PROVIDER=openai          # or anthropic / deepseek / gemini / vllm
 FUTURESRLX_LLM_MODEL=gpt-4o-mini
 FUTURESRLX_LLM_API_KEY=sk-...
 # FUTURESRLX_LLM_BASE_URL=http://vllm-host:8000/v1   # optional
 ```
 
-Hosted providers (`openai`, `anthropic`, `deepseek`) require `FUTURESRLX_LLM_API_KEY`.
-The local `vllm` provider is **keyless**: point `FUTURESRLX_LLM_BASE_URL` at the OpenAI-compatible
-vLLM server (default `http://localhost:8000/v1`) and leave `FUTURESRLX_LLM_API_KEY` empty.
+Hosted providers (`openai`, `anthropic`, `deepseek`, `gemini`) require
+`FUTURESRLX_LLM_API_KEY`. Google Gemini is supported through its OpenAI-compatible endpoint
+(default base `https://generativelanguage.googleapis.com/v1beta/openai`, e.g.
+`FUTURESRLX_LLM_MODEL=gemini-2.5-flash`); set `FUTURESRLX_LLM_BASE_URL` only for a proxy.
+The local `vllm` provider is **keyless**: point `FUTURESRLX_LLM_BASE_URL` at the
+OpenAI-compatible vLLM server (default `http://localhost:8000/v1`) and leave
+`FUTURESRLX_LLM_API_KEY` empty.
 
 All LLM outputs remain subject to the confidence/variance filter and the deterministic circuit
 breaker; slow multi-sample calls are served from the async TTL cache and never block the pipeline.
