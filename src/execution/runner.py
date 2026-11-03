@@ -36,6 +36,17 @@ deterministic :class:`~src.data.databento_loader.OfflineBarSource` and an
 :class:`OfflineTargetBroker` wrapping the simulated venue, so the runner can be
 exercised with no IBKR/Databento connectivity at all.
 
+Runner <-> API bridge (Phase 9)
+-------------------------------
+When a :class:`~src.execution.runner_bridge.RunnerBridgeStore` is injected (the
+CLI enables it via ``Settings.runner_bridge_enabled``) the runner atomically
+publishes a :class:`~src.execution.runner_bridge.RunnerBridgeSnapshot` after every
+processed state, after the pipeline warm-up prime and on the kill-switch/lock
+paths, so the dashboard/API can render positions, working orders, fills, account
+and pipeline telemetry without sharing memory with the trading process.
+:class:`OfflineRunnerSession` packages the deterministic offline stack behind an
+``async warm_start()/step()/snapshot()/close()`` API for the API controller.
+
 Production wiring lives in :func:`main`: ``ib_async``/Databento are imported
 *lazily* only on the trading path, and ``--check`` validates settings, the
 instrument master, the strategy YAML and the hydration configuration without
@@ -47,14 +58,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import math
 import sys
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, runtime_checkable
 
 import polars as pl
 from configs.instruments import InstrumentsConfig, load_instruments
@@ -70,6 +83,7 @@ from src.core.types import (
     OrderEvent,
     OrderReceipt,
     OrderStatus,
+    PipelineResult,
     Position,
     ScalarValue,
     ensure_utc,
@@ -92,6 +106,13 @@ from src.execution.hydrator import (
     build_backfill_chain,
     offline_backfill,
 )
+from src.execution.runner_bridge import (
+    DEFAULT_STALE_AFTER_SECONDS,
+    BridgeMode,
+    RunnerBridgeSnapshot,
+    RunnerBridgeStore,
+    snapshot_from_runner,
+)
 from src.risk.state_store import PersistedRiskState, RiskStateStore
 
 if TYPE_CHECKING:
@@ -104,6 +125,7 @@ __all__ = [
     "OFFLINE_REPLAY_STATES",
     "OFFLINE_SIMULATION_END",
     "OfflineMarketStateStreamer",
+    "OfflineRunnerSession",
     "OfflineTargetBroker",
     "RunnerConfigError",
     "RunnerNotHydratedError",
@@ -261,6 +283,13 @@ class TradingRunner:
         keep the process alive and report; operators can raise this).
     dry_run:
         Never connect/disconnect the streamer or broker (injected fakes).
+    bridge_store:
+        Optional :class:`~src.execution.runner_bridge.RunnerBridgeStore`; when
+        present the runner publishes a bridge snapshot after every processed
+        state (and after the warm-up prime / kill-switch paths) for the API.
+    runner_id:
+        Stable identifier published on the bridge (defaults to a random
+        ``runner-<pid>-<hex>`` identifier).
     """
 
     def __init__(
@@ -280,6 +309,8 @@ class TradingRunner:
         halt_on_error: bool = False,
         dry_run: bool = False,
         prime_pipeline: bool = False,
+        bridge_store: RunnerBridgeStore | None = None,
+        runner_id: str | None = None,
     ) -> None:
         if not isinstance(settings, Settings):
             raise TypeError(f"settings must be a Settings, got {type(settings)!r}")
@@ -310,6 +341,15 @@ class TradingRunner:
         self._last_error: str | None = None
         self._started_at: datetime | None = None
         self._ended_at: datetime | None = None
+        self._bridge_store = bridge_store
+        self._runner_id = runner_id or f"runner-{uuid.uuid4().hex[:12]}"
+        self._last_bridge_snapshot: RunnerBridgeSnapshot | None = None
+        self._last_pipeline_result: PipelineResult | None = None
+        self._last_positions: Mapping[InstrumentId, Position] | None = None
+        self._last_account: dict[str, float] | None = None
+        if bridge_store is not None:
+            # Continue the sequence across restarts and never regress the file.
+            self._last_bridge_snapshot = bridge_store.load()
 
     # -- introspection ---------------------------------------------------------
 
@@ -344,6 +384,56 @@ class TradingRunner:
         if self._master is None:
             self._master = load_instruments()
         return self._master
+
+    @property
+    def bridge_store(self) -> RunnerBridgeStore | None:
+        """Durable API bridge store (``None`` disables snapshot publishing)."""
+        return self._bridge_store
+
+    @property
+    def runner_id(self) -> str:
+        """Stable identifier published on the bridge."""
+        return self._runner_id
+
+    @property
+    def mode(self) -> BridgeMode:
+        """Execution mode published on the bridge (``offline``/``paper``/``live``)."""
+        if self._dry_run:
+            return "offline"
+        environment = self._settings.environment
+        if environment in ("paper", "live"):
+            return cast("BridgeMode", environment)
+        return "offline"
+
+    @property
+    def clock(self) -> Clock:
+        """Injectable UTC clock (exposed for the bridge snapshot timestamp)."""
+        return self._clock
+
+    @property
+    def dry_run(self) -> bool:
+        """Whether the runner never connects/disconnects real venues."""
+        return self._dry_run
+
+    @property
+    def last_bridge_snapshot(self) -> RunnerBridgeSnapshot | None:
+        """Most recent published bridge snapshot (``None`` before the first)."""
+        return self._last_bridge_snapshot
+
+    @property
+    def last_pipeline_result(self) -> PipelineResult | None:
+        """Pipeline result of the most recently processed state/prime."""
+        return self._last_pipeline_result
+
+    @property
+    def last_positions(self) -> Mapping[InstrumentId, Position] | None:
+        """Broker positions observed by the most recent state/prime."""
+        return self._last_positions
+
+    @property
+    def last_account(self) -> Mapping[str, float] | None:
+        """Latest account valuation/margin scalars (bridge-ready)."""
+        return self._last_account
 
     @property
     def hydrated(self) -> bool:
@@ -483,6 +573,8 @@ class TradingRunner:
                 logger.critical(
                     "runner refusing to trade: persisted kill switch is engaged (%s)", lock_reason
                 )
+                await self._refresh_bridge_caches()
+                self._write_bridge_snapshot()
             else:
                 await self._maybe_connect(self._streamer)
                 await self._maybe_connect(self._broker)
@@ -594,6 +686,8 @@ class TradingRunner:
         equity = float(account.net_liquidation)
         if not math.isfinite(equity) or equity <= 0.0:
             return state
+        if self._last_account is None:
+            self._last_account = {"net_liquidation": equity}
         return replace(
             state,
             equity=equity,
@@ -601,7 +695,20 @@ class TradingRunner:
             fx_rates=dict(self._settings.fx_rates),
         )
 
-    async def _prime_pipeline_once(self, hydration: HydrationResult) -> None:
+    async def prime_pipeline(self) -> PipelineResult:
+        """Public warm-up hook: run the pipeline once on the hydrated final state.
+
+        The offline/API session and the CLI call this after :meth:`warm_start`;
+        it never submits orders and publishes a bridge snapshot so the dashboard
+        sees the primed pipeline before the first traded state.
+        """
+        if not self._hydrated or self._hydration is None:
+            raise RunnerNotHydratedError(
+                "TradingRunner.prime_pipeline() requires warm_start() to have hydrated first"
+            )
+        return await self._prime_pipeline_once(self._hydration)
+
+    async def _prime_pipeline_once(self, hydration: HydrationResult) -> PipelineResult:
         """Run the pipeline once on the warm historical state, before any live bar.
 
         Optional production warm-up (``prime_pipeline=True``): it exercises the
@@ -611,8 +718,10 @@ class TradingRunner:
         """
         state = await self._state_with_account_equity(hydration.final_state)
         result = self._pipeline.run(state)
+        self._last_pipeline_result = result
         self._ensure_daily_anchor(state)
         self._persisted = self._persisted  # keep property semantics explicit
+        await self._refresh_bridge_caches()
         await self._publish_telemetry(
             "pipeline_warmup",
             {
@@ -632,11 +741,13 @@ class TradingRunner:
             len(result.universe),
             sum(abs(weight) for weight in result.final_weights.weights.values()),
         )
+        self._write_bridge_snapshot(pipeline_result=result)
+        return result
 
     # -- per-state pipeline ----------------------------------------------------
 
     async def _process_state(self, state: MarketState) -> list[OrderReceipt]:
-        """Run the pipeline for one state and submit the resulting targets."""
+        """Run the pipeline for one state, submit the targets and publish the bridge."""
         if not self._hydrated:
             raise RunnerNotHydratedError(
                 "refusing to process a MarketState before warm_start(); cold-start hydration "
@@ -646,80 +757,101 @@ class TradingRunner:
             raise TypeError(f"state must be a MarketState, got {type(state)!r}")
         state = await self._state_with_account_equity(state)
         self._states_processed += 1
-        await self._publish_telemetry(
-            "state",
-            {
-                "timestamp": state.timestamp.isoformat(),
-                "instruments": ",".join(state.ids),
-                "equity": state.equity,
-                "account_currency": state.account_currency,
-            },
-        )
-        result = self._pipeline.run(state)
-        await self._publish_telemetry(
-            "pipeline",
-            {
-                "timestamp": result.timestamp.isoformat(),
-                "universe": ",".join(result.universe),
-                "final_weights": len(result.final_weights),
-                "gross_leverage": sum(
-                    abs(weight) for weight in result.final_weights.weights.values()
-                ),
-                "elapsed_ms": result.elapsed_ms,
-                "targets": len(result.targets) if result.targets is not None else None,
-            },
-        )
-        targets = result.targets
-        if targets is None and self._translator is not None:
-            # The translator resolves the base currency/FX table from ``state``
-            # itself (Phase-7 base-currency normalisation), so only the explicit
-            # equity override is threaded through here.
-            targets = self._translator.translate(result.final_weights, state, equity=state.equity)
-        if targets is None:
-            self._ensure_daily_anchor(state)
+        result: PipelineResult | None = None
+        receipts: list[OrderReceipt] = []
+        try:
             await self._publish_telemetry(
-                "orders", {"timestamp": state.timestamp.isoformat(), "submitted": 0}
+                "state",
+                {
+                    "timestamp": state.timestamp.isoformat(),
+                    "instruments": ",".join(state.ids),
+                    "equity": state.equity,
+                    "account_currency": state.account_currency,
+                },
             )
-            return []
-        lock_reason = self._current_lock_reason()
-        if lock_reason is not None:
-            self._halted = True
-            await self._publish_telemetry("kill_switch", {"locked": True, "reason": lock_reason})
-            logger.critical("kill switch engaged (%s); not submitting targets", lock_reason)
-            return []
-        self._ensure_daily_anchor(state)
-        positions = await self._broker.get_positions()
-        current = {
-            instrument_id: int(position.quantity)
-            for instrument_id, position in positions.items()
-            if int(position.quantity) != 0
-        }
-        receipts = await self._submit_targets(targets, current, state.timestamp)
-        accepted = [receipt for receipt in receipts if receipt.status is not OrderStatus.REJECTED]
-        rejected = len(receipts) - len(accepted)
-        self._orders_submitted += len(accepted)
-        self._orders_rejected += rejected
-        summary = await self._account_summary()
-        await self._publish_telemetry(
-            "orders",
-            {
-                "timestamp": state.timestamp.isoformat(),
-                "targets": len(targets),
-                "orders": len(receipts),
-                "accepted": len(accepted),
-                "rejected": rejected,
-                "order_ids": ",".join(receipt.order_id for receipt in receipts)[:512],
-                **summary,
-            },
-        )
-        logger.info(
-            "state %s processed: %d targets, %d orders accepted, %d rejected",
-            state.timestamp.isoformat(),
-            len(targets),
-            len(accepted),
-            rejected,
-        )
-        return receipts
+            result = self._pipeline.run(state)
+            self._last_pipeline_result = result
+            await self._publish_telemetry(
+                "pipeline",
+                {
+                    "timestamp": result.timestamp.isoformat(),
+                    "universe": ",".join(result.universe),
+                    "final_weights": len(result.final_weights),
+                    "gross_leverage": sum(
+                        abs(weight) for weight in result.final_weights.weights.values()
+                    ),
+                    "elapsed_ms": result.elapsed_ms,
+                    "targets": len(result.targets) if result.targets is not None else None,
+                },
+            )
+            targets = result.targets
+            if targets is None and self._translator is not None:
+                # The translator resolves the base currency/FX table from ``state``
+                # itself (Phase-7 base-currency normalisation), so only the explicit
+                # equity override is threaded through here.
+                targets = self._translator.translate(
+                    result.final_weights, state, equity=state.equity
+                )
+            if targets is None:
+                self._ensure_daily_anchor(state)
+                await self._refresh_bridge_caches()
+                await self._publish_telemetry(
+                    "orders", {"timestamp": state.timestamp.isoformat(), "submitted": 0}
+                )
+                return receipts
+            lock_reason = self._current_lock_reason()
+            if lock_reason is not None:
+                self._halted = True
+                await self._refresh_bridge_caches()
+                await self._publish_telemetry(
+                    "kill_switch", {"locked": True, "reason": lock_reason}
+                )
+                logger.critical("kill switch engaged (%s); not submitting targets", lock_reason)
+                return receipts
+            self._ensure_daily_anchor(state)
+            positions = await self._broker.get_positions()
+            self._last_positions = positions
+            current = {
+                instrument_id: int(position.quantity)
+                for instrument_id, position in positions.items()
+                if int(position.quantity) != 0
+            }
+            receipts = await self._submit_targets(targets, current, state.timestamp)
+            accepted = [
+                receipt for receipt in receipts if receipt.status is not OrderStatus.REJECTED
+            ]
+            rejected = len(receipts) - len(accepted)
+            self._orders_submitted += len(accepted)
+            self._orders_rejected += rejected
+            summary = await self._account_summary()
+            if self._bridge_store is not None:
+                # The bridge must describe the post-trade book, not the pre-trade one.
+                with contextlib.suppress(Exception):
+                    self._last_positions = await self._broker.get_positions()
+            await self._publish_telemetry(
+                "orders",
+                {
+                    "timestamp": state.timestamp.isoformat(),
+                    "targets": len(targets),
+                    "orders": len(receipts),
+                    "accepted": len(accepted),
+                    "rejected": rejected,
+                    "order_ids": ",".join(receipt.order_id for receipt in receipts)[:512],
+                    **summary,
+                },
+            )
+            logger.info(
+                "state %s processed: %d targets, %d orders accepted, %d rejected",
+                state.timestamp.isoformat(),
+                len(targets),
+                len(accepted),
+                rejected,
+            )
+            return receipts
+        finally:
+            # The bridge must reflect every processed state, including the
+            # no-targets / kill-switch / failure paths.
+            self._write_bridge_snapshot(pipeline_result=result)
 
     async def _submit_targets(
         self,
@@ -759,12 +891,54 @@ class TradingRunner:
         except Exception as exc:
             logger.warning("could not fetch the broker account for telemetry: %s", exc)
             return {"account_error": f"{type(exc).__name__}: {exc}"}
-        return {
+        summary: dict[str, ScalarValue] = {
             "net_liquidation": account.net_liquidation,
             "cash_balance": account.cash_balance,
             "initial_margin_used": account.initial_margin_used,
             "margin_utilization": account.margin_utilization,
         }
+        self._last_account = {
+            key: float(value)
+            for key, value in summary.items()
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        }
+        return summary
+
+    # -- bridge publishing -----------------------------------------------------
+
+    async def _refresh_bridge_caches(self) -> None:
+        """Refresh the cached positions/account used by the bridge snapshot."""
+        if self._bridge_store is None:
+            return
+        try:
+            self._last_positions = await self._broker.get_positions()
+        except Exception as exc:
+            logger.warning("could not fetch broker positions for the runner bridge: %s", exc)
+        await self._account_summary()
+
+    def _write_bridge_snapshot(
+        self, pipeline_result: PipelineResult | None = None
+    ) -> RunnerBridgeSnapshot | None:
+        """Publish one bridge snapshot (best effort; never aborts a state)."""
+        store = self._bridge_store
+        if store is None:
+            return None
+        try:
+            snapshot = snapshot_from_runner(
+                self,
+                broker=self._broker,
+                pipeline_result=pipeline_result,
+                mode=self.mode,
+                stale_after_seconds=store.stale_after_seconds,
+            )
+            store.save(snapshot)
+        except Exception:  # pragma: no cover - bridge I/O must never stop trading
+            logger.exception("could not publish the runner bridge snapshot")
+            return None
+        self._last_bridge_snapshot = snapshot
+        return snapshot
 
     # -- persisted risk state (runner-owned fields only) -----------------------
 
@@ -1251,6 +1425,304 @@ class OfflineTargetBroker:
         return await self._broker.flatten_all()
 
 
+class OfflineRunnerSession:
+    """Reusable deterministic offline runner session for API/dashboard controllers.
+
+    Builds exactly the same stack as ``python -m src.execution.runner --offline``
+    (ParquetRepository + offline hydration chain + :class:`OfflineMarketStateStreamer`
+    + :class:`OfflineTargetBroker` + a ``TradingRunner(dry_run=True,
+    prime_pipeline=True, bridge_store=...)``) and exposes an incremental
+    ``async warm_start() / step() / snapshot() / close()`` surface. A controller can
+    therefore advance the deterministic simulation one bar at a time while the
+    published :class:`~src.execution.runner_bridge.RunnerBridgeSnapshot` supplies
+    the same book/pipeline data the live runner would publish.
+
+    Sessions are independent (no module-global state): every instance owns its
+    repository, broker, streamer and runner, so the API can create one per
+    requested offline run and close it to release the replay window.
+    """
+
+    #: Execution mode published on the bridge.
+    mode: ClassVar[BridgeMode] = "offline"
+
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        strategy_path: str | None = None,
+        roots: Sequence[InstrumentId] | None = None,
+        bridge_store: RunnerBridgeStore | None = None,
+        runner_id: str | None = None,
+        replay_states: int = OFFLINE_REPLAY_STATES,
+        initial_cash: float = OFFLINE_INITIAL_CASH,
+        clock: Clock | None = None,
+    ) -> None:
+        from src.backtest.simulated_broker import SimulatedBroker
+        from src.risk.contract_translator import ContractTranslator
+        from src.risk.state_store import build_risk_state_store
+        from src.strategies.pipeline import build_pipeline
+
+        resolved = settings if settings is not None else get_settings()
+        if not isinstance(resolved, Settings):
+            raise TypeError(f"settings must be a Settings, got {type(resolved)!r}")
+        if isinstance(replay_states, bool) or replay_states < 1:
+            raise ValueError("replay_states must be a positive int")
+        if not math.isfinite(initial_cash) or initial_cash <= 0.0:
+            raise ValueError("initial_cash must be finite and strictly positive")
+        self._settings = resolved
+        self._clock: Clock = clock if clock is not None else _offline_clock
+        end = ensure_utc(self._clock())
+        history_start = end - timedelta(days=resolved.hydration_lookback_days)
+        resolved_roots = (
+            _parse_roots(None) if roots is None else tuple(root.strip().upper() for root in roots)
+        )
+        self._roots = tuple(sorted(resolved_roots or OFFLINE_DEFAULT_ROOTS))
+        self._end = end
+        self._history_start = history_start
+        self._replay_states = replay_states
+        self._initial_cash = float(initial_cash)
+        config, master = _load_strategy(resolved, strategy_path or _strategy_path(resolved, None))
+        self._master = master
+        translator = ContractTranslator.from_config(
+            config.translator,
+            instruments=master,
+            account_currency=resolved.account_currency,
+            fx_rates=resolved.fx_rates,
+        )
+        pipeline = build_pipeline(config, master, translator=translator)
+        repository = ParquetRepository(resolved)
+        state_store = build_risk_state_store(
+            resolved.risk_state_store_uri, duckdb_path=resolved.duckdb_path
+        )
+        chain = build_hydration_chain(
+            resolved,
+            repository=repository,
+            instrument_master=master,
+            source="offline",
+            offline_allowed=True,
+        )
+        hydrator = ColdStartHydrator(
+            repository=repository,
+            instrument_master=master,
+            lookback_days=resolved.hydration_lookback_days,
+            backfill=chain,
+            backfill_enabled=True,
+            clock=self._clock,
+        )
+        simulated = SimulatedBroker(
+            master, initial_cash=self._initial_cash, timestamp=history_start
+        )
+        broker = OfflineTargetBroker(simulated_broker=simulated, instrument_master=master)
+        streamer = OfflineMarketStateStreamer(
+            roots=self._roots,
+            start=history_start,
+            end=end,
+            equity=self._initial_cash,
+            instrument_master=master,
+            replay_states=replay_states,
+            on_state=broker.update_market,
+        )
+        if bridge_store is None and resolved.runner_bridge_enabled:
+            bridge_store = RunnerBridgeStore(resolved)
+        self._bridge_store = bridge_store
+        self._broker = broker
+        self._streamer = streamer
+        self._repository = repository
+        self._runner = TradingRunner(
+            settings=resolved,
+            pipeline=pipeline,
+            streamer=streamer,
+            broker=broker,
+            hydrator=hydrator,
+            instrument_master=master,
+            translator=translator,
+            event_bus=None,
+            state_store=state_store,
+            clock=self._clock,
+            dry_run=True,
+            prime_pipeline=True,
+            bridge_store=bridge_store,
+            runner_id=runner_id,
+        )
+        self._stream: AsyncIterator[MarketState] | None = None
+        self._exhausted = False
+        self._warm_summary: dict[str, ScalarValue] | None = None
+        self._closed = False
+
+    # -- introspection ---------------------------------------------------------
+
+    @property
+    def settings(self) -> Settings:
+        """Runtime settings the session was built from."""
+        return self._settings
+
+    @property
+    def runner(self) -> TradingRunner:
+        """Underlying deterministic trading runner."""
+        return self._runner
+
+    @property
+    def broker(self) -> OfflineTargetBroker:
+        """Simulated broker adapter driving the offline fills."""
+        return self._broker
+
+    @property
+    def streamer(self) -> OfflineMarketStateStreamer:
+        """Deterministic replay streamer."""
+        return self._streamer
+
+    @property
+    def bridge_store(self) -> RunnerBridgeStore | None:
+        """Bridge store receiving the published snapshots."""
+        return self._bridge_store
+
+    @property
+    def roots(self) -> tuple[InstrumentId, ...]:
+        """Roots replayed by this session."""
+        return self._roots
+
+    @property
+    def warm_started(self) -> bool:
+        """Whether :meth:`warm_start` completed."""
+        return self._warm_summary is not None
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether every replay state has been consumed."""
+        return self._exhausted
+
+    # -- session API -----------------------------------------------------------
+
+    async def warm_start(self) -> Mapping[str, ScalarValue]:
+        """Hydrate the warm-up window and prime the pipeline (idempotent)."""
+        if self._warm_summary is not None:
+            return dict(self._warm_summary)
+        hydration = self._runner.warm_start(self._roots)
+        primed = await self._runner.prime_pipeline()
+        snapshot = self._runner.last_bridge_snapshot
+        summary: dict[str, ScalarValue] = {
+            "mode": self.mode,
+            "runner_id": self._runner.runner_id,
+            "hydrated": True,
+            "roots": ",".join(self._roots),
+            "warm_states": len(hydration.states),
+            "bars": hydration.bar_count,
+            "backfilled": hydration.backfilled,
+            "sequence": snapshot.sequence if snapshot is not None else None,
+            "universe": ",".join(primed.universe),
+            "targets": len(primed.targets) if primed.targets is not None else None,
+        }
+        self._warm_summary = summary
+        return dict(summary)
+
+    async def step(self, states: int = 1) -> Mapping[str, ScalarValue]:
+        """Advance the deterministic replay by ``states`` bars and publish a snapshot."""
+        if isinstance(states, bool) or not isinstance(states, int) or states < 1:
+            raise ValueError("states must be a positive int")
+        if self._warm_summary is None:
+            await self.warm_start()
+        if self._stream is None:
+            self._stream = self._streamer.stream()
+        advanced = 0
+        orders = 0
+        accepted = 0
+        for _ in range(states):
+            if self._exhausted:
+                break
+            state = await self._next_state()
+            if state is None:
+                break
+            receipts = await self._runner.run_once(state)
+            advanced += 1
+            orders += len(receipts)
+            accepted += sum(1 for receipt in receipts if receipt.status is not OrderStatus.REJECTED)
+            if self._runner.halted:
+                break
+        status = self._runner.status
+        snapshot = self.snapshot()
+        return {
+            "mode": self.mode,
+            "runner_id": self._runner.runner_id,
+            "hydrated": status.hydrated,
+            "states_advanced": advanced,
+            "states_processed": status.states_processed,
+            "orders": orders,
+            "orders_accepted": accepted,
+            "orders_submitted": status.orders_submitted,
+            "orders_rejected": status.orders_rejected,
+            "halted": status.halted,
+            "locked": status.locked,
+            "exhausted": self._exhausted,
+            "sequence": snapshot.sequence if snapshot is not None else None,
+            "last_error": status.last_error,
+        }
+
+    async def run(self, max_states: int | None = None) -> RunnerStatus:
+        """Drive the replay to the end (or ``max_states``) and return the status."""
+        if max_states is not None and (isinstance(max_states, bool) or max_states < 1):
+            raise ValueError("max_states must be a positive int or None")
+        await self.warm_start()
+        advanced = 0
+        while not self._exhausted and not self._runner.halted:
+            if max_states is not None and advanced >= max_states:
+                break
+            summary = await self.step(1)
+            progressed = summary["states_advanced"]
+            advanced += int(progressed) if isinstance(progressed, int) else 0
+            if progressed == 0:
+                break
+        return self._runner.status
+
+    def snapshot(self) -> RunnerBridgeSnapshot | None:
+        """Most recent bridge snapshot (in-memory, else the persisted file)."""
+        snapshot = self._runner.last_bridge_snapshot
+        if snapshot is not None:
+            return snapshot
+        if self._bridge_store is not None:
+            return self._bridge_store.load()
+        return None
+
+    async def close(self) -> None:
+        """Close the replay generator and shut the runner down (idempotent)."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._stream is not None:
+            close_stream = getattr(self._stream, "aclose", None)
+            if callable(close_stream):
+                with contextlib.suppress(Exception):
+                    await cast("Callable[[], Awaitable[None]]", close_stream)()
+            self._stream = None
+        await self._runner.shutdown()
+
+    async def __aenter__(self) -> OfflineRunnerSession:
+        """Async context manager: warm the session on entry."""
+        await self.warm_start()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Async context manager: always close the session."""
+        await self.close()
+
+    # -- internals -------------------------------------------------------------
+
+    async def _next_state(self) -> MarketState | None:
+        """Next replay state, or ``None`` once the deterministic window is done."""
+        stream = self._stream
+        if stream is None:  # pragma: no cover - guarded by step()
+            return None
+        try:
+            return await anext(stream)
+        except StopAsyncIteration:
+            self._exhausted = True
+            return None
+
+
+def _offline_clock() -> datetime:
+    """Deterministic clock for the offline session (fixed simulation end)."""
+    return OFFLINE_SIMULATION_END
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -1509,6 +1981,11 @@ def _check_configuration(
         "hydration_sources": description,
         "hydration_backfill_chain": list(chain.sources),
         "hydration_backfill_ready": bool(chain),
+        "runner_bridge": {
+            "enabled": bool(settings.runner_bridge_enabled),
+            "path": str(RunnerBridgeStore.default_path(settings)),
+            "stale_after_seconds": DEFAULT_STALE_AFTER_SECONDS,
+        },
     }
     store = build_risk_state_store(settings.risk_state_store_uri, duckdb_path=settings.duckdb_path)
     summary["state_store"] = type(store).__name__
@@ -1568,71 +2045,26 @@ def _run_offline(settings: Settings, args: argparse.Namespace) -> RunnerStatus:
     """Run the full runner loop against the deterministic offline stack.
 
     ``--offline`` must work with an empty data directory and no credentials:
-    hydration backfills the synthetic history through the offline chain source,
-    the streamer replays fixed warm states and the simulated broker fills the
-    runner's target orders. No IBKR/Databento client is constructed.
+    the :class:`OfflineRunnerSession` hydrates the synthetic history through the
+    offline chain source, primes the pipeline, replays fixed warm states and lets
+    the simulated broker fill the runner's target orders. No IBKR/Databento client
+    is constructed, and the same session API is what the FastAPI controller uses.
     """
-    from src.backtest.simulated_broker import SimulatedBroker
-    from src.risk.contract_translator import ContractTranslator
-    from src.risk.state_store import build_risk_state_store
-    from src.strategies.pipeline import build_pipeline
-
-    strategy_path = _strategy_path(settings, args.strategy)
-    config, master = _load_strategy(settings, strategy_path)
-    translator = ContractTranslator.from_config(
-        config.translator,
-        instruments=master,
-        account_currency=settings.account_currency,
-        fx_rates=settings.fx_rates,
-    )
-    pipeline = build_pipeline(config, master, translator=translator)
-    repository = ParquetRepository(settings)
-    state_store = build_risk_state_store(
-        settings.risk_state_store_uri, duckdb_path=settings.duckdb_path
-    )
-    end = OFFLINE_SIMULATION_END
-    history_start = end - timedelta(days=settings.hydration_lookback_days)
-    roots = _parse_roots(args.roots) or OFFLINE_DEFAULT_ROOTS
-    chain = build_hydration_chain(
+    bridge_store = RunnerBridgeStore(settings) if settings.runner_bridge_enabled else None
+    session = OfflineRunnerSession(
         settings,
-        repository=repository,
-        instrument_master=master,
-        source="offline",
-        offline_allowed=True,
+        strategy_path=_strategy_path(settings, args.strategy),
+        roots=_parse_roots(args.roots),
+        bridge_store=bridge_store,
     )
-    hydrator = ColdStartHydrator(
-        repository=repository,
-        instrument_master=master,
-        lookback_days=settings.hydration_lookback_days,
-        backfill=chain,
-        backfill_enabled=True,
-        clock=lambda: end,
-    )
-    simulated = SimulatedBroker(master, initial_cash=OFFLINE_INITIAL_CASH, timestamp=history_start)
-    broker = OfflineTargetBroker(simulated_broker=simulated, instrument_master=master)
-    streamer = OfflineMarketStateStreamer(
-        roots=roots,
-        start=history_start,
-        end=end,
-        equity=OFFLINE_INITIAL_CASH,
-        instrument_master=master,
-        on_state=broker.update_market,
-    )
-    runner = TradingRunner(
-        settings=settings,
-        pipeline=pipeline,
-        streamer=streamer,
-        broker=broker,
-        hydrator=hydrator,
-        instrument_master=master,
-        translator=translator,
-        event_bus=None,
-        state_store=state_store,
-        clock=lambda: end,
-        dry_run=True,
-        prime_pipeline=True,
-    )
-    return asyncio.run(runner.run(roots=roots, max_states=args.max_states))
+
+    async def _run() -> RunnerStatus:
+        try:
+            return await session.run(max_states=args.max_states)
+        finally:
+            await session.close()
+
+    return asyncio.run(_run())
 
 
 def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # pragma: no cover
@@ -1650,6 +2082,7 @@ def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # 
     state_store = build_risk_state_store(
         settings.risk_state_store_uri, duckdb_path=settings.duckdb_path
     )
+    bridge_store = RunnerBridgeStore(settings) if settings.runner_bridge_enabled else None
     offline_allowed = bool(
         args.backfill_source == "offline" or settings.hydration_source == "offline"
     )
@@ -1707,6 +2140,7 @@ def _run_live(settings: Settings, args: argparse.Namespace) -> RunnerStatus:  # 
         event_bus=None,
         state_store=state_store,
         prime_pipeline=True,
+        bridge_store=bridge_store,
     )
     return asyncio.run(runner.run(roots=_parse_roots(args.roots), max_states=args.max_states))
 

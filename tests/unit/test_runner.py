@@ -28,6 +28,7 @@ from src.core.types import (
 )
 from src.execution.hydrator import HydrationError, HydrationResult
 from src.execution.runner import (
+    OfflineRunnerSession,
     RunnerConfigError,
     RunnerNotHydratedError,
     RunnerStatus,
@@ -35,6 +36,13 @@ from src.execution.runner import (
     _check_configuration,
     _parse_roots,
     main,
+)
+from src.execution.runner_bridge import (
+    BRIDGE_SCHEMA_VERSION,
+    BridgePosition,
+    BridgeWorkingOrder,
+    RunnerBridgeSnapshot,
+    RunnerBridgeStore,
 )
 from src.risk.state_store import InMemoryRiskStateStore, PersistedRiskState
 
@@ -283,6 +291,8 @@ def make_runner(
     halt_on_error: bool = False,
     dry_run: bool = True,
     prime_pipeline: bool = False,
+    bridge_store: RunnerBridgeStore | None = None,
+    runner_id: str | None = None,
     events: list[str] | None = None,
 ) -> tuple[TradingRunner, dict[str, Any]]:
     ordered_events: list[str] = events if events is not None else []
@@ -310,6 +320,8 @@ def make_runner(
         halt_on_error=halt_on_error,
         dry_run=dry_run,
         prime_pipeline=prime_pipeline,
+        bridge_store=bridge_store,
+        runner_id=runner_id,
     )
     return runner, components
 
@@ -757,3 +769,204 @@ def test_runner_module_clock_default_is_utc() -> None:
     assert now.tzinfo is not None
     assert now.astimezone(UTC).tzinfo is UTC
     assert isinstance(FIXED_TIMESTAMP, datetime)
+
+
+# ---------------------------------------------------------------------------
+# Runner <-> API bridge (Phase 9)
+# ---------------------------------------------------------------------------
+
+
+def make_bridge_snapshot(sequence: int = 1) -> RunnerBridgeSnapshot:
+    return RunnerBridgeSnapshot(
+        schema_version=BRIDGE_SCHEMA_VERSION,
+        runner_id="runner-previous",
+        mode="offline",
+        sequence=sequence,
+        updated_at=FIXED_TIMESTAMP,
+        stale_after_seconds=15.0,
+        status={"hydrated": True, "states_processed": sequence},
+        positions=(
+            BridgePosition(
+                instrument_id="ES",
+                contract_symbol=None,
+                quantity=1,
+                average_price=4_800.0,
+                market_price=4_810.0,
+                multiplier=50.0,
+                unrealized_pnl=500.0,
+                initial_margin=13_000.0,
+            ),
+        ),
+        working_orders=(
+            BridgeWorkingOrder(
+                order_id="old-order",
+                instrument_id="ES",
+                contract_symbol=None,
+                side="BUY",
+                quantity=1,
+                filled_quantity=0,
+                remaining_quantity=1,
+                order_type="LMT",
+                limit_price=4_790.0,
+                status="SUBMITTED",
+                updated_at=FIXED_TIMESTAMP,
+            ),
+        ),
+    )
+
+
+async def test_bridge_snapshot_written_after_each_processed_state(
+    settings: Settings,
+) -> None:
+    store = RunnerBridgeStore(settings)
+    runner, _fakes = make_runner(
+        settings,
+        states=single_state_states(2),
+        bridge_store=store,
+        runner_id="runner-bridge-test",
+    )
+    status = await runner.run(roots=("ES",))
+    assert status.halted is False
+    loaded = store.load()
+    assert loaded is not None
+    assert loaded.schema_version == BRIDGE_SCHEMA_VERSION
+    assert loaded.mode == "offline"
+    assert loaded.runner_id == "runner-bridge-test"
+    assert loaded.sequence == 2  # one snapshot per processed state
+    assert loaded.status["states_processed"] == 2
+    assert loaded.status["orders_submitted"] == 2
+    assert loaded.status["roots"] == "ES"
+    assert loaded.status["halted"] is False
+    assert loaded.updated_at == FIXED_TIMESTAMP
+    assert loaded.account is not None and loaded.account["net_liquidation"] == pytest.approx(
+        1_000_000.0
+    )
+    assert loaded.pipeline is not None and loaded.pipeline["universe"] == "ES"
+    assert runner.last_bridge_snapshot is not None
+    assert runner.last_bridge_snapshot.sequence == 2
+    assert runner.bridge_store is store
+    assert store.path.is_file()
+
+
+async def test_bridge_snapshot_sequence_continues_across_restart(
+    settings: Settings,
+) -> None:
+    store = RunnerBridgeStore(settings)
+    store.save(make_bridge_snapshot(sequence=7))
+    runner, _ = make_runner(settings, states=single_state_states(1), bridge_store=store)
+    await runner.run(roots=("ES",))
+    loaded = store.load()
+    assert loaded is not None
+    assert loaded.sequence == 8
+
+
+async def test_bridge_snapshot_after_pipeline_prime(settings: Settings) -> None:
+    store = RunnerBridgeStore(settings)
+    runner, fakes = make_runner(
+        settings,
+        states=single_state_states(1),
+        bridge_store=store,
+        prime_pipeline=True,
+    )
+    await runner.run(roots=("ES",))
+    loaded = store.load()
+    assert loaded is not None
+    assert loaded.sequence == 2  # prime snapshot + state snapshot
+    assert len(fakes["pipeline"].calls) == 2
+    assert len(fakes["broker"].submitted) == 1
+
+
+async def test_bridge_snapshot_written_on_persisted_kill_switch(
+    settings: Settings,
+) -> None:
+    store = RunnerBridgeStore(settings)
+    state_store = InMemoryRiskStateStore(
+        PersistedRiskState(kill_switch_locked=True, kill_switch_reason="operator halt")
+    )
+    runner, fakes = make_runner(
+        settings,
+        states=single_state_states(2),
+        state_store=state_store,
+        bridge_store=store,
+    )
+    status = await runner.run(roots=("ES",))
+    assert status.halted is True
+    assert status.states_processed == 0
+    assert fakes["broker"].submitted == []
+    loaded = store.load()
+    assert loaded is not None
+    assert loaded.sequence == 1  # the lock path still publishes
+    assert loaded.status["halted"] is True
+    assert loaded.status["locked"] is True
+
+
+async def test_bridge_store_none_writes_nothing(settings: Settings) -> None:
+    runner, _ = make_runner(settings, states=single_state_states(1))
+    await runner.run(roots=("ES",))
+    bridge_path = settings.runner_bridge_dir / "runner_state.json"
+    assert not bridge_path.exists()
+    assert runner.last_bridge_snapshot is None
+    assert runner.bridge_store is None
+
+
+async def test_bridge_snapshot_after_failed_state(settings: Settings) -> None:
+    store = RunnerBridgeStore(settings)
+    states = single_state_states(2)
+    runner, _ = make_runner(
+        settings,
+        states=states,
+        pipeline=FakePipeline(fail_on={states[0].timestamp}),
+        bridge_store=store,
+    )
+    status = await runner.run(roots=("ES",))
+    assert status.states_processed == 2
+    loaded = store.load()
+    assert loaded is not None
+    assert loaded.sequence == 2  # the failed state still publishes a snapshot
+
+
+async def test_offline_runner_session_warm_start_step_snapshot_close(
+    settings: Settings,
+) -> None:
+    strategy_path = settings.strategies_dir / "tsmom_vol_target.yaml"
+    session = OfflineRunnerSession(settings, strategy_path=str(strategy_path))
+    try:
+        assert session.mode == "offline"
+        assert session.warm_started is False
+        assert session.snapshot() is None
+        warm = await session.warm_start()
+        assert warm["mode"] == "offline"
+        assert warm["hydrated"] is True
+        assert warm["roots"] == ",".join(sorted(session.roots))
+        assert isinstance(warm["sequence"], int) and warm["sequence"] >= 1
+        assert session.warm_started is True
+        first = session.snapshot()
+        assert first is not None
+        assert first.mode == "offline"
+        assert first.sequence == warm["sequence"]
+        assert session.bridge_store is not None
+        assert session.bridge_store.load() is not None
+
+        summary = await session.step(2)
+        assert summary["states_advanced"] == 2
+        assert summary["states_processed"] == 2
+        assert summary["sequence"] == first.sequence + 2
+        assert summary["hydrated"] is True
+        assert summary["halted"] is False
+        snapshot = session.snapshot()
+        assert snapshot is not None
+        assert snapshot.sequence == summary["sequence"]
+        assert snapshot.status["states_processed"] == 2
+
+        status = await session.run(max_states=2)
+        assert status.states_processed == 4
+        assert session.snapshot() is not None
+        assert session.snapshot().sequence == first.sequence + 4  # type: ignore[union-attr]
+
+        with pytest.raises(ValueError):
+            await session.step(0)
+    finally:
+        await session.close()
+    await session.close()  # idempotent
+    assert session.runner.halted is False
+    assert session.exhausted is False
