@@ -269,6 +269,7 @@ cd frontend && npm install && npm run dev     # http://localhost:3000
 REST surface: `/health`, `/api/positions`, `/api/pipeline/latest`, `/api/risk/state`,
 `PUT /api/risk/thresholds`, `POST /api/risk/flatten-all`, `/api/term-structure`,
 `/api/strategies[/{id}]`, `/api/backtests[ POST, /{id}, /{id}/tearsheet]`, `/api/telemetry/status`,
+`/api/orders/working`, `/api/fills/recent`, `/api/runner/status`, `POST /api/runner/step`,
 plus `WS /ws/telemetry`. The backend runs **offline by default** (`/health.offline_mode=true`,
 deterministic fixtures, `data_source` recorded on every pipeline/backtest payload); set
 `FUTURESRLX_API_ENABLE_IBKR=1` to attach a real IBKR paper/live session. The dashboard shows a
@@ -345,6 +346,32 @@ both engines produce identical targets and deltas for identical market states.
    A neural policy can never override the hard projection: risk is enforced post-hoc.
 
 ---
+
+## Live runner ↔ API bridge, DRL training, live news (Phase 9)
+
+- **Shared live state.** A running `TradingRunner` (offline dry-run or IBKR paper/live) publishes an
+  atomic bridge snapshot to `data/bridge/runner_state.json` (`RunnerBridgeStore`). The FastAPI
+  backend — when it shares the same `FUTURESRLX_DATA_DIR` — serves the runner's positions,
+  working orders, recent fills and pipeline snapshot via `GET /api/orders/working`,
+  `GET /api/fills/recent`, `GET /api/runner/status`, and prefers them in `/api/positions` and
+  `/api/pipeline/latest` (`source="runner-bridge"`). `POST /api/runner/step` runs the deterministic
+  offline runner in-process and advances it N states, so the dashboard can drive a live book without
+  a broker connection.
+- **Persisted Backtest Lab.** Custom runs (including walk-forward runs) are persisted atomically to
+  `artifacts/backtests/<id>.json` and reloaded on API startup, so they survive `uvicorn` restarts.
+  `POST /api/backtests` accepts `walk_forward`, `wf_splits`, `purge_bars`, `embargo_bars`.
+- **DRL training.** `python -m src.strategies.train_drl --strategy configs/strategies/drl_ppo_llm_risk.yaml
+  --offline --timesteps 50000 --output artifacts/models/ppo_tsmom.zip` trains the configured
+  SB3 agent, writes `<checkpoint>.meta.json` and can be loaded by `DRLAllocator` via
+  `allocator.params.model_path` or `drl.model_path` in the strategy YAML.
+- **Pluggable news + LLM providers.** `src/data/news_ingestor.py` resolves RSS feeds → IBKR news →
+  deterministic fixtures, and the LLM Risk-First engine switches from fixture to live inference via
+  `FUTURESRLX_LLM_PROVIDER` / `FUTURESRLX_LLM_MODEL` / `FUTURESRLX_LLM_API_KEY` (optional
+  `FUTURESRLX_LLM_BASE_URL` for vLLM/OpenAI-compatible endpoints).
+- **Dashboard fixes.** Live WebSocket ticks update the last daily bar in place for daily timeframes
+  (intraday points only on `1D`), real discretization tracking error + micro-routing are shown, the
+  Backtest Lab overlays all selected runs with a Walk-Forward toggle, and the ribbon shows a
+  three-state mode badge (`UI FALLBACK` / `OFFLINE ENGINE` / `PAPER·IBKR` / `LIVE·IBKR`).
 
 ## Production hardening (Phase 7)
 
@@ -427,6 +454,7 @@ boundary. Detailed per-phase deliverables, gates and verification numbers are re
 | 6 | `feat/phase-6-api-dashboard` | `v1.0.0` | FastAPI REST/WS telemetry, Next.js dashboard, Docker stack |
 | 7 | `feat/phase-7-production-hardening` | `v1.1.0` | cold-start hydration, durable risk state, open-order reconciliation, async LLM cache, FX normalisation |
 | 8 | `feat/phase-8-production-polish` | `v1.2.0` | hermetic test env, multi-source hydration + offline runner, walk-forward CLI, lazy imports, finite gym bounds, institutional dashboard redesign |
+| 9 | `feat/phase-9-live-bridge-and-drl` | `v1.3.0` | live runner↔API bridge, orders/fills endpoints, persisted backtests, walk-forward runs, DRL training CLI, live news + LLM provider switch, UI telemetry fixes |
 
 ---
 

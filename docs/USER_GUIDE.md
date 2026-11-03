@@ -111,7 +111,18 @@ Open **http://localhost:3100**.
 - backend running with `offline_mode: true` → real pipeline/broker simulation on fixture market data (no paid vendors).
 - `PAPER · IBKR` / `LIVE · IBKR` → backend attached to a real IBKR session (`FUTURESRLX_API_ENABLE_IBKR=1`).
 
-Frontend/API base URL is `NEXT_PUBLIC_API_BASE_URL` (default `http://127.0.0.1:8000`); WebSocket `/ws/telemetry` is derived from it.
+Frontend/API base URL is `NEXT_PUBLIC_API_BASE_URL` (default `http://127.0.0.1:8000`); WebSocket `/ws/telemetry` is derived from it. The API's default CORS allow-list includes the dashboard origins `http://localhost:3100`, `http://127.0.0.1:3100`, `http://localhost:3080`, `http://127.0.0.1:3080` (and legacy 3000).
+
+The ribbon shows a **three-state data-mode badge**:
+- `UI FALLBACK` (amber) — the FastAPI backend is unreachable; the dashboard renders deterministic
+  fixtures for preview only.
+- `OFFLINE ENGINE` (zinc/blue) — connected to FastAPI running with `offline_mode=true`
+  (real pipeline/broker simulation on fixture market data).
+- `PAPER · IBKR` (blue) / `LIVE · IBKR` (emerald) — connected to an IBKR paper/live session
+  (`ibkr_connected=true` plus the API `environment`).
+
+On the Command Center equity chart, daily timeframes (`1W/1M/3M/6M/1Y/ALL`) update the latest daily
+bar in place when live `/ws/telemetry` ticks arrive; only the `1D` timeframe appends intraday points.
 
 Stop servers with `Ctrl-C` in each terminal.
 
@@ -183,6 +194,19 @@ Nested risk settings use a double underscore: `FUTURESRLX_RISK__MAX_MARGIN_UTILI
 | `FUTURESRLX_RISK__DUPLICATE_ORDER_WINDOW_SECONDS` | `1.0` | duplicate suppression window |
 | `FUTURESRLX_RISK__RECONCILE_GRACE_SECONDS` | `30` | open-order grace before drift halt |
 | `FUTURESRLX_RISK__RECONCILIATION_INTERVAL_SECONDS` | `30` | reconciler period |
+
+#### Live news, LLM provider & runner bridge (Phase 9)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FUTURESRLX_LLM_PROVIDER` | `offline` | `offline` (deterministic fixtures) / `openai` / `anthropic` / `deepseek` / `vllm` |
+| `FUTURESRLX_LLM_MODEL` | `gpt-4o-mini` | model identifier passed to the provider adapter |
+| `FUTURESRLX_LLM_BASE_URL` | _(empty)_ | optional custom endpoint (vLLM / OpenAI-compatible proxy); empty = adapter default |
+| `FUTURESRLX_LLM_API_KEY` | _(unset)_ | provider API key (secret; required for non-offline providers) |
+| `FUTURESRLX_NEWS_RSS_FEEDS` | `[]` | JSON list of financial RSS/Atom feed URLs |
+| `FUTURESRLX_NEWS_MAX_ITEMS` | `20` | max headlines per fetch |
+| `FUTURESRLX_NEWS_POLL_INTERVAL_SECONDS` | `300` | background news refresh cadence in the API |
+| `FUTURESRLX_RUNNER_BRIDGE_ENABLED` | `true` | publish runner snapshots to `data/bridge/runner_state.json` |
 
 #### Account currency / FX
 
@@ -369,6 +393,15 @@ Walk-forward example:
 
 Output JSON includes run/fold metadata (`train_start/train_end/test_start/test_end`, fold metrics), per-fold metrics and aggregate mean/std statistics — useful for the Backtest Lab comparison.
 
+### Persistence & the Backtest Lab
+
+Custom backtest runs triggered via the API (including walk-forward runs) are persisted atomically
+to `artifacts/backtests/<id>.json` and reloaded when the API restarts, so the Backtest Lab history
+survives `uvicorn` restarts. The dashboard's Experiment runner sends `walk_forward`,
+`wf_splits` (2-20), `purge_bars` and `embargo_bars`; walk-forward runs are marked `kind="walk_forward"`
+with `n_folds`, real aggregate `n_trades`/`n_rebalances` and per-fold equity/underwater series in the
+tear sheet. Seeded demo runs are in-memory only and clearly marked `data_source="fixture"`.
+
 ### Programmatic API
 
 ```python
@@ -431,6 +464,77 @@ Startup sequence (in order):
 - `FUTURESRLX_ENVIRONMENT=paper|live` with matching port
 - a writable Parquet cache (`FUTURESRLX_PARQUET_DIR`) for hydration
 - optionally `FUTURESRLX_RISK_STATE_STORE_URI` so restarts/nightly resets keep risk state
+
+### Live runner ↔ API bridge (Phase 9)
+
+The API and a `TradingRunner` process can share live state when both use the same
+`FUTURESRLX_DATA_DIR`. The runner publishes an atomic snapshot to
+`data/bridge/runner_state.json` after every processed state (`RunnerBridgeStore`); the API then
+serves the runner's book:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/orders/working` | in-flight/partial working orders (source `runner-bridge` when fresh, else simulated/fixture) |
+| `GET /api/fills/recent?limit=50` | recent fills with commission/slippage |
+| `GET /api/runner/status` | bridge availability/staleness, runner mode/id/sequence, session state |
+| `POST /api/runner/step` `{"states": 1}` | advance the in-process deterministic offline runner by N states (writes the bridge; returns status JSON) |
+| `POST /api/runner/reset` | close the in-process offline runner session (bridge snapshot retained) |
+
+`GET /api/positions` and `GET /api/pipeline/latest` prefer a *fresh* bridge snapshot (updated within
+the configured staleness window) and report `source="runner-bridge"`; stale or absent snapshots fall
+back to the API's simulated/fixture engine. Start either an external runner:
+
+```bash
+# terminal A: runner (offline dry-run) publishes the bridge
+.venv/bin/python -m src.execution.runner --offline --max-states 30
+
+# terminal B: backend + dashboard see the runner book live
+.venv/bin/python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
+```
+
+or drive it from the dashboard/API with `POST /api/runner/step` (Backtest/Command Center Step
+Runner control). A stale bridge is displayed honestly (`bridge_stale=true`, source falls back).
+
+### DRL training & checkpoints (Phase 9)
+
+```bash
+# deterministic offline training (no vendor data needed; requires .[drl] extra)
+.venv/bin/python -m src.strategies.train_drl   --strategy configs/strategies/drl_ppo_llm_risk.yaml   --offline --timesteps 50000   --output artifacts/models/ppo_tsmom.zip
+```
+
+The CLI prints a JSON summary and writes `<checkpoint>.zip.meta.json` (algorithm, policy, timesteps,
+seed, device, feature names, observation shape/bounds, universe, SB3 version, git commit, timestamps).
+Select the checkpoint in the strategy YAML:
+
+```yaml
+drl:
+  algorithm: PPO
+  model_path: artifacts/models/ppo_tsmom.zip
+```
+
+or via `allocator: {name: drl, params: {model_path: artifacts/models/ppo_tsmom.zip}}` (explicit
+allocator params win over `drl.model_path`). `DRLAllocator` loads the checkpoint lazily on first
+use; missing/corrupt checkpoints or a missing Stable-Baselines3 install raise actionable errors.
+Checkpoint observation layout must match the configured universe/features (recorded in metadata).
+
+### Live news & LLM provider (Phase 9)
+
+`src/data/news_ingestor.py` resolves headlines in this order: **RSS feeds** (when
+`FUTURESRLX_NEWS_RSS_FEEDS` is set) → **IBKR news** (when an IBKR client is connected) →
+**deterministic fixtures** (offline). The API serves them in the Risk & LLM Monitor (`news_source`
+reports provenance).
+
+To switch the LLM Risk-First engine from fixtures to real inference, set in `.env`:
+
+```bash
+FUTURESRLX_LLM_PROVIDER=openai          # or anthropic / deepseek / vllm
+FUTURESRLX_LLM_MODEL=gpt-4o-mini
+FUTURESRLX_LLM_API_KEY=sk-...
+# FUTURESRLX_LLM_BASE_URL=http://vllm-host:8000/v1   # optional
+```
+
+All LLM outputs remain subject to the confidence/variance filter and the deterministic circuit
+breaker; slow multi-sample calls are served from the async TTL cache and never block the pipeline.
 
 ### Monitoring
 
@@ -523,6 +627,11 @@ Useful subsets:
 | `margin utilization` -> `whatIf` rejection | Order would exceed `η_max` after margin impact; reduce gross/target or raise `RISK__MAX_MARGIN_UTILIZATION` deliberately. |
 | `kill switch engaged: ...` on startup | Persisted lock (daily loss/drawdown/operator). Review `/api/risk/state`, fix the cause, then `oms.reset_kill_switch()` / API reset. |
 | `reconciliation drift` | OMS/broker mismatch, or open orders older than the grace window. Check `/api/positions`, TWS positions, working orders; `approve_drift`/`resume` only after manual verification. |
+| Dashboard shows `UI FALLBACK` with the API running | Browser origin not in CORS (defaults include :3100/:3080) or wrong `NEXT_PUBLIC_API_BASE_URL`; check the API `/health` and browser console. |
+| Orders/fills empty while a runner is active | Runner and API must share `FUTURESRLX_DATA_DIR`; check `/api/runner/status` (bridge stale > 15 s means the runner stopped publishing) and `data/bridge/runner_state.json`. |
+| `POST /api/runner/step` returns 503 | `OfflineRunnerSession` unavailable (execution package import failed); check server logs/`pip install -e .`. |
+| DRL training fails | Install the DRL extra (`pip install -e ".[drl]"`); check checkpoint algorithm matches `drl.algorithm`; inspect `<checkpoint>.meta.json`. |
+| Batch/API feed returns fixtures | `news_source`/`data_source` fields state provenance; configure `FUTURESRLX_NEWS_RSS_FEEDS` or IBKR for live news. |
 | Databento `403/authentication` | Wrong/expired key, dataset entitlement missing (e.g. `GLBX.MDP3`), or IP restriction. |
 
 Logs: `data/` holds cache; `artifacts/` holds tear sheets; API logs to stdout; runner logs to stderr with `run_id`/state telemetry.

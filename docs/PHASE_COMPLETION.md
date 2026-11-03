@@ -287,3 +287,73 @@ setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, 
   `runner --offline --max-states 2` → exit 0 and hydrated JSON status.
 - Frontend: `npx tsc --noEmit` clean, `npm run lint` clean, `npm run build` success (8/8 pages),
   production `npm run start` → all five routes HTTP 200, anti-slop/filler/legacy-palette greps empty.
+
+---
+
+## Phase 9 — Live bridge, DRL training & UI telemetry polish (`v1.3.0`)
+
+**Branch:** `feat/phase-9-live-bridge-and-drl`
+
+**Part A — five UI / telemetry data-binding fixes**
+1. **Equity chart timeframe vs live ticks** — new pure helper `frontend/lib/equity-series.ts`
+   (`mergeTelemetryIntoSeries`): `1D` appends/merges intraday `/ws/telemetry` points; daily timeframes
+   (`1W/1M/3M/6M/1Y/ALL`) update the last daily bar in place and never append intraday timestamps
+   (underwater/drawdown derived from the same window). Verified headless: 3M keeps 63 daily points
+   with a stable last timestamp while the value updates in place.
+2. **Discretization tracking error** — `ContractTranslator.discretization_report()` computes
+   `tracking_error = Σ|w_target − w_actual|/2` with `w_actual = N·P^USD·M / E^USD` (FX-aware) plus
+   per-family `MicroRoute` summaries; `/api/pipeline/latest` exposes `tracking_error_pct`,
+   `micro_routing[]`, `tracking_error_source` and per-instrument `weight_actual`, and the Pipeline
+   view renders the real percentage/micro-routing (no more `n/a`). Weight matrix re-laid out with
+   fixed fractional columns: no horizontal scrollbar, DRIVER fully visible at 1440/1920.
+3. **Backtest Lab** — all checked runs (2–3) overlay on equity (rebased to 100) and underwater
+   charts with distinct colours + legend; TRADES/REBAL populated from real `n_trades`/`n_rebalances`;
+   Walk-Forward checkbox + splits (2–20) + purge/embargo inputs added and forwarded to
+   `POST /api/backtests`; walk-forward runs show `kind="walk_forward"` + `n_folds` badges.
+4. **Persisted backtest runs** — API-triggered runs (single-pass + walk-forward) are written
+   atomically to `artifacts/backtests/<id>.json` (summary + tearsheet + request), reloaded on API
+   startup (verified across an app restart), corrupt files quarantined, seeded demo runs kept in
+   memory only.
+5. **Three-state data-mode badge** — `UI FALLBACK` (amber, backend unreachable), `OFFLINE ENGINE`
+   (zinc/blue, `offline_mode=true`), `PAPER · IBKR` (blue) / `LIVE · IBKR` (emerald) from
+   `ibkr_connected` + environment; no `DEMO DATA` remains.
+
+**Part B — core platform capabilities**
+1. **Live runner ↔ API bridge** — `src/execution/runner_bridge.py` (versioned, atomic
+   `data/bridge/runner_state.json` snapshot: mode/sequence/status/account/positions/working
+   orders/fills/pipeline, 200-entry caps, 15 s staleness) written by `TradingRunner` after every
+   processed state; `OfflineRunnerSession` exposes deterministic `warm_start/step/run/snapshot/close`.
+   API adds `GET /api/orders/working`, `GET /api/fills/recent`, `GET /api/runner/status`,
+   `POST /api/runner/step`, `POST /api/runner/reset`, and bridge-first `/api/positions` +
+   `/api/pipeline/latest` (`source="runner-bridge"`), with honest simulated/fixture fallbacks.
+2. **DRL training CLI** — `python -m src.strategies.train_drl --strategy ... --timesteps N
+   --output artifacts/models/<name>.zip --offline` trains PPO/CPPO/SAC/TD3/A2C on
+   `FuturesTradingEnv` from deterministic offline data, saves model + `<checkpoint>.meta.json`
+   (algorithm/policy/timesteps/seed/device/features/obs bounds/universe/SB3 version/git commit),
+   with actionable exit-2 errors. `DRLAllocator(model_path=...)` lazily loads checkpoints and
+   `build_pipeline` honours `drl.model_path` (explicit allocator params win).
+3. **Pluggable live news + LLM provider switch** — `src/data/news_ingestor.py` resolves
+   RSS/Atom feeds → IBKR news → deterministic fixtures (root/severity/sentiment classification,
+   dedupe, UTC timestamps, injectable fetcher/IBKR client/clock). New
+   `FUTURESRLX_LLM_PROVIDER` (`offline|openai|anthropic|deepseek|vllm`), `LLM_MODEL`,
+   `LLM_API_KEY`, optional `LLM_BASE_URL` drive `src.risk.llm_clients.build_llm_client`; the API's
+   LLM overlay uses the real client when configured, and the async TTL cache keeps slow providers
+   off the request path. News feeds/interval configured via `FUTURESRLX_NEWS_*`.
+4. **E2E bug fixed during integration** — default API CORS origins now include the dashboard
+   `:3100` and compose `:3080` origins (previously a browser at `127.0.0.1:3100` was blocked and
+   showed `UI FALLBACK` even with the API up).
+
+**Verification (as merged)**
+- `FUTURESRLX_ENVIRONMENT=paper FUTURESRLX_RISK_STATE_STORE_URI=duckdb: ./scripts/quality_gate.sh --cov`
+  → ruff/format/mypy clean, **1316 passed, 0 warnings**, coverage `src/core`+`src/risk` **94.33%**
+  (translator 100%, llm_clients 100%, quant overlay 100%).
+- Headless Chromium E2E against the real Phase-9 API: `UI FALLBACK`/`OFFLINE ENGINE`/`PAPER·IBKR`/
+  `LIVE·IBKR` badges, real `tracking_error 9.78%` + micro-routing, 3-run overlays, WF badge,
+  no matrix horizontal scroll at 1440/1920, 3 working-order rows + 4 fill rows rendered from the
+  bridge payload, **zero page errors**; contract-render pass also green.
+- Live backend smoke: `POST /api/runner/step` → bridge written (`sequence=3`, `mode=offline`),
+  `source="runner-bridge"` on orders/status; `POST /api/backtests` with `walk_forward=true` →
+  `kind="walk_forward"`, `n_folds=3`, `n_trades=35`; persisted `bt-0004.json` survived a uvicorn
+  restart and its tearsheet exposed 3 folds.
+- Frontend: `npx tsc --noEmit` clean, `npm run lint` zero warnings/errors, `npm run build` success
+  (8/8 pages), production routes `/ /pipeline /risk /term-structure /backtests` all HTTP 200.
