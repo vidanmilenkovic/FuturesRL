@@ -138,7 +138,9 @@ export function getTelemetryStatus(): Promise<ApiResult<TelemetryStatusResponse>
 // ---------------------------------------------------------------------------
 
 export function getAccount(): Promise<ApiResult<AccountSnapshotResponse>> {
-  return withFallback("/api/positions", () => buildAccount());
+  // The first live snapshot can block while IBKR streams the ledger; allow more
+  // than the default 2.5 s so the dashboard does not silently fall back to mock data.
+  return withFallback("/api/positions", () => buildAccount(), undefined, 15_000);
 }
 
 // ---------------------------------------------------------------------------

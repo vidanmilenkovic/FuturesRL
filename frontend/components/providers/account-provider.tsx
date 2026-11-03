@@ -62,6 +62,14 @@ export function AccountProvider({ children }: { children: ReactNode }) {
     };
   }, [nonce]);
 
+  // Poll the account snapshot so a slow/initially-unavailable IBKR ledger, a
+  // backend restart or a runner bridge transition cannot leave the dashboard
+  // stuck on fixture values.
+  useEffect(() => {
+    const timer = setInterval(() => setNonce((value) => value + 1), 15_000);
+    return () => clearInterval(timer);
+  }, []);
+
   // Merge streaming frames into the account snapshot.
   useEffect(() => {
     // If the REST snapshot fell back to fixtures but the WS is connected to a
@@ -120,26 +128,45 @@ export function AccountProvider({ children }: { children: ReactNode }) {
           "FastAPI unreachable — deterministic fixtures and a local WebSocket simulator drive the UI",
       };
     }
-    if (health.offline_mode) {
-      return {
-        key: "offline_engine",
-        label: "OFFLINE ENGINE",
-        description:
-          "API online — deterministic offline engine (no live IBKR session attached)",
-      };
-    }
     if (health.ibkr_connected && health.environment === "live") {
       return {
         key: "live_ibkr",
         label: "LIVE · IBKR",
-        description: "Live IBKR execution session connected",
+        description: "Live IBKR execution session connected (API-owned session)",
       };
     }
     if (health.ibkr_connected && health.environment === "paper") {
       return {
         key: "paper_ibkr",
         label: "PAPER · IBKR",
-        description: "IBKR paper execution session connected",
+        description: "IBKR paper execution session connected (API-owned session)",
+      };
+    }
+    // A separate TradingRunner publishes a runner bridge; a fresh bridge in
+    // paper/live mode means the app IS connected to IBKR even when the API's own
+    // execution service stays in offline mode.
+    if (health.runner_bridge_available && !health.runner_bridge_stale) {
+      if (health.runner_mode === "live") {
+        return {
+          key: "live_ibkr",
+          label: "LIVE · IBKR",
+          description: "Live IBKR runner bridge publishing fresh state",
+        };
+      }
+      if (health.runner_mode === "paper") {
+        return {
+          key: "paper_ibkr",
+          label: "PAPER · IBKR",
+          description: "IBKR paper runner bridge publishing fresh state",
+        };
+      }
+    }
+    if (health.offline_mode) {
+      return {
+        key: "offline_engine",
+        label: "OFFLINE ENGINE",
+        description:
+          "API online — deterministic offline engine (no live IBKR session attached)",
       };
     }
     return {
