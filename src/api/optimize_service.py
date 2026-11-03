@@ -560,6 +560,32 @@ class OptimizationService:
         """Runtime settings the service was built from."""
         return self._settings
 
+    # -- deletion --------------------------------------------------------------
+
+    def delete_study(self, study_id: str) -> bool:
+        """Delete one study from memory + its canonical top-level artifact.
+
+        Returns whether a persisted artifact file was removed. Raises
+        :class:`OptimizationError` (404) for unknown ids and validates the id against
+        traversal before touching the filesystem. Legacy quarantine files are left
+        untouched (they are already archived).
+        """
+        self._study_path(study_id)  # validates id/path before any deletion
+        study = self._studies.pop(study_id, None)
+        if study is None:
+            raise OptimizationError(f"unknown optimization study {study_id!r}", status_code=404)
+        path = self._study_path(study_id)
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:  # pragma: no cover - best-effort artifact cleanup
+            warning = f"could not delete optimization artifact {path.name}"
+            logger.warning(warning)
+            self._warnings.append(warning)
+            return False
+
     # -- persistence -----------------------------------------------------------
 
     def _study_path(self, study_id: str) -> Path:

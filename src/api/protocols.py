@@ -17,6 +17,7 @@ The concrete implementations live in :mod:`src.api.services` and
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from configs.strategy import StrategyConfig
@@ -157,6 +158,14 @@ class BacktestService(Protocol):
 
     def tearsheet(self, run_id: str) -> TearsheetResponse | None:
         """Tear sheet series + metrics for a stored run."""
+        ...
+
+    def artifact_path(self, run_id: str) -> Path:
+        """Persisted artifact path for one run (may not exist for seed runs)."""
+        ...
+
+    def delete_run(self, run_id: str) -> bool:
+        """Delete one run from the store (and its artifact); raise ``KeyError`` if unknown."""
         ...
 
 

@@ -14,6 +14,7 @@ from src.api.optimize_service import (
     OptimizeRequest,
 )
 from src.api.phase10_deps import OptimizeDep
+from src.api.qol_schemas import ArtifactDeleteResponse
 
 router = APIRouter(tags=["optimize"])
 
@@ -100,3 +101,29 @@ async def apply_optimization(
         return await run_in_threadpool(optimize.apply, study_id, payload)
     except OptimizationError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.delete(
+    "/optimize/{study_id}",
+    response_model=ArtifactDeleteResponse,
+    summary="Delete an optimization study and its artifact",
+    description=(
+        "Removes the study from the in-memory history and deletes the canonical "
+        "``optimizations/<study_id>.json`` artifact (legacy quarantine files are left "
+        "untouched). The study immediately disappears from list/detail/apply. Unknown "
+        "ids return 404; the response receipt reports ``artifact_deleted``."
+    ),
+    responses={404: {"description": "Unknown study id"}},
+)
+def delete_optimization(study_id: str, optimize: OptimizeDep) -> ArtifactDeleteResponse:
+    """Delete one persisted optimization study."""
+    try:
+        artifact_deleted = optimize.delete_study(study_id)
+    except OptimizationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return ArtifactDeleteResponse(
+        id=study_id,
+        deleted=True,
+        artifact_deleted=artifact_deleted,
+        path=str(optimize.output_dir / f"{study_id}.json") if artifact_deleted else None,
+    )

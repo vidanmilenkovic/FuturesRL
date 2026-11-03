@@ -51,6 +51,7 @@ from configs.strategy import StrategyConfig, discover_strategy_configs, parse_st
 
 from src.api import fixtures
 from src.api.live import (
+    BRIDGE_FILE_NAME,
     EQUITY_HISTORY_FILE_NAME,
     LiveEquityHistoryStore,
     LiveStateService,
@@ -65,17 +66,24 @@ from src.api.protocols import (
     StrategyCatalog,
 )
 from src.api.schemas import (
+    PAPER_STATE_RESET_CONFIRM,
+    RISK_LOCK_RESET_CONFIRM,
     AccountSnapshotResponse,
     EquityPoint,
     FlattenAllResponse,
     FlattenReceipt,
     HealthResponse,
     MicroRoutingEntry,
+    PaperStateResetReceipts,
+    PaperStateResetRequest,
+    PaperStateResetResponse,
     PipelineDiagnostic,
     PipelineInstrumentRow,
     PipelineStage,
     PipelineWaterfallResponse,
     PositionRow,
+    RiskLockResetRequest,
+    RiskLockResetResponse,
     RiskStateResponse,
     RiskThresholdOverride,
     RiskThresholds,
@@ -99,6 +107,7 @@ from src.core.types import (
     Position,
     WeightVector,
 )
+from src.risk.state_store import PersistedRiskState, RiskStateStore, build_risk_state_store
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports of optional layers
     from src.backtest.simulated_broker import BarQuote, SimulatedBroker
@@ -118,6 +127,10 @@ __all__ = [
     "IBKRExecutionService",
     "InMemoryStrategyCatalog",
     "LiveEquityHistoryStore",
+    "OperatorActionUnavailableError",
+    "OperatorConfirmationError",
+    "OperatorResetError",
+    "OperatorTokenError",
     "SimulatedExecutionService",
     "build_container",
 ]
@@ -127,6 +140,32 @@ IBKR_ENABLE_ENV: str = "FUTURESRLX_API_ENABLE_IBKR"
 
 #: How long the kill switch keeps execution locked after a flatten.
 KILL_SWITCH_LOCK_MINUTES: int = 30
+
+#: Env var holding the optional operator reset token for ``POST /api/risk/reset-lock``.
+OPERATOR_RESET_TOKEN_ENV: str = "FUTURESRLX_OPERATOR_RESET_TOKEN"
+
+#: Environments where the destructive operator paper-state reset is allowed.
+PAPER_STATE_RESET_ENVIRONMENTS: frozenset[str] = frozenset({"development", "paper", "backtest"})
+
+#: ``PersistedRiskState.extra`` keys owned by the quant risk overlay (cleared on reset).
+QUANT_OVERLAY_EXTRA_PREFIX: str = "quant_overlay."
+
+
+class OperatorResetError(RuntimeError):
+    """Base class for guarded operator reset failures (mapped to 4xx by routes)."""
+
+
+class OperatorConfirmationError(OperatorResetError, ValueError):
+    """The request body confirmation phrase is missing or wrong (HTTP 400)."""
+
+
+class OperatorTokenError(OperatorResetError, PermissionError):
+    """The required ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is missing/wrong (HTTP 403)."""
+
+
+class OperatorActionUnavailableError(OperatorResetError):
+    """The reset cannot run now (active flatten / live environment / unsupported)."""
+
 
 #: Default strategy shown by the pipeline inspector when available.
 DEFAULT_STRATEGY_ID: str = "tsmom_vol_target"
@@ -292,6 +331,18 @@ class InMemoryStrategyCatalog:
             self._configs[config.id] = config
             self._updated_at[config.id] = self._clock()
             return self._view(config)
+
+    def remove(self, strategy_id: str) -> bool:
+        """Remove a strategy from the runtime catalog (delete/rename QoL flows).
+
+        Additive runtime hook: drops the in-memory entry only; on-disk deletion is
+        owned by the Strategy Studio service. Returns whether an entry was removed.
+        """
+        key = strategy_id.strip().lower()
+        with self._lock:
+            removed = self._configs.pop(key, None) is not None
+            self._updated_at.pop(key, None)
+            return removed
 
     def reload(self) -> tuple[str, ...]:
         """Re-discover the committed strategy directory (additive refresh hook)."""
@@ -477,6 +528,7 @@ class SimulatedExecutionService:
         self._broker._connected = True
         self._trade_kind = TradeKind
         self._kill_switch = _KillSwitchState(clock)
+        self._flatten_in_progress = False
         self._seed_book()
 
     @property
@@ -567,8 +619,46 @@ class SimulatedExecutionService:
         """Kill-switch reason (empty when unlocked)."""
         return self._kill_switch.reason
 
+    @property
+    def lock_until(self) -> datetime | None:
+        """Kill-switch expiry timestamp (``None`` when never engaged)."""
+        return self._kill_switch.locked_until
+
+    @property
+    def flatten_in_progress(self) -> bool:
+        """Whether an emergency flatten is currently executing."""
+        return self._flatten_in_progress
+
+    def reset_kill_switch(self) -> None:
+        """Release the kill switch (operator ``POST /api/risk/reset-lock``)."""
+        self._kill_switch.release()
+
+    def reset_paper_state(self) -> None:
+        """Rebuild the deterministic simulated paper book and release the latch."""
+        from src.backtest.simulated_broker import SimulatedBroker
+
+        self._broker = SimulatedBroker(
+            self._master,
+            initial_cash=INITIAL_EQUITY,
+            timestamp=self._market.as_of,
+            name="simulated-offline",
+        )
+        self._broker.set_market(self._market.as_of, _quotes_for_market(self._market))
+        self._broker._connected = True
+        self._kill_switch = _KillSwitchState(self._clock)
+        self._flatten_in_progress = False
+        self._seed_book()
+
     async def flatten_all(self) -> FlattenAllResponse:
         """Market-close every position, cancel orders and lock execution."""
+        self._flatten_in_progress = True
+        try:
+            return await self._flatten_all_impl()
+        finally:
+            self._flatten_in_progress = False
+
+    async def _flatten_all_impl(self) -> FlattenAllResponse:
+        """Implementation of :meth:`flatten_all` (tracked by ``flatten_in_progress``)."""
         timestamp = self._clock()
         positions = self._broker.get_positions_sync()
         targets = [
@@ -636,6 +726,7 @@ class FixtureExecutionService:
         self._settings = settings
         self._clock = clock
         self._kill_switch = _KillSwitchState(clock)
+        self._flatten_in_progress = False
 
     @property
     def source_name(self) -> str:
@@ -722,8 +813,34 @@ class FixtureExecutionService:
         """Kill-switch reason (empty when unlocked)."""
         return self._kill_switch.reason
 
+    @property
+    def lock_until(self) -> datetime | None:
+        """Kill-switch expiry timestamp (``None`` when never engaged)."""
+        return self._kill_switch.locked_until
+
+    @property
+    def flatten_in_progress(self) -> bool:
+        """Whether an emergency flatten is currently executing."""
+        return self._flatten_in_progress
+
+    def reset_kill_switch(self) -> None:
+        """Release the kill switch (operator ``POST /api/risk/reset-lock``)."""
+        self._kill_switch.release()
+
+    def reset_paper_state(self) -> None:
+        """Reset the arithmetic fixture paper latch (positions are stateless)."""
+        self._kill_switch = _KillSwitchState(self._clock)
+
     async def flatten_all(self) -> FlattenAllResponse:
         """Deterministically acknowledge a flatten without a broker."""
+        self._flatten_in_progress = True
+        try:
+            return await self._flatten_all_impl()
+        finally:
+            self._flatten_in_progress = False
+
+    async def _flatten_all_impl(self) -> FlattenAllResponse:
+        """Implementation of :meth:`flatten_all` (tracked by ``flatten_in_progress``)."""
         timestamp = self._clock()
         positions = self._positions()
         receipts: list[FlattenReceipt] = []
@@ -816,6 +933,7 @@ class IBKRExecutionService:
         self._liveness_task: asyncio.Task[None] | None = None
         self._ensure_task: asyncio.Task[bool] | None = None
         self._last_ensure_at: float | None = None
+        self._flatten_in_progress: bool = False
         # One IBKR book refresh at a time: concurrent account-summary requests on
         # the same client can wedge TWS after a reconnect.
         self._refresh_lock = asyncio.Lock()
@@ -1149,8 +1267,30 @@ class IBKRExecutionService:
         """Kill-switch reason (empty when unlocked)."""
         return self._oms.gate.lock_reason if self._oms.is_locked else ""
 
+    @property
+    def lock_until(self) -> datetime | None:
+        """OMS kill switch has no wall-clock expiry (``None``)."""
+        return None
+
+    @property
+    def flatten_in_progress(self) -> bool:
+        """Whether an emergency IBKR flatten is currently executing."""
+        return self._flatten_in_progress
+
+    def reset_kill_switch(self) -> None:
+        """Release the OMS pre-trade kill switch and its persisted latch."""
+        self._oms.reset_kill_switch()
+
     async def flatten_all(self) -> FlattenAllResponse:
         """Kill switch: live OMS flatten (never a simulated fallback)."""
+        self._flatten_in_progress = True
+        try:
+            return await self._flatten_all_impl()
+        finally:
+            self._flatten_in_progress = False
+
+    async def _flatten_all_impl(self) -> FlattenAllResponse:
+        """Implementation of :meth:`flatten_all` (tracked by ``flatten_in_progress``)."""
         if not self._manager.is_connected:
             # Operator intent: attempt a bounded reconnect immediately, even if a
             # background probe ran a moment ago.
@@ -1964,12 +2104,14 @@ class EngineRiskService:
         execution: ExecutionService,
         clock: fixtures.Clock = fixtures.utc_now,
         news: NewsFeedService | None = None,
+        state_store: RiskStateStore | None = None,
     ) -> None:
         self._settings = settings
         self._market = market
         self._execution = execution
         self._clock = clock
         self._news = news
+        self._state_store = state_store
         self._thresholds = thresholds_from_settings(settings)
 
     def thresholds(self) -> RiskThresholds:
@@ -1987,6 +2129,161 @@ class EngineRiskService:
         self._thresholds = merged
         logger.warning("risk thresholds overridden: %s", sorted(changes))
         return self._thresholds
+
+    # -- operator kill-switch status / reset (QoL) -----------------------------
+
+    @staticmethod
+    def operator_reset_token_required() -> bool:
+        """Whether ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is configured."""
+        return bool(os.environ.get(OPERATOR_RESET_TOKEN_ENV, "").strip())
+
+    @staticmethod
+    def _configured_operator_token() -> str:
+        return os.environ.get(OPERATOR_RESET_TOKEN_ENV, "").strip()
+
+    def _persisted_state(self) -> PersistedRiskState | None:
+        """Durable risk state, or ``None`` when no store/state exists."""
+        store = self._state_store
+        if store is None:
+            return None
+        try:
+            return store.load()
+        except Exception:
+            logger.warning("risk state store could not be read", exc_info=True)
+            return None
+
+    def _kill_switch_snapshot(self) -> dict[str, object]:
+        """Honest kill-switch status merged from execution and the risk state store."""
+        persisted = self._persisted_state()
+        execution_locked = bool(self._execution.is_locked)
+        execution_reason = str(self._execution.lock_reason or "") if execution_locked else ""
+        store_locked = bool(persisted.kill_switch_locked) if persisted is not None else False
+        store_reason = (
+            str(persisted.kill_switch_reason) if persisted is not None and store_locked else ""
+        )
+        daily_latched = bool(persisted.daily_loss_locked) if persisted is not None else False
+        raw_lock_until = getattr(self._execution, "lock_until", None)
+        lock_until = raw_lock_until if isinstance(raw_lock_until, datetime) else None
+        flattening = bool(getattr(self._execution, "flatten_in_progress", False))
+        reset_available = (
+            callable(getattr(self._execution, "reset_kill_switch", None)) and not flattening
+        )
+        return {
+            "kill_switch_active": execution_locked or store_locked or daily_latched,
+            "kill_switch_reason": execution_reason or store_reason,
+            "daily_loss_breaker_active": daily_latched,
+            "lock_until": lock_until,
+            "reset_available": reset_available,
+            "operator_reset_token_required": self.operator_reset_token_required(),
+            "flattening": flattening,
+        }
+
+    def _clear_persisted_risk_state(self, now: datetime) -> bool:
+        """Operator reset of the durable risk state (kill switch/daily/HWM latches).
+
+        The load-modify-save cycle preserves OMS-owned fields (the rate-limiter
+        bucket) while clearing the kill-switch latch, the daily-loss latch, the
+        starting daily NLV, the portfolio/instrument high-water marks and the
+        quant-overlay trailing-stop metadata so the re-armed engine resumes cleanly.
+        Returns whether any durable latch/HWM state was actually cleared.
+        """
+        store = self._state_store
+        if store is None:
+            return False
+        base = store.load()
+        if base is None:
+            return False
+        overlay_extra = any(key.startswith(QUANT_OVERLAY_EXTRA_PREFIX) for key in base.extra)
+        cleared = bool(
+            base.kill_switch_locked
+            or base.daily_loss_locked
+            or base.starting_daily_nlv is not None
+            or base.portfolio_high_water_mark is not None
+            or base.instrument_high_water_marks
+            or overlay_extra
+        )
+        extra = {
+            key: value
+            for key, value in base.extra.items()
+            if not key.startswith(QUANT_OVERLAY_EXTRA_PREFIX)
+        }
+        updated = base.unlocked().updated(
+            starting_daily_nlv=None,
+            portfolio_high_water_mark=None,
+            instrument_high_water_marks={},
+            trading_day=now.date(),
+            updated_at=now,
+            extra=extra,
+        )
+        store.save(updated)
+        return cleared
+
+    def reset_risk_lock(
+        self,
+        request: RiskLockResetRequest,
+        *,
+        header_token: str | None = None,
+    ) -> RiskLockResetResponse:
+        """Operator kill-switch reset with confirmation phrase + optional token."""
+        now = self._clock()
+        if request.confirm.strip() != RISK_LOCK_RESET_CONFIRM:
+            raise OperatorConfirmationError(f'confirm must be exactly "{RISK_LOCK_RESET_CONFIRM}"')
+        required_token = self._configured_operator_token()
+        supplied_token = (request.operator_token or request.token or header_token or "").strip()
+        if required_token and supplied_token != required_token:
+            raise OperatorTokenError(
+                f"operator reset token is required and must match {OPERATOR_RESET_TOKEN_ENV}"
+            )
+        before = self._kill_switch_snapshot()
+        if bool(before["flattening"]):
+            raise OperatorActionUnavailableError(
+                "refusing to reset the risk lock while an emergency flatten is in progress"
+            )
+        resetter = getattr(self._execution, "reset_kill_switch", None)
+        if not callable(resetter):
+            raise OperatorActionUnavailableError(
+                "the active execution adapter does not support a manual kill-switch reset"
+            )
+        warnings: list[str] = []
+        try:
+            resetter()
+            execution_reset = True
+        except Exception as exc:
+            raise OperatorActionUnavailableError(
+                f"execution kill-switch reset failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        day_resetter = getattr(self._execution, "reset_day", None)
+        if callable(day_resetter):
+            try:
+                day_resetter()
+            except Exception:
+                logger.warning("execution reset_day() failed", exc_info=True)
+        persisted_reset = False
+        if request.reset_persisted_state:
+            try:
+                persisted_reset = self._clear_persisted_risk_state(now)
+            except Exception as exc:
+                warnings.append(f"persisted risk state reset failed: {type(exc).__name__}: {exc}")
+                logger.warning("persisted risk state reset failed", exc_info=True)
+        after = self._kill_switch_snapshot()
+        changed = bool(before["kill_switch_active"]) or persisted_reset
+        status: Literal["reset", "already_unlocked"] = "reset" if changed else "already_unlocked"
+        return RiskLockResetResponse(
+            status=status,
+            timestamp=now,
+            execution_reset=execution_reset,
+            persisted_state_reset=persisted_reset,
+            kill_switch_active=bool(after["kill_switch_active"]),
+            kill_switch_reason=str(after["kill_switch_reason"]),
+            daily_loss_breaker_active=bool(after["daily_loss_breaker_active"]),
+            lock_until=cast(datetime | None, after["lock_until"]),
+            warnings=warnings,
+            message=(
+                "risk lock cleared; execution resumed"
+                if execution_reset
+                else "risk lock was not latched"
+            ),
+        )
 
     def state(self) -> RiskStateResponse:
         """Latest assessments, breaker state, macro lockout and news feed."""
@@ -2034,6 +2331,7 @@ class EngineRiskService:
                 f"no root above κ={thresholds.llm_critical_score:.1f} with "
                 f"c ≥ τ={thresholds.llm_confidence_threshold:.2f}"
             )
+        lock = self._kill_switch_snapshot()
         return RiskStateResponse(
             timestamp=now,
             thresholds=thresholds,
@@ -2045,6 +2343,12 @@ class EngineRiskService:
             news=news,
             neutralized_instruments=[row.instrument_id for row in coerced],
             news_source=news_source,
+            kill_switch_active=bool(lock["kill_switch_active"]),
+            kill_switch_reason=str(lock["kill_switch_reason"]),
+            daily_loss_breaker_active=bool(lock["daily_loss_breaker_active"]),
+            lock_until=cast(datetime | None, lock["lock_until"]),
+            reset_available=bool(lock["reset_available"]),
+            operator_reset_token_required=bool(lock["operator_reset_token_required"]),
         )
 
 
@@ -2071,6 +2375,8 @@ class Container:
     news: NewsFeedService
     offline_mode: bool
     warnings: list[str] = field(default_factory=list)
+    #: Durable risk/kill-switch state shared with the live runner (file/DuckDB/Redis).
+    risk_state_store: RiskStateStore | None = None
 
     def health(self) -> HealthResponse:
         """Liveness payload with dynamically derived IBKR connectivity state.
@@ -2108,6 +2414,123 @@ class Container:
     def telemetry_status(self) -> TelemetryStatusResponse:
         """WebSocket broadcaster status."""
         return self.telemetry.status()
+
+    # -- operator resets (QoL) -------------------------------------------------
+
+    def reset_risk_lock(
+        self,
+        request: RiskLockResetRequest,
+        *,
+        header_token: str | None = None,
+    ) -> RiskLockResetResponse:
+        """Delegate the guarded operator kill-switch reset to the risk service."""
+        resetter = getattr(self.risk, "reset_risk_lock", None)
+        if not callable(resetter):
+            raise OperatorActionUnavailableError(
+                "the configured risk service does not support a manual lock reset"
+            )
+        return cast(RiskLockResetResponse, resetter(request, header_token=header_token))
+
+    async def reset_paper_state(self, request: PaperStateResetRequest) -> PaperStateResetResponse:
+        """Clear paper/backtest operator state (bridge file, risk store, paper book).
+
+        Never available in the ``live`` environment. Every requested clear is
+        attempted independently so one failure cannot block the others; the
+        response receipts record exactly what happened and repeated calls are safe.
+        """
+        now = self.clock()
+        environment = self.settings.environment
+        if environment not in PAPER_STATE_RESET_ENVIRONMENTS:
+            raise OperatorActionUnavailableError(
+                "reset-paper-state is only available in non-live environments "
+                f"(environment={environment!r})"
+            )
+        if request.confirm.strip() != PAPER_STATE_RESET_CONFIRM:
+            raise OperatorConfirmationError(
+                f'confirm must be exactly "{PAPER_STATE_RESET_CONFIRM}"'
+            )
+        receipts = PaperStateResetReceipts(
+            risk_state_store_uri=self.settings.risk_state_store_uri or "memory:"
+        )
+        warnings: list[str] = []
+        actions = 0
+        if request.clear_runner_bridge:
+            removed = self._remove_runner_bridge_snapshot()
+            receipts.files_removed.extend(removed)
+            actions += len(removed)
+        if request.clear_risk_state:
+            store = self.risk_state_store
+            if store is None:
+                warnings.append("no persisted risk state store is configured")
+            else:
+                try:
+                    existing = store.load()
+                    store.clear()
+                    receipts.risk_state_store_cleared = existing is not None
+                    actions += 1 if existing is not None else 0
+                except Exception as exc:
+                    warnings.append(f"risk state store reset failed: {type(exc).__name__}: {exc}")
+                    logger.warning("paper-state risk store reset failed", exc_info=True)
+        if request.clear_paper_cache:
+            try:
+                await self.live.close()
+                receipts.paper_session_reset = True
+                actions += 1
+            except Exception as exc:
+                warnings.append(f"paper runner session reset failed: {type(exc).__name__}: {exc}")
+                logger.warning("paper runner session reset failed", exc_info=True)
+            resetter = getattr(self.execution, "reset_paper_state", None)
+            if callable(resetter):
+                try:
+                    resetter()
+                except Exception as exc:
+                    warnings.append(
+                        f"paper execution cache reset failed: {type(exc).__name__}: {exc}"
+                    )
+                    logger.warning("paper execution cache reset failed", exc_info=True)
+            elif bool(getattr(self.execution, "ibkr_enabled", False)):
+                warnings.append(
+                    "IBKR adapter: IBKR session/book left untouched by the paper-state reset"
+                )
+        if warnings and actions:
+            status: Literal["reset", "noop", "partial"] = "partial"
+        elif warnings:
+            status = "noop"
+        elif actions:
+            status = "reset"
+        else:
+            status = "noop"
+        return PaperStateResetResponse(
+            status=status,
+            timestamp=now,
+            environment=environment,
+            confirm_ok=True,
+            receipts=receipts,
+            warnings=warnings,
+            message=(
+                "paper state cleared"
+                if status == "reset"
+                else "nothing to clear (idempotent no-op)"
+                if status == "noop"
+                else "paper state partially cleared; see warnings"
+            ),
+        )
+
+    def _remove_runner_bridge_snapshot(self) -> list[str]:
+        """Remove the runner bridge snapshot (and its atomic temp files)."""
+        bridge_dir = self.settings.runner_bridge_dir
+        removed: list[str] = []
+        candidates = [bridge_dir / BRIDGE_FILE_NAME]
+        with contextlib.suppress(OSError):
+            candidates.extend(bridge_dir.glob(f".{BRIDGE_FILE_NAME}.*.tmp"))
+        for path in candidates:
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed.append(str(path))
+            except OSError as exc:
+                logger.warning("could not remove runner bridge file %s: %s", path, exc)
+        return removed
 
     async def start(self) -> None:
         """Start the telemetry publisher, live execution session and reconnect probe."""
@@ -2230,6 +2653,15 @@ def build_container(
         clock=resolved_clock,
         warnings=warnings,
     )
+    try:
+        risk_state_store: RiskStateStore | None = build_risk_state_store(
+            resolved_settings.risk_state_store_uri,
+            duckdb_path=resolved_settings.duckdb_path,
+        )
+    except Exception as exc:
+        warnings.append(f"risk state store unavailable: {type(exc).__name__}: {exc}")
+        logger.exception("risk state store could not be constructed")
+        risk_state_store = None
     news = NewsFeedService(settings=resolved_settings, clock=resolved_clock)
     risk = EngineRiskService(
         settings=resolved_settings,
@@ -2237,6 +2669,7 @@ def build_container(
         execution=execution,
         clock=resolved_clock,
         news=news,
+        state_store=risk_state_store,
     )
     from src.api.backtests_service import EngineBacktestService
 
@@ -2281,4 +2714,5 @@ def build_container(
         news=news,
         offline_mode=offline_mode,
         warnings=warnings,
+        risk_state_store=risk_state_store,
     )

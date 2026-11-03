@@ -49,6 +49,7 @@ from src.api.schemas import (
     SeriesPoint,
     TailPoint,
     TearsheetResponse,
+    TradeRow,
     WalkForwardFold,
 )
 
@@ -633,6 +634,35 @@ def fixture_backtest_config(config: StrategyConfig) -> StrategyConfig:
     return config.model_copy(update={"timing": (tsmom,)})
 
 
+def _strategy_config_snapshot(config: StrategyConfig) -> dict[str, object]:
+    """JSON-safe snapshot of the exact validated config used for a run."""
+    return config.model_dump(mode="json")
+
+
+def _trade_rows(trades: Sequence[object]) -> list[TradeRow]:
+    """Map engine ``TradeRecord``s onto the additive API ``TradeRow`` contract."""
+    rows: list[TradeRow] = []
+    for trade in trades:
+        timestamp = getattr(trade, "timestamp", None)
+        if not isinstance(timestamp, datetime):
+            continue
+        rows.append(
+            TradeRow(
+                timestamp=timestamp,
+                order_id=str(getattr(trade, "order_id", "")),
+                instrument_id=str(getattr(trade, "instrument_id", "")),
+                side=str(getattr(trade, "side", "")),
+                quantity=int(getattr(trade, "quantity", 0)),
+                price=float(getattr(trade, "price", 0.0)),
+                notional=float(getattr(trade, "notional", 0.0)),
+                commissions=float(getattr(trade, "commissions", 0.0)),
+                slippage=float(getattr(trade, "slippage", 0.0)),
+                kind=str(getattr(trade, "kind", "")),
+            )
+        )
+    return rows
+
+
 class EngineBacktestService:
     """In-memory run store backed by the production backtest engine."""
 
@@ -769,6 +799,7 @@ class EngineBacktestService:
             n_trades=result.n_trades,
             n_rebalances=result.n_rebalances,
             data_source="engine",
+            strategy_config=_strategy_config_snapshot(config),
         )
         return summary, tearsheet
 
@@ -807,6 +838,7 @@ class EngineBacktestService:
             roll_yield_attribution=self._attribution(result),
             monthly_returns=_monthly_returns(timestamps, equity),
             metrics=_performance_metrics(performance),
+            trades=_trade_rows(result.trades),
         )
 
     def _attribution(self, result: BacktestResult) -> list[AttributionRow]:
@@ -914,11 +946,16 @@ class EngineBacktestService:
         drawdown = _series_from_curve_mapping(report_dict, "drawdown")
         folds = _merge_combined_folds(folds, combined, drawdown, fold_count)
         base = self._fixture_tearsheet("pending", timestamps, values, metrics)
+        combined_result = getattr(report, "combined_result", None)
+        walk_forward_trades = _trade_rows(
+            cast(Sequence[object], getattr(combined_result, "trades", ()) or ())
+        )
         tearsheet = base.model_copy(
             update={
                 "equity_curve": combined or base.equity_curve,
                 "underwater": drawdown or base.underwater,
                 "folds": folds,
+                "trades": walk_forward_trades,
             }
         )
         summary = BacktestRunSummary(
@@ -935,6 +972,7 @@ class EngineBacktestService:
             data_source="engine",
             kind="walk_forward",
             n_folds=fold_count,
+            strategy_config=_strategy_config_snapshot(config),
         )
         return summary, tearsheet
 
@@ -1067,6 +1105,7 @@ class EngineBacktestService:
             data_source="fixture",
             kind="walk_forward",
             n_folds=request.wf_splits,
+            strategy_config=self._config_snapshot_for(request.strategy_id),
         )
         self._store_run(summary, tearsheet)
         return summary
@@ -1101,6 +1140,7 @@ class EngineBacktestService:
             n_rebalances=None,
             data_source="fixture",
             kind="backtest",
+            strategy_config=self._config_snapshot_for(request.strategy_id),
         )
         self._store_run(summary, tearsheet)
         return summary
@@ -1128,6 +1168,7 @@ class EngineBacktestService:
                 n_trades=None,
                 n_rebalances=None,
                 data_source="fixture",
+                strategy_config=self._config_snapshot_for(request.strategy_id),
             )
             self._runs[run_id] = summary
             self._tearsheets[run_id] = tearsheet
@@ -1248,6 +1289,40 @@ class EngineBacktestService:
                 )
             )
         return rows
+
+    # -- deletion --------------------------------------------------------------
+
+    def artifact_path(self, run_id: str) -> Path:
+        """Persisted artifact path for one run id (may not exist for seed runs)."""
+        return self._artifact_path(run_id)
+
+    def _config_snapshot_for(self, strategy_id: str) -> dict[str, object] | None:
+        """Best-effort strategy-config snapshot for fixture/seeded runs."""
+        config = self._catalog.core_config(strategy_id)
+        return _strategy_config_snapshot(config) if config is not None else None
+
+    def delete_run(self, run_id: str) -> bool:
+        """Delete one stored run + its persisted artifact.
+
+        Returns whether a persisted artifact file was removed. Raises ``KeyError``
+        for unknown ids. Seeded fixture runs live in memory only (their artifact is
+        not persisted) and reappear after an API restart; this is documented on the
+        DELETE route.
+        """
+        summary = self._runs.pop(run_id, None)
+        if summary is None:
+            raise KeyError(f"unknown backtest run {run_id!r}")
+        self._tearsheets.pop(run_id, None)
+        self._persisted_ids.discard(run_id)
+        path = self._artifact_path(run_id)
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:  # pragma: no cover - best effort artifact cleanup
+            logger.warning("could not delete backtest artifact %s", path)
+            return False
 
     # -- persistence -----------------------------------------------------------
 

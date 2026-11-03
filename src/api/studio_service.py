@@ -29,6 +29,7 @@ a deterministic built-in fallback keeps the Studio fully usable and the response
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -1402,6 +1403,21 @@ class StrategyStudioService:
         )
         self._custom_dir = custom_dir or Path(default_custom)
         self._builtin_writes = settings.environment in _BUILTIN_WRITE_ENVIRONMENTS
+        #: Durable registry of API-created/cloned/optimized strategies. It lives under
+        #: the artifact tree (never in the committed configs tree) and survives API
+        #: restarts, so a custom strategy written to ``configs/strategies`` in
+        #: development/paper/live is still deletable/renamable after a restart.
+        self._custom_registry_path: Path = settings.strategy_artifacts_dir / ".custom_ids.json"
+        self._custom_registry_lock = threading.Lock()
+        self._custom_ids: set[str] = self._load_custom_ids()
+        #: Committed built-in ids seen at service construction: protected from delete/
+        #: rename. Anything registered custom is excluded (it may live in the committed
+        #: configs tree only because dev/paper/live writes new strategies there).
+        self._protected_builtin_ids: frozenset[str] = frozenset(
+            strategy_id
+            for strategy_id, item in self._discover().items()
+            if item.builtin and strategy_id not in self._custom_ids
+        )
 
     # -- paths / safety --------------------------------------------------------
 
@@ -1457,6 +1473,81 @@ class StrategyStudioService:
             upsert(config)
         except Exception:  # pragma: no cover - defensive: catalog must not wedge writes
             logger.exception("strategy catalog refresh failed for %s", config.id)
+
+    # -- durable custom-strategy registry --------------------------------------
+
+    @property
+    def custom_registry_path(self) -> Path:
+        """Durable registry of API-created strategy ids (survives restarts)."""
+        return self._custom_registry_path
+
+    def _load_custom_ids(self) -> set[str]:
+        """Load the custom-strategy registry (corrupt/missing registry is empty)."""
+        path = self._custom_registry_path
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        except (OSError, ValueError) as exc:
+            logger.warning("custom strategy registry unreadable at %s: %s", path, exc)
+            return set()
+        raw = payload.get("custom_ids") if isinstance(payload, Mapping) else payload
+        if not isinstance(raw, Sequence) or isinstance(raw, str | bytes | bytearray):
+            return set()
+        return {
+            value.strip()
+            for value in raw
+            if isinstance(value, str) and _STRATEGY_ID_PATTERN.match(value.strip())
+        }
+
+    def _persist_custom_ids(self) -> None:
+        """Atomically persist the custom-strategy registry (best effort)."""
+        path = self._custom_registry_path
+        payload = json.dumps(
+            {"version": 1, "custom_ids": sorted(self._custom_ids)},
+            sort_keys=True,
+        ).encode("utf-8")
+        temp_name: str | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=".custom_ids.", suffix=".json.tmp", dir=str(path.parent)
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            Path(temp_name).replace(path)
+        except OSError:  # pragma: no cover - metadata store must not wedge writes
+            logger.exception("could not persist custom strategy registry %s", path)
+            if temp_name is not None:
+                Path(temp_name).unlink(missing_ok=True)
+
+    def _register_custom(self, strategy_id: str) -> None:
+        """Mark one strategy id as API-created (durable across restarts)."""
+        with self._custom_registry_lock:
+            if strategy_id in self._custom_ids:
+                return
+            self._custom_ids.add(strategy_id)
+            self._persist_custom_ids()
+
+    def _unregister_custom(self, strategy_id: str) -> None:
+        """Forget a deleted/renamed custom strategy id."""
+        with self._custom_registry_lock:
+            if strategy_id not in self._custom_ids:
+                return
+            self._custom_ids.discard(strategy_id)
+            self._persist_custom_ids()
+
+    def _drop_from_catalog(self, strategy_id: str) -> None:
+        """Remove a deleted/renamed strategy from the runtime strategy catalog."""
+        remove = getattr(self._catalog, "remove", None)
+        if not callable(remove):
+            return
+        try:
+            remove(strategy_id)
+        except Exception:  # pragma: no cover - catalog must not wedge QoL writes
+            logger.exception("strategy catalog removal failed for %s", strategy_id)
 
     # -- catalog ---------------------------------------------------------------
 
@@ -1579,17 +1670,29 @@ class StrategyStudioService:
                     params[str(key)] = value
         return StageConfig(name=str(mapping.get("name") or ""), params=params)
 
-    def view_for(self, config: StrategyConfig, *, target: Path | None = None) -> StrategyConfigView:
-        """API view of a validated strategy config."""
+    def view_for(
+        self,
+        config: StrategyConfig,
+        *,
+        target: Path | None = None,
+        builtin: bool | None = None,
+    ) -> StrategyConfigView:
+        """API view of a validated strategy config (with additive builtin/path info)."""
+        found = self._find(config.id)
         if target is not None and target.is_file():
             updated_at = datetime.fromtimestamp(target.stat().st_mtime, tz=UTC)
         else:
-            found = self._find(config.id)
             updated_at = (
                 datetime.fromtimestamp(found.path.stat().st_mtime, tz=UTC)
                 if found is not None
                 else self._clock()
             )
+        resolved_path = (
+            target if target is not None else (found.path if found is not None else None)
+        )
+        resolved_builtin = (
+            builtin if builtin is not None else (found.builtin if found is not None else False)
+        )
         return StrategyConfigView(
             id=config.id,
             description=config.description,
@@ -1599,6 +1702,8 @@ class StrategyStudioService:
             timing=[self._stage_view(stage) for stage in config.timing],
             risk=[self._stage_view(stage) for stage in config.risk],
             updated_at=updated_at,
+            builtin=resolved_builtin,
+            path=str(resolved_path) if resolved_path is not None else None,
         )
 
     # -- CRUD ------------------------------------------------------------------
@@ -1606,12 +1711,24 @@ class StrategyStudioService:
     def list_configs(self) -> list[StrategyConfigView]:
         """Every strategy (built-ins + custom overlays), sorted by id."""
         discovered = self._discover()
-        return [self.view_for(discovered[key].config) for key in sorted(discovered)]
+        return [
+            self.view_for(
+                discovered[key].config,
+                target=discovered[key].path,
+                builtin=discovered[key].builtin,
+            )
+            for key in sorted(discovered)
+        ]
 
     def get_config(self, strategy_id: str) -> StrategyConfigView | None:
         """One strategy view or ``None``."""
         core = self.core_config(strategy_id)
-        return None if core is None else self.view_for(core)
+        if core is None:
+            return None
+        found = self._find(core.id)
+        return (
+            None if found is None else self.view_for(core, target=found.path, builtin=found.builtin)
+        )
 
     def core_config(self, strategy_id: str) -> StrategyConfig | None:
         """Validated strategy config or ``None`` (used by optimizer/backtests)."""
@@ -1642,8 +1759,9 @@ class StrategyStudioService:
             )
         config = self._validate_payload({**dict(payload), "id": strategy_id})
         target = self._write_config(config, builtin=False)
+        self._register_custom(config.id)
         self._refresh_catalog(config)
-        return self.view_for(config, target=target)
+        return self.view_for(config, target=target, builtin=False)
 
     def update_strategy(
         self, strategy_id: str, payload: Mapping[str, object]
@@ -1666,8 +1784,102 @@ class StrategyStudioService:
                 merged[field] = value
         config = self._validate_payload({**merged, "id": key})
         target = self._write_config(config, builtin=current.builtin)
+        if not (current.builtin and key in self._protected_builtin_ids):
+            self._register_custom(config.id)
         self._refresh_catalog(config)
-        return self.view_for(config, target=target)
+        return self.view_for(config, target=target, builtin=current.builtin)
+
+    # -- QoL: delete / clone / rename / YAML export ---------------------------
+
+    def delete_strategy(self, strategy_id: str) -> Path:
+        """Delete a custom/tuned strategy YAML (committed built-ins are protected)."""
+        key = self.validate_strategy_id(strategy_id)
+        source = self._find(key)
+        if source is None:
+            raise StrategyStudioError(f"unknown strategy {key!r}", status_code=404)
+        if source.builtin and key in self._protected_builtin_ids:
+            raise StrategyStudioError(
+                f"strategy {key!r} is a committed built-in and cannot be deleted; "
+                "clone it to a custom id instead",
+                status_code=409,
+            )
+        target = source.path
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as exc:
+            raise StrategyStudioError(
+                f"could not delete strategy {key!r}: {exc}", status_code=500
+            ) from exc
+        self._unregister_custom(key)
+        self._drop_from_catalog(key)
+        return target
+
+    def clone_strategy(self, strategy_id: str, new_strategy_id: str) -> StrategyConfigView:
+        """Copy an existing strategy (including built-ins) to a new custom id."""
+        source_key = self.validate_strategy_id(strategy_id)
+        source = self._find(source_key)
+        if source is None:
+            raise StrategyStudioError(f"unknown strategy {source_key!r}", status_code=404)
+        new_key = self.validate_strategy_id(new_strategy_id)
+        if self._find(new_key) is not None:
+            raise StrategyStudioError(f"strategy {new_key!r} already exists", status_code=409)
+        clone = source.config.model_copy(
+            update={
+                "id": new_key,
+                "description": (
+                    f"{source.config.description or source.config.id} (clone of {source.config.id})"
+                ),
+                "tags": tuple(dict.fromkeys((*source.config.tags, "cloned"))),
+            }
+        )
+        target = self._write_config(clone, builtin=False)
+        self._register_custom(clone.id)
+        self._refresh_catalog(clone)
+        return self.view_for(clone, target=target, builtin=False)
+
+    def rename_strategy(self, strategy_id: str, new_strategy_id: str) -> StrategyConfigView:
+        """Rename a custom strategy (copy to the new id, delete the old file)."""
+        source_key = self.validate_strategy_id(strategy_id)
+        source = self._find(source_key)
+        if source is None:
+            raise StrategyStudioError(f"unknown strategy {source_key!r}", status_code=404)
+        if source.builtin and source_key in self._protected_builtin_ids:
+            raise StrategyStudioError(
+                f"strategy {source_key!r} is a committed built-in and cannot be renamed; "
+                "clone it to a custom id instead",
+                status_code=409,
+            )
+        new_key = self.validate_strategy_id(new_strategy_id)
+        if new_key == source_key:
+            raise StrategyStudioError(
+                "new_strategy_id must differ from the current strategy id", status_code=400
+            )
+        if self._find(new_key) is not None:
+            raise StrategyStudioError(f"strategy {new_key!r} already exists", status_code=409)
+        renamed = source.config.model_copy(update={"id": new_key})
+        target = self._write_config(renamed, builtin=False)
+        try:
+            source.path.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - best-effort old-file cleanup
+            logger.warning("could not remove renamed strategy file %s", source.path)
+        self._unregister_custom(source_key)
+        self._register_custom(renamed.id)
+        self._drop_from_catalog(source_key)
+        self._refresh_catalog(renamed)
+        return self.view_for(renamed, target=target, builtin=False)
+
+    def strategy_yaml(self, strategy_id: str) -> str:
+        """Current YAML text for one strategy (download/export endpoint)."""
+        key = self.validate_strategy_id(strategy_id)
+        source = self._find(key)
+        if source is None:
+            raise StrategyStudioError(f"unknown strategy {key!r}", status_code=404)
+        try:
+            return source.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise StrategyStudioError(
+                f"could not read strategy YAML for {key!r}: {exc}", status_code=404
+            ) from exc
 
     def _validate_payload(self, payload: Mapping[str, object]) -> StrategyConfig:
         try:
@@ -1752,7 +1964,12 @@ class StrategyStudioService:
         )
         target = self._write_config(tuned, builtin=False)
         self._refresh_catalog(tuned)
-        return SavedStrategy(view=self.view_for(tuned, target=target), config=tuned, path=target)
+        self._register_custom(tuned.id)
+        return SavedStrategy(
+            view=self.view_for(tuned, target=target, builtin=False),
+            config=tuned,
+            path=target,
+        )
 
     def apply_best_params(
         self,

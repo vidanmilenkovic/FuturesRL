@@ -6,9 +6,10 @@ import json
 from collections.abc import Mapping
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from src.api.phase10_deps import StudioDep
+from src.api.qol_schemas import ArtifactDeleteResponse, StrategyIdentityRequest
 from src.api.schemas import StrategyConfigView
 from src.api.studio_service import (
     MAX_STRATEGY_PAYLOAD_BYTES,
@@ -133,6 +134,113 @@ async def create_strategy(request: Request, studio: StudioDep) -> StrategyConfig
         return studio.create_strategy(payload)
     except StrategyStudioError as exc:
         raise _studio_http_error(exc) from exc
+
+
+@router.delete(
+    "/strategies/{strategy_id}",
+    response_model=ArtifactDeleteResponse,
+    summary="Delete a custom/tuned strategy YAML",
+    description=(
+        "Deletes a custom or optimized strategy YAML (``configs/strategies`` in "
+        "development/paper/live, the ``artifacts/strategies`` overlay otherwise) and "
+        "removes it from the runtime strategy catalog immediately. Committed built-in "
+        "strategies are protected and return 409 (clone them to a custom id instead). "
+        "Unknown ids return 404."
+    ),
+    responses={
+        404: {"description": "Unknown strategy id"},
+        409: {"description": "Committed built-in strategies cannot be deleted"},
+    },
+)
+def delete_strategy(strategy_id: str, studio: StudioDep) -> ArtifactDeleteResponse:
+    """Delete one custom/tuned strategy YAML."""
+    try:
+        path = studio.delete_strategy(strategy_id)
+    except StrategyStudioError as exc:
+        raise _studio_http_error(exc) from exc
+    return ArtifactDeleteResponse(
+        id=strategy_id, deleted=True, artifact_deleted=True, path=str(path)
+    )
+
+
+@router.post(
+    "/strategies/{strategy_id}/clone",
+    response_model=StrategyConfigView,
+    summary="Clone a strategy to a new custom id",
+    description=(
+        "Copies the validated config to ``new_strategy_id`` (environment write rules "
+        "apply), refreshes the runtime catalog immediately and returns the new view. "
+        "Built-in strategies can be cloned; unknown source ids return 404 and existing "
+        "target ids return 409."
+    ),
+    responses={
+        400: {"description": "Unsafe/invalid new strategy id"},
+        404: {"description": "Unknown source strategy id"},
+        409: {"description": "Target strategy id already exists"},
+    },
+)
+def clone_strategy(
+    strategy_id: str, payload: StrategyIdentityRequest, studio: StudioDep
+) -> StrategyConfigView:
+    """Clone one strategy under a new custom id."""
+    try:
+        return studio.clone_strategy(strategy_id, payload.new_strategy_id)
+    except StrategyStudioError as exc:
+        raise _studio_http_error(exc) from exc
+
+
+@router.post(
+    "/strategies/{strategy_id}/rename",
+    response_model=StrategyConfigView,
+    summary="Rename a custom strategy",
+    description=(
+        "Persists the config under ``new_strategy_id``, deletes the old YAML and swaps "
+        "the runtime catalog entry (old id disappears, new id is immediately runnable). "
+        "Committed built-ins cannot be renamed (409 — clone instead); existing target "
+        "ids return 409; unknown sources return 404."
+    ),
+    responses={
+        400: {"description": "Unsafe/invalid new strategy id / unchanged id"},
+        404: {"description": "Unknown source strategy id"},
+        409: {"description": "Built-in source or target id already exists"},
+    },
+)
+def rename_strategy(
+    strategy_id: str, payload: StrategyIdentityRequest, studio: StudioDep
+) -> StrategyConfigView:
+    """Rename one custom strategy."""
+    try:
+        return studio.rename_strategy(strategy_id, payload.new_strategy_id)
+    except StrategyStudioError as exc:
+        raise _studio_http_error(exc) from exc
+
+
+@router.get(
+    "/strategies/{strategy_id}/yaml",
+    summary="Download a strategy YAML",
+    description=(
+        "Returns the current strategy YAML as a ``text/yaml`` attachment named "
+        "``<strategy_id>.yaml`` (the exact persisted file). Unknown ids return 404."
+    ),
+    response_class=Response,
+    responses={
+        200: {"content": {"text/yaml": {}}, "description": "Strategy YAML attachment"},
+        404: {"description": "Unknown strategy id"},
+    },
+)
+def download_strategy_yaml(strategy_id: str, studio: StudioDep) -> Response:
+    """Download one strategy as a YAML attachment."""
+    try:
+        content = studio.strategy_yaml(strategy_id)
+    except StrategyStudioError as exc:
+        raise _studio_http_error(exc) from exc
+    return Response(
+        content=content,
+        media_type="text/yaml",
+        headers={
+            "Content-Disposition": f'attachment; filename="{strategy_id}.yaml"',
+        },
+    )
 
 
 @router.put(

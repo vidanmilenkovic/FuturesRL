@@ -363,6 +363,16 @@ class RiskStateResponse(APIModel):
     neutralized_instruments: list[str] = Field(default_factory=list)
     #: ``news-ingestor`` when live/ingested headlines are wired, else ``fixture``.
     news_source: str = "fixture"
+    #: Additive QoL kill-switch status, read from the execution adapter and the
+    #: persisted risk state store; never synthesised when neither reports a latch.
+    kill_switch_active: bool = False
+    kill_switch_reason: str = ""
+    daily_loss_breaker_active: bool = False
+    lock_until: datetime | None = None
+    #: Whether the execution adapter can accept an operator ``POST /api/risk/reset-lock``.
+    reset_available: bool = False
+    #: Whether ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is configured (token required).
+    operator_reset_token_required: bool = False
 
 
 class FlattenReceipt(APIModel):
@@ -386,6 +396,75 @@ class FlattenAllResponse(APIModel):
     cancelled_orders: int = Field(ge=0)
     receipts: list[FlattenReceipt] = Field(default_factory=list)
     execution_locked_until: datetime | None = None
+    message: str = ""
+
+
+#: Exact body confirmation phrase for ``POST /api/risk/reset-lock``.
+RISK_LOCK_RESET_CONFIRM: str = "RESET RISK LOCK"
+
+#: Exact body confirmation phrase for ``POST /api/maintenance/reset-paper-state``.
+PAPER_STATE_RESET_CONFIRM: str = "RESET PAPER STATE"
+
+
+class RiskLockResetRequest(StrictModel):
+    """Body of ``POST /api/risk/reset-lock`` (operator kill-switch reset)."""
+
+    confirm: str = Field(
+        description=f'Must be exactly "{RISK_LOCK_RESET_CONFIRM}".',
+    )
+    #: Operator token; required when ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is set.
+    operator_token: str | None = Field(default=None, repr=False)
+    #: Alias of ``operator_token`` (accepted for script/frontend ergonomics).
+    token: str | None = Field(default=None, repr=False)
+    #: Also unlock/clear the durable risk state (persisted kill switch/daily latch,
+    #: HWM/trailing-stop state). Defaults to true.
+    reset_persisted_state: bool = True
+
+
+class RiskLockResetResponse(APIModel):
+    """Result of ``POST /api/risk/reset-lock`` with the updated lock status."""
+
+    status: Literal["reset", "already_unlocked"]
+    timestamp: datetime
+    execution_reset: bool = False
+    persisted_state_reset: bool = False
+    kill_switch_active: bool = False
+    kill_switch_reason: str = ""
+    daily_loss_breaker_active: bool = False
+    lock_until: datetime | None = None
+    warnings: list[str] = Field(default_factory=list)
+    message: str = ""
+
+
+class PaperStateResetRequest(StrictModel):
+    """Body of ``POST /api/maintenance/reset-paper-state``."""
+
+    confirm: str = Field(
+        description=f'Must be exactly "{PAPER_STATE_RESET_CONFIRM}".',
+    )
+    clear_risk_state: bool = True
+    clear_runner_bridge: bool = True
+    clear_paper_cache: bool = True
+
+
+class PaperStateResetReceipts(APIModel):
+    """Operator receipts for a paper-state reset (files/store/session actions)."""
+
+    files_removed: list[str] = Field(default_factory=list)
+    risk_state_store_cleared: bool = False
+    risk_state_store_uri: str | None = None
+    paper_session_reset: bool = False
+
+
+class PaperStateResetResponse(APIModel):
+    """Result of ``POST /api/maintenance/reset-paper-state``."""
+
+    status: Literal["reset", "noop", "partial"]
+    timestamp: datetime
+    environment: Environment
+    confirm_ok: bool
+    receipts: PaperStateResetReceipts = Field(default_factory=PaperStateResetReceipts)
+    warnings: list[str] = Field(default_factory=list)
     message: str = ""
 
 
@@ -459,6 +538,10 @@ class StrategyConfigView(APIModel):
     timing: list[StageConfig] = Field(default_factory=list)
     risk: list[StageConfig] = Field(default_factory=list)
     updated_at: datetime
+    #: Additive QoL metadata: committed built-ins are protected from delete/rename.
+    builtin: bool = False
+    #: Persisted YAML path backing this view (overlay in test/backtest envs).
+    path: str | None = None
 
 
 class StrategyConfigUpdate(BaseModel):
@@ -579,6 +662,9 @@ class BacktestRunSummary(APIModel):
     kind: Literal["backtest", "walk_forward"] = "backtest"
     #: Number of walk-forward folds (``None`` for a single-pass backtest).
     n_folds: int | None = Field(default=None, ge=0)
+    #: Additive QoL snapshot of the exact validated strategy config used for the run.
+    #: ``None`` for legacy artifacts / old fixture seeds (clients tolerate null).
+    strategy_config: dict[str, object] | None = None
 
 
 class BacktestListResponse(APIModel):
@@ -603,6 +689,21 @@ class WalkForwardFold(APIModel):
     underwater: list[SeriesPoint] = Field(default_factory=list)
 
 
+class TradeRow(APIModel):
+    """One executed trade exposed by the tear sheet / CSV export (additive QoL)."""
+
+    timestamp: datetime
+    order_id: str
+    instrument_id: str
+    side: str
+    quantity: int = Field(ge=0)
+    price: float
+    notional: float = 0.0
+    commissions: float = 0.0
+    slippage: float = 0.0
+    kind: str = ""
+
+
 class TearsheetResponse(APIModel):
     """Tear sheet series + metrics for one run."""
 
@@ -616,6 +717,8 @@ class TearsheetResponse(APIModel):
     metrics: MetricsSet
     #: Per-fold series for ``kind="walk_forward"`` runs (empty for single-pass runs).
     folds: list[WalkForwardFold] = Field(default_factory=list)
+    #: Additive QoL trade tape (empty for legacy artifacts / fixture runs).
+    trades: list[TradeRow] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +917,8 @@ class TelemetryEnvelope(APIModel):
 
 
 __all__ = [
+    "PAPER_STATE_RESET_CONFIRM",
+    "RISK_LOCK_RESET_CONFIRM",
     "AccountSnapshotResponse",
     "AttributionRow",
     "BacktestListResponse",
@@ -836,6 +941,9 @@ __all__ = [
     "MicroRoutingEntry",
     "MonthlyReturn",
     "NewsEvent",
+    "PaperStateResetReceipts",
+    "PaperStateResetRequest",
+    "PaperStateResetResponse",
     "PipelineDiagnostic",
     "PipelineInstrumentRow",
     "PipelineStage",
@@ -848,6 +956,8 @@ __all__ = [
     "RiskAction",
     "RiskAlertTelemetryPayload",
     "RiskAssessmentRow",
+    "RiskLockResetRequest",
+    "RiskLockResetResponse",
     "RiskStateResponse",
     "RiskThresholdOverride",
     "RiskThresholds",
