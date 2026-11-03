@@ -31,10 +31,12 @@ from src.backtest.optimizer import (
     default_search_space,
     deterministic_lhs_parameter_sets,
     deterministic_param_importances,
+    filter_search_space_for_config,
     load_optimization,
     run_optimization,
     write_optimization_artifact,
 )
+from src.strategies.parameter_catalog import parameter_catalog
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PATH = REPO_ROOT / "configs" / "strategies" / "tsmom_vol_target.yaml"
@@ -356,29 +358,153 @@ def test_apply_parameters_validation(config: StrategyConfig) -> None:
         apply_parameters(config, {"timing.not_a_stage.params.lookback_fast": 10})
     with pytest.raises(ValueError, match="invalid StrategyConfig"):
         apply_parameters(config, {"translator.max_margin_utilization": 5.0})
+    # Catalogued stage params omitted from the base config stay strict by default
+    # and become injectable only for optimizer-sampled defaults.
+    with pytest.raises(ValueError, match="unknown parameter path"):
+        apply_parameters(config, {"risk.0.params.trailing_stop_pct": 0.10})
+    injected = apply_parameters(
+        config,
+        {"risk.0.params.trailing_stop_pct": 0.10},
+        allow_new_params=True,
+    )
+    assert injected.risk[0].params["trailing_stop_pct"] == pytest.approx(0.10)
 
 
-def test_optimizer_rejects_unknown_search_space_path(
+def test_optimizer_filters_inactive_search_space_paths(
     config: StrategyConfig, tmp_path: Path
 ) -> None:
-    bad_space = (ParameterRange(param_path="allocator.name", type="float", low=0.0, high=1.0),)
-    with pytest.raises(ValueError, match="numeric parameter"):
-        WalkForwardOptimizer(
+    inactive_spaces = (
+        (ParameterRange(param_path="allocator.name", type="float", low=0.0, high=1.0),),
+        (ParameterRange(param_path="allocator.params.nope", type="float", low=0.0, high=1.0),),
+        (
+            ParameterRange(
+                param_path="timing.mean_reversion.rsi_period",
+                type="int",
+                low=2,
+                high=20,
+            ),
+        ),
+        (
+            ParameterRange(
+                param_path="universe.params.top_n",
+                type="int",
+                low=3,
+                high=20,
+            ),
+        ),
+    )
+    for space in inactive_spaces:
+        with pytest.raises(ValueError, match="no active tunable parameters"):
+            WalkForwardOptimizer(
+                config,
+                request=_request(config, space),
+                backtest_runner=_SpyRunner(),
+                output_dir=tmp_path,
+                use_optuna=False,
+            )
+
+
+def test_optimizer_filters_explicit_ui_search_space(
+    config: StrategyConfig,
+    tmp_path: Path,
+) -> None:
+    explicit = (
+        ParameterRange(param_path="timing.tsmom.lookback_fast", type="int", low=5, high=60, step=5),
+        ParameterRange(param_path="timing.mean_reversion.rsi_period", type="int", low=5, high=30),
+        ParameterRange(param_path="universe.params.top_n", type="int", low=3, high=20),
+        ParameterRange(
+            param_path="allocator.params.target_annual_volatility",
+            type="float",
+            low=0.05,
+            high=0.30,
+            step=0.01,
+        ),
+    )
+    spy = _SpyRunner()
+    optimizer = WalkForwardOptimizer(
+        config,
+        request=_request(config, explicit),
+        backtest_runner=spy,
+        output_dir=tmp_path,
+        use_optuna=False,
+    )
+    filtered_paths = [parameter.param_path for parameter in optimizer.request.search_space]
+    assert filtered_paths == [
+        "timing.0.params.lookback_fast",
+        "allocator.params.target_annual_volatility",
+    ]
+    result = optimizer.optimize()
+    for trial in result.trials:
+        assert set(trial.params) == {
+            "timing.0.params.lookback_fast",
+            "allocator.params.target_annual_volatility",
+        }
+    assert [parameter.param_path for parameter in result.request.search_space] == filtered_paths
+
+
+def test_filter_search_space_for_config(config: StrategyConfig) -> None:
+    explicit = (
+        ParameterRange(
+            param_path="allocator.params.target_annual_volatility",
+            type="float",
+            low=0.05,
+            high=0.30,
+            step=0.01,
+        ),
+        ParameterRange(param_path="timing.mean_reversion.rsi_period", type="int", low=2, high=20),
+        ParameterRange(param_path="universe.params.top_n", type="int", low=3, high=20),
+        ParameterRange(param_path="timing.tsmom.lookback_fast", type="int", low=5, high=60, step=5),
+        ParameterRange(
+            param_path="allocator.params.target_annual_volatility",
+            type="float",
+            low=0.10,
+            high=0.20,
+        ),
+    )
+    filtered = filter_search_space_for_config(explicit, config)
+    assert [parameter.param_path for parameter in filtered] == [
+        "allocator.params.target_annual_volatility",
+        "timing.0.params.lookback_fast",
+    ]
+    # The first occurrence wins (order kept, duplicates removed).
+    assert filtered[0].low == pytest.approx(0.05)
+    assert filtered[0].high == pytest.approx(0.30)
+    with pytest.raises(ValueError, match="search space is empty"):
+        filter_search_space_for_config((), config)
+    with pytest.raises(ValueError, match="no active tunable parameters"):
+        filter_search_space_for_config(
+            (
+                ParameterRange(
+                    param_path="timing.mean_reversion.rsi_period",
+                    type="int",
+                    low=2,
+                    high=20,
+                ),
+                ParameterRange(param_path="universe.params.top_n", type="int", low=3, high=20),
+            ),
             config,
-            request=_request(config, bad_space),
-            backtest_runner=_SpyRunner(),
-            output_dir=tmp_path,
-            use_optuna=False,
         )
-    missing = (ParameterRange(param_path="allocator.params.nope", type="float", low=0.0, high=1.0),)
-    with pytest.raises(ValueError, match="unknown parameter path"):
-        WalkForwardOptimizer(
-            config,
-            request=_request(config, missing),
-            backtest_runner=_SpyRunner(),
-            output_dir=tmp_path,
-            use_optuna=False,
-        )
+
+
+def test_filter_search_space_for_config_fallback_without_catalog(
+    config: StrategyConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(optimizer_module, "_catalog_search_context", lambda config: None)
+    space = (
+        ParameterRange(
+            param_path="allocator.params.target_annual_volatility",
+            type="float",
+            low=0.05,
+            high=0.30,
+        ),
+        ParameterRange(param_path="universe.params.top_n", type="int", low=3, high=20),
+        ParameterRange(param_path="timing.mean_reversion.rsi_period", type="int", low=2, high=20),
+    )
+    filtered = filter_search_space_for_config(space, config)
+    assert [parameter.param_path for parameter in filtered] == [
+        "allocator.params.target_annual_volatility"
+    ]
 
 
 def test_optimizer_rejects_mismatched_strategy_id(config: StrategyConfig, tmp_path: Path) -> None:
@@ -401,19 +527,105 @@ def test_optimizer_rejects_mismatched_strategy_id(config: StrategyConfig, tmp_pa
         )
 
 
-def test_default_search_space(config: StrategyConfig) -> None:
+def test_default_search_space_is_active_only(config: StrategyConfig) -> None:
     space = default_search_space(config)
-    assert space
-    paths = {parameter.param_path for parameter in space}
-    assert "allocator.params.target_annual_volatility" in paths
-    assert "translator.max_margin_utilization" in paths
-    assert any(path.startswith("timing.0.params.") for path in paths)
-    assert any(path.startswith("risk.0.params.") for path in paths)
+    paths = [parameter.param_path for parameter in space]
+    assert paths == [
+        "allocator.params.target_annual_volatility",
+        "timing.0.params.lookback_fast",
+        "timing.0.params.lookback_slow",
+        "timing.1.params.window",
+        "timing.2.params.min_carry_bps",
+        "risk.0.params.trailing_stop_pct",
+    ]
+    assert len(paths) == len(set(paths))
+    # No data-hygiene/structural, inactive overlays, LLM plumbing or translator
+    # execution parameters in the default space.
+    forbidden_fragments = (
+        "min_avg_dollar_volume",
+        "min_open_interest",
+        "min_history_days",
+        "top_n",
+        "mean_reversion",
+        "seasonality",
+        "llm_risk",
+        "macro_lockout",
+        "translator",
+    )
+    for path in paths:
+        assert not any(fragment in path for fragment in forbidden_fragments), path
+    # Bounds/steps come from the strategy catalog (not the old heuristics).
+    catalog = parameter_catalog()
+    fast = catalog.get("timing.tsmom.lookback_fast")
+    slow = catalog.get("timing.tsmom.lookback_slow")
+    fast_range = next(p for p in space if p.param_path == "timing.0.params.lookback_fast")
+    slow_range = next(p for p in space if p.param_path == "timing.0.params.lookback_slow")
+    assert fast_range.low == pytest.approx(float(fast.min))
+    assert fast_range.high <= float(fast.max)
+    assert fast_range.step == pytest.approx(float(fast.step))
+    assert slow_range.low >= float(slow.min)
+    assert slow_range.high <= float(slow.max)
+    # Curated defaults clip the catalog bounds to classic signal horizons.
+    assert fast_range.high == pytest.approx(63.0)
+    assert slow_range.low == pytest.approx(64.0)
+    assert slow_range.high == pytest.approx(252.0)
+    # Fast/slow lookbacks are partitioned by the deterministic constraint so the
+    # default space never samples an invalid TSMOM definition.
+    assert fast_range.high < slow_range.low
     for parameter in space:
-        if parameter.type == "categorical":
-            assert parameter.choices
-        else:
-            assert parameter.numeric_bounds()[0] < parameter.numeric_bounds()[1]
+        assert parameter.numeric_bounds()[0] < parameter.numeric_bounds()[1]
+        assert parameter.type in {"int", "float"}
+
+
+def test_default_lookback_pair_is_constrained(config: StrategyConfig) -> None:
+    space = default_search_space(config)
+    parameter_sets = deterministic_lhs_parameter_sets(space, 40, seed=3)
+    for params in parameter_sets:
+        fast = params["timing.0.params.lookback_fast"]
+        slow = params["timing.0.params.lookback_slow"]
+        assert isinstance(fast, int) and isinstance(slow, int)
+        assert fast < slow, params
+
+
+def test_default_search_space_panic_mean_reversion() -> None:
+    preset = next(
+        template
+        for template in parameter_catalog().presets
+        if template.id == "panic_mean_reversion"
+    )
+    panic_config = preset.to_config()
+    space = default_search_space(panic_config)
+    paths = [parameter.param_path for parameter in space]
+    assert paths == [
+        "allocator.params.target_annual_volatility",
+        "timing.0.params.rsi_period",
+        "timing.0.params.oversold_threshold",
+        "timing.0.params.overbought_threshold",
+        "timing.0.params.turbulence_veto_threshold",
+        "timing.0.params.reversion_strength",
+        "risk.0.params.trailing_stop_pct",
+    ]
+    assert not any(
+        ("tsmom" in path) or ("kama" in path) or ("carry_filter" in path) for path in paths
+    )
+    assert not any("llm_risk" in path or "translator" in path for path in paths)
+    assert len(space) == 7
+
+
+def test_default_search_space_fallback_without_catalog(
+    config: StrategyConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(optimizer_module, "_catalog_search_context", lambda config: None)
+    space = default_search_space(config)
+    paths = [parameter.param_path for parameter in space]
+    assert paths == [
+        "allocator.params.target_annual_volatility",
+        "timing.0.params.lookback_fast",
+        "timing.0.params.lookback_slow",
+        "timing.1.params.window",
+        "timing.2.params.min_carry_bps",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +816,32 @@ def test_default_output_dir_uses_phase10_settings(
     )
     assert optimizer._output_dir == expected
     assert optimizer._output_dir.name == "optimizations"
+
+
+def test_optuna_backend_when_installed(
+    config: StrategyConfig,
+    tmp_path: Path,
+) -> None:
+    optuna_module = optimizer_module._load_optuna_module()
+    if optuna_module is None:
+        pytest.skip("optuna is not installed in this environment")
+    spy = _SpyRunner()
+    space = default_search_space(config)
+    optimizer = WalkForwardOptimizer(
+        config,
+        request=_request(config, space, n_trials=2),
+        backtest_runner=spy,
+        output_dir=tmp_path,
+        use_optuna=True,
+    )
+    result = optimizer.optimize()
+    assert result.backend.value == "optuna"
+    assert len(spy.calls) == 2
+    assert result.completed_trials == 2
+    assert result.failed_trials == 0
+    for trial in result.trials:
+        assert trial.state is TrialState.COMPLETE
+        assert "timing.0.params.lookback_fast" in trial.params
 
 
 def test_same_seed_is_reproducible(

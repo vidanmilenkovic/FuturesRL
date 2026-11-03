@@ -30,6 +30,7 @@ CLI
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import json
 import math
@@ -39,6 +40,7 @@ import tempfile
 import time
 import warnings
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -313,10 +315,17 @@ def _descend(cursor: Any, part: str, param_path: str) -> Any:
     raise ValueError(f"unknown parameter path {param_path!r}: {part!r} is not a container")
 
 
-def _set_leaf(cursor: Any, part: str, value: ParamValue, param_path: str) -> None:
+def _set_leaf(
+    cursor: Any,
+    part: str,
+    value: ParamValue,
+    param_path: str,
+    *,
+    allow_new: bool,
+) -> None:
     if not isinstance(cursor, dict):
         raise ValueError(f"unknown parameter path {param_path!r}: {part!r} is not a mapping")
-    if part not in cursor:
+    if part not in cursor and not allow_new:
         raise ValueError(f"unknown parameter path {param_path!r}: missing {part!r}")
     cursor[part] = value
 
@@ -328,24 +337,37 @@ def _get_dotted(payload: Mapping[str, Any], param_path: str) -> Any:
     return cursor
 
 
-def _set_dotted(payload: dict[str, Any], param_path: str, value: ParamValue) -> None:
+def _set_dotted(
+    payload: dict[str, Any],
+    param_path: str,
+    value: ParamValue,
+    *,
+    allow_new: bool = False,
+) -> None:
     parts = _split_param_path(param_path)
     cursor: Any = payload
     for part in parts[:-1]:
         cursor = _descend(cursor, part, param_path)
-    _set_leaf(cursor, parts[-1], value, param_path)
+    _set_leaf(cursor, parts[-1], value, param_path, allow_new=allow_new)
 
 
-def apply_parameters(config: StrategyConfig, params: Mapping[str, ParamValue]) -> StrategyConfig:
+def apply_parameters(
+    config: StrategyConfig,
+    params: Mapping[str, ParamValue],
+    *,
+    allow_new_params: bool = False,
+) -> StrategyConfig:
     """Apply sampled parameters to a copy of ``config`` by dotted path.
 
     The modified payload is re-validated through :class:`StrategyConfig`, so an
     invalid combination raises ``ValueError`` instead of producing a broken
-    strategy.
+    strategy. ``allow_new_params`` permits catalogued stage parameters that the
+    base config omits (e.g. ``risk.quant_risk.trailing_stop_pct``): the optimizer
+    uses it for catalog-validated defaults, while the public default stays strict.
     """
     raw: dict[str, Any] = config.model_dump(mode="python")
     for param_path, value in params.items():
-        _set_dotted(raw, param_path, value)
+        _set_dotted(raw, param_path, value, allow_new=allow_new_params)
     try:
         return StrategyConfig.model_validate(raw)
     except ValidationError as exc:
@@ -354,22 +376,352 @@ def apply_parameters(config: StrategyConfig, params: Mapping[str, ParamValue]) -
         ) from exc
 
 
-def _validate_search_space(config: StrategyConfig, search_space: Sequence[ParameterRange]) -> None:
-    """Fail fast when a search-space path does not exist or has the wrong type."""
-    raw = config.model_dump(mode="python")
-    for parameter in search_space:
-        existing = _get_dotted(raw, parameter.param_path)
-        if parameter.type == "categorical":
-            if isinstance(existing, (dict, list)) or existing is None:
-                raise ValueError(
-                    f"categorical parameter {parameter.param_path!r} does not address a "
-                    "scalar config value"
-                )
-        elif isinstance(existing, bool) or not isinstance(existing, (int, float)):
-            raise ValueError(
-                f"numeric parameter {parameter.param_path!r} does not address a "
-                f"numeric config value (found {type(existing).__name__})"
+#: Curated *active-core* catalog keys used for the default optimizer search space.
+#: This is the Studio's "high-signal hypothesis" set: the active allocator's
+#: volatility target plus the active timing overlays' core signal parameters and
+#: the quant-risk trailing stop. Structural/hygiene params, inactive overlays,
+#: arbitrary risk caps and translator plumbing are deliberately excluded.
+CORE_OPTIMIZER_KEYS: tuple[str, ...] = (
+    "allocator.volatility_target.target_annual_volatility",
+    "allocator.risk_parity.target_annual_volatility",
+    "timing.tsmom.lookback_fast",
+    "timing.tsmom.lookback_slow",
+    "timing.kama.window",
+    "timing.carry_filter.min_carry_bps",
+    "timing.mean_reversion.rsi_period",
+    "timing.mean_reversion.oversold_threshold",
+    "timing.mean_reversion.overbought_threshold",
+    "timing.mean_reversion.turbulence_veto_threshold",
+    "timing.mean_reversion.reversion_strength",
+    "risk.quant_risk.trailing_stop_pct",
+)
+
+#: Defensive blocklist of structural/data-hygiene leaf params (also marked
+#: ``optuna_tunable=False`` by the strategy catalog; duplicated here so the
+#: optimizer still filters them when the catalog module is unavailable).
+_UNIVERSE_HYGIENE_PARAMS: frozenset[str] = frozenset(
+    {"min_avg_dollar_volume", "min_open_interest", "min_history_days", "top_n"}
+)
+_LLM_STRUCTURAL_PARAMS: frozenset[str] = frozenset(
+    {
+        "sample_count",
+        "cache_ttl_seconds",
+        "macro_lockout_minutes_before",
+        "macro_lockout_minutes_after",
+        "macro_lockout_action",
+        "macro_lockout_leverage_cap",
+        "semantic_variance_max",
+    }
+)
+
+_MISSING: object = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _CatalogSearchContext:
+    """Active catalog bindings for one strategy config.
+
+    Built from strategy-eng's catalog helpers when ``src.strategies`` is
+    importable; the optimizer degrades gracefully to its built-in curated bounds
+    when it is not.
+    """
+
+    key_to_path: Mapping[str, str]
+    numeric_ranges: Mapping[str, ParameterRange]
+    active_tunable_paths: frozenset[str]
+    injectable_paths: frozenset[str]
+    default_selected_keys: tuple[str, ...]
+
+
+def _path_value(strategy: Mapping[str, Any], param_path: str) -> Any:
+    """Value at a dotted path, or the ``_MISSING`` sentinel when absent."""
+    try:
+        return _get_dotted(strategy, param_path)
+    except ValueError:
+        return _MISSING
+
+
+def _is_structural_parameter(param_path: str) -> bool:
+    """Whether a dotted path addresses a structural/data-hygiene parameter."""
+    parts = param_path.split(".")
+    leaf = parts[-1].lower() if parts else ""
+    if leaf in _LLM_STRUCTURAL_PARAMS:
+        return True
+    return bool(parts and parts[0] == "universe" and leaf in _UNIVERSE_HYGIENE_PARAMS)
+
+
+def _normalise_param_path(strategy: Mapping[str, Any], param_path: str) -> str:
+    """Normalise ``stage.stage_name.param`` catalog keys to dotted config paths."""
+    cleaned = param_path.strip()
+    parts = cleaned.split(".")
+    if len(parts) < 3:
+        return cleaned
+    stage = parts[0]
+    if stage in {"universe", "allocator"}:
+        block = strategy.get(stage)
+        if isinstance(block, Mapping):
+            name = str(block.get("name", "")).strip().lower()
+            if parts[1].strip().lower() == name and parts[2] != "params":
+                return ".".join([stage, "params", *parts[2:]])
+        return cleaned
+    if stage in {"timing", "risk"}:
+        entries = strategy.get(stage)
+        if not isinstance(entries, (list, tuple)) or parts[1].isdigit():
+            return cleaned
+        wanted = parts[1].strip().lower()
+        for index, entry in enumerate(entries):
+            if isinstance(entry, Mapping) and str(entry.get("name", "")).strip().lower() == wanted:
+                tail = parts[2:]
+                if tail and tail[0] == "params":
+                    tail = tail[1:]
+                return ".".join([stage, str(index), "params", *tail])
+    return cleaned
+
+
+def _catalog_search_context(config: StrategyConfig) -> _CatalogSearchContext | None:
+    """Active/tunable catalog bindings for ``config`` (``None`` when unavailable)."""
+    try:
+        catalog_module: Any = importlib.import_module("src.strategies.parameter_catalog")
+    except ImportError:  # pragma: no cover - graceful fallback path
+        return None
+    strategy = config.model_dump(mode="python")
+    try:
+        catalog = catalog_module.parameter_catalog()
+        resolver = getattr(catalog_module, "resolve_param_path", None)
+        parameters_fn = getattr(catalog_module, "parameters_for_strategy", None)
+        if callable(parameters_fn):
+            active_specs: Sequence[Any] = tuple(parameters_fn(strategy))
+        else:  # pragma: no cover - compatibility with older catalog revisions
+            active_keys = set(catalog_module.parameter_keys_for_strategy(strategy))
+            active_specs = tuple(spec for spec in catalog.parameters if spec.key in active_keys)
+        defaults_fn = getattr(catalog_module, "default_selected_parameter_keys", None)
+        if callable(defaults_fn):
+            default_selected = tuple(str(key) for key in defaults_fn(strategy))
+        else:  # pragma: no cover - compatibility with older catalog revisions
+            default_selected = tuple(
+                str(spec.key)
+                for spec in active_specs
+                if bool(getattr(spec, "optuna_default_selected", False))
             )
+    except Exception:  # pragma: no cover - defensive: catalog must never block tuning
+        return None
+    if not callable(resolver):
+        return None
+    key_to_path: dict[str, str] = {}
+    numeric_ranges: dict[str, ParameterRange] = {}
+    active_tunable_paths: set[str] = set()
+    injectable_paths: set[str] = set()
+    for spec in active_specs:
+        if not bool(getattr(spec, "optuna_tunable", False)):
+            continue
+        key = str(getattr(spec, "key", ""))
+        if not key:
+            continue
+        spec_type = getattr(getattr(spec, "type", None), "value", None)
+        if spec_type not in {"int", "float", "bool", "select"}:
+            continue
+        try:
+            path = resolver(strategy, key)
+        except (KeyError, ValueError):
+            continue
+        path = _normalise_param_path(strategy, str(path))
+        if _is_structural_parameter(path):
+            continue
+        missing = _path_value(strategy, path) is _MISSING
+        if missing:
+            # A catalogued stage parameter that the base config omits can still
+            # be tuned: applying it adds the key to the stage's ``params`` dict.
+            parent_path = ".".join(path.split(".")[:-1])
+            try:
+                parent = _get_dotted(strategy, parent_path)
+            except ValueError:
+                continue
+            if not isinstance(parent, Mapping) or ".params." not in f".{path}.":
+                continue
+            injectable_paths.add(path)
+        key_to_path[key] = path
+        active_tunable_paths.add(path)
+        if spec_type not in {"int", "float"}:
+            continue
+        minimum = getattr(spec, "min", None)
+        maximum = getattr(spec, "max", None)
+        step = getattr(spec, "step", None)
+        if minimum is None or maximum is None:
+            continue
+        try:
+            low = float(minimum)
+            high = float(maximum)
+            step_value = float(step) if step is not None else None
+        except (TypeError, ValueError):  # pragma: no cover - defensive catalog data
+            continue
+        if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+            continue
+        range_type: Literal["int", "float"] = "int" if spec_type == "int" else "float"
+        if range_type == "int" and step_value is None:
+            step_value = 1.0
+        numeric_ranges[path] = ParameterRange(
+            param_path=path,
+            type=range_type,
+            low=low,
+            high=high,
+            step=step_value,
+        )
+    return _CatalogSearchContext(
+        key_to_path=key_to_path,
+        numeric_ranges=numeric_ranges,
+        active_tunable_paths=frozenset(active_tunable_paths),
+        injectable_paths=frozenset(injectable_paths),
+        default_selected_keys=default_selected,
+    )
+
+
+def _fallback_default_ranges(config: StrategyConfig) -> list[ParameterRange]:
+    """Built-in curated default ranges used when the strategy catalog is unavailable."""
+    strategy = config.model_dump(mode="python")
+    ranges: list[ParameterRange] = []
+    allocator = strategy.get("allocator")
+    if isinstance(allocator, Mapping):
+        name = str(allocator.get("name", "")).strip().lower()
+        params = allocator.get("params")
+        if (
+            name in {"volatility_target", "risk_parity"}
+            and isinstance(params, Mapping)
+            and "target_annual_volatility" in params
+        ):
+            ranges.append(
+                ParameterRange(
+                    param_path="allocator.params.target_annual_volatility",
+                    type="float",
+                    low=0.01,
+                    high=0.6,
+                    step=0.01,
+                )
+            )
+    overlay_bounds: Mapping[str, tuple[tuple[str, str, float, float, float], ...]] = {
+        "tsmom": (
+            ("lookback_fast", "int", 2.0, 126.0, 1.0),
+            ("lookback_slow", "int", 21.0, 504.0, 1.0),
+        ),
+        "kama": (("window", "int", 2.0, 50.0, 1.0),),
+        "carry_filter": (("min_carry_bps", "float", -2000.0, 2000.0, 10.0),),
+        "mean_reversion": (
+            ("rsi_period", "int", 2.0, 50.0, 1.0),
+            ("oversold_threshold", "float", 1.0, 49.0, 1.0),
+            ("overbought_threshold", "float", 51.0, 99.0, 1.0),
+            ("turbulence_veto_threshold", "float", 0.05, 10.0, 0.05),
+            ("reversion_strength", "float", 0.0, 1.0, 0.05),
+        ),
+    }
+    timing = strategy.get("timing")
+    if isinstance(timing, (list, tuple)):
+        for index, entry in enumerate(timing):
+            if not isinstance(entry, Mapping):
+                continue
+            name = str(entry.get("name", "")).strip().lower()
+            params = entry.get("params")
+            if not isinstance(params, Mapping):
+                continue
+            for param_name, type_name, low, high, step in overlay_bounds.get(name, ()):
+                if param_name not in params:
+                    continue
+                range_type: Literal["int", "float"] = "int" if type_name == "int" else "float"
+                ranges.append(
+                    ParameterRange(
+                        param_path=f"timing.{index}.params.{param_name}",
+                        type=range_type,
+                        low=low,
+                        high=high,
+                        step=step,
+                    )
+                )
+    risk = strategy.get("risk")
+    if isinstance(risk, (list, tuple)):
+        for index, entry in enumerate(risk):
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("name", "")).strip().lower() != "quant_risk":
+                continue
+            params = entry.get("params")
+            if isinstance(params, Mapping) and "trailing_stop_pct" in params:
+                ranges.append(
+                    ParameterRange(
+                        param_path=f"risk.{index}.params.trailing_stop_pct",
+                        type="float",
+                        low=0.01,
+                        high=0.9,
+                        step=0.01,
+                    )
+                )
+    return ranges
+
+
+def _generic_active_ranges(context: _CatalogSearchContext) -> list[ParameterRange]:
+    """Generic active numeric fallback (allocator/timing first, capped at six)."""
+    preferred = [
+        parameter
+        for path, parameter in context.numeric_ranges.items()
+        if path.startswith(("allocator.", "timing."))
+    ]
+    remaining = [
+        parameter
+        for path, parameter in context.numeric_ranges.items()
+        if not path.startswith(("allocator.", "timing."))
+    ]
+    return (preferred + remaining)[:6]
+
+
+def filter_search_space_for_config(
+    search_space: Sequence[ParameterRange],
+    config: StrategyConfig,
+) -> tuple[ParameterRange, ...]:
+    """Drop inactive, non-tunable and structural parameters from an explicit space.
+
+    Used by :class:`WalkForwardOptimizer` for UI-supplied search spaces so a stale
+    Studio selection can never evaluate parameters whose stage/overlay is not
+    active in the base strategy. Paths are normalised from catalog-key form
+    (``timing.tsmom.lookback_fast``) to the concrete config form, order is kept
+    and duplicates are removed. Raises an actionable ``ValueError`` when nothing
+    tunable remains.
+    """
+    if not search_space:
+        raise ValueError(
+            "optimizer search space is empty; select at least one active tunable parameter"
+        )
+    strategy = config.model_dump(mode="python")
+    context = _catalog_search_context(config)
+    active_paths = context.active_tunable_paths if context is not None else None
+    filtered: list[ParameterRange] = []
+    seen: set[str] = set()
+    dropped: list[str] = []
+    for parameter in search_space:
+        path = _normalise_param_path(strategy, parameter.param_path)
+        if path in seen:
+            continue
+        existing = _path_value(strategy, path)
+        injectable = context is not None and path in context.injectable_paths
+        keep = (existing is not _MISSING or injectable) and not _is_structural_parameter(path)
+        if keep and active_paths is not None:
+            keep = path in active_paths
+        if keep and not injectable:
+            if parameter.type == "categorical":
+                keep = not isinstance(existing, (dict, list, tuple)) and existing is not None
+            else:
+                keep = isinstance(existing, (int, float)) and not isinstance(existing, bool)
+        if not keep:
+            dropped.append(parameter.param_path)
+            continue
+        seen.add(path)
+        filtered.append(parameter.model_copy(update={"param_path": path}))
+    if not filtered:
+        hint = ""
+        if active_paths:
+            preview = sorted(active_paths)[:8]
+            hint = f" Active tunable paths include: {preview}."
+        raise ValueError(
+            f"optimizer search space has no active tunable parameters for strategy "
+            f"{config.id!r}; dropped inactive/non-tunable paths {sorted(set(dropped))}.{hint}"
+        )
+    return tuple(filtered)
 
 
 # ---------------------------------------------------------------------------
@@ -620,76 +972,115 @@ def load_optimization(
 # ---------------------------------------------------------------------------
 
 
-def default_search_space(config: StrategyConfig) -> tuple[ParameterRange, ...]:
-    """Derive a sensible, config-valid search space for the Studio/CLI optimizer."""
-    ranges: list[ParameterRange] = []
+#: Curated default bounds for the active-core parameters: the catalog bounds are
+#: clipped to classic signal horizons so a fresh Studio/CLI study is useful on
+#: the deterministic offline window instead of sampling lookbacks longer than the
+#: available history. Explicit UI search spaces keep the user's own bounds.
+_CURATED_DEFAULT_BOUNDS: Mapping[str, tuple[float | None, float | None]] = {
+    "target_annual_volatility": (0.05, 0.30),
+    "lookback_fast": (None, 63.0),
+    "lookback_slow": (64.0, 252.0),
+    "window": (5.0, 30.0),
+    "min_carry_bps": (-200.0, 200.0),
+    "trailing_stop_pct": (0.03, 0.30),
+}
 
-    def add_allocator(name: str, low: float, high: float, step: float) -> None:
-        if name in config.allocator.params:
-            ranges.append(
-                ParameterRange(
-                    param_path=f"allocator.params.{name}",
-                    type="float",
-                    low=low,
-                    high=high,
-                    step=step,
-                )
-            )
 
-    add_allocator("target_annual_volatility", 0.05, 0.25, 0.01)
-    timing_ranges: dict[str, tuple[int, int, int]] = {
-        "lookback_fast": (10, 40, 5),
-        "lookback_slow": (60, 200, 20),
-        "vol_lookback": (10, 60, 5),
-        "window": (5, 30, 5),
-        "fast_period": (2, 10, 1),
-        "slow_period": (15, 60, 5),
-    }
-    if config.timing:
-        first_timing = config.timing[0]
-        for name, (low, high, step) in timing_ranges.items():
-            if name in first_timing.params:
-                ranges.append(
-                    ParameterRange(
-                        param_path=f"timing.0.params.{name}",
-                        type="int",
-                        low=low,
-                        high=high,
-                        step=step,
-                    )
-                )
-    float_risk_ranges: dict[str, tuple[float, float, float]] = {
-        "max_single_instrument_weight": (0.10, 0.50, 0.05),
-        "max_sector_weight": (0.20, 0.60, 0.05),
-        "vol_target": (0.05, 0.25, 0.01),
-    }
-    for index, stage in enumerate(config.risk):
-        for name, (low_f, high_f, step_f) in float_risk_ranges.items():
-            if name in stage.params:
-                ranges.append(
-                    ParameterRange(
-                        param_path=f"risk.{index}.params.{name}",
-                        type="float",
-                        low=low_f,
-                        high=high_f,
-                        step=step_f,
-                    )
-                )
-    ranges.append(
-        ParameterRange(
-            param_path="translator.max_margin_utilization",
-            type="float",
-            low=0.40,
-            high=0.80,
-            step=0.05,
+def _apply_curated_default_bounds(ranges: list[ParameterRange]) -> list[ParameterRange]:
+    """Clip catalog bounds of curated defaults to sensible signal horizons."""
+    clipped: list[ParameterRange] = []
+    for parameter in ranges:
+        leaf = parameter.param_path.split(".")[-1]
+        lower_cap, upper_cap = _CURATED_DEFAULT_BOUNDS.get(leaf, (None, None))
+        if lower_cap is None and upper_cap is None:
+            clipped.append(parameter)
+            continue
+        low, high = parameter.numeric_bounds()
+        new_low = max(low, lower_cap) if lower_cap is not None else low
+        new_high = min(high, upper_cap) if upper_cap is not None else high
+        if new_low >= new_high:
+            clipped.append(parameter)
+            continue
+        clipped.append(
+            parameter.model_copy(update={"low": float(new_low), "high": float(new_high)})
         )
+    return clipped
+
+
+def _constrain_default_ranges(ranges: list[ParameterRange]) -> list[ParameterRange]:
+    """Apply cross-parameter constraints to the curated default ranges.
+
+    The catalog exposes independent TSMOM fast/slow lookback bounds; sampling them
+    independently frequently produces ``lookback_fast >= lookback_slow`` (an
+    invalid TSMOM definition). Partition the two ranges at a deterministic boundary
+    so the default space only ever samples valid fast/slow pairs.
+    """
+    by_path = {parameter.param_path: parameter for parameter in ranges}
+    fast = by_path.get("timing.0.params.lookback_fast")
+    slow = by_path.get("timing.0.params.lookback_slow")
+    if fast is None or slow is None or fast.low is None or fast.high is None:
+        return ranges
+    if slow.low is None or slow.high is None:
+        return ranges
+    boundary = max(
+        int(fast.low),
+        min(int(fast.high), int((float(fast.high) + float(slow.low)) / 2)),
     )
+    slow_low = max(int(slow.low), boundary + 1)
+    if boundary < int(fast.low) or slow_low >= int(slow.high):
+        return ranges
+    constrained: list[ParameterRange] = []
+    for parameter in ranges:
+        if parameter.param_path == fast.param_path:
+            constrained.append(parameter.model_copy(update={"high": float(boundary)}))
+        elif parameter.param_path == slow.param_path:
+            constrained.append(parameter.model_copy(update={"low": float(slow_low)}))
+        else:
+            constrained.append(parameter)
+    return constrained
+
+
+def default_search_space(config: StrategyConfig) -> tuple[ParameterRange, ...]:
+    """Derive the curated, ACTIVE-ONLY default search space for the optimizer.
+
+    Only high-signal parameters of the strategy's *active* stages are included:
+    the active allocator's volatility target, the active timing overlays' core
+    signal parameters (TSMOM fast/slow, KAMA window, carry threshold,
+    mean-reversion thresholds) and the quant-risk trailing stop. Structural/data
+    hygiene parameters, inactive overlays, arbitrary risk caps and translator
+    plumbing are deliberately excluded; the returned space is passed through
+    :func:`filter_search_space_for_config` so it can never contain a parameter
+    that is absent from the config.
+
+    Bounds come from strategy-eng's parameter catalog when it is importable, with
+    a built-in curated fallback otherwise.
+    """
+    context = _catalog_search_context(config)
+    ranges: list[ParameterRange] = []
+    if context is not None:
+        for key in CORE_OPTIMIZER_KEYS:
+            path = context.key_to_path.get(key)
+            parameter = context.numeric_ranges.get(path) if path is not None else None
+            if parameter is not None and parameter not in ranges:
+                ranges.append(parameter)
+        if not ranges:
+            for key in context.default_selected_keys:
+                path = context.key_to_path.get(key)
+                parameter = context.numeric_ranges.get(path) if path is not None else None
+                if parameter is not None and parameter not in ranges:
+                    ranges.append(parameter)
+        if not ranges:
+            ranges = _generic_active_ranges(context)
+    else:
+        ranges = _fallback_default_ranges(config)
     if not ranges:
         raise ValueError(
-            f"cannot derive a default search space for strategy {config.id!r}: "
-            "declare explicit ParameterRange entries"
+            f"cannot derive an active default search space for strategy {config.id!r}: "
+            "no curated/active numeric tunables were found; declare explicit "
+            "ParameterRange entries"
         )
-    return tuple(ranges)
+    curated = _apply_curated_default_bounds(ranges)
+    return filter_search_space_for_config(tuple(_constrain_default_ranges(curated)), config)
 
 
 # ---------------------------------------------------------------------------
@@ -774,7 +1165,7 @@ class WalkForwardOptimizer:
                 f"request base_strategy_id {request.base_strategy_id!r} does not match "
                 f"config id {config.id!r}"
             )
-        _validate_search_space(config, request.search_space)
+        filtered_search_space = filter_search_space_for_config(request.search_space, config)
         optuna_module = _load_optuna_module()
         if use_optuna is True and optuna_module is None:
             raise RuntimeError(
@@ -783,7 +1174,7 @@ class WalkForwardOptimizer:
             )
         resolved_use_optuna = (optuna_module is not None) if use_optuna is None else use_optuna
         self._config = config
-        self._request = request
+        self._request = request.model_copy(update={"search_space": filtered_search_space})
         self._instrument_master = (
             instrument_master if instrument_master is not None else load_instruments()
         )
@@ -856,6 +1247,15 @@ class WalkForwardOptimizer:
             self._backtest_runner = previous_runner
 
     def _optimize_impl(self) -> OptimizationResult:
+        # Defensive re-filter: an explicit UI/WS search space may contain stale or
+        # inactive parameters; never evaluate those.
+        self._request = self._request.model_copy(
+            update={
+                "search_space": filter_search_space_for_config(
+                    self._request.search_space, self._config
+                )
+            }
+        )
         started = time.perf_counter()
         self._window_bars, self._window_states = self._prepare_window()
         optuna_study: Any | None = None
@@ -870,7 +1270,7 @@ class WalkForwardOptimizer:
             )
             raise RuntimeError(f"all {len(trials)} optimization trials failed: {first_error}")
         best = max(completed, key=lambda trial: (trial.objective_value, -trial.trial_number))
-        best_config = apply_parameters(self._config, best.params)
+        best_config = apply_parameters(self._config, best.params, allow_new_params=True)
         importances = self._param_importances(trials, optuna_study)
         duration_ms = (time.perf_counter() - started) * 1000.0
         artifact_path = str(self._output_dir / f"{self._study_id}.json") if self._persist else None
@@ -931,6 +1331,12 @@ class WalkForwardOptimizer:
         optuna = self._optuna
         if optuna is None:  # pragma: no cover - constructor guarantees it
             raise RuntimeError("Optuna backend selected but optuna is not available")
+        # Optuna logs every trial at INFO to stderr by default; keep CLI runs
+        # quiet (zero-warning contract) while retaining genuine warnings/errors.
+        logging_module = getattr(optuna, "logging", None)
+        if logging_module is not None:
+            with contextlib.suppress(Exception):  # pragma: no cover - optuna API guard
+                logging_module.set_verbosity(logging_module.WARNING)
         sampler = optuna.samplers.TPESampler(seed=self._seed)
         study = optuna.create_study(
             direction="maximize", sampler=sampler, study_name=self._study_id
@@ -979,7 +1385,7 @@ class WalkForwardOptimizer:
     def _evaluate_params(self, params: Mapping[str, ParamValue], trial_number: int) -> TrialSummary:
         started = time.perf_counter()
         try:
-            trial_config = apply_parameters(self._config, params)
+            trial_config = apply_parameters(self._config, params, allow_new_params=True)
             metrics, fold_count = self._evaluate_config(trial_config)
         except Exception as exc:
             return TrialSummary(
