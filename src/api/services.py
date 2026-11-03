@@ -809,6 +809,9 @@ class IBKRExecutionService:
         self._liveness_task: asyncio.Task[None] | None = None
         self._ensure_task: asyncio.Task[bool] | None = None
         self._last_ensure_at: float | None = None
+        # One IBKR book refresh at a time: concurrent account-summary requests on
+        # the same client can wedge TWS after a reconnect.
+        self._refresh_lock = asyncio.Lock()
         self._probe_interval: float = max(
             self._MIN_PROBE_INTERVAL_SECONDS,
             float(settings.ibkr_heartbeat_interval_seconds),
@@ -1025,6 +1028,11 @@ class IBKRExecutionService:
 
     async def _refresh_book(self) -> bool:
         """Fetch the live book; cache it as last-known-good. Never raises."""
+        async with self._refresh_lock:
+            return await self._refresh_book_locked()
+
+    async def _refresh_book_locked(self) -> bool:
+        """Single-flight body of :meth:`_refresh_book`."""
         if not self._manager.is_connected:
             return False
         try:

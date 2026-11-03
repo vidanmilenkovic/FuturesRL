@@ -476,6 +476,19 @@ async def test_nightly_reset_window_custom_hours(
     assert not manager.in_nightly_reset_window()
 
 
+async def test_client_id_rotates_across_reconnects(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    """A wedged TWS client id must not prevent reconnection with a fresh id."""
+    manager = make_manager(settings, fake_client, clock)
+    await manager.connect()
+    first = manager.active_client_id
+    assert first == settings.ibkr_client_id
+    manager.invalidate("simulated wedge")
+    assert await manager.ensure_connected()
+    assert manager.active_client_id == settings.ibkr_client_id + 1
+
+
 async def test_connect_waits_for_nightly_reset_window(
     settings: Settings, fake_client: FakeIBClient
 ) -> None:
@@ -530,6 +543,24 @@ async def test_fetch_account_accepts_account_base_currency_rows(
     snapshot = await manager.fetch_account()
     assert snapshot.net_liquidation == pytest.approx(1_003_547.18)
     assert snapshot.cash_balance == pytest.approx(1_001_970.93)
+    assert snapshot.buying_power == pytest.approx(4_007_883.72)
+
+
+async def test_fetch_account_uses_ledger_currency_when_config_mismatches(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    """EUR-base IBKR accounts must work even if account_currency says USD."""
+    assert settings.account_currency.upper() == "USD"
+    fake_client.account_rows = [
+        VenueAccountValue("NetLiquidation", "1003691.28", "EUR"),
+        VenueAccountValue("TotalCashValue", "1001957.62", "EUR"),
+        VenueAccountValue("BuyingPower", "4007883.72", "EUR"),
+    ]
+    manager = make_manager(settings, fake_client, clock)
+    await manager.connect()
+    snapshot = await manager.fetch_account()
+    assert snapshot.net_liquidation == pytest.approx(1_003_691.28)
+    assert snapshot.cash_balance == pytest.approx(1_001_957.62)
     assert snapshot.buying_power == pytest.approx(4_007_883.72)
 
 
