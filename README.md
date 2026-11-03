@@ -386,6 +386,24 @@ both engines produce identical targets and deltas for identical market states.
   positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
   book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
+### v1.5.3 Optuna integrity & apply visibility
+
+- **Flat trials can no longer win.** Walk-forward optimizer trials now record `n_trades` and
+  `avg_gross_exposure`; trials with <3 OOS trades or <1% average exposure are marked
+  `zero_activity` with a hard `-10.0` objective penalty and are never selected as best. The
+  optimizer also generates 750+ offline bars (default TSMOM window is ~1,265–1,514 bars) so a
+  `lookback_slow` up to 252 days and KAMA/carry overlays are warmed across the train→test boundary.
+- **Carry tuning defaults are sane.** `carry_filter.min_carry_bps` now defaults to **-50 bps**
+  (bounds −200..+50) and is no longer pre-selected; the curated Optuna defaults are the five core
+  sizing/trend/risk parameters.
+- **Apply is visible everywhere.** `POST /api/optimize/{id}/apply` writes the tuned YAML to
+  `configs/strategies/<id>.yaml` in development/paper/live, reloads the in-memory strategy catalog,
+  automatically persists a verification walk-forward run, and returns
+  `saved_strategy_id` / `strategy_path` / `backtest_run_id`. The Studio shows a target-ID modal,
+  “Saving & Running Backtest...” spinner and an emerald confirmation banner with
+  **View in Backtest Lab** / **Open in Manual Builder** links; the new strategy appears immediately
+  in both views without a restart.
+
 ### v1.5.2 state-sync hardening
 
 - **WS/REST parity for IBKR.** The telemetry broadcaster now emits `pnl`/`margin`/`positions`

@@ -428,6 +428,19 @@ The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
    history with a best-so-far frontier, parameter importances, a sortable trial table with the winner
    highlighted, and **Apply Best Parameters**, which saves `<id>_opt.yaml` and (optionally) runs a
    verification backtest.
+   The optimizer rejects **flat/zero-activity trials**: any trial with fewer than 3 OOS trades or
+   under 1% average gross exposure is flagged `flat` and receives a hard −10 objective penalty, so a
+   0-trade portfolio can never beat an actively traded strategy. The offline window is extended to
+   750+ bars (≈1,265 for the default TSMOM request) so long lookbacks are warmed across folds.
+   `carry_filter.min_carry_bps` defaults to −50 bps (bounds −200..+50) and is tunable but not
+   pre-selected; the five curated defaults are TSMOM fast/slow, KAMA window, volatility-target target
+   vol and quant-risk trailing stop.
+   **Apply Best Parameters** opens a target-ID modal (default `<base>_opt`), shows a
+   “Saving & Running Backtest...” spinner, then an emerald banner with **View in Backtest Lab** and
+   **Open in Manual Builder** links. The tuned YAML is saved to `configs/strategies/<id>.yaml` in
+   development/paper/live, the strategy catalog reloads immediately, and a verification walk-forward
+   run is persisted and visible in Backtest Lab without restarting the API.
+
 3. **DRL Neural Trainer** — choose PPO/CPPO/SAC/TD3/A2C, universe/strategy, timesteps, learning rate,
    γ, LLM semantic-risk penalty λ and a checkpoint name; **Train Neural Agent** calls
    `POST /api/drl/train` (offline deterministic; synchronous, bounded to 20k timesteps). The registry

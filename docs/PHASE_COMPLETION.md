@@ -573,3 +573,40 @@ Command Center/Optuna verified against the real endpoints.
 (16 tests) and updated v1.5.1 acceptance suite (24 tests) green; frontend `tsc`/`lint`/`build`
 clean; live API smoke + headless checks confirm flat IBKR REST and WS parity, distinct-day source
 switching, and legacy-study quarantine.
+
+
+---
+
+## v1.5.3 — Optuna integrity (no flat winner) and visible apply
+
+1. **Zero-trade/flat-trial protection.** `OptimizationRequest` gained `min_trades=3` and
+   `min_avg_gross_exposure=0.01`; `TrialSummary` records `n_trades`, `avg_gross_exposure` and
+   `zero_activity`. Trials below either threshold stay COMPLETE but receive objective `-10.0` and
+   are excluded from best-trial selection; an all-flat study persists with no best trial
+   (`best_trial_number=None`, empty params) instead of crowning a 0-trade run. Walk-forward offline
+   windows are extended to ≥750 bars (default TSMOM ~1,265–1,514) with full warm-up across the
+   train→test boundary.
+2. **Carry tuning hygiene.** `carry_filter.min_carry_bps` default −50 bps, bounds [−200, +50],
+   step 10 bps; removed from the curated `optuna_default_selected` set (now exactly five: TSMOM
+   fast/slow, KAMA window, volatility-target target vol, quant trailing stop), while remaining
+   tunable for explicit search spaces.
+3. **Apply/save visibility.** In development/paper/live, `POST /api/strategies` and optimizer apply
+   write `configs/strategies/<id>.yaml` (test/backtest keep artifact overlays); `GET /api/strategies`
+   merges both trees and the in-memory catalog is upserted immediately. Optimizer apply now always
+   triggers and persists a verification walk-forward backtest and additively returns
+   `saved_strategy_id`, `strategy_path`, `backtest_run_id`. The Studio adds a target-ID apply modal,
+   “Saving & Running Backtest...” disabled spinner state, emerald confirmation banner with Backtest
+   Lab/Manual Builder deep links, immediate strategy-list refresh, inline 409/422/404 handling, and
+   flat-study “No active trial” UI.
+4. **Injectable-default apply fix.** Real optimizer studies can tune catalog-default parameters that
+   the committed YAML omits (e.g. `risk.quant_risk.trailing_stop_pct`); `apply_dotted_params` now
+   supports `allow_new_params=True` for missing final leaves inside stage `params` blocks, so applying
+   a real TSMOM study no longer 422s while invalid paths still fail validation.
+
+**Verification** — hostile-env `./scripts/quality_gate.sh --cov`: **1733 passed, 0 failures,
+0 warnings**, coverage 94.24%, mypy strict 103 files; independent v1.5.3 verification (8 tests) plus
+focused 210-test regression batch green; real optimizer run over 1,514 bars/root produced active
+best trial (293 trades, 0.83 avg gross exposure) and forced-flat studies never selected a winner;
+apply visibility confirmed end-to-end (strategy + verification run immediately in API). Frontend
+`tsc`/`lint`/`build` clean; headless 1440/1920 apply modal/spinner/banner/list-refresh/5-default/
+flat-study checks pass with zero page errors.
