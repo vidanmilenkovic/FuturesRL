@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "futuresrl-x"
-version = "1.5.2"
+version = "1.5.3"
 description = "FuturesRL-X: modular, production-grade algorithmic futures trading platform (FinRL-X weight-centric pipeline, futures-native backtesting, IBKR paper/live execution)."
 readme = "README.md"
 requires-python = ">=3.12"
