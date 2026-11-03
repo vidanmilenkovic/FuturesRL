@@ -58,9 +58,11 @@ import math
 import re
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -93,6 +95,13 @@ DEFAULT_STRATEGY_PATH: Path = Path("configs/strategies/drl_ppo_llm_risk.yaml")
 DEFAULT_OUTPUT_DIR: Path = Path("artifacts/models")
 #: Number of synthetic daily bars generated per root for training.
 DEFAULT_PERIODS: int = 512
+#: Maximum number of offline training-data builds kept in the in-process LRU cache.
+#: Bounded so a long-running API cannot pin memory for many master/seed/period
+#: combinations (one cached 45-root frame is tens of MB).
+TRAINING_DATA_CACHE_MAXSIZE: int = 4
+#: Observation-feature configuration hashed into the cache key (future-proofing:
+#: changing the DRL feature set must invalidate cached training data).
+TRAINING_DATA_FEATURE_CONFIG: tuple[str, ...] = DEFAULT_OBSERVATION_FEATURES
 #: Default SB3 device (CPU keeps the tiny MLP policies deterministic and fast).
 DEFAULT_DEVICE: str = "cpu"
 #: Hard upper bound for a single training run (guards CLI/API from runaway jobs).
@@ -131,6 +140,125 @@ class TrainingData:
     def usable_rows(self) -> int:
         """Number of fully-featured rows handed to the environment."""
         return int(self.prices.shape[0])
+
+
+# ---------------------------------------------------------------------------
+# Bounded training-data cache (45-root offline builds are expensive)
+# ---------------------------------------------------------------------------
+
+type TrainingDataCacheKey = tuple[object, ...]
+
+#: LRU of immutable training-data snapshots, guarded by ``_TRAINING_DATA_CACHE_LOCK``.
+_TRAINING_DATA_CACHE: OrderedDict[TrainingDataCacheKey, TrainingData] = OrderedDict()
+_TRAINING_DATA_CACHE_LOCK = threading.Lock()
+_TRAINING_DATA_CACHE_HITS = 0
+_TRAINING_DATA_CACHE_MISSES = 0
+_TRAINING_DATA_CACHE_EVICTIONS = 0
+
+
+def _instrument_master_fingerprint(instruments: InstrumentsConfig) -> tuple[object, ...]:
+    """Hashable content fingerprint of the instrument master (roots + full specs).
+
+    Serialising every spec means any contract change (multiplier, tick size, margins,
+    roll rules, micro/standard routing, currency, root order, ...) produces a new
+    cache key, so a reloaded/expanded ``configs/instruments.yaml`` can never be
+    served stale cached training data (no cross-master contamination).
+    """
+    return (
+        instruments.version,
+        tuple(instruments.roots()),
+        tuple(instruments.sectors()),
+        tuple(spec.model_dump_json() for spec in instruments.instruments.values()),
+    )
+
+
+def _training_data_cache_key(
+    config: StrategyConfig,
+    instruments: InstrumentsConfig,
+    *,
+    seed: int,
+    periods: int,
+) -> TrainingDataCacheKey:
+    """Cache identity of one ``build_training_data`` call.
+
+    Includes every input that can change the returned matrices: the instrument
+    master content, ``seed``, ``periods``, the observation-feature configuration,
+    the universe selector (name + params) and the backtest initial equity used to
+    build the point-in-time state the selector ranks on.
+    """
+    initial_equity = config.backtest.initial_equity if config.backtest is not None else 1_000_000.0
+    return (
+        _instrument_master_fingerprint(instruments),
+        int(seed),
+        int(periods),
+        TRAINING_DATA_FEATURE_CONFIG,
+        config.universe.name.strip().lower(),
+        tuple(sorted(config.universe.params.items())),
+        float(initial_equity),
+    )
+
+
+def _copy_training_data(data: TrainingData) -> TrainingData:
+    """Return a caller-owned copy (writable arrays, immutable metadata tuples)."""
+    return replace(
+        data,
+        prices=np.array(data.prices, dtype=np.float64, copy=True),
+        features=np.array(data.features, dtype=np.float64, copy=True),
+    )
+
+
+def _freeze_training_data(data: TrainingData) -> TrainingData:
+    """Return a cached snapshot whose numpy arrays are read-only."""
+    prices = np.array(data.prices, dtype=np.float64, copy=True)
+    features = np.array(data.features, dtype=np.float64, copy=True)
+    prices.setflags(write=False)
+    features.setflags(write=False)
+    return replace(data, prices=prices, features=features)
+
+
+def _training_data_cache_lookup(key: TrainingDataCacheKey) -> TrainingData | None:
+    global _TRAINING_DATA_CACHE_MISSES, _TRAINING_DATA_CACHE_HITS
+    with _TRAINING_DATA_CACHE_LOCK:
+        cached = _TRAINING_DATA_CACHE.get(key)
+        if cached is None:
+            _TRAINING_DATA_CACHE_MISSES += 1
+            return None
+        _TRAINING_DATA_CACHE.move_to_end(key)
+        _TRAINING_DATA_CACHE_HITS += 1
+        return cached
+
+
+def _training_data_cache_store(key: TrainingDataCacheKey, data: TrainingData) -> None:
+    global _TRAINING_DATA_CACHE_EVICTIONS
+    frozen = _freeze_training_data(data)
+    with _TRAINING_DATA_CACHE_LOCK:
+        _TRAINING_DATA_CACHE[key] = frozen
+        _TRAINING_DATA_CACHE.move_to_end(key)
+        while len(_TRAINING_DATA_CACHE) > TRAINING_DATA_CACHE_MAXSIZE:
+            _TRAINING_DATA_CACHE.popitem(last=False)
+            _TRAINING_DATA_CACHE_EVICTIONS += 1
+
+
+def training_data_cache_info() -> dict[str, int]:
+    """Bounded-cache telemetry: ``size``/``maxsize``/``hits``/``misses``/``evictions``."""
+    with _TRAINING_DATA_CACHE_LOCK:
+        return {
+            "size": len(_TRAINING_DATA_CACHE),
+            "maxsize": TRAINING_DATA_CACHE_MAXSIZE,
+            "hits": _TRAINING_DATA_CACHE_HITS,
+            "misses": _TRAINING_DATA_CACHE_MISSES,
+            "evictions": _TRAINING_DATA_CACHE_EVICTIONS,
+        }
+
+
+def clear_training_data_cache() -> None:
+    """Drop every cached build and reset the hit/miss/eviction counters (tests/API)."""
+    global _TRAINING_DATA_CACHE_EVICTIONS, _TRAINING_DATA_CACHE_HITS, _TRAINING_DATA_CACHE_MISSES
+    with _TRAINING_DATA_CACHE_LOCK:
+        _TRAINING_DATA_CACHE.clear()
+        _TRAINING_DATA_CACHE_HITS = 0
+        _TRAINING_DATA_CACHE_MISSES = 0
+        _TRAINING_DATA_CACHE_EVICTIONS = 0
 
 
 # ---------------------------------------------------------------------------
@@ -686,9 +814,45 @@ def build_training_data(
     seed: int,
     periods: int = DEFAULT_PERIODS,
 ) -> TrainingData:
-    """Build deterministic offline price/feature matrices for the configured universe."""
+    """Build deterministic offline price/feature matrices for the configured universe.
+
+    The 45-root offline build is expensive (synthetic F1/F2 bars + the full
+    ``FeatureProcessor`` frame + universe selection), so results are cached in a
+    small bounded in-process LRU — one entry per (instrument-master content,
+    ``seed``, ``periods``, feature config, universe selector, initial equity) —
+    with :data:`TRAINING_DATA_CACHE_MAXSIZE` entries. Repeated calls with the same
+    inputs (API retries, multiple seeds sharing a build, tests) return the cached
+    matrices, while the cached snapshot keeps read-only numpy arrays and each call
+    receives its own writable defensive copy, so callers can never mutate cached
+    state. Use :func:`training_data_cache_info` for hit/miss telemetry and
+    :func:`clear_training_data_cache` to evict everything.
+    """
+    key = _training_data_cache_key(config, instruments, seed=seed, periods=periods)
+    cached = _training_data_cache_lookup(key)
+    if cached is not None:
+        return _copy_training_data(cached)
+    data = _build_training_data_uncached(config, instruments, seed=seed, periods=periods)
+    _training_data_cache_store(key, data)
+    return _copy_training_data(data)
+
+
+def _build_training_data_uncached(
+    config: StrategyConfig,
+    instruments: InstrumentsConfig,
+    *,
+    seed: int,
+    periods: int = DEFAULT_PERIODS,
+) -> TrainingData:
+    """Uncached implementation behind :func:`build_training_data`."""
     initial_equity = config.backtest.initial_equity if config.backtest is not None else 1_000_000.0
-    source = OfflineBarSource(seed=seed, periods=periods, instrument_master=instruments)
+    # Training must see the expanded instrument master, not the legacy 5-root
+    # synthetic default: pass the configured universe roots explicitly.
+    source = OfflineBarSource(
+        roots=tuple(instruments.roots()),
+        seed=seed,
+        periods=periods,
+        instrument_master=instruments,
+    )
     generated_roots = tuple(source.roots)
     bars = source.load(
         generated_roots,

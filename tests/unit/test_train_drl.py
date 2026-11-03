@@ -8,6 +8,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -624,3 +625,259 @@ def test_cli_help_lists_new_training_options() -> None:
         "--reward-curve-windows",
     ):
         assert option in completed.stdout
+
+
+# ---------------------------------------------------------------------------
+# Phase-StudioUX: bounded offline training-data cache (45-root runtime control)
+# ---------------------------------------------------------------------------
+
+
+def _fake_uncached_builder(
+    calls: list[tuple[int, int, tuple[str, ...]]],
+) -> Any:
+    """Cheap stand-in for the expensive 45-root offline build (records calls)."""
+
+    def fake(
+        config: object,
+        instruments: object,
+        *,
+        seed: int,
+        periods: int = trainer.DEFAULT_PERIODS,
+    ) -> trainer.TrainingData:
+        assert config is not None
+        roots = tuple(instruments.roots())
+        calls.append((seed, periods, roots))
+        rows = 4
+        prices = np.full((rows, len(roots)), 1_000.0 + seed + periods, dtype=np.float64)
+        features = np.full(
+            (rows, len(roots), len(DEFAULT_OBSERVATION_FEATURES)),
+            float(periods),
+            dtype=np.float64,
+        )
+        start = datetime(2024, 1, 2, tzinfo=UTC)
+        timestamps = tuple(start + timedelta(days=index) for index in range(rows))
+        return trainer.TrainingData(
+            prices=prices,
+            features=features,
+            timestamps=timestamps,
+            instrument_ids=roots,
+            feature_names=DEFAULT_OBSERVATION_FEATURES,
+            feature_fallbacks=(),
+            multipliers=tuple(1.0 for _ in roots),
+            initial_margins=tuple(0.0 for _ in roots),
+            maintenance_margins=tuple(0.0 for _ in roots),
+            tick_sizes=tuple(0.01 for _ in roots),
+            periods=periods,
+        )
+
+    return fake
+
+
+def _custom_cache_master(root: str = "ZC9") -> object:
+    """A one-root instrument master that must not share cache entries with the real one."""
+    from configs.instruments import load_instruments, parse_instruments_config
+
+    master = load_instruments(REPO_ROOT / "configs" / "instruments.yaml")
+    entry = master.get("ES").model_dump(mode="json")
+    entry.pop("micro_root", None)
+    entry.pop("standard_root", None)
+    entry.update(
+        {
+            "root": root,
+            "name": "Corn (cache isolation test)",
+            "asset_class": "agriculture",
+            "sector": "agri",
+            "exchange": "CBOT",
+            "databento_symbol": f"{root}.FUT",
+            "ibkr_exchange": "CBOT",
+        }
+    )
+    return parse_instruments_config(
+        {
+            "version": master.version,
+            "defaults": master.defaults.model_dump(mode="json"),
+            "instruments": {root: entry},
+        }
+    )
+
+
+def test_training_data_cache_hits_and_returns_defensive_copies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from configs.instruments import load_instruments
+    from configs.strategy import load_strategy_config
+
+    trainer.clear_training_data_cache()
+    calls: list[tuple[int, int, tuple[str, ...]]] = []
+    monkeypatch.setattr(trainer, "_build_training_data_uncached", _fake_uncached_builder(calls))
+    config = load_strategy_config(STRATEGY_PATH)
+    master = load_instruments(REPO_ROOT / "configs" / "instruments.yaml")
+
+    first = trainer.build_training_data(config, master, seed=7, periods=64)
+    second = trainer.build_training_data(config, master, seed=7, periods=64)
+    assert len(calls) == 1  # second call was a cache hit (no rebuild)
+    info = trainer.training_data_cache_info()
+    assert info == {
+        "size": 1,
+        "maxsize": trainer.TRAINING_DATA_CACHE_MAXSIZE,
+        "hits": 1,
+        "misses": 1,
+        "evictions": 0,
+    }
+    # Same outputs, but caller-owned writable arrays (defensive copies).
+    assert np.array_equal(first.prices, second.prices)
+    assert np.array_equal(first.features, second.features)
+    assert first.instrument_ids == second.instrument_ids
+    assert first.feature_names == second.feature_names
+    assert first.timestamps == second.timestamps
+    assert first.prices is not second.prices
+    assert first.features is not second.features
+    assert first.prices.flags.writeable and second.prices.flags.writeable
+    # Mutating a returned copy can never corrupt the cached snapshot.
+    snapshot = second.features.copy()
+    first.features[0, 0, 0] = 123_456.0
+    first.prices[0, 0] = -1.0
+    third = trainer.build_training_data(config, master, seed=7, periods=64)
+    assert np.array_equal(third.features, snapshot)
+    assert third.prices[0, 0] != -1.0
+    # The cached arrays themselves are read-only.
+    cached = next(iter(trainer._TRAINING_DATA_CACHE.values()))
+    assert cached.prices.flags.writeable is False
+    assert cached.features.flags.writeable is False
+    trainer.clear_training_data_cache()
+
+
+def test_training_data_cache_separates_seed_periods_master_and_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from configs.instruments import load_instruments
+    from configs.strategy import load_strategy_config
+
+    trainer.clear_training_data_cache()
+    calls: list[tuple[int, int, tuple[str, ...]]] = []
+    monkeypatch.setattr(trainer, "_build_training_data_uncached", _fake_uncached_builder(calls))
+    config = load_strategy_config(STRATEGY_PATH)
+    master = load_instruments(REPO_ROOT / "configs" / "instruments.yaml")
+    custom_master = _custom_cache_master()
+
+    base = trainer.build_training_data(config, master, seed=7, periods=64)
+    other_seed = trainer.build_training_data(config, master, seed=8, periods=64)
+    other_periods = trainer.build_training_data(config, master, seed=7, periods=128)
+    other_master = trainer.build_training_data(config, custom_master, seed=7, periods=64)
+    assert len(calls) == 4
+    assert trainer.training_data_cache_info()["misses"] == 4
+    assert base.prices[0, 0] != other_seed.prices[0, 0]
+    assert base.features[0, 0, 0] != other_periods.features[0, 0, 0]
+    assert custom_master.roots() == ("ZC9",)
+    assert other_master.instrument_ids == ("ZC9",)
+    # Four distinct keys fit in the bounded cache (maxsize=4): every repeat is a hit.
+    for builder_master, seed, periods in (
+        (master, 7, 64),
+        (master, 8, 64),
+        (master, 7, 128),
+        (custom_master, 7, 64),
+    ):
+        trainer.build_training_data(config, builder_master, seed=seed, periods=periods)
+    info = trainer.training_data_cache_info()
+    assert len(calls) == 4
+    assert info["hits"] == 4
+    assert info["misses"] == 4
+    assert info["size"] == trainer.TRAINING_DATA_CACHE_MAXSIZE
+    trainer.clear_training_data_cache()
+
+
+def test_training_data_cache_separates_universe_and_equity_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from configs.instruments import load_instruments
+    from configs.strategy import StageConfig, load_strategy_config
+
+    trainer.clear_training_data_cache()
+    calls: list[tuple[int, int, tuple[str, ...]]] = []
+    monkeypatch.setattr(trainer, "_build_training_data_uncached", _fake_uncached_builder(calls))
+    config = load_strategy_config(STRATEGY_PATH)
+    master = load_instruments(REPO_ROOT / "configs" / "instruments.yaml")
+    assert config.backtest is not None
+    variants = (
+        config,
+        config.model_copy(update={"universe": StageConfig(name="liquidity", params={"top_n": 3})}),
+        config.model_copy(
+            update={"backtest": config.backtest.model_copy(update={"initial_equity": 2_000_000.0})}
+        ),
+    )
+    # Each config variant affects the build inputs and must be keyed separately.
+    for variant in variants:
+        trainer.build_training_data(variant, master, seed=7, periods=64)
+    assert len(calls) == 3
+    for variant in variants:
+        trainer.build_training_data(variant, master, seed=7, periods=64)
+    info = trainer.training_data_cache_info()
+    assert len(calls) == 3
+    assert info["hits"] == 3 and info["misses"] == 3 and info["size"] == 3
+    trainer.clear_training_data_cache()
+
+
+def test_training_data_cache_is_bounded_and_evictable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from configs.instruments import load_instruments
+    from configs.strategy import load_strategy_config
+
+    trainer.clear_training_data_cache()
+    calls: list[tuple[int, int, tuple[str, ...]]] = []
+    monkeypatch.setattr(trainer, "_build_training_data_uncached", _fake_uncached_builder(calls))
+    config = load_strategy_config(STRATEGY_PATH)
+    master = load_instruments(REPO_ROOT / "configs" / "instruments.yaml")
+
+    for seed in range(6):
+        trainer.build_training_data(config, master, seed=seed, periods=64)
+    info = trainer.training_data_cache_info()
+    assert len(calls) == 6
+    assert info["size"] == trainer.TRAINING_DATA_CACHE_MAXSIZE == 4
+    assert info["evictions"] == 2
+    # The two oldest entries (seeds 0,1) were evicted; seed 5 is still cached.
+    trainer.build_training_data(config, master, seed=5, periods=64)
+    assert len(calls) == 6
+    trainer.build_training_data(config, master, seed=0, periods=64)
+    assert len(calls) == 7  # evicted -> rebuilt
+    assert trainer.training_data_cache_info()["evictions"] == 3
+    # Clearing the cache resets entries and counters (API reload hook).
+    trainer.clear_training_data_cache()
+    cleared = trainer.training_data_cache_info()
+    assert cleared == {
+        "size": 0,
+        "maxsize": trainer.TRAINING_DATA_CACHE_MAXSIZE,
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0,
+    }
+
+
+def test_training_data_cache_real_build_is_identical_on_hit() -> None:
+    """Real 45-root build: cached hit returns byte-identical matrices/metadata."""
+    from configs.instruments import load_instruments
+    from configs.strategy import load_strategy_config
+
+    trainer.clear_training_data_cache()
+    config = load_strategy_config(STRATEGY_PATH)
+    master = load_instruments(REPO_ROOT / "configs" / "instruments.yaml")
+    first = trainer.build_training_data(config, master, seed=7, periods=160)
+    snapshot_prices = first.prices.copy()
+    snapshot_features = first.features.copy()
+    first_info = trainer.training_data_cache_info()
+    assert first_info["misses"] == 1 and first_info["hits"] == 0
+
+    second = trainer.build_training_data(config, master, seed=7, periods=160)
+    second_info = trainer.training_data_cache_info()
+    assert second_info["hits"] == 1 and second_info["misses"] == 1
+    assert np.array_equal(second.prices, snapshot_prices)
+    assert np.array_equal(second.features, snapshot_features)
+    assert second.instrument_ids == first.instrument_ids
+    assert second.feature_names == DEFAULT_OBSERVATION_FEATURES
+    assert second.feature_fallbacks == ()  # canonical features complete (A2)
+    assert second.timestamps == first.timestamps
+    assert second.periods == first.periods
+    assert np.all(second.prices > 0.0) and np.all(np.isfinite(second.features))
+    # Cache hits are still safe to mutate (own copy) and never leak into later hits.
+    first.features[0, 0, 0] += 1.0
+    third = trainer.build_training_data(config, master, seed=7, periods=160)
+    assert np.array_equal(third.features, snapshot_features)
+    trainer.clear_training_data_cache()
