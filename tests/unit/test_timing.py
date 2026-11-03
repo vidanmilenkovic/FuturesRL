@@ -312,7 +312,14 @@ def test_composite_timing_applies_components_in_order() -> None:
 
 
 def test_build_timing_registry_and_yaml_params() -> None:
-    assert set(TIMING_REGISTRY) == {"tsmom", "kama", "carry_filter", "composite"}
+    assert set(TIMING_REGISTRY) == {
+        "tsmom",
+        "kama",
+        "carry_filter",
+        "mean_reversion",
+        "seasonality",
+        "composite",
+    }
     state = make_market_state()
     weights = WeightVector.equal_weight(state.ids, 1.0)
     tsmom = build_timing("tsmom", {"lookback_fast": 21, "lookback_slow": 126, "vol_lookback": 20})
@@ -343,7 +350,9 @@ def test_timing_overlays_never_emit_non_finite_weights() -> None:
         ("tsmom", {}),
         ("kama", {}),
         ("carry_filter", {}),
-        ("composite", {"components": "tsmom,kama,carry_filter"}),
+        ("mean_reversion", {}),
+        ("seasonality", {}),
+        ("composite", {"components": "tsmom,kama,carry_filter,mean_reversion,seasonality"}),
     ):
         adjusted = build_timing(name, params).adjust_timing(weights, state)
         assert all(np.isfinite(value) for value in adjusted.as_dict().values())

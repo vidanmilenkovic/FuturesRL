@@ -1,7 +1,10 @@
 """Timing overlays (``T_t``) and their declarative build registry.
 
 Registry keys match the ``timing[].name`` values used by the strategy YAMLs:
-``tsmom``, ``kama``, ``carry_filter`` (plus ``composite`` to nest them).
+``tsmom``, ``kama``, ``carry_filter``, ``mean_reversion``, ``seasonality`` (plus
+``composite`` to nest them). Every overlay is a pure
+``WeightVector -> WeightVector`` transformation so the pipeline can chain them in
+the configured YAML order.
 """
 
 from __future__ import annotations
@@ -19,6 +22,18 @@ from src.strategies.timing.kama import (
     build_kama_timing,
     kaufman_adaptive_moving_average,
 )
+from src.strategies.timing.mean_reversion import (
+    MeanReversionTiming,
+    bollinger_bands,
+    build_mean_reversion_timing,
+    wilder_rsi,
+)
+from src.strategies.timing.seasonality import (
+    ALL_MONTHS,
+    DEFAULT_ROOT_MONTH_BIASES,
+    SeasonalityTiming,
+    build_seasonality_timing,
+)
 from src.strategies.timing.tsmom import (
     FAST_RETURN_FEATURES,
     SLOW_RETURN_FEATURES,
@@ -34,6 +49,8 @@ TIMING_REGISTRY: Mapping[str, TimingFactory] = MappingProxyType(
         "tsmom": build_tsmom_timing,
         "kama": build_kama_timing,
         "carry_filter": build_carry_filter,
+        "mean_reversion": build_mean_reversion_timing,
+        "seasonality": build_seasonality_timing,
         "composite": build_composite_timing,
     }
 )
@@ -54,19 +71,27 @@ def build_timing(
 
 
 __all__ = [
+    "ALL_MONTHS",
     "CARRY_FILTER_MODES",
+    "DEFAULT_ROOT_MONTH_BIASES",
     "FAST_RETURN_FEATURES",
     "SLOW_RETURN_FEATURES",
     "TIMING_REGISTRY",
     "CarryFilter",
     "CompositeTiming",
     "KAMATiming",
+    "MeanReversionTiming",
+    "SeasonalityTiming",
     "TSMOMTiming",
     "TimingFactory",
+    "bollinger_bands",
     "build_carry_filter",
     "build_composite_timing",
     "build_kama_timing",
+    "build_mean_reversion_timing",
+    "build_seasonality_timing",
     "build_timing",
     "build_tsmom_timing",
     "kaufman_adaptive_moving_average",
+    "wilder_rsi",
 ]
