@@ -20,6 +20,7 @@ import {
   mockDrlBind,
   mockDrlModels,
   mockDrlTrain,
+  mockInstruments,
   mockOptimizationApply,
   mockOptimizationList,
   mockOptimizationStudy,
@@ -38,6 +39,7 @@ import {
   normalizeDrlTrainResult,
   normalizeOptimizationApply,
   normalizeOptimizationList,
+  normalizeInstrumentsResponse,
   normalizeOptimizationStudy,
   normalizeStrategyConfig,
   normalizeStudioCatalog,
@@ -64,6 +66,7 @@ import type {
   DrlTrainRequest,
   DrlTrainResult,
   FillsResponse,
+  InstrumentsResponse,
   OptimizationApplyResult,
   OptimizationListResponse,
   OptimizationRequest,
@@ -411,6 +414,18 @@ export function connectTelemetry(options: {
   };
 }
 
+
+// ---------------------------------------------------------------------------
+// Instrument universe (Strategy Studio, task-32)
+// ---------------------------------------------------------------------------
+
+export function getInstruments(): Promise<ApiResult<InstrumentsResponse>> {
+  const fallback = mockInstruments();
+  return withFallback<unknown>("/api/instruments", () => fallback).then((result) => ({
+    ...result,
+    data: normalizeInstrumentsResponse(result.data, fallback),
+  }));
+}
 
 // ---------------------------------------------------------------------------
 // Strategy Studio (Phase 10)

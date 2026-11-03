@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 
 import { cn } from "@/lib/cn";
 import { formatCompactUsd } from "@/lib/format";
@@ -39,24 +39,59 @@ export function RangeField({
   value,
   onChange,
   disabled = false,
+  badge,
 }: {
   parameter: StudioParameter;
   value: number;
   onChange: (value: number) => void;
   disabled?: boolean;
+  /** Optional human badge (e.g. `$50.0M`, `12.0%`) shown next to the input. */
+  badge?: string | null;
 }) {
   const id = useId();
+  const [text, setText] = useState(() => String(value));
   const min = parameter.min ?? 0;
   const max = parameter.max ?? Math.max(value * 2, 1);
   const step = parameter.step ?? (parameter.type === "int" ? 1 : 0.01);
+
+  useEffect(() => {
+    setText(String(value));
+  }, [value]);
+
+  const commitText = (raw: string) => {
+    setText(raw);
+    if (raw.trim() === "") return;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) onChange(parsed);
+  };
+
   return (
     <div className={cn("min-w-0", disabled && "opacity-45")}>
-      <div className="mb-1 flex items-baseline justify-between gap-2">
-        <label htmlFor={id} className="truncate text-[11px] font-medium text-zinc-400" title={parameter.label}>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <label htmlFor={id} className="truncate text-[11px] font-medium text-zinc-400" title={parameter.description || parameter.label}>
           {parameter.label}
         </label>
-        <span className="shrink-0 font-mono text-[11px] tabular-nums text-zinc-200">
-          {formatParameterValue(parameter, value)}
+        <span className="flex shrink-0 items-center gap-1.5">
+          {badge ? (
+            <span className="rounded bg-surface px-1 font-mono text-[10px] tabular-nums text-zinc-400" data-testid="numeric-badge">
+              {badge}
+            </span>
+          ) : null}
+          <input
+            id={`${id}-number`}
+            type="number"
+            inputMode="decimal"
+            min={min}
+            max={max}
+            step={step}
+            value={text}
+            disabled={disabled}
+            onChange={(event) => commitText(event.target.value)}
+            onBlur={() => setText(String(value))}
+            aria-label={`${parameter.label} numeric input`}
+            data-testid={`numeric-input-${parameter.path.split(".").pop() ?? parameter.path}`}
+            className="h-6 w-[92px] rounded border border-edge bg-canvas px-1.5 text-right font-mono text-[11px] tabular-nums text-zinc-200 outline-none focus:border-accent/70 disabled:opacity-50"
+          />
         </span>
       </div>
       <input
@@ -69,7 +104,7 @@ export function RangeField({
         value={value}
         disabled={disabled}
         onChange={(event) => onChange(Number(event.target.value))}
-        aria-label={parameter.label}
+        aria-label={`${parameter.label} slider`}
       />
       <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-zinc-600" title={parameter.description}>
         {parameter.description}

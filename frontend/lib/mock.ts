@@ -59,6 +59,9 @@ import type {
   StudioPreset,
   StudioTranslatorConfig,
   StudioParamValue,
+  InstrumentRoot,
+  InstrumentSector,
+  InstrumentsResponse,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -1645,12 +1648,33 @@ export function mockStudioCatalog(): StudioCatalogResponse {
     },
   ];
 
+  const instruments = mockInstruments();
   return {
     version: "1.0",
     roots: STUDIO_ROOTS,
     parameters,
     presets,
     strategies: mockStrategies(),
+    stage_choices: {
+      universe: ["liquidity", "regime", "composite"],
+      allocator: ["volatility_target", "risk_parity", "equal_weight", "mean_variance", "drl"],
+      timing: ["tsmom", "kama", "carry_filter", "mean_reversion", "seasonality", "composite"],
+      risk: ["quant_risk", "llm_risk"],
+      translator: ["translator"],
+    },
+    selector_choices: [
+      { value: "liquidity", label: "Liquidity + OI" },
+      { value: "regime", label: "Macro regime" },
+      { value: "composite", label: "Composite" },
+    ],
+    allocator_choices: [
+      { value: "volatility_target", label: "Volatility target" },
+      { value: "risk_parity", label: "Risk parity" },
+      { value: "equal_weight", label: "Equal weight" },
+      { value: "mean_variance", label: "Mean variance" },
+      { value: "drl", label: "DRL policy" },
+    ],
+    universe: { roots: instruments.roots, sectors: instruments.sectors },
   };
 }
 
@@ -1997,5 +2021,124 @@ export function mockDrlBind(model: DrlModel, strategyId: string): {
     strategy_id: strategyId,
     bound: true,
     message: `UI FALLBACK: ${model.name} bound to ${strategyId} in memory.`,
+  };
+}
+
+
+// ---------------------------------------------------------------------------
+// Instrument universe fallback (GET /api/instruments, task-32)
+// ---------------------------------------------------------------------------
+
+interface RootSeed {
+  root: string;
+  name: string;
+  sector: string;
+  asset_class: string;
+  exchange: string;
+  multiplier: number;
+  tick_size: number;
+  micro_root?: string;
+}
+
+const ROOT_SEEDS: RootSeed[] = [
+  // Equities — 9
+  { root: "ES", name: "E-mini S&P 500", sector: "equities", asset_class: "equity_index", exchange: "CME", multiplier: 50, tick_size: 0.25, micro_root: "MES" },
+  { root: "MES", name: "Micro E-mini S&P 500", sector: "equities", asset_class: "equity_index", exchange: "CME", multiplier: 5, tick_size: 0.25 },
+  { root: "NQ", name: "E-mini Nasdaq-100", sector: "equities", asset_class: "equity_index", exchange: "CME", multiplier: 20, tick_size: 0.25, micro_root: "MNQ" },
+  { root: "MNQ", name: "Micro E-mini Nasdaq-100", sector: "equities", asset_class: "equity_index", exchange: "CME", multiplier: 2, tick_size: 0.25 },
+  { root: "YM", name: "E-mini Dow Jones", sector: "equities", asset_class: "equity_index", exchange: "CBOT", multiplier: 5, tick_size: 1 },
+  { root: "MYM", name: "Micro E-mini Dow Jones", sector: "equities", asset_class: "equity_index", exchange: "CBOT", multiplier: 0.5, tick_size: 1 },
+  { root: "RTY", name: "E-mini Russell 2000", sector: "equities", asset_class: "equity_index", exchange: "CME", multiplier: 50, tick_size: 0.1, micro_root: "M2K" },
+  { root: "M2K", name: "Micro E-mini Russell 2000", sector: "equities", asset_class: "equity_index", exchange: "CME", multiplier: 5, tick_size: 0.1 },
+  { root: "NKD", name: "Nikkei 225 (USD)", sector: "equities", asset_class: "equity_index", exchange: "CME", multiplier: 5, tick_size: 5 },
+  // Rates — 7
+  { root: "ZN", name: "10-Year Treasury Note", sector: "rates", asset_class: "rates", exchange: "CBOT", multiplier: 1000, tick_size: 0.015625 },
+  { root: "ZB", name: "30-Year Treasury Bond", sector: "rates", asset_class: "rates", exchange: "CBOT", multiplier: 1000, tick_size: 0.03125 },
+  { root: "ZF", name: "5-Year Treasury Note", sector: "rates", asset_class: "rates", exchange: "CBOT", multiplier: 1000, tick_size: 0.0078125 },
+  { root: "ZT", name: "2-Year Treasury Note", sector: "rates", asset_class: "rates", exchange: "CBOT", multiplier: 2000, tick_size: 0.00390625 },
+  { root: "ZQ", name: "30-Day Fed Funds", sector: "rates", asset_class: "rates", exchange: "CBOT", multiplier: 4167, tick_size: 0.0025 },
+  { root: "GE", name: "Eurodollar", sector: "rates", asset_class: "rates", exchange: "CME", multiplier: 2500, tick_size: 0.0025 },
+  { root: "SR3", name: "3-Month SOFR", sector: "rates", asset_class: "rates", exchange: "CME", multiplier: 2500, tick_size: 0.0025 },
+  // Energy — 6
+  { root: "CL", name: "WTI Crude Oil", sector: "energy", asset_class: "energy", exchange: "NYMEX", multiplier: 1000, tick_size: 0.01, micro_root: "MCL" },
+  { root: "MCL", name: "Micro WTI Crude Oil", sector: "energy", asset_class: "energy", exchange: "NYMEX", multiplier: 100, tick_size: 0.01 },
+  { root: "RB", name: "RBOB Gasoline", sector: "energy", asset_class: "energy", exchange: "NYMEX", multiplier: 42000, tick_size: 0.0001 },
+  { root: "HO", name: "NY Harbor ULSD", sector: "energy", asset_class: "energy", exchange: "NYMEX", multiplier: 42000, tick_size: 0.0001 },
+  { root: "NG", name: "Henry Hub Natural Gas", sector: "energy", asset_class: "energy", exchange: "NYMEX", multiplier: 10000, tick_size: 0.001, micro_root: "MNG" },
+  { root: "MNG", name: "Micro Henry Hub Natural Gas", sector: "energy", asset_class: "energy", exchange: "NYMEX", multiplier: 2500, tick_size: 0.001 },
+  // Metals — 8
+  { root: "GC", name: "Gold", sector: "metals", asset_class: "metals", exchange: "COMEX", multiplier: 100, tick_size: 0.1, micro_root: "MGC" },
+  { root: "MGC", name: "Micro Gold", sector: "metals", asset_class: "metals", exchange: "COMEX", multiplier: 10, tick_size: 0.1 },
+  { root: "SI", name: "Silver", sector: "metals", asset_class: "metals", exchange: "COMEX", multiplier: 5000, tick_size: 0.005, micro_root: "SIL" },
+  { root: "SIL", name: "Micro Silver", sector: "metals", asset_class: "metals", exchange: "COMEX", multiplier: 1000, tick_size: 0.005 },
+  { root: "HG", name: "Copper", sector: "metals", asset_class: "metals", exchange: "COMEX", multiplier: 25000, tick_size: 0.0005, micro_root: "MHG" },
+  { root: "MHG", name: "Micro Copper", sector: "metals", asset_class: "metals", exchange: "COMEX", multiplier: 2500, tick_size: 0.0005 },
+  { root: "PL", name: "Platinum", sector: "metals", asset_class: "metals", exchange: "NYMEX", multiplier: 50, tick_size: 0.1 },
+  { root: "PA", name: "Palladium", sector: "metals", asset_class: "metals", exchange: "NYMEX", multiplier: 100, tick_size: 0.5 },
+  // FX — 6
+  { root: "6E", name: "Euro FX", sector: "fx", asset_class: "fx", exchange: "CME", multiplier: 125000, tick_size: 0.00005 },
+  { root: "6J", name: "Japanese Yen", sector: "fx", asset_class: "fx", exchange: "CME", multiplier: 12500000, tick_size: 0.0000005 },
+  { root: "6B", name: "British Pound", sector: "fx", asset_class: "fx", exchange: "CME", multiplier: 62500, tick_size: 0.0001 },
+  { root: "6A", name: "Australian Dollar", sector: "fx", asset_class: "fx", exchange: "CME", multiplier: 100000, tick_size: 0.00005 },
+  { root: "6C", name: "Canadian Dollar", sector: "fx", asset_class: "fx", exchange: "CME", multiplier: 100000, tick_size: 0.00005 },
+  { root: "6S", name: "Swiss Franc", sector: "fx", asset_class: "fx", exchange: "CME", multiplier: 125000, tick_size: 0.00005 },
+  // Agri — 7
+  { root: "ZC", name: "Corn", sector: "agri", asset_class: "agriculture", exchange: "CBOT", multiplier: 50, tick_size: 0.25 },
+  { root: "ZS", name: "Soybeans", sector: "agri", asset_class: "agriculture", exchange: "CBOT", multiplier: 50, tick_size: 0.25 },
+  { root: "ZW", name: "Chicago Wheat", sector: "agri", asset_class: "agriculture", exchange: "CBOT", multiplier: 50, tick_size: 0.25 },
+  { root: "LE", name: "Live Cattle", sector: "agri", asset_class: "agriculture", exchange: "CME", multiplier: 400, tick_size: 0.025 },
+  { root: "HE", name: "Lean Hogs", sector: "agri", asset_class: "agriculture", exchange: "CME", multiplier: 400, tick_size: 0.025 },
+  { root: "ZL", name: "Soybean Oil", sector: "agri", asset_class: "agriculture", exchange: "CBOT", multiplier: 600, tick_size: 0.01 },
+  { root: "KE", name: "KC Wheat", sector: "agri", asset_class: "agriculture", exchange: "CBOT", multiplier: 50, tick_size: 0.25 },
+  // Crypto — 2
+  { root: "BTC", name: "Bitcoin Futures", sector: "crypto", asset_class: "crypto", exchange: "CME", multiplier: 5, tick_size: 5, micro_root: "MBT" },
+  { root: "MBT", name: "Micro Bitcoin", sector: "crypto", asset_class: "crypto", exchange: "CME", multiplier: 0.1, tick_size: 5 },
+];
+
+const SECTOR_LABELS: Record<string, string> = {
+  equity: "Equities",
+  equities: "Equities",
+  rates: "Rates",
+  energy: "Energy",
+  metals: "Metals",
+  fx: "FX",
+  agri: "Agri",
+  crypto: "Crypto",
+};
+
+const SECTOR_ORDER = ["equities", "rates", "energy", "metals", "fx", "agri", "crypto"];
+
+export function mockInstruments(): InstrumentsResponse {
+  const roots: InstrumentRoot[] = ROOT_SEEDS.map((seed) => {
+    const standardRoot = ROOT_SEEDS.find((entry) => entry.micro_root === seed.root)?.root ?? null;
+    return {
+      root: seed.root,
+      name: seed.name,
+      asset_class: seed.asset_class,
+      sector: seed.sector,
+      exchange: seed.exchange,
+      multiplier: seed.multiplier,
+      tick_size: seed.tick_size,
+      currency: "USD",
+      micro_root: seed.micro_root ?? null,
+      standard_root: standardRoot,
+    };
+  });
+  const sectors: InstrumentSector[] = SECTOR_ORDER.map((id) => {
+    const sectorRoots = roots
+      .filter((entry) => entry.sector === id)
+      .sort((a, b) => a.root.localeCompare(b.root));
+    return {
+      id,
+      label: SECTOR_LABELS[id] ?? id,
+      count: sectorRoots.length,
+      roots: sectorRoots,
+    };
+  }).filter((sector) => sector.count > 0);
+  return {
+    generated_at: isoFromMs(nowMs()),
+    count: roots.length,
+    sectors,
+    roots,
   };
 }

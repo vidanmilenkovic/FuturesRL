@@ -360,6 +360,7 @@ export type StudioParamType =
 export interface StudioParamOption {
   value: string | number | boolean;
   label: string;
+  description?: string;
 }
 
 /** One editable strategy parameter served by GET /api/strategies/schema/catalog. */
@@ -436,6 +437,40 @@ export interface StudioPreset {
   drl?: StudioDrlConfig;
 }
 
+export interface InstrumentRoot {
+  root: string;
+  name: string;
+  asset_class: string;
+  sector: string;
+  exchange: string;
+  multiplier: number;
+  tick_size: number;
+  currency: string;
+  /** Paired micro root for a standard contract (None for micros). */
+  micro_root: string | null;
+  /** Standard root a micro contract rolls up to (None for standards). */
+  standard_root: string | null;
+}
+
+export interface InstrumentSector {
+  id: string;
+  label: string;
+  count: number;
+  roots: InstrumentRoot[];
+}
+
+export interface InstrumentsResponse {
+  generated_at: string;
+  count: number;
+  sectors: InstrumentSector[];
+  roots: InstrumentRoot[];
+}
+
+export interface StudioUniverseMetadata {
+  roots: InstrumentRoot[];
+  sectors: InstrumentSector[];
+}
+
 export interface StudioCatalogResponse {
   version?: string | null;
   roots: string[];
@@ -446,6 +481,13 @@ export interface StudioCatalogResponse {
   source?: string | null;
   preset_source?: string | null;
   generated_at?: string | null;
+  /** Additive selector/allocator type choices (task-31). */
+  selector_choices?: StudioParamOption[];
+  allocator_choices?: StudioParamOption[];
+  /** Raw `stage_choices` map from the catalog (universe/allocator/timing/risk/translator). */
+  stage_choices?: Record<string, string[]>;
+  /** Additive sector-grouped universe metadata (task-31). */
+  universe?: StudioUniverseMetadata | null;
 }
 
 /** Editable draft the Manual Builder serializes to YAML + POST/PUT payload. */

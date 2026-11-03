@@ -22,6 +22,10 @@ import type {
   SeriesPoint,
   StageConfig,
   StrategyConfig,
+  InstrumentRoot,
+  InstrumentSector,
+  InstrumentsResponse,
+  StudioUniverseMetadata,
   StudioCatalogResponse,
   StudioDraft,
   StudioDrlConfig,
@@ -34,6 +38,7 @@ import type {
   StudioValidation,
   StudioParamValue,
 } from "./types";
+import { formatCompactUsd } from "./format";
 
 // ---------------------------------------------------------------------------
 // Defaults / cloning
@@ -132,6 +137,68 @@ function normaliseTranslator(raw: unknown): StudioTranslatorConfig {
     max_margin_utilization: asNumber(value.max_margin_utilization, 0.6),
     enable_micro_routing: value.enable_micro_routing === false ? false : true,
     min_micro_notional_ratio: asNumber(value.min_micro_notional_ratio, 0),
+  };
+}
+
+function normalizeInstrumentRoot(raw: unknown): InstrumentRoot | null {
+  if (!isRecord(raw)) return null;
+  const root = asString(raw.root, "");
+  if (root.length === 0) return null;
+  return {
+    root,
+    name: asString(raw.name, root),
+    asset_class: asString(raw.asset_class, "unknown"),
+    // Catalog roots expose both `sector` (component/singular) and `sector_group`.
+    sector: asString(raw.sector_group ?? raw.sector, "unknown"),
+    exchange: asString(raw.exchange, ""),
+    multiplier: asNumber(raw.multiplier, 0),
+    tick_size: asNumber(raw.tick_size, 0),
+    currency: asString(raw.currency, "USD"),
+    micro_root: asString(raw.micro_root, "") || null,
+    standard_root: asString(raw.standard_root, "") || null,
+  };
+}
+
+function normalizeInstrumentSectors(raw: unknown, roots?: InstrumentRoot[]): InstrumentSector[] {
+  const sectors = asArray(raw);
+  if (sectors.length === 0) return [];
+  return sectors
+    .map((entry) => {
+      if (!isRecord(entry)) return null;
+      const id = asString(entry.id, "");
+      if (id.length === 0 || id === "all") return null;
+      const sectorRoots = asArray(entry.roots)
+        .map(normalizeInstrumentRoot)
+        .filter((root): root is InstrumentRoot => root !== null);
+      const fallbackRoots = roots?.filter((root) => root.sector === id) ?? [];
+      const resolved = sectorRoots.length > 0 ? sectorRoots : fallbackRoots;
+      return {
+        id,
+        label: asString(entry.label, SECTOR_LABELS[id] ?? id),
+        count: typeof entry.count === "number" ? entry.count : resolved.length,
+        roots: resolved,
+      } satisfies InstrumentSector;
+    })
+    .filter((sector): sector is InstrumentSector => sector !== null);
+}
+
+/** Normalize `GET /api/instruments` (task-32) with a deterministic fallback. */
+export function normalizeInstrumentsResponse(
+  raw: unknown,
+  fallback: InstrumentsResponse,
+): InstrumentsResponse {
+  if (!isRecord(raw)) return fallback;
+  const roots = asArray(raw.roots)
+    .map(normalizeInstrumentRoot)
+    .filter((root): root is InstrumentRoot => root !== null);
+  const sectors = normalizeInstrumentSectors(raw.sectors, roots);
+  if (roots.length === 0 && sectors.length === 0) return fallback;
+  const resolvedRoots = roots.length > 0 ? roots : universeRoots(sectors);
+  return {
+    generated_at: asString(raw.generated_at, fallback.generated_at),
+    count: typeof raw.count === "number" ? raw.count : resolvedRoots.length,
+    sectors: sectors.length > 0 ? sectors : fallback.sectors,
+    roots: resolvedRoots,
   };
 }
 
@@ -571,6 +638,173 @@ export function stageSummary(draft: StudioDraft, stage: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Universe / sector helpers (task-31 / task-32)
+// ---------------------------------------------------------------------------
+
+export const SECTOR_TABS: { id: string; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "equities", label: "Equities" },
+  { id: "rates", label: "Rates" },
+  { id: "energy", label: "Energy" },
+  { id: "metals", label: "Metals" },
+  { id: "fx", label: "FX" },
+  { id: "agri", label: "Agri" },
+  { id: "crypto", label: "Crypto" },
+];
+
+const SECTOR_LABELS: Record<string, string> = {
+  equity: "Equities",
+  equities: "Equities",
+  rates: "Rates",
+  energy: "Energy",
+  metals: "Metals",
+  fx: "FX",
+  agri: "Agri",
+  crypto: "Crypto",
+};
+
+export function universeRoots(forSectors: InstrumentSector[]): InstrumentRoot[] {
+  return forSectors.flatMap((sector) => sector.roots);
+}
+
+/** Default selection: every standard contract (micros remain available pairs). */
+export function defaultUniverseRoots(forSectors: InstrumentSector[]): string[] {
+  const roots = universeRoots(forSectors);
+  const standards = roots.filter((root) => root.standard_root === null).map((root) => root.root);
+  return standards.length > 0 ? standards : roots.map((root) => root.root);
+}
+
+/** Root list ordered the way the universe endpoint groups it (stable YAML output). */
+export function orderUniverseRoots(roots: string[], forSectors: InstrumentSector[]): string[] {
+  const order = new Map(universeRoots(forSectors).map((root, index) => [root.root, index]));
+  return [...roots].sort((a, b) => (order.get(a) ?? 999) - (order.get(b) ?? 999));
+}
+
+/** Mirror Stage-2 allocator sizing into Stage-4 hard risk caps. */
+export function syncQuantCaps(draft: StudioDraft): StudioDraft {
+  const allocator = draft.allocator;
+  const targetVol = allocator.params.target_annual_volatility;
+  // `max_weight` is the allocator's per-root weight cap; gross leverage is a
+  // different concept and must not be mirrored into a single-root risk cap.
+  const maxWeight =
+    allocator.params.max_weight ?? allocator.params.max_single_instrument_weight;
+  const quantIndex = draft.risk.findIndex((stage) => stage.name === "quant_risk");
+  if (quantIndex === -1) return draft;
+  if (targetVol === undefined && maxWeight === undefined) return draft;
+  const next = cloneDraft(draft);
+  const quant = next.risk[quantIndex];
+  if (!quant) return draft;
+  quant.params = { ...quant.params };
+  if (typeof targetVol === "number") quant.params.vol_target = targetVol;
+  if (typeof maxWeight === "number" && quant.params.max_single_instrument_weight !== undefined) {
+    quant.params.max_single_instrument_weight = maxWeight;
+  } else if (typeof maxWeight === "number") {
+    quant.params.max_single_instrument_weight = maxWeight;
+  }
+  return next;
+}
+
+/** Build the default params for a timing/risk overlay from the catalog. */
+export function overlayDefaults(
+  parameters: StudioParameter[],
+  groupName: string,
+): Record<string, StudioParamValue> {
+  const defaults: Record<string, StudioParamValue> = {};
+  for (const parameter of parameters) {
+    if (parameter.stage !== "timing" && parameter.stage !== "risk") continue;
+    if (parameter.stage_name !== groupName) continue;
+    const key = parameter.path.endsWith(".enabled")
+      ? null
+      : (parameter.path.split(".").pop() ?? parameter.path);
+    if (!key || key === "enabled") continue;
+    defaults[key] = Array.isArray(parameter.default) ? [...parameter.default] : parameter.default;
+  }
+  return defaults;
+}
+
+/** Parameters that should live under the collapsible Advanced section. */
+export function isAdvancedParameter(parameter: StudioParameter): boolean {
+  const haystack = `${parameter.key ?? ""} ${parameter.path} ${parameter.label}`.toLowerCase();
+  return /(covariance ridge|covariance_ridge|covariance shrinkage|covariance_shrinkage|min_volatility|minimum volatility|feature_fallback|feature fallback|dust|min_micro_notional|micro.*floor|ridge|shrinkage|fallback_band|band_fallback|epsilon|lambda_l2)/.test(
+    haystack,
+  );
+}
+
+const LABEL_OVERRIDES: Record<string, string> = {
+  "allocator:target_annual_volatility": "Base Allocator Target Vol",
+  "allocator:max_gross_leverage": "Base Allocator Max Gross Leverage",
+  "allocator:max_single_instrument_weight": "Base Allocator Max Weight",
+  "allocator:max_weight": "Base Allocator Max Weight",
+  "risk:vol_target": "Hard Portfolio Vol Ceiling",
+  "risk:max_single_instrument_weight": "Hard Single-Root Cap",
+  "risk:max_sector_weight": "Hard Sector Cap",
+};
+
+/** Plain-English labels that disambiguate Stage-2 sizing from Stage-4 caps. */
+export function parameterLabel(stage: string, parameter: StudioParameter): string {
+  const paramKey = parameter.path.split(".").pop() ?? "";
+  return LABEL_OVERRIDES[`${stage}:${paramKey}`] ?? parameter.label;
+}
+
+/** Formatting badge for large/currency/percent numeric parameters. */
+export function numericBadge(parameter: StudioParameter, value: number): string | null {
+  if (!Number.isFinite(value)) return null;
+  const haystack = `${parameter.key ?? ""} ${parameter.path} ${parameter.label} ${parameter.unit ?? ""}`.toLowerCase();
+  if (
+    parameter.unit === "$" ||
+    parameter.unit?.toUpperCase() === "USD" ||
+    haystack.includes("dollar volume") ||
+    haystack.includes("notional")
+  ) {
+    return formatCompactUsd(value);
+  }
+  if (parameter.unit === "%") return `${(value * 100).toFixed(1)}%`;
+  if (haystack.includes("annual_volatility") || haystack.includes("vol_target") || haystack.includes("drawdown") || haystack.includes("max_loss")) {
+    return `${(value * 100).toFixed(1)}%`;
+  }
+  if (Math.abs(value) >= 1_000_000) return value.toLocaleString("en-US");
+  return null;
+}
+
+/** Build the params for a newly selected universe selector/allocator component. */
+export function componentDefaults(
+  parameters: StudioParameter[],
+  stage: "universe" | "allocator",
+  componentName: string,
+): Record<string, StudioParamValue> {
+  const params: Record<string, StudioParamValue> = {};
+  for (const parameter of parameters) {
+    if (parameter.stage !== stage) continue;
+    if (parameter.stage_name !== componentName) continue;
+    const key = parameter.path.split(".").pop() ?? parameter.path;
+    if (key === "selector" || key === "name" || key === "enabled") continue;
+    if (parameter.location === "translator" || parameter.location === "drl_block") continue;
+    params[key] = Array.isArray(parameter.default) ? [...parameter.default] : parameter.default;
+  }
+  return params;
+}
+
+export function selectorChoices(catalog: StudioCatalogResponse): StudioParamOption[] {
+  if (catalog.selector_choices && catalog.selector_choices.length > 0) return catalog.selector_choices;
+  return [
+    { value: "liquidity", label: "Liquidity + OI" },
+    { value: "regime", label: "Macro regime" },
+    { value: "composite", label: "Composite" },
+  ];
+}
+
+export function allocatorChoices(catalog: StudioCatalogResponse): StudioParamOption[] {
+  if (catalog.allocator_choices && catalog.allocator_choices.length > 0) return catalog.allocator_choices;
+  return [
+    { value: "volatility_target", label: "Volatility target" },
+    { value: "risk_parity", label: "Risk parity" },
+    { value: "equal_weight", label: "Equal weight" },
+    { value: "mean_variance", label: "Mean variance" },
+    { value: "drl", label: "DRL policy" },
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // Tolerant contract normalization (backend shapes may evolve during Phase 10)
 // ---------------------------------------------------------------------------
 
@@ -806,6 +1040,94 @@ export function normalizeStudioCatalog(
       stage_name: null,
     });
   }
+  const stageChoices = isRecord(candidate.stage_choices) ? candidate.stage_choices : null;
+  const stageChoiceOptions = new Map<string, StudioParamOption[]>();
+  for (const stage of asArray(candidate.stages)) {
+    if (!isRecord(stage)) continue;
+    const id = asString(stage.id, "");
+    const choices: StudioParamOption[] = [];
+    for (const entry of asArray(stage.choices)) {
+      if (!isRecord(entry)) continue;
+      const value = asString(entry.name, "");
+      if (value.length === 0) continue;
+      choices.push({
+        value,
+        label: asString(entry.label, value),
+        description: asString(entry.description, ""),
+      });
+    }
+    if (id && choices.length > 0) stageChoiceOptions.set(id, choices);
+  }
+  const selectorRaw =
+    stageChoiceOptions.get("universe") ??
+    stageChoices?.universe ??
+    candidate.selector_choices ??
+    (isRecord(candidate.universe) ? candidate.universe.selector_choices : undefined) ??
+    candidate.selector_types;
+  const allocatorRaw =
+    stageChoiceOptions.get("allocator") ??
+    stageChoices?.allocator ??
+    candidate.allocator_choices ??
+    (isRecord(candidate.universe) ? candidate.universe.allocator_choices : undefined) ??
+    candidate.allocators;
+  const selectorParsed = normaliseOptions(selectorRaw);
+  const allocatorParsed = normaliseOptions(allocatorRaw);
+  const selectorLabelMap: Record<string, string> = {
+    liquidity: "Liquidity + OI",
+    regime: "Macro regime",
+    composite: "Composite",
+  };
+  const allocatorLabelMap: Record<string, string> = {
+    volatility_target: "Volatility target",
+    risk_parity: "Risk parity",
+    equal_weight: "Equal weight",
+    mean_variance: "Mean variance",
+    drl: "DRL policy",
+  };
+  const derivedSelectors = Array.from(
+    new Set(
+      resolvedParameters
+        .filter((parameter) => parameter.stage === "universe" && parameter.stage_name)
+        .map((parameter) => parameter.stage_name as string),
+    ),
+  ).sort(
+    (a, b) =>
+      (Object.keys(selectorLabelMap).indexOf(a) + 1 || 99) -
+      (Object.keys(selectorLabelMap).indexOf(b) + 1 || 99),
+  );
+  const derivedAllocators = Array.from(
+    new Set(
+      resolvedParameters
+        .filter((parameter) => parameter.stage === "allocator" && parameter.stage_name)
+        .map((parameter) => parameter.stage_name as string),
+    ),
+  ).sort(
+    (a, b) =>
+      (Object.keys(allocatorLabelMap).indexOf(a) + 1 || 99) -
+      (Object.keys(allocatorLabelMap).indexOf(b) + 1 || 99),
+  );
+  const universeMetaRaw = isRecord(candidate.universe) ? candidate.universe : null;
+  const universeSectors = normalizeInstrumentSectors(
+    universeMetaRaw?.sectors ?? candidate.sectors,
+  );
+  const universeRootsRaw = asArray(
+    universeMetaRaw?.roots ?? candidate.universe_roots ?? candidate.instruments,
+  )
+    .map(normalizeInstrumentRoot)
+    .filter((root): root is InstrumentRoot => root !== null);
+  const universeMetadata: StudioUniverseMetadata | null =
+    universeSectors.length > 0 || universeRootsRaw.length > 0
+      ? {
+          sectors:
+            universeSectors.length > 0
+              ? universeSectors
+              : fallback.universe?.sectors ?? [],
+          roots:
+            universeRootsRaw.length > 0
+              ? universeRootsRaw
+              : universeSectors.flatMap((sector) => sector.roots),
+        }
+      : fallback.universe ?? null;
   return {
     version: asString(candidate.version ?? candidate.schema_version, fallback.version ?? "1"),
     roots: derivedRoots,
@@ -813,6 +1135,28 @@ export function normalizeStudioCatalog(
     source: asString(candidate.source, "") || fallback.source || null,
     preset_source: asString(candidate.preset_source, "") || fallback.preset_source || null,
     generated_at: asString(candidate.generated_at, "") || fallback.generated_at || null,
+    stage_choices: stageChoices
+      ? Object.fromEntries(
+          Object.entries(stageChoices).map(([key, value]) => [key, asArray(value).map(String)]),
+        )
+      : undefined,
+    selector_choices:
+      selectorParsed ??
+      (derivedSelectors.length > 0
+        ? derivedSelectors.map((name) => ({
+            value: name,
+            label: selectorLabelMap[name] ?? name.replace(/_/g, " "),
+          }))
+        : fallback.selector_choices),
+    allocator_choices:
+      allocatorParsed ??
+      (derivedAllocators.length > 0
+        ? derivedAllocators.map((name) => ({
+            value: name,
+            label: allocatorLabelMap[name] ?? name.replace(/_/g, " "),
+          }))
+        : fallback.allocator_choices),
+    universe: universeMetadata,
     presets: presets.length > 0 ? presets : fallback.presets,
     strategies:
       strategiesRaw.length > 0

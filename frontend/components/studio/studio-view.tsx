@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { Tabs } from "@/components/ui/primitives";
 import { getStudioCatalog, listStrategies } from "@/lib/api";
-import { draftFromPreset, draftFromStrategy, withDefaultRoots } from "@/lib/studio";
+import { draftFromPreset, draftFromStrategy } from "@/lib/studio";
 import type { StrategyConfig, StudioDraft } from "@/lib/types";
 import { useAsyncData } from "@/lib/use-async-data";
 
@@ -31,7 +31,7 @@ export function StudioView() {
     if (draft !== null) return;
     const presets = catalog.data?.presets ?? [];
     const first = presets[0];
-    if (first) setDraft(withDefaultRoots(draftFromPreset(first), catalog.data?.roots ?? []));
+    if (first) setDraft(draftFromPreset(first));
   }, [catalog.data, draft]);
 
   useEffect(() => {

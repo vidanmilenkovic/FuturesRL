@@ -78,6 +78,7 @@ export function Button({
   className,
   title,
   ariaLabel,
+  testId,
 }: {
   children: ReactNode;
   variant?: ButtonVariant;
@@ -88,6 +89,7 @@ export function Button({
   className?: string;
   title?: string;
   ariaLabel?: string;
+  testId?: string;
 }) {
   return (
     <button
@@ -96,6 +98,7 @@ export function Button({
       disabled={disabled}
       title={title}
       aria-label={ariaLabel}
+      data-testid={testId}
       className={`focus-ring inline-flex select-none items-center justify-center gap-1.5 rounded-md font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${buttonVariants[variant]} ${buttonSizes[size]} ${className ?? ""}`}
     >
       {children}
