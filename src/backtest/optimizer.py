@@ -968,6 +968,224 @@ def load_optimization(
 
 
 # ---------------------------------------------------------------------------
+# Persisted-study validation (legacy / inactive search spaces)
+# ---------------------------------------------------------------------------
+
+#: Top-level strategy stages understood by the declarative config/catalog.
+_KNOWN_STAGES: frozenset[str] = frozenset({"universe", "allocator", "timing", "risk", "translator"})
+
+
+def _optimization_payload(result_or_dict: OptimizationResult | Mapping[str, Any]) -> dict[str, Any]:
+    """Normalise a typed result or a raw ``json.loads`` payload into a dict."""
+    if isinstance(result_or_dict, OptimizationResult):
+        return result_or_dict.model_dump(mode="json")
+    if isinstance(result_or_dict, Mapping):
+        return dict(result_or_dict)
+    raise TypeError(
+        "validate_persisted_optimization accepts an OptimizationResult or a mapping payload"
+    )
+
+
+def _looks_like_fixture_payload(payload: Mapping[str, Any]) -> bool:
+    """API-owned fixture studies are not canonical engine studies and are skipped.
+
+    Fixture payloads carry an explicit ``provenance`` tag, a non-engine backend
+    (e.g. ``deterministic-fixture``) and no ``request``/``seed``; they are owned by
+    the API model and must never be reported as legacy engine studies.
+    """
+    if "provenance" in payload:
+        return True
+    backend = payload.get("backend")
+    engine_backends = {OptimizationBackend.OPTUNA.value, OptimizationBackend.DETERMINISTIC.value}
+    if isinstance(backend, str) and backend not in engine_backends:
+        return True
+    request = payload.get("request")
+    return not isinstance(request, Mapping) and "seed" not in payload
+
+
+def _extract_base_strategy_id(payload: Mapping[str, Any]) -> str | None:
+    """Best-effort ``base_strategy_id`` lookup (top-level or nested request)."""
+    value = payload.get("base_strategy_id")
+    if not isinstance(value, str):
+        request = payload.get("request")
+        if isinstance(request, Mapping):
+            value = request.get("base_strategy_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _collect_persisted_parameter_paths(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Unique parameter paths recorded in the search space, best params and trials."""
+    collected: list[str] = []
+
+    def add(value: object) -> None:
+        if isinstance(value, str) and value.strip():
+            collected.append(value.strip())
+
+    request = payload.get("request")
+    if isinstance(request, Mapping):
+        search_space = request.get("search_space")
+        if isinstance(search_space, Sequence) and not isinstance(search_space, (str, bytes)):
+            for entry in search_space:
+                if isinstance(entry, Mapping):
+                    add(entry.get("param_path"))
+                elif isinstance(entry, str):
+                    add(entry)
+    best_params = payload.get("best_params")
+    if isinstance(best_params, Mapping):
+        for key in best_params:
+            add(key)
+    trials = payload.get("trials")
+    if isinstance(trials, Sequence) and not isinstance(trials, (str, bytes)):
+        for trial in trials:
+            if not isinstance(trial, Mapping):
+                continue
+            params = trial.get("params")
+            if isinstance(params, Mapping):
+                for key in params:
+                    add(key)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in collected:
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return tuple(unique)
+
+
+def _resolve_base_strategy_config(base_strategy_id: str) -> StrategyConfig | None:
+    """Resolve a base strategy config by id (committed YAML, preset, custom YAML)."""
+    repo_root = Path(__file__).resolve().parents[2]
+    configs_dir = repo_root / "configs" / "strategies"
+    direct = configs_dir / f"{base_strategy_id}.yaml"
+    candidates: list[Path] = []
+    if direct.is_file():
+        candidates.append(direct)
+    if configs_dir.is_dir():
+        candidates.extend(sorted(path for path in configs_dir.glob("*.yaml") if path != direct))
+    for path in candidates:
+        try:
+            config = load_strategy_config(path)
+        except (FileNotFoundError, ValueError, OSError):
+            continue
+        if config.id == base_strategy_id:
+            return config
+    try:
+        catalog_module: Any = importlib.import_module("src.strategies.parameter_catalog")
+        catalog = catalog_module.parameter_catalog()
+        for preset in catalog.presets:
+            if str(getattr(preset, "id", "")) == base_strategy_id:
+                resolved = preset.to_config()
+                if isinstance(resolved, StrategyConfig):
+                    return resolved
+    except Exception:  # pragma: no cover - catalog must never block startup validation
+        pass
+    try:
+        from configs.settings import get_settings
+
+        custom_path = get_settings().strategy_artifacts_dir / f"{base_strategy_id}.yaml"
+        if custom_path.is_file():
+            return load_strategy_config(custom_path)
+    except Exception:  # pragma: no cover - optional settings/custom-strategy lookup
+        pass
+    return None
+
+
+def validate_persisted_optimization(
+    result_or_dict: OptimizationResult | Mapping[str, Any],
+    config: StrategyConfig | None = None,
+) -> list[str]:
+    """Validate a persisted optimizer study against its base strategy.
+
+    Returns an empty list when the study is a valid current-engine study, or a
+    sorted list of human-readable legacy/quarantine reasons when its recorded
+    search space (or trial/best parameter paths) references an inactive
+    stage/overlay, a non-tunable structural/data-hygiene path, or a parameter that
+    is absent from the base strategy.
+
+    Parameters
+    ----------
+    result_or_dict:
+        A typed :class:`OptimizationResult` (from :func:`load_optimization`) or the
+        raw ``json.loads`` payload mapping. API-owned fixture payloads (explicit
+        ``provenance`` / non-engine backend / no ``request``+``seed``) are not
+        canonical engine studies and return ``[]``.
+    config:
+        Optional pre-resolved base strategy config. When omitted (or when its id
+        does not match ``base_strategy_id``) the helper resolves the base strategy
+        itself from the committed YAMLs, catalog presets, or the custom strategy
+        artifact directory.
+
+    The helper is pure: it never mutates the payload or writes/quarantines files.
+    Unresolvable base strategies are handled conservatively: non-tunable
+    structural paths and unknown stages are flagged, while known-stage paths that
+    cannot be verified are accepted (custom/undeployed strategies are not legacy).
+    """
+    payload = _optimization_payload(result_or_dict)
+    if _looks_like_fixture_payload(payload):
+        return []
+    base_strategy_id = _extract_base_strategy_id(payload)
+    if base_strategy_id is None:
+        # Non-canonical payload without a base id: nothing engine-specific to check.
+        return []
+    parameter_paths = _collect_persisted_parameter_paths(payload)
+    if not parameter_paths:
+        return []
+    resolved_config: StrategyConfig | None = None
+    if config is not None and config.id == base_strategy_id:
+        resolved_config = config
+    else:
+        resolved_config = _resolve_base_strategy_config(base_strategy_id)
+    reasons: list[str] = []
+    if resolved_config is None:
+        for raw_path in parameter_paths:
+            path = raw_path.strip()
+            parts = path.split(".")
+            stage = parts[0] if parts else ""
+            if _is_structural_parameter(path):
+                reasons.append(f"non-tunable structural/hygiene parameter path {raw_path!r}")
+            elif stage not in _KNOWN_STAGES:
+                reasons.append(
+                    f"unknown stage in parameter path {raw_path!r} "
+                    f"(base strategy {base_strategy_id!r} could not be resolved)"
+                )
+        return sorted(set(reasons))
+    strategy = resolved_config.model_dump(mode="python")
+    context = _catalog_search_context(resolved_config)
+    active_paths = context.active_tunable_paths if context is not None else None
+    for raw_path in parameter_paths:
+        path = _normalise_param_path(strategy, raw_path)
+        if _is_structural_parameter(path):
+            reasons.append(f"non-tunable structural/hygiene parameter path {raw_path!r}")
+            continue
+        existing = _path_value(strategy, path)
+        if existing is _MISSING:
+            # Catalog-active parameters omitted by the committed YAML are still
+            # tuneable (the optimizer injects them), so they are not legacy.
+            if active_paths is not None and path in active_paths:
+                continue
+            reasons.append(
+                f"inactive or unknown parameter path {raw_path!r} "
+                f"for base strategy {base_strategy_id!r}"
+            )
+            continue
+        if active_paths is not None and path not in active_paths:
+            reasons.append(
+                f"inactive parameter path {raw_path!r} for base strategy {base_strategy_id!r}"
+            )
+    return sorted(set(reasons))
+
+
+def is_legacy_search_space(
+    result_or_dict: OptimizationResult | Mapping[str, Any],
+    config: StrategyConfig | None = None,
+) -> bool:
+    """Whether a persisted optimizer study should be quarantined as legacy."""
+    return bool(validate_persisted_optimization(result_or_dict, config))
+
+
+# ---------------------------------------------------------------------------
 # Default search space
 # ---------------------------------------------------------------------------
 

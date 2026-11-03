@@ -32,8 +32,10 @@ from src.backtest.optimizer import (
     deterministic_lhs_parameter_sets,
     deterministic_param_importances,
     filter_search_space_for_config,
+    is_legacy_search_space,
     load_optimization,
     run_optimization,
+    validate_persisted_optimization,
     write_optimization_artifact,
 )
 from src.strategies.parameter_catalog import parameter_catalog
@@ -996,6 +998,186 @@ def test_result_json_contract(
     rebuilt = opt.OptimizationResult.from_dict(payload)
     assert rebuilt.to_dict() == payload
     assert run_optimization(config, _request(config, small_space), output_dir=tmp_path) is not None
+
+
+# ---------------------------------------------------------------------------
+# Persisted-study validation (legacy/inactive search spaces)
+# ---------------------------------------------------------------------------
+
+
+def _clean_persisted_study(
+    config: StrategyConfig,
+    tmp_path: Path,
+) -> tuple[Any, Path]:
+    optimizer = _optimizer(
+        config,
+        default_search_space(config),
+        tmp_path,
+        n_trials=2,
+    )
+    result = optimizer.optimize()
+    assert result.artifact_path is not None
+    artifact = Path(result.artifact_path)
+    return load_optimization(artifact), artifact
+
+
+def test_clean_v151_study_is_valid(config: StrategyConfig, tmp_path: Path) -> None:
+    loaded, artifact = _clean_persisted_study(config, tmp_path)
+    original_bytes = artifact.read_bytes()
+    assert validate_persisted_optimization(loaded) == []
+    assert validate_persisted_optimization(loaded, config) == []
+    assert validate_persisted_optimization(loaded.to_dict()) == []
+    assert is_legacy_search_space(loaded) is False
+    # Validation is read-only: canonical artifact bytes are untouched.
+    assert artifact.read_bytes() == original_bytes
+
+
+def test_fabricated_old_tsmom_study_is_legacy() -> None:
+    old_study = {
+        "base_strategy_id": "tsmom_vol_target",
+        "request": {
+            "base_strategy_id": "tsmom_vol_target",
+            "search_space": [
+                {"param_path": "allocator.params.gross_leverage"},
+                {"param_path": "allocator.params.risk_aversion"},
+                {"param_path": "universe.params.top_n"},
+                {"param_path": "timing.0.params.lookback_fast"},
+            ],
+        },
+        "best_params": {"allocator.params.gross_leverage": 1.0},
+        "trials": [
+            {
+                "params": {
+                    "timing.0.params.lookback_fast": 21,
+                    "allocator.params.risk_aversion": 2.0,
+                }
+            }
+        ],
+    }
+    snapshot = json.loads(json.dumps(old_study))
+    reasons = validate_persisted_optimization(old_study)
+    assert reasons
+    assert is_legacy_search_space(old_study) is True
+    text = "\n".join(reasons)
+    assert "non-tunable structural/hygiene parameter path 'universe.params.top_n'" in text
+    assert "allocator.params.gross_leverage" in text
+    assert "allocator.params.risk_aversion" in text
+    assert "timing.0.params.lookback_fast" not in text
+    assert reasons == sorted(set(reasons))
+    # No mutation of the input payload.
+    assert old_study == snapshot
+
+
+def test_old_study_typed_result_is_legacy(config: StrategyConfig, tmp_path: Path) -> None:
+    clean, _artifact = _clean_persisted_study(config, tmp_path)
+    legacy_space = (
+        ParameterRange(
+            param_path="allocator.params.gross_leverage", type="float", low=0.5, high=2.0
+        ),
+        ParameterRange(param_path="universe.params.top_n", type="int", low=3, high=20),
+        ParameterRange(
+            param_path="allocator.params.risk_aversion", type="float", low=0.1, high=5.0
+        ),
+    )
+    legacy_request = clean.request.model_copy(update={"search_space": legacy_space})
+    legacy_result = clean.model_copy(
+        update={
+            "request": legacy_request,
+            "best_params": {"allocator.params.gross_leverage": 1.0},
+        }
+    )
+    reasons = validate_persisted_optimization(legacy_result)
+    text = "\n".join(reasons)
+    assert is_legacy_search_space(legacy_result) is True
+    assert "allocator.params.gross_leverage" in text
+    assert "allocator.params.risk_aversion" in text
+    assert "universe.params.top_n" in text
+
+
+def test_old_drl_study_with_equal_weight_paths_is_legacy() -> None:
+    old_study = {
+        "base_strategy_id": "drl_ppo_llm_risk",
+        "request": {
+            "base_strategy_id": "drl_ppo_llm_risk",
+            "search_space": [
+                {"param_path": "allocator.equal_weight.gross_leverage"},
+                {"param_path": "allocator.params.risk_aversion"},
+                {"param_path": "timing.0.params.lookback_fast"},
+            ],
+        },
+        "best_params": {},
+    }
+    reasons = validate_persisted_optimization(old_study)
+    text = "\n".join(reasons)
+    assert "allocator.equal_weight.gross_leverage" in text
+    assert "allocator.params.risk_aversion" in text
+    assert "timing.0.params.lookback_fast" not in text
+    assert is_legacy_search_space(old_study) is True
+
+
+def test_unresolvable_base_strategy_is_conservative() -> None:
+    old_study = {
+        "base_strategy_id": "custom_undeployed_strategy_xyz",
+        "request": {
+            "search_space": [
+                {"param_path": "timing.0.params.lookback_fast"},
+                {"param_path": "universe.params.top_n"},
+                {"param_path": "foo.params.bar"},
+            ]
+        },
+    }
+    reasons = validate_persisted_optimization(old_study)
+    text = "\n".join(reasons)
+    assert "universe.params.top_n" in text and "structural" in text
+    assert "foo.params.bar" in text and "unknown stage" in text
+    assert "timing.0.params.lookback_fast" not in text
+    assert "could not be resolved" in text
+
+
+def test_fixture_payload_is_skipped() -> None:
+    fixture = {
+        "provenance": "fixture",
+        "backend": "deterministic-fixture",
+        "base_strategy_id": "tsmom_vol_target",
+        "message": "optimizer unavailable",
+        "best_params": {"allocator.params.gross_leverage": 1.0},
+    }
+    assert validate_persisted_optimization(fixture) == []
+    assert is_legacy_search_space(fixture) is False
+    # Non-engine backend without provenance is skipped as well.
+    assert (
+        validate_persisted_optimization(
+            {"backend": "deterministic-fixture", "base_strategy_id": "tsmom_vol_target"}
+        )
+        == []
+    )
+
+
+def test_validation_input_handling(config: StrategyConfig) -> None:
+    with pytest.raises(TypeError):
+        validate_persisted_optimization(object())  # type: ignore[arg-type]
+    # Non-canonical payload without a base strategy id has nothing to validate.
+    assert validate_persisted_optimization({"best_params": {"whatever": 1.0}}) == []
+    clean = {
+        "base_strategy_id": config.id,
+        "request": {"search_space": []},
+        "best_params": {},
+    }
+    assert validate_persisted_optimization(clean) == []
+    # A config with a mismatched id is ignored; the helper resolves the base id.
+    other = StrategyConfig.model_validate(
+        load_strategy_config(
+            REPO_ROOT / "configs" / "strategies" / "drl_ppo_llm_risk.yaml"
+        ).model_dump(mode="python")
+    )
+    reasons = validate_persisted_optimization(
+        {
+            "base_strategy_id": "tsmom_vol_target",
+            "request": {"search_space": [{"param_path": "universe.params.top_n"}]},
+        },
+        other,
+    )
+    assert reasons and "universe.params.top_n" in reasons[0]
 
 
 # ---------------------------------------------------------------------------
