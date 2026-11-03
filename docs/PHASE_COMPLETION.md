@@ -348,6 +348,16 @@ setup, dashboard, backtests/walk-forward, live runner, risk operations, Docker, 
    with an actionable supported-provider message; keyless local `vllm` is supported. Subprocess CLI
    tests now run from a temp cwd so a developer's real repo-root `.env` can never leak into the
    hermetic test suite.
+6. **API ↔ IBKR attachment and live ledger** — new `FUTURESRLX_API_ENABLE_IBKR` setting (honored from
+   `.env`, the legacy env flag still works) makes the FastAPI backend own a real paper/live session,
+   so `/health` reports `ibkr_connected=true` and the ribbon shows `PAPER · IBKR` (the badge also
+   recognises a fresh paper/live runner bridge). The `ib_async` adapter now subscribes to account
+   updates with an `accountSummary` fallback, is currency-aware for non-USD base accounts
+   (`FUTURESRLX_ACCOUNT_CURRENCY` / `FX_RATES`), and `/api/positions` degrades to a 503 with
+   actionable text instead of a raw 500. The dashboard allows a longer first account fetch and
+   refreshes every 15 s so a slow ledger never leaves fixture values on screen. WSL2 NAT/mirrored
+   setup is documented (and either Windows-host-IP or mirrored `127.0.0.1` works; verified live
+   against TWS paper with EUR base account).
 
 **Verification (as merged)**
 - `FUTURESRLX_ENVIRONMENT=paper FUTURESRLX_RISK_STATE_STORE_URI=duckdb: ./scripts/quality_gate.sh --cov`

@@ -233,7 +233,8 @@ For a non-USD IBKR account, set both, e.g. `FUTURESRLX_ACCOUNT_CURRENCY=EUR` and
 | `FUTURESRLX_API_HOST` / `PORT` | `0.0.0.0` / `8000` | FastAPI bind |
 | `FUTURESRLX_API_CORS_ORIGINS` | `localhost:3000`, `localhost:3100` | dashboard origins |
 | `FUTURESRLX_TELEMETRY_INTERVAL_SECONDS` | `1.0` | WebSocket telemetry cadence |
-| `FUTURESRLX_API_ENABLE_IBKR` | `0` (compose) | opt-in real IBKR session in the API container |
+| `FUTURESRLX_API_ENABLE_IBKR` | `0` (compose) | opt-in real IBKR session in the API container / local `.env` |
+| `FUTURESRLX_ACCOUNT_CURRENCY` | `USD` | IBKR account base currency for ledger/FX normalization |
 
 ### Instrument master
 
@@ -352,6 +353,43 @@ FUTURESRLX_RISK_STATE_STORE_URI=duckdb:   # durable intraday risk state
 ```
 
 This opens **no socket**: it validates settings, instrument master, strategy YAML, FX/base currency, state-store type and hydration configuration, and prints a JSON summary. Exit code `0` = ready. Because it never connects, **no "incoming connection" prompt will appear in TWS** — use the live runner (or the `ib_async` handshake snippet below) to actually open the socket.
+
+### Attach the FastAPI backend (dashboard) to IBKR
+
+The API backend runs its deterministic offline engine by default: `/health` reports
+`offline_mode=true` / `ibkr_connected=false` and the ribbon shows `OFFLINE ENGINE` even when TWS is
+reachable and the live runner works. Enable the API-owned IBKR session explicitly:
+
+```dotenv
+FUTURESRLX_API_ENABLE_IBKR=1
+FUTURESRLX_ENVIRONMENT=paper
+FUTURESRLX_IBKR_HOST=127.0.0.1
+FUTURESRLX_IBKR_PORT=7497
+```
+
+Then restart `uvicorn`. `/health` should report `"ibkr_connected": true` and
+`"offline_mode": false`, and the ribbon switches to `PAPER · IBKR` (or `LIVE · IBKR` with
+`FUTURESRLX_ENVIRONMENT=live`). The flag is also honored from `docker/.env` in compose. Without it,
+`OFFLINE ENGINE` is correct even if TWS is connected — the dashboard is not attached to the broker.
+Alternatively, run a separate `TradingRunner` (which publishes the runner bridge) and the ribbon also
+reports `PAPER · IBKR` / `LIVE · IBKR` from a fresh bridge snapshot.
+
+![Command Center connected to the IBKR paper account](screenshots/phase9-paper-ibkr-connected.png)
+
+### Non-USD IBKR account base currency
+
+IBKR reports the ledger in the account's base currency. If that is not USD, set the account
+currency and the USD-per-unit FX rate so notional/margin math is correct:
+
+```dotenv
+FUTURESRLX_ACCOUNT_CURRENCY=EUR
+FUTURESRLX_FX_RATES={"EUR": 1.1216}   # reference rate, update periodically
+```
+
+Otherwise `fetch_account` cannot find a usable NetLiquidation row (e.g. a EUR ledger is rejected
+when only USD/currency-less rows are accepted) and `/api/positions` degrades to a 503 with an
+actionable message. The API reads the ledger via `reqAccountUpdates` with an `accountSummary`
+fallback, so either streaming path is sufficient.
 
 ### Running from WSL2 (TWS on the Windows host)
 
