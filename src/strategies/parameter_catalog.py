@@ -24,6 +24,22 @@ to a pipeline stage so :func:`resolve_param_path` can find the concrete dotted
 path inside any strategy dict (timing/risk are ordered lists, so the index is
 resolved dynamically from the stage name).
 
+Dynamic instrument master / Studio dropdowns
+-------------------------------------------
+The catalog is **not** a static snapshot of the instrument master: root choices
+(``universe.regime.risk_off_roots``, ``timing.seasonality.root_month_biases``) and
+sector choices are rebuilt from :func:`configs.instruments.load_instruments`, and
+:func:`parameter_catalog` caches one catalog per *instrument-master fingerprint*
+(roots + sectors + per-root contract specs). Adding futures roots/sectors to
+``configs/instruments.yaml`` therefore yields updated catalog choices without a
+code change; :func:`refresh_parameter_catalog` forces a reload after the file
+changes, and callers may pass an explicit ``instrument_master`` instead.
+
+The payload also carries the Studio's universe explorer and stage dropdowns:
+:func:`universe_metadata` (sector-grouped roots with multiplier/tick/micro data,
+sector groups All/Equities/Rates/Energy/Metals/FX/Agri/Crypto) and per-stage
+``choices`` (universe selectors, allocators, timing overlays, risk overlays).
+
 Helper API (also the contract reported to the API/optimizer owners)
 -------------------------------------------------------------------
 * :func:`parameter_catalog` — cached :class:`ParameterCatalog` singleton
@@ -40,6 +56,13 @@ Helper API (also the contract reported to the API/optimizer owners)
 Only hyperparameters are catalogued; runtime artefacts such as
 ``DRLSpec.model_path`` (trained checkpoint path) are intentionally excluded —
 they are run configuration, not tunable parameters.
+
+Import note: this module and the cached ``parameter_catalog()`` callable share a
+name, and ``src.strategies`` re-exports the callable. Use
+``from src.strategies.parameter_catalog import catalog_dict, parameter_catalog``
+(or ``importlib.import_module("src.strategies.parameter_catalog")``); the
+``import src.strategies.parameter_catalog as x`` form binds the *function* from
+the package namespace instead of the module.
 """
 
 from __future__ import annotations
@@ -50,10 +73,9 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from functools import lru_cache
 from typing import Any
 
-from configs.instruments import load_instruments
+from configs.instruments import InstrumentsConfig, InstrumentSpec, load_instruments
 from configs.strategy import StrategyConfig
 
 from src.strategies.timing.seasonality import ALL_MONTHS, DEFAULT_ROOT_MONTH_BIASES
@@ -82,6 +104,134 @@ type CatalogScalar = int | float | bool | str | None
 type CatalogDefault = CatalogScalar | tuple[CatalogScalar, ...]
 type UIValue = object
 
+#: Studio universe-sector groups, in display order: ``(id, label, description)``.
+#: ``all`` is always first and contains every root; the seven asset-class groups
+#: follow (empty groups are still exposed so the UI dropdown stays stable).
+UNIVERSE_SECTOR_GROUPS: tuple[tuple[str, str, str], ...] = (
+    ("all", "All", "Every futures root in the instrument master"),
+    ("equities", "Equities", "Equity index futures (ES/NQ/YM/RTY families)"),
+    ("rates", "Rates", "Interest-rate and bond futures"),
+    ("energy", "Energy", "Crude oil, refined products and natural gas futures"),
+    ("metals", "Metals", "Precious and industrial metals futures"),
+    ("fx", "FX", "Currency futures"),
+    ("agri", "Agri", "Grains, oilseeds, softs and livestock futures"),
+    ("crypto", "Crypto", "Crypto-currency futures"),
+)
+
+#: ``configs/instruments.yaml`` sector id (or common alias) -> Studio group id.
+SECTOR_GROUP_ALIASES: Mapping[str, str] = {
+    "equity": "equities",
+    "equities": "equities",
+    "equity_index": "equities",
+    "index": "equities",
+    "indices": "equities",
+    "rates": "rates",
+    "rate": "rates",
+    "fixed_income": "rates",
+    "bonds": "rates",
+    "energy": "energy",
+    "metals": "metals",
+    "metal": "metals",
+    "precious_metals": "metals",
+    "industrial_metals": "metals",
+    "fx": "fx",
+    "currency": "fx",
+    "currencies": "fx",
+    "agri": "agri",
+    "agriculture": "agri",
+    "agricultural": "agri",
+    "grains": "agri",
+    "grain": "agri",
+    "oilseeds": "agri",
+    "softs": "agri",
+    "livestock": "agri",
+    "crypto": "crypto",
+    "cryptocurrencies": "crypto",
+    "digital_assets": "crypto",
+}
+
+#: Fallback group per :class:`~src.core.types.AssetClass` value.
+ASSET_CLASS_GROUPS: Mapping[str, str] = {
+    "equity_index": "equities",
+    "rates": "rates",
+    "energy": "energy",
+    "metals": "metals",
+    "fx": "fx",
+    "agriculture": "agri",
+    "crypto": "crypto",
+}
+
+#: Display metadata for studio stage dropdown options.
+STAGE_OPTION_LABELS: Mapping[str, Mapping[str, tuple[str, str]]] = {
+    "universe": {
+        "liquidity": (
+            "Liquidity",
+            "Rank roots by traded dollar volume, open interest and history.",
+        ),
+        "regime": (
+            "Adaptive regime",
+            "Slow trend/macro-vol regime plus a fast 3-day risk-off shock filter.",
+        ),
+        "composite": ("Composite", "Combine several selectors by intersection or union."),
+    },
+    "allocator": {
+        "volatility_target": (
+            "Volatility target",
+            "Inverse-volatility weights scaled to an annualised volatility target.",
+        ),
+        "risk_parity": ("Risk parity", "Equal-risk-contribution allocation across the universe."),
+        "equal_weight": (
+            "Equal weight",
+            "Equal signed notional per candidate (naive diversification baseline).",
+        ),
+        "mean_variance": (
+            "Mean variance",
+            "Regularised inverse-covariance mean-variance allocation.",
+        ),
+        "drl": ("DRL policy", "Trained PPO/CPPO/SAC/TD3/A2C policy allocator."),
+    },
+    "timing": {
+        "tsmom": ("TSMOM", "Volatility-scaled time-series momentum."),
+        "kama": ("KAMA", "Kaufman adaptive moving-average trend agreement."),
+        "carry_filter": ("Carry filter", "Term-structure carry/roll-yield tilt."),
+        "mean_reversion": (
+            "Mean reversion",
+            "Fade RSI/Bollinger extremes unless turbulence vetoes.",
+        ),
+        "seasonality": ("Seasonality", "UTC-month seasonal commodity cycle tilt."),
+        "composite": ("Composite", "Apply several timing overlays in order."),
+    },
+    "risk": {
+        "quant_risk": (
+            "Quant risk",
+            "Volatility targeting, drawdown limits and correlated-cluster caps.",
+        ),
+        "llm_risk": ("LLM Risk-First", "Confidence-filtered LLM semantic risk circuit breaker."),
+    },
+    "translator": {
+        "translator": ("Contract translator", "Approved weights → discrete futures contracts."),
+    },
+}
+
+#: Preferred dropdown ordering per stage (registry entries not listed are appended).
+_STAGE_CHOICE_ORDER: Mapping[str, tuple[str, ...]] = {
+    "universe": ("liquidity", "regime", "composite"),
+    "allocator": ("volatility_target", "risk_parity", "equal_weight", "mean_variance", "drl"),
+    "timing": ("tsmom", "kama", "carry_filter", "mean_reversion", "seasonality", "composite"),
+}
+
+#: Fallback monthly tilt curves per asset class for roots without a bespoke curve.
+_GENERIC_SEASONAL_CURVES: Mapping[str, Mapping[int, float]] = {
+    "equity_index": {1: 0.05, 9: -0.10, 10: 0.05, 11: 0.10, 12: 0.10},
+    "rates": {3: -0.05, 6: -0.05, 9: -0.05, 12: -0.05},
+    "energy": {2: 0.10, 3: 0.15, 4: 0.20, 5: 0.25, 6: 0.20, 7: 0.10, 9: -0.05, 10: -0.10},
+    "metals": {1: 0.10, 8: 0.05, 9: 0.10, 10: 0.10, 11: 0.05, 12: 0.10},
+    "fx": {},
+    "agriculture": {3: 0.10, 4: 0.10, 5: 0.05, 6: -0.05, 7: -0.10, 8: -0.10, 9: -0.15, 10: -0.10},
+    "crypto": {},
+    "unknown": {},
+}
+
 
 class ParameterType(StrEnum):
     """Value kind of one catalogued parameter."""
@@ -91,6 +241,98 @@ class ParameterType(StrEnum):
     BOOL = "bool"
     SELECT = "select"
     MULTISELECT = "multiselect"
+
+
+@dataclass(frozen=True, slots=True)
+class StageOption:
+    """One selectable implementation of a pipeline stage (Studio dropdown entry)."""
+
+    name: str
+    label: str
+    description: str
+    parameter_keys: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable representation."""
+        return {
+            "name": self.name,
+            "label": self.label,
+            "description": self.description,
+            "parameter_keys": list(self.parameter_keys),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UniverseRoot:
+    """Studio metadata for one futures root in the instrument master."""
+
+    root: str
+    name: str
+    asset_class: str
+    sector: str
+    sector_group: str
+    exchange: str
+    multiplier: float
+    tick_size: float
+    micro_root: str | None
+    standard_root: str | None
+    currency: str
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable representation."""
+        return {
+            "root": self.root,
+            "name": self.name,
+            "asset_class": self.asset_class,
+            "sector": self.sector,
+            "sector_group": self.sector_group,
+            "exchange": self.exchange,
+            "multiplier": self.multiplier,
+            "tick_size": self.tick_size,
+            "micro_root": self.micro_root,
+            "standard_root": self.standard_root,
+            "currency": self.currency,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UniverseSector:
+    """One Studio universe group (``All`` + asset-class sectors)."""
+
+    id: str
+    label: str
+    description: str
+    roots: tuple[UniverseRoot, ...]
+
+    @property
+    def count(self) -> int:
+        """Number of roots in this sector group."""
+        return len(self.roots)
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable representation (``count`` is derived)."""
+        return {
+            "id": self.id,
+            "label": self.label,
+            "description": self.description,
+            "count": self.count,
+            "roots": [root.to_dict() for root in self.roots],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UniverseMetadata:
+    """Sector-grouped instrument-master metadata for the Studio universe explorer."""
+
+    sectors: tuple[UniverseSector, ...]
+    roots: tuple[UniverseRoot, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable representation."""
+        return {
+            "sectors": [sector.to_dict() for sector in self.sectors],
+            "roots": [root.to_dict() for root in self.roots],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +397,7 @@ class CatalogStage:
     label: str
     description: str
     parameter_keys: tuple[str, ...]
+    choices: tuple[StageOption, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serialisable representation."""
@@ -163,6 +406,7 @@ class CatalogStage:
             "label": self.label,
             "description": self.description,
             "parameter_keys": list(self.parameter_keys),
+            "choices": [option.to_dict() for option in self.choices],
         }
 
 
@@ -203,6 +447,7 @@ class ParameterCatalog:
     stages: tuple[CatalogStage, ...]
     parameters: tuple[ParameterSpec, ...]
     presets: tuple[PresetTemplate, ...]
+    instrument_master: InstrumentsConfig
 
     # -- lookups --------------------------------------------------------------
 
@@ -227,6 +472,18 @@ class ParameterCatalog:
     def tunable(self) -> tuple[ParameterSpec, ...]:
         """Parameters the Optuna optimizer may sample."""
         return tuple(spec for spec in self.parameters if spec.optuna_tunable)
+
+    def stage_choices(self) -> Mapping[str, tuple[str, ...]]:
+        """Stage id -> selectable implementation names (Studio dropdowns)."""
+        return {stage.id: tuple(option.name for option in stage.choices) for stage in self.stages}
+
+    def universe_metadata(self) -> UniverseMetadata:
+        """Sector-grouped metadata for the instrument master this catalog was built from."""
+        return universe_metadata(self.instrument_master)
+
+    def universe_sectors(self) -> tuple[UniverseSector, ...]:
+        """Sector groups (``All`` + asset-class sectors) for the Studio universe explorer."""
+        return self.universe_metadata().sectors
 
     # -- validation / serialisation ------------------------------------------
 
@@ -254,6 +511,34 @@ class ParameterCatalog:
         for spec in self.parameters:
             if spec.stage not in stage_ids:
                 raise ValueError(f"{spec.key}: stage {spec.stage!r} is not declared in stages")
+        for stage in self.stages:
+            seen: set[str] = set()
+            for option in stage.choices:
+                if not option.name or option.name in seen:
+                    raise ValueError(
+                        f"stage {stage.id!r} has an invalid/duplicate choice {option.name!r}"
+                    )
+                seen.add(option.name)
+                for key in option.parameter_keys:
+                    if key not in keys:
+                        raise ValueError(
+                            f"stage {stage.id!r} choice {option.name!r} references unknown key {key!r}"
+                        )
+            if stage.id == "universe" and not stage.choices:
+                raise ValueError("the universe stage must expose selector choices")
+            if stage.id == "allocator" and not stage.choices:
+                raise ValueError("the allocator stage must expose allocator choices")
+        metadata = self.universe_metadata()
+        root_ids = {root.root for root in metadata.roots}
+        if not root_ids:
+            raise ValueError("universe metadata has no roots")
+        covered: list[str] = [
+            root.root for sector in metadata.sectors if sector.id != "all" for root in sector.roots
+        ]
+        if len(covered) != len(set(covered)):
+            raise ValueError("a root is assigned to more than one non-All sector group")
+        if set(covered) != root_ids:
+            raise ValueError("sector groups do not partition the instrument master roots")
         preset_ids: set[str] = set()
         for preset in self.presets:
             if preset.id in preset_ids:
@@ -321,12 +606,23 @@ class ParameterCatalog:
             )
 
     def to_dict(self) -> dict[str, object]:
-        """JSON-ready payload for ``GET /api/strategies/schema/catalog``."""
+        """JSON-ready payload for ``GET /api/strategies/schema/catalog``.
+
+        Additive top-level keys beyond the Phase-10 contract: ``universe``
+        (:meth:`universe_metadata`, sector-grouped instrument master) and
+        ``stage_choices`` (stage id -> dropdown option names). Existing
+        ``version``/``stages``/``parameters``/``presets`` shapes are unchanged
+        except that every stage dict now also carries ``choices``.
+        """
         return {
             "version": self.version,
             "stages": [stage.to_dict() for stage in self.stages],
             "parameters": [spec.to_dict() for spec in self.parameters],
             "presets": [preset.to_dict() for preset in self.presets],
+            "universe": self.universe_metadata().to_dict(),
+            "stage_choices": {
+                stage_id: list(names) for stage_id, names in self.stage_choices().items()
+            },
         }
 
 
@@ -403,8 +699,7 @@ def _p(
 # ---------------------------------------------------------------------------
 
 
-def _universe_specs() -> tuple[ParameterSpec, ...]:
-    master = load_instruments()
+def _universe_specs(master: InstrumentsConfig) -> tuple[ParameterSpec, ...]:
     root_choices: tuple[CatalogScalar, ...] = tuple(master.roots())
     sector_choices: tuple[CatalogScalar, ...] = tuple(master.sectors())
     return (
@@ -1250,7 +1545,7 @@ def _drl_allocator_specs() -> tuple[ParameterSpec, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _timing_specs() -> tuple[ParameterSpec, ...]:
+def _timing_specs(master: InstrumentsConfig) -> tuple[ParameterSpec, ...]:
     timing_names: tuple[CatalogScalar, ...] = (
         "tsmom",
         "kama",
@@ -1258,7 +1553,7 @@ def _timing_specs() -> tuple[ParameterSpec, ...]:
         "mean_reversion",
         "seasonality",
     )
-    roots: tuple[CatalogScalar, ...] = tuple(load_instruments().roots())
+    roots: tuple[CatalogScalar, ...] = tuple(master.roots())
     return (
         _p(
             "timing",
@@ -2309,6 +2604,213 @@ def _preset_specs() -> tuple[PresetTemplate, ...]:
     )
 
 
+# ---------------------------------------------------------------------------
+# Instrument-master -> Studio universe metadata
+# ---------------------------------------------------------------------------
+
+
+def _sector_group_for(spec: InstrumentSpec) -> str:
+    """Map an instrument spec to one of the Studio universe sector groups."""
+    raw_sector = spec.sector.strip().lower()
+    group = SECTOR_GROUP_ALIASES.get(raw_sector)
+    if group is not None:
+        return group
+    group = ASSET_CLASS_GROUPS.get(spec.asset_class.value)
+    return group if group is not None else "other"
+
+
+def _universe_root(spec: InstrumentSpec) -> UniverseRoot:
+    return UniverseRoot(
+        root=spec.root,
+        name=spec.name,
+        asset_class=spec.asset_class.value,
+        sector=spec.sector,
+        sector_group=_sector_group_for(spec),
+        exchange=spec.exchange,
+        multiplier=spec.multiplier,
+        tick_size=spec.tick_size,
+        micro_root=spec.micro_root,
+        standard_root=spec.standard_root,
+        currency=spec.currency,
+    )
+
+
+def universe_roots(
+    instrument_master: InstrumentsConfig | None = None,
+) -> tuple[UniverseRoot, ...]:
+    """Every futures root in the instrument master, in declaration order."""
+    master = instrument_master if instrument_master is not None else load_instruments()
+    return tuple(_universe_root(spec) for spec in master.instruments.values())
+
+
+def universe_sectors(
+    instrument_master: InstrumentsConfig | None = None,
+) -> tuple[UniverseSector, ...]:
+    """Sector-grouped universe metadata for the Studio universe explorer.
+
+    Returns ``All`` first and then the seven canonical asset-class groups
+    (Equities/Rates/Energy/Metals/FX/Agri/Crypto) — empty groups are included so
+    the UI dropdown is stable — plus an ``Other`` group only when a root cannot be
+    mapped to a canonical group. Every root appears exactly once outside ``All``.
+    """
+    roots = universe_roots(instrument_master)
+    buckets: dict[str, list[UniverseRoot]] = {
+        group_id: [] for group_id, _label, _description in UNIVERSE_SECTOR_GROUPS
+    }
+    for root in roots:
+        buckets.setdefault(root.sector_group, []).append(root)
+    sectors: list[UniverseSector] = []
+    for group_id, label, description in UNIVERSE_SECTOR_GROUPS:
+        group_roots = tuple(buckets.pop(group_id, ()))
+        sectors.append(
+            UniverseSector(
+                id=group_id,
+                label=label,
+                description=description,
+                roots=tuple(roots) if group_id == "all" else group_roots,
+            )
+        )
+    leftover = tuple(root for remaining in buckets.values() for root in remaining)
+    if leftover:
+        sectors.append(
+            UniverseSector(
+                id="other",
+                label="Other",
+                description="Roots whose instrument-master sector/asset class has no Studio group",
+                roots=leftover,
+            )
+        )
+    return tuple(sectors)
+
+
+def universe_metadata(
+    instrument_master: InstrumentsConfig | None = None,
+) -> UniverseMetadata:
+    """JSON-friendly sector-grouped instrument-master metadata for the Studio."""
+    return UniverseMetadata(
+        sectors=universe_sectors(instrument_master),
+        roots=universe_roots(instrument_master),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage dropdown choices (derived from the live registries)
+# ---------------------------------------------------------------------------
+
+
+def _ordered_choice_names(available: Sequence[str], stage_id: str) -> tuple[str, ...]:
+    preferred = _STAGE_CHOICE_ORDER.get(stage_id, ())
+    ordered = [name for name in preferred if name in available]
+    ordered.extend(name for name in available if name not in ordered)
+    return tuple(ordered)
+
+
+def _registry_choice_names(stage_id: str) -> tuple[str, ...]:
+    """Selectable implementation names for a stage, derived from its registry."""
+    if stage_id == "universe":
+        from src.strategies.selectors import SELECTOR_REGISTRY  # local import avoids cycles
+
+        return _ordered_choice_names(tuple(SELECTOR_REGISTRY), stage_id)
+    if stage_id == "allocator":
+        from src.strategies.allocators import ALLOCATOR_REGISTRY  # local import avoids cycles
+
+        return _ordered_choice_names(tuple(ALLOCATOR_REGISTRY), stage_id)
+    if stage_id == "timing":
+        from src.strategies.timing import TIMING_REGISTRY  # local import avoids cycles
+
+        return _ordered_choice_names(tuple(TIMING_REGISTRY), stage_id)
+    return ()
+
+
+def _stage_choices(stage_id: str, parameters: tuple[ParameterSpec, ...]) -> tuple[StageOption, ...]:
+    names = _registry_choice_names(stage_id)
+    if not names:
+        # risk / translator: derive from the catalogued sub-stage names (stable order).
+        names = tuple(
+            dict.fromkeys(spec.stage_name for spec in parameters if spec.stage == stage_id)
+        )
+    labels = STAGE_OPTION_LABELS.get(stage_id, {})
+    options: list[StageOption] = []
+    for name in names:
+        parameter_keys = tuple(
+            spec.key for spec in parameters if spec.stage == stage_id and spec.stage_name == name
+        )
+        label, description = labels.get(
+            name, (name.replace("_", " ").title(), f"{stage_id} stage option {name}")
+        )
+        options.append(
+            StageOption(
+                name=name,
+                label=label,
+                description=description,
+                parameter_keys=parameter_keys,
+            )
+        )
+    return tuple(options)
+
+
+# ---------------------------------------------------------------------------
+# Catalog construction (cached per instrument-master fingerprint)
+# ---------------------------------------------------------------------------
+
+type MasterFingerprint = tuple[object, ...]
+
+_CATALOG_CACHE: dict[MasterFingerprint, ParameterCatalog] = {}
+
+
+def _master_fingerprint(master: InstrumentsConfig) -> MasterFingerprint:
+    """Stable, hashable signature of the instrument master's content."""
+    return (
+        master.version,
+        tuple(master.roots()),
+        tuple(master.sectors()),
+        tuple(
+            (
+                spec.root,
+                spec.name,
+                spec.asset_class.value,
+                spec.sector,
+                spec.exchange,
+                spec.multiplier,
+                spec.tick_size,
+                spec.currency,
+                spec.micro_root,
+                spec.standard_root,
+            )
+            for spec in master.instruments.values()
+        ),
+    )
+
+
+def _build_catalog(master: InstrumentsConfig) -> ParameterCatalog:
+    parameters: tuple[ParameterSpec, ...] = (
+        *_universe_specs(master),
+        *_allocator_specs(),
+        *_timing_specs(master),
+        *_risk_specs(),
+        *_translator_specs(),
+    )
+    stages = tuple(
+        CatalogStage(
+            id=stage_id,
+            label=label,
+            description=description,
+            parameter_keys=tuple(spec.key for spec in parameters if spec.stage == stage_id),
+            choices=_stage_choices(stage_id, parameters),
+        )
+        for stage_id, label, description in _STAGE_METADATA
+    )
+    catalog = ParameterCatalog(
+        version=CATALOG_VERSION,
+        stages=stages,
+        parameters=parameters,
+        presets=_preset_specs(),
+        instrument_master=master,
+    )
+    catalog.validate()
+    return catalog
+
+
 _STAGE_METADATA: tuple[tuple[str, str, str], ...] = (
     (
         "universe",
@@ -2342,42 +2844,60 @@ _STAGE_METADATA: tuple[tuple[str, str, str], ...] = (
 )
 
 
-@lru_cache(maxsize=1)
-def parameter_catalog() -> ParameterCatalog:
-    """Return the cached, validated :class:`ParameterCatalog` singleton."""
-    parameters = (
-        *_universe_specs(),
-        *_allocator_specs(),
-        *_timing_specs(),
-        *_risk_specs(),
-        *_translator_specs(),
-    )
-    stages = tuple(
-        CatalogStage(
-            id=stage_id,
-            label=label,
-            description=description,
-            parameter_keys=tuple(spec.key for spec in parameters if spec.stage == stage_id),
-        )
-        for stage_id, label, description in _STAGE_METADATA
-    )
-    catalog = ParameterCatalog(
-        version=CATALOG_VERSION,
-        stages=stages,
-        parameters=parameters,
-        presets=_preset_specs(),
-    )
-    catalog.validate()
-    return catalog
+def parameter_catalog(
+    instrument_master: InstrumentsConfig | None = None,
+) -> ParameterCatalog:
+    """Return the validated catalog for an instrument master (cached per master).
+
+    ``instrument_master`` defaults to the live :func:`configs.instruments.load_instruments`
+    master, so root/sector choices always mirror ``configs/instruments.yaml``. One
+    catalog is cached per instrument-master *fingerprint* (roots + sectors + per-root
+    contract specs); :func:`refresh_parameter_catalog` clears the instruments cache
+    and rebuilds after the YAML changes, and callers with a freshly loaded master may
+    pass it explicitly.
+    """
+    master = instrument_master if instrument_master is not None else load_instruments()
+    fingerprint = _master_fingerprint(master)
+    cached = _CATALOG_CACHE.get(fingerprint)
+    if cached is None:
+        cached = _build_catalog(master)
+        _CATALOG_CACHE[fingerprint] = cached
+    return cached
 
 
-#: Module-level constant mirror (``CATALOG`` is ``parameter_catalog()``).
+def refresh_parameter_catalog() -> ParameterCatalog:
+    """Reload the instrument master and return the rebuilt catalog.
+
+    Use after ``configs/instruments.yaml`` is edited/committed so a long-running
+    API/Studio process picks up new roots/sectors immediately.
+    """
+    from configs.instruments import clear_instruments_cache  # local import: reload hook
+
+    clear_instruments_cache()
+    return parameter_catalog()
+
+
+def clear_parameter_catalog_cache() -> None:
+    """Drop every cached catalog (test/configuration-reload helper)."""
+    _CATALOG_CACHE.clear()
+
+
+#: Module-level constant mirror of the import-time catalog (``parameter_catalog()``).
+#: Long-running processes should call :func:`parameter_catalog`/``refresh_parameter_catalog``
+#: after the instrument master changes instead of relying on this snapshot.
 CATALOG: ParameterCatalog = parameter_catalog()
 
 
-def catalog_dict() -> dict[str, object]:
-    """JSON-ready payload for ``GET /api/strategies/schema/catalog``."""
-    return parameter_catalog().to_dict()
+def catalog_dict(
+    instrument_master: InstrumentsConfig | None = None,
+) -> dict[str, object]:
+    """JSON-ready payload for ``GET /api/strategies/schema/catalog``.
+
+    Includes the additive ``universe`` (sector-grouped instrument-master metadata)
+    and ``stage_choices`` (universe selector / allocator / timing / risk dropdowns)
+    keys plus the Phase-10 ``version``/``stages``/``parameters``/``presets`` shape.
+    """
+    return parameter_catalog(instrument_master).to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -2682,7 +3202,28 @@ def decode_parameter_value(key_or_spec: str | ParameterSpec, raw: object) -> obj
     return raw
 
 
-def encode_parameter_value(key_or_spec: str | ParameterSpec, value: object) -> CatalogScalar:
+def _seasonal_curve_for(
+    root: str, *, instrument_master: InstrumentsConfig | None = None
+) -> Mapping[int, float]:
+    """Monthly tilt curve for ``root``: bespoke curve, else its asset-class default."""
+    bespoke = DEFAULT_ROOT_MONTH_BIASES.get(root)
+    if bespoke is not None:
+        return bespoke
+    master = instrument_master if instrument_master is not None else load_instruments()
+    spec = master.instruments.get(root)
+    if spec is None:
+        raise ValueError(
+            f"unknown futures root {root!r} for seasonal biases; known roots: {list(master.roots())!r}"
+        )
+    return _GENERIC_SEASONAL_CURVES.get(spec.asset_class.value, {})
+
+
+def encode_parameter_value(
+    key_or_spec: str | ParameterSpec,
+    value: object,
+    *,
+    instrument_master: InstrumentsConfig | None = None,
+) -> CatalogScalar:
     """Validate a UI-native value and encode it for ``StageConfig.params``/YAML."""
     spec = _catalog_lookup(key_or_spec)
     normalised = validate_parameter_value(spec, value)
@@ -2704,18 +3245,16 @@ def encode_parameter_value(key_or_spec: str | ParameterSpec, value: object) -> C
     assert isinstance(normalised, tuple)
     selected: dict[str, dict[str, float]] = {}
     for root in normalised:
-        curve = DEFAULT_ROOT_MONTH_BIASES.get(str(root))
-        if curve is None:
-            raise ValueError(
-                f"{spec.key}: no built-in seasonal curve for {root!r}; provide an explicit "
-                "JSON object of month biases instead"
-            )
+        curve = _seasonal_curve_for(str(root), instrument_master=instrument_master)
         selected[str(root)] = {str(int(month)): float(bias) for month, bias in curve.items()}
     return json.dumps(selected, sort_keys=True)
 
 
 def apply_parameter_overrides(
-    strategy: Mapping[str, object], overrides: Mapping[str, object]
+    strategy: Mapping[str, object],
+    overrides: Mapping[str, object],
+    *,
+    instrument_master: InstrumentsConfig | None = None,
 ) -> dict[str, object]:
     """Deep-copy ``strategy`` and apply UI-native ``overrides`` as YAML-native values.
 
@@ -2726,13 +3265,14 @@ def apply_parameter_overrides(
     updated: dict[str, object] = copy.deepcopy(dict(strategy))
     for key, value in overrides.items():
         spec = _catalog_lookup(key)
-        encoded = encode_parameter_value(spec, value)
+        encoded = encode_parameter_value(spec, value, instrument_master=instrument_master)
         segments = _segments(resolve_param_path(updated, spec.key))
         _set_at(updated, segments, encoded)
     return updated
 
 
 __all__ = [
+    "ASSET_CLASS_GROUPS",
     "CATALOG",
     "CATALOG_VERSION",
     "ENCODING_COMMA_INTS",
@@ -2742,6 +3282,9 @@ __all__ = [
     "LOCATION_DRL_BLOCK",
     "LOCATION_STAGE_PARAMS",
     "LOCATION_TRANSLATOR",
+    "SECTOR_GROUP_ALIASES",
+    "STAGE_OPTION_LABELS",
+    "UNIVERSE_SECTOR_GROUPS",
     "CatalogDefault",
     "CatalogScalar",
     "CatalogStage",
@@ -2749,13 +3292,22 @@ __all__ = [
     "ParameterSpec",
     "ParameterType",
     "PresetTemplate",
+    "StageOption",
+    "UniverseMetadata",
+    "UniverseRoot",
+    "UniverseSector",
     "apply_parameter_overrides",
     "catalog_dict",
+    "clear_parameter_catalog_cache",
     "decode_parameter_value",
     "encode_parameter_value",
     "get_parameter_value",
     "parameter_catalog",
     "parameter_keys_for_strategy",
+    "refresh_parameter_catalog",
     "resolve_param_path",
+    "universe_metadata",
+    "universe_roots",
+    "universe_sectors",
     "validate_parameter_value",
 ]

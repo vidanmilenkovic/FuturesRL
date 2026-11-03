@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-from configs.instruments import load_instruments
+from configs.instruments import InstrumentsConfig, load_instruments, parse_instruments_config
 from configs.strategy import (
     StrategyConfig,
     TranslatorConfig,
@@ -32,9 +34,19 @@ from src.strategies import (
     resolve_param_path,
     validate_parameter_value,
 )
-from src.strategies.timing import ALL_MONTHS
+from src.strategies.parameter_catalog import (
+    UNIVERSE_SECTOR_GROUPS,
+    clear_parameter_catalog_cache,
+    refresh_parameter_catalog,
+    universe_metadata,
+    universe_roots,
+    universe_sectors,
+)
+from src.strategies.timing import ALL_MONTHS, DEFAULT_ROOT_MONTH_BIASES
 
 from tests.fixtures.market import make_market_state
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PRESET_IDS: tuple[str, ...] = (
     "trend_following_tsmom_kama",
@@ -65,7 +77,7 @@ def _yaml_strategy() -> dict[str, object]:
 def test_catalog_is_a_cached_singleton() -> None:
     catalog = parameter_catalog()
     assert isinstance(catalog, ParameterCatalog)
-    assert catalog is CATALOG
+    assert catalog is CATALOG  # import-time catalog is the default-master cache entry
     assert parameter_catalog() is catalog
     assert catalog.version == 1
     assert [stage.id for stage in catalog.stages] == [
@@ -82,7 +94,8 @@ def test_catalog_json_is_serialisable_and_well_formed() -> None:
     payload = catalog_dict()
     encoded = json.dumps(payload)  # must not raise
     assert len(encoded) > 10_000
-    assert set(payload) == {"version", "stages", "parameters", "presets"}
+    assert set(payload) >= {"version", "stages", "parameters", "presets"}
+    assert {"universe", "stage_choices"} <= set(payload)
     parameters = payload["parameters"]
     assert isinstance(parameters, list) and parameters
     required = {
@@ -217,6 +230,8 @@ def test_new_overlay_parameters_are_catalogued() -> None:
     assert months.type is ParameterType.MULTISELECT
     assert set(months.choices) == set(ALL_MONTHS)
     roots = catalog.get("timing.seasonality.root_month_biases")
+    # Root choices are derived from the live instrument master (no hardcoded list).
+    assert roots.choices == tuple(load_instruments().roots())
     assert "CL" in roots.choices and "GC" in roots.choices
     assert roots.yaml_encoding == "json_object"
 
@@ -501,3 +516,287 @@ translator:
     assert result.timing_weights
     assert result.final_weights.gross <= result.timing_weights.gross + 1e-9
     assert result.diagnostics["timing_overlays"] == ("mean_reversion", "seasonality")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic instrument master: universe metadata + stage dropdown choices
+# ---------------------------------------------------------------------------
+
+CANONICAL_SECTOR_IDS: tuple[str, ...] = tuple(
+    group_id for group_id, _label, _desc in UNIVERSE_SECTOR_GROUPS
+)
+
+
+def _custom_master_with_extra_root(
+    root: str = "ZC9",
+    *,
+    sector: str = "agri",
+    asset_class: str = "agriculture",
+    name: str = "Corn (custom catalog test)",
+) -> InstrumentsConfig:
+    """Minimal single-root instrument master derived from the committed ES spec."""
+    master = load_instruments()
+    entry = master.get("ES").model_dump(mode="json")
+    entry.pop("micro_root", None)
+    entry.pop("standard_root", None)
+    entry.update(
+        {
+            "root": root,
+            "name": name,
+            "asset_class": asset_class,
+            "sector": sector,
+            "exchange": "CBOT",
+            "databento_symbol": f"{root}.FUT",
+            "ibkr_exchange": "CBOT",
+        }
+    )
+    return parse_instruments_config(
+        {
+            "version": master.version,
+            "defaults": master.defaults.model_dump(mode="json"),
+            "instruments": {root: entry},
+        }
+    )
+
+
+def test_universe_sectors_partition_the_instrument_master() -> None:
+    master = load_instruments()
+    sectors = universe_sectors()
+    # Canonical Studio groups come first, in display order (All first).
+    assert [sector.id for sector in sectors] == list(CANONICAL_SECTOR_IDS)
+    assert sectors[0].id == "all"
+    assert sectors[0].count == len(master.roots())
+    assert [root.root for root in sectors[0].roots] == list(master.roots())
+    # Every root lands in exactly one non-All group and the groups partition the master.
+    covered = [root.root for sector in sectors[1:] for root in sector.roots]
+    assert len(covered) == len(set(covered))
+    assert set(covered) == set(master.roots())
+    assert sum(sector.count for sector in sectors[1:]) == len(master.roots())
+    for sector in sectors:
+        assert sector.count == len(sector.roots)
+        assert sector.label and sector.description
+    # The seven canonical asset-class groups all exist (empty ones stay exposed too).
+    assert {sector.id for sector in sectors} == set(CANONICAL_SECTOR_IDS)
+
+
+def test_universe_sector_groups_map_instrument_master_sectors() -> None:
+    master = load_instruments()
+    by_group: dict[str, set[str]] = {}
+    for spec in master.instruments.values():
+        group = next(root.sector_group for root in universe_roots() if root.root == spec.root)
+        by_group.setdefault(group, set()).add(spec.sector)
+    for group_id, raw_sectors in by_group.items():
+        assert group_id in CANONICAL_SECTOR_IDS, (
+            f"root sectors {raw_sectors} mapped to unknown group"
+        )
+    # The seven canonical groups account for every current instrument-master sector.
+    assert set(by_group) == set(CANONICAL_SECTOR_IDS[1:])
+    # Spot-check the UI grouping for the sectors currently in the master.
+    sectors = {sector.id: sector for sector in universe_sectors()}
+    for group_id, raw_sectors in by_group.items():
+        assert {root.sector for root in sectors[group_id].roots} == raw_sectors
+
+
+def test_universe_root_metadata_matches_instrument_master() -> None:
+    master = load_instruments()
+    roots = universe_roots()
+    assert tuple(root.root for root in roots) == master.roots()
+    for meta in roots:
+        spec = master.get(meta.root)
+        assert meta.name == spec.name
+        assert meta.asset_class == spec.asset_class.value
+        assert meta.sector == spec.sector
+        assert meta.exchange == spec.exchange
+        assert meta.multiplier == spec.multiplier
+        assert meta.tick_size == spec.tick_size
+        assert meta.micro_root == spec.micro_root
+        assert meta.standard_root == spec.standard_root
+        assert meta.currency == spec.currency
+        assert meta.sector_group in CANONICAL_SECTOR_IDS
+    payload = [root.to_dict() for root in roots]
+    assert set(payload[0]) == {
+        "root",
+        "name",
+        "asset_class",
+        "sector",
+        "sector_group",
+        "exchange",
+        "multiplier",
+        "tick_size",
+        "micro_root",
+        "standard_root",
+        "currency",
+    }
+    json.dumps(payload)  # JSON-serialisable
+
+
+def test_catalog_root_and_sector_choices_track_instrument_master() -> None:
+    master = load_instruments()
+    catalog = parameter_catalog()
+    assert catalog.get("universe.regime.risk_off_roots").choices == tuple(master.roots())
+    assert catalog.get("universe.regime.risk_off_sectors").choices == tuple(master.sectors())
+    assert catalog.get("timing.seasonality.root_month_biases").choices == tuple(master.roots())
+    # The catalog is bound to the master it was built from.
+    assert catalog.instrument_master is not None
+    assert tuple(catalog.instrument_master.roots()) == tuple(master.roots())
+    assert len(catalog.instrument_master.roots()) == len(master.roots())
+
+
+def test_universe_metadata_is_additive_in_catalog_payload() -> None:
+    payload = catalog_dict()
+    assert isinstance(payload["universe"], dict)
+    universe = payload["universe"]
+    assert set(universe) == {"sectors", "roots"}
+    json.dumps(universe)
+    assert tuple(root["root"] for root in universe["roots"]) == tuple(load_instruments().roots())
+    assert universe_metadata().to_dict() == universe
+    first_sector = universe["sectors"][0]
+    assert set(first_sector) >= {"id", "label", "description", "count", "roots"}
+    assert first_sector["id"] == "all"
+    assert first_sector["count"] == len(load_instruments().roots())
+    # Catalog object exposes the same universe metadata.
+    catalog = parameter_catalog()
+    assert catalog.universe_metadata().to_dict() == universe
+    assert tuple(sector.id for sector in catalog.universe_sectors()) == CANONICAL_SECTOR_IDS
+
+
+def test_stage_choices_expose_registry_dropdowns() -> None:
+    catalog = parameter_catalog()
+    payload = catalog_dict()
+    stage_choices = catalog.stage_choices()
+    assert stage_choices["universe"] == ("liquidity", "regime", "composite")
+    assert set(stage_choices["universe"]) == set(SELECTOR_REGISTRY)
+    assert stage_choices["allocator"][:2] == ("volatility_target", "risk_parity")
+    assert set(stage_choices["allocator"]) == set(ALLOCATOR_REGISTRY)
+    assert set(stage_choices["timing"]) == set(TIMING_REGISTRY)
+    assert set(stage_choices["risk"]) == {"quant_risk", "llm_risk"}
+    assert set(stage_choices["translator"]) == {"translator"}
+    # Payload mirrors the object API and each option carries bindable parameter keys.
+    assert payload["stage_choices"] == {
+        stage_id: list(names) for stage_id, names in stage_choices.items()
+    }
+    known_keys = {spec.key for spec in catalog.parameters}
+    payload_stages = {stage["id"]: stage for stage in payload["stages"]}
+    for stage_id, names in stage_choices.items():
+        options = payload_stages[stage_id]["choices"]
+        assert [option["name"] for option in options] == list(names)
+        for option in options:
+            assert option["label"] and option["description"]
+            assert set(option["parameter_keys"]) <= known_keys
+    # Universe/allocator dropdown options expose the expected stage parameters.
+    assert {spec.param for spec in catalog.for_stage_name("liquidity")} <= {
+        key.split(".")[-1]
+        for option in payload_stages["universe"]["choices"]
+        if option["name"] == "liquidity"
+        for key in option["parameter_keys"]
+    }
+    assert {spec.param for spec in catalog.for_stage_name("volatility_target")} <= {
+        key.split(".")[-1]
+        for option in payload_stages["allocator"]["choices"]
+        if option["name"] == "volatility_target"
+        for key in option["parameter_keys"]
+    }
+
+
+def test_parameter_catalog_is_cached_per_instrument_master_and_refreshes() -> None:
+    clear_parameter_catalog_cache()
+    default_catalog = parameter_catalog()
+    custom = _custom_master_with_extra_root()
+    custom_catalog = parameter_catalog(custom)
+    assert custom_catalog is not default_catalog
+    assert custom_catalog.instrument_master is custom
+    assert custom_catalog.get("universe.regime.risk_off_roots").choices == ("ZC9",)
+    assert tuple(root.root for root in universe_roots(custom)) == ("ZC9",)
+    custom_sectors = universe_sectors(custom)
+    assert [sector.id for sector in custom_sectors] == list(CANONICAL_SECTOR_IDS)
+    agri = next(sector for sector in custom_sectors if sector.id == "agri")
+    assert agri.count == 1
+    assert agri.roots[0].root == "ZC9"
+    # Cached per instrument-master fingerprint.
+    assert parameter_catalog(custom) is custom_catalog
+    clear_parameter_catalog_cache()
+    rebuilt = parameter_catalog(custom)
+    assert rebuilt is not custom_catalog
+    assert rebuilt.get("universe.regime.risk_off_roots").choices == ("ZC9",)
+    assert rebuilt.get("timing.seasonality.root_month_biases").choices == ("ZC9",)
+    # refresh_parameter_catalog reloads the committed default master and re-primes the cache.
+    refreshed = refresh_parameter_catalog()
+    assert refreshed is parameter_catalog()
+    assert len(refreshed.get("universe.regime.risk_off_roots").choices) == len(
+        load_instruments().roots()
+    )
+    custom_catalog.validate()
+    rebuilt.validate()
+
+
+def test_universe_sector_mapping_falls_back_for_unmapped_sectors() -> None:
+    # Unknown sector string but a known asset class -> asset-class fallback group.
+    fallback = _custom_master_with_extra_root(
+        root="ZZ1", sector="exotic", asset_class="agriculture"
+    )
+    meta = universe_roots(fallback)[0]
+    assert meta.sector_group == "agri"
+    # Unknown sector *and* unknown asset class -> additive "Other" group only when needed.
+    unknown = _custom_master_with_extra_root(root="ZZ2", sector="exotic", asset_class="unknown")
+    sectors = universe_sectors(unknown)
+    assert [sector.id for sector in sectors] == [*CANONICAL_SECTOR_IDS, "other"]
+    assert sectors[-1].count == 1
+    assert sectors[-1].roots[0].root == "ZZ2"
+
+
+def test_seasonal_encoding_handles_expanded_instrument_master() -> None:
+    master = load_instruments()
+    extra_roots = [root for root in master.roots() if root not in DEFAULT_ROOT_MONTH_BIASES]
+    assert extra_roots, "expected the expanded master to add roots beyond the bespoke curves"
+    target = extra_roots[0]
+    encoded = encode_parameter_value("timing.seasonality.root_month_biases", [target])
+    payload = json.loads(encoded)
+    assert target in payload
+    assert isinstance(payload[target], dict)
+    decoded = decode_parameter_value("timing.seasonality.root_month_biases", encoded)
+    assert isinstance(decoded, dict) and target in decoded
+    # Custom instrument masters can supply their own root choices via the typed spec.
+    custom = _custom_master_with_extra_root()
+    custom_spec = parameter_catalog(custom).get("timing.seasonality.root_month_biases")
+    custom_encoded = encode_parameter_value(custom_spec, ["ZC9"], instrument_master=custom)
+    assert "ZC9" in json.loads(custom_encoded)
+    with pytest.raises(ValueError):
+        encode_parameter_value("timing.seasonality.root_month_biases", ["NOT_A_ROOT"])
+
+
+def test_presets_remain_valid_with_expanded_instrument_master() -> None:
+    master = load_instruments()
+    catalog = parameter_catalog()
+    catalog_roots = set(master.roots())
+    for preset in catalog.presets:
+        config = preset.to_config()
+        assert config.id.startswith("preset_")
+        for stage in config.timing:
+            if stage.name != "seasonality":
+                continue
+            raw = str(stage.params.get("root_month_biases", ""))
+            if raw and not raw.startswith("{"):
+                assert {root.strip() for root in raw.split(",")} <= catalog_roots
+        pipeline = build_pipeline(config, master)
+        assert pipeline.selector.name == config.universe.name
+
+
+def test_catalog_imports_without_gymnasium_sb3_or_torch() -> None:
+    script = (
+        "import importlib, json, sys; "
+        "catalog = importlib.import_module('src.strategies.parameter_catalog'); "
+        "payload = catalog.catalog_dict(); json.dumps(payload); "
+        "assert 'gymnasium' not in sys.modules, 'gymnasium imported'; "
+        "assert 'stable_baselines3' not in sys.modules, 'stable_baselines3 imported'; "
+        "assert 'torch' not in sys.modules, 'torch imported'; "
+        "assert payload['stage_choices']['universe'] == ['liquidity', 'regime', 'composite']; "
+        "assert set(payload['universe']) == {'sectors', 'roots'}"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
