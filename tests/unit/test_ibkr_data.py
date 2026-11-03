@@ -9,6 +9,7 @@ the async stream generator, heartbeat reconnection and the event handlers.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -34,16 +35,34 @@ class FakeSubscription:
 
 
 class FakeIB:
-    """Deterministic fake of the ``ib_async.IB`` subset used by the streamer."""
+    """Deterministic fake of the ``ib_async.IB`` subset used by the streamer.
 
-    def __init__(self, failures: int = 0) -> None:
+    Records an ordered event log (qualification vs. market-data requests), the
+    exact contracts passed to each request and the qualified contracts returned by
+    ``qualifyContractsAsync`` so tests can prove IBKR's conId ordering contract.
+    """
+
+    def __init__(
+        self,
+        failures: int = 0,
+        *,
+        qualification_failures: set[str] | None = None,
+        qualification_error: str | None = None,
+    ) -> None:
         self.failures = failures
         self.connected = False
         self.connect_calls = 0
         self.disconnect_calls = 0
         self.subscriptions: dict[str, list[FakeSubscription]] = {}
         self.cancellations: list[str] = []
+        self.events: list[tuple[str, object]] = []
+        self.requests: list[tuple[str, object]] = []
+        self.cancelled_contracts: list[tuple[str, object]] = []
+        self.qualified_contracts: dict[str, object] = {}
+        self.qualification_failures = frozenset(qualification_failures or ())
+        self.qualification_error = qualification_error
         self._next_req_id = 1
+        self._next_con_id = 10_000
 
     def isConnected(self) -> bool:  # noqa: N802 - mirrors the ib_async API
         return self.connected
@@ -59,7 +78,30 @@ class FakeIB:
         self.connected = False
         self.disconnect_calls += 1
 
-    def _subscribe(self, kind: str) -> FakeSubscription:
+    async def qualifyContractsAsync(self, *contracts: object) -> list[object]:  # noqa: N802
+        """Resolve contracts to conId-bearing qualified contracts (ib_async shaped)."""
+        if self.qualification_error is not None:
+            raise RuntimeError(self.qualification_error)
+        qualified: list[object] = []
+        for contract in contracts:
+            self.events.append(("qualify", contract))
+            root = str(getattr(contract, "symbol", contract))
+            if root in self.qualification_failures:
+                continue
+            resolved = SimpleNamespace(
+                symbol=root,
+                localSymbol=getattr(contract, "localSymbol", root),
+                exchange=getattr(contract, "exchange", "CME"),
+                conId=self._next_con_id,
+            )
+            self._next_con_id += 1
+            self.qualified_contracts[root] = resolved
+            qualified.append(resolved)
+        return qualified
+
+    def _subscribe(self, kind: str, contract: object) -> FakeSubscription:
+        self.events.append((f"req:{kind}", contract))
+        self.requests.append((kind, contract))
         subscription = FakeSubscription(self._next_req_id)
         self._next_req_id += 1
         self.subscriptions.setdefault(kind, []).append(subscription)
@@ -68,43 +110,73 @@ class FakeIB:
     def reqRealTimeBars(  # noqa: N802
         self, contract: object, bar_size: int, what_to_show: str, use_rth: bool
     ) -> FakeSubscription:
-        del contract
         assert bar_size == BAR_INTERVAL_SECONDS
         assert what_to_show == "TRADES"
         del use_rth
-        return self._subscribe("bars")
+        return self._subscribe("bars", contract)
 
     def reqTickByTickData(  # noqa: N802
         self, contract: object, tick_type: str, number_of_ticks: int, ignore_size: bool
     ) -> FakeSubscription:
-        del contract, number_of_ticks, ignore_size
+        del number_of_ticks, ignore_size
         assert tick_type == "AllLast"
-        return self._subscribe("ticks")
+        return self._subscribe("ticks", contract)
 
     def reqMktData(  # noqa: N802
         self, contract: object, generic_ticks: str, snapshot: bool, regulatory: bool
     ) -> FakeSubscription:
-        del contract, generic_ticks, snapshot, regulatory
-        return self._subscribe("quotes")
+        del generic_ticks, snapshot, regulatory
+        return self._subscribe("quotes", contract)
 
     def reqMktDepth(  # noqa: N802
         self, contract: object, num_rows: int, is_smart_depth: bool
     ) -> FakeSubscription:
-        del contract, is_smart_depth
+        del is_smart_depth
         assert num_rows == MARKET_DEPTH_LEVELS
-        return self._subscribe("depth")
+        return self._subscribe("depth", contract)
 
     def cancelRealTimeBars(self, bars: object) -> None:  # noqa: N802
         self.cancellations.append("bars")
 
     def cancelTickByTickData(self, contract: object, tick_type: str) -> None:  # noqa: N802
         self.cancellations.append("ticks")
+        self.cancelled_contracts.append(("ticks", contract))
 
     def cancelMktData(self, contract: object) -> None:  # noqa: N802
         self.cancellations.append("quotes")
+        self.cancelled_contracts.append(("quotes", contract))
 
     def cancelMktDepth(self, contract: object, is_smart_depth: bool) -> None:  # noqa: N802
         self.cancellations.append("depth")
+        self.cancelled_contracts.append(("depth", contract))
+
+
+class LegacyFakeIB(FakeIB):
+    """Fake client without a qualification API (old duck-typed adapter)."""
+
+    qualifyContractsAsync = None  # type: ignore[assignment]  # noqa: N815
+
+
+class SyncQualifiedFakeIB(FakeIB):
+    """Fake client exposing only the synchronous ``qualifyContracts`` fallback."""
+
+    qualifyContractsAsync = None  # type: ignore[assignment]  # noqa: N815
+
+    def qualifyContracts(self, *contracts: object) -> list[object]:  # noqa: N802
+        results = []
+        for contract in contracts:
+            self.events.append(("qualify", contract))
+            root = str(getattr(contract, "symbol", contract))
+            resolved = SimpleNamespace(
+                symbol=root,
+                localSymbol=getattr(contract, "localSymbol", root),
+                exchange=getattr(contract, "exchange", "CME"),
+                conId=self._next_con_id,
+            )
+            self._next_con_id += 1
+            self.qualified_contracts[root] = resolved
+            results.append(resolved)
+        return results
 
 
 def contract_factory(root: str) -> object:
@@ -122,12 +194,13 @@ class Harness:
         roots: tuple[str, ...] = ("ES", "NQ"),
         failures: int = 0,
         max_attempts: int | None = None,
+        **fake_kwargs: Any,
     ) -> None:
         updates: dict[str, Any] = {}
         if max_attempts is not None:
             updates["ibkr_reconnect_max_attempts"] = max_attempts
         self.settings = settings.model_copy(update=updates) if updates else settings
-        self.fake = FakeIB(failures)
+        self.fake = FakeIB(failures, **fake_kwargs)
         self.sleeps: list[float] = []
         self.clients: list[FakeIB] = []
 
@@ -135,7 +208,7 @@ class Harness:
             self.sleeps.append(seconds)
 
         def factory() -> FakeIB:
-            client = FakeIB(0) if self.clients else self.fake
+            client = FakeIB(0, **fake_kwargs) if self.clients else self.fake
             self.clients.append(client)
             return client
 
@@ -226,6 +299,192 @@ async def test_connect_backoff_is_capped(settings: Settings) -> None:
         await streamer.connect()
     assert sleeps == [2.0, 3.0, 3.0]
     assert streamer.backoff_delays == (2.0, 3.0, 3.0)
+
+
+def _contract_symbol(contract: object) -> str:
+    return str(getattr(contract, "symbol", ""))
+
+
+def _con_id(contract: object) -> object:
+    return getattr(contract, "conId", None)
+
+
+async def test_connect_qualifies_contracts_before_market_data_requests(
+    settings: Settings,
+) -> None:
+    """Every root is qualified first; the qualified conId contract is used for all subs."""
+    harness = build_harness(settings, roots=("ES", "NQ"))
+    await harness.streamer.connect()
+    fake = harness.fake
+    assert fake.qualification_error is None
+    events = fake.events
+    # Two roots x (1 qualification + 4 market-data requests), in root order.
+    assert len(events) == 2 * 5
+    expected_request_kinds = ["req:bars", "req:ticks", "req:quotes", "req:depth"]
+    for root_index, root in enumerate(("ES", "NQ")):
+        offset = root_index * 5
+        stage, raw_contract = events[offset]
+        assert stage == "qualify"
+        assert _contract_symbol(raw_contract) == root
+        assert _con_id(raw_contract) is None  # unqualified input
+        for request_index, expected_kind in enumerate(expected_request_kinds):
+            request_stage, request_contract = events[offset + 1 + request_index]
+            assert request_stage == expected_kind
+            assert request_contract is fake.qualified_contracts[root]
+            assert _contract_symbol(request_contract) == root
+            assert isinstance(_con_id(request_contract), int)
+            assert _con_id(request_contract) > 0
+    # Each root qualified exactly once and every request carries a conId.
+    assert len([event for event in events if event[0] == "qualify"]) == 2
+    assert all(
+        _con_id(contract) is None or isinstance(_con_id(contract), int)
+        for _, contract in fake.requests
+    )
+    assert all(isinstance(_con_id(contract), int) for _, contract in fake.requests)
+    await harness.streamer.disconnect()
+
+
+async def test_qualified_contract_is_used_for_cancellation(settings: Settings) -> None:
+    harness = build_harness(settings, roots=("ES", "NQ"))
+    await harness.streamer.connect()
+    await harness.streamer.disconnect()
+    fake = harness.fake
+    cancelled = {
+        (kind, _contract_symbol(contract)): contract for kind, contract in fake.cancelled_contracts
+    }
+    assert {kind for kind, _ in cancelled} == {"ticks", "quotes", "depth"}
+    for root in ("ES", "NQ"):
+        for kind in ("ticks", "quotes", "depth"):
+            assert cancelled[(kind, root)] is fake.qualified_contracts[root]
+            assert isinstance(_con_id(cancelled[(kind, root)]), int)
+
+
+async def test_qualification_failure_is_actionable_and_subscribes_nothing(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = build_harness(settings, roots=("ES",), qualification_failures={"ES"})
+    with (
+        caplog.at_level(logging.WARNING, logger="src.data.ibkr_data"),
+        pytest.raises(
+            RuntimeError,
+            match=r"could not resolve a conId for root 'ES' on CME",
+        ),
+    ):
+        await harness.streamer.connect()
+    assert harness.fake.requests == []
+    assert harness.fake.subscriptions == {}
+    assert harness.streamer._subscriptions == {}
+    assert any("could not resolve a conId" in record.message for record in caplog.records)
+
+
+async def test_partial_qualification_failure_skips_root_and_logs(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = build_harness(settings, roots=("ES", "NQ"), qualification_failures={"NQ"})
+    with caplog.at_level(logging.WARNING, logger="src.data.ibkr_data"):
+        await harness.streamer.connect()
+    fake = harness.fake
+    # Only the resolvable root is subscribed; the failed root is skipped cleanly.
+    assert set(fake.subscriptions) == {"bars", "ticks", "quotes", "depth"}
+    assert all(len(subs) == 1 for subs in fake.subscriptions.values())
+    assert [_contract_symbol(contract) for _, contract in fake.requests] == ["ES"] * 4
+    assert any("NQ" in record.message for record in caplog.records)
+    state = harness.streamer.ingest_tick("ES", timestamp=NOW, price=4_800.0)
+    assert state.ids == ("ES",)
+    await harness.streamer.disconnect()
+
+
+async def test_all_roots_failing_qualification_raises_aggregate_error(
+    settings: Settings,
+) -> None:
+    harness = build_harness(settings, roots=("ES", "NQ"), qualification_failures={"ES", "NQ"})
+    with pytest.raises(RuntimeError) as excinfo:
+        await harness.streamer.connect()
+    message = str(excinfo.value)
+    assert "could not qualify any market-data contract" in message
+    assert "root 'ES'" in message and "root 'NQ'" in message
+    assert harness.fake.requests == []
+    assert harness.fake.subscriptions == {}
+    # The half-initialised session is torn down so a retry starts cleanly.
+    assert harness.streamer._client is None
+    assert harness.streamer._contracts == {}
+    assert harness.fake.disconnect_calls == 1
+
+
+async def test_qualification_exception_warns_and_skips(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = build_harness(
+        settings, roots=("ES",), qualification_error="TWS qualification timeout"
+    )
+    with (
+        caplog.at_level(logging.WARNING, logger="src.data.ibkr_data"),
+        pytest.raises(RuntimeError, match="could not resolve a conId"),
+    ):
+        await harness.streamer.connect()
+    assert any("qualification failed" in record.message for record in caplog.records)
+    assert harness.fake.requests == []
+
+
+async def test_legacy_client_without_qualification_api_still_subscribes(
+    settings: Settings,
+) -> None:
+    fake = LegacyFakeIB()
+    streamer = IBKRMarketDataStreamer(
+        settings,
+        roots=("ES",),
+        ib_factory=lambda: fake,
+        contract_factory=contract_factory,
+    )
+    await streamer.connect()
+    assert [stage for stage, _ in fake.events] == [
+        "req:bars",
+        "req:ticks",
+        "req:quotes",
+        "req:depth",
+    ]
+    assert all(_con_id(contract) is None for _, contract in fake.requests)
+    assert all(_contract_symbol(contract) == "ES" for _, contract in fake.requests)
+    await streamer.disconnect()
+
+
+async def test_synchronous_qualification_fallback_is_supported(settings: Settings) -> None:
+    fake = SyncQualifiedFakeIB()
+    streamer = IBKRMarketDataStreamer(
+        settings,
+        roots=("ES",),
+        ib_factory=lambda: fake,
+        contract_factory=contract_factory,
+    )
+    await streamer.connect()
+    assert [stage for stage, _ in fake.events] == [
+        "qualify",
+        "req:bars",
+        "req:ticks",
+        "req:quotes",
+        "req:depth",
+    ]
+    assert all(contract is fake.qualified_contracts["ES"] for _, contract in fake.requests)
+    assert all(isinstance(_con_id(contract), int) for _, contract in fake.requests)
+    await streamer.disconnect()
+
+
+async def test_reconnect_requalifies_contracts_on_the_new_client(settings: Settings) -> None:
+    harness = build_harness(settings, roots=("ES",))
+    await harness.streamer.connect()
+    first_client = harness.clients[0]
+    await harness.streamer.reconnect()
+    second_client = harness.clients[1]
+    assert second_client is not first_client
+    assert [stage for stage, _ in second_client.events] == [
+        "qualify",
+        "req:bars",
+        "req:ticks",
+        "req:quotes",
+        "req:depth",
+    ]
+    assert all(isinstance(_con_id(contract), int) for _, contract in second_client.requests)
+    await harness.streamer.disconnect()
 
 
 async def test_disconnect_before_connect_is_safe(settings: Settings) -> None:

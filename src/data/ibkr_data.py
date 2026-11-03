@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import math
 import threading
@@ -87,6 +88,16 @@ class _IBClient(Protocol):
         """Close the TWS/Gateway session."""
         ...
 
+    async def qualifyContractsAsync(self, *contracts: object) -> object:  # noqa: N802
+        """Resolve contracts to qualified versions carrying a ``conId``.
+
+        Optional at runtime: duck-typed/legacy clients without this method fall
+        back to their raw contracts, while a real ``ib_async.IB`` always qualifies
+        before any ``reqRealTimeBars``/``reqTickByTickData``/``reqMktData``/
+        ``reqMktDepth`` call (unqualified IBKR contracts cannot be hashed).
+        """
+        ...
+
     def reqRealTimeBars(  # noqa: N802
         self, contract: object, bar_size: int, what_to_show: str, use_rth: bool
     ) -> object:
@@ -128,6 +139,32 @@ class _IBClient(Protocol):
     def cancelMktDepth(self, contract: object, is_smart_depth: bool) -> None:  # noqa: N802
         """Cancel an L2 subscription."""
         ...
+
+
+def _has_con_id(contract: object) -> bool:
+    """Whether ``contract`` carries an IBKR contract id (``conId``/``con_id``)."""
+    con_id = getattr(contract, "conId", None)
+    if con_id is None:
+        con_id = getattr(contract, "con_id", None)
+    return isinstance(con_id, int) and not isinstance(con_id, bool) and con_id > 0
+
+
+def _first_qualified_contract(result: object) -> object | None:
+    """Pick the first qualified contract from an ``ib_async`` qualification result.
+
+    ``qualifyContractsAsync`` returns a list with one qualified contract per
+    requested contract (fewer/none when resolution fails); single-contract
+    duck-typed fakes are accepted too.
+    """
+    if result is None:
+        return None
+    candidates: tuple[object, ...] = (
+        tuple(result) if isinstance(result, (list, tuple)) else (result,)
+    )
+    for candidate in candidates:
+        if candidate is not None and _has_con_id(candidate):
+            return candidate
+    return None
 
 
 class _BarState:
@@ -212,6 +249,7 @@ class IBKRMarketDataStreamer:
         self._client: _IBClient | None = None
         self._states: dict[InstrumentId, _BarState] = {root: _BarState() for root in self._roots}
         self._latest_state: MarketState | None = None
+        self._contracts: dict[InstrumentId, object] = {}
         self._subscriptions: dict[InstrumentId, tuple[object, object, object, object]] = {}
         self._subscription_roots: dict[int, InstrumentId] = {}
         self._backoff_delays: list[float] = []
@@ -261,7 +299,18 @@ class IBKRMarketDataStreamer:
         client = self._client if self._client is not None else self._create_client()
         await self._connect_with_backoff(client)
         self._client = client
-        self._subscribe(client)
+        try:
+            await self._subscribe(client)
+        except Exception:
+            # A subscription failure must not leave a half-initialised session:
+            # tear the connection down so a later retry/heartbeat starts cleanly.
+            self._client = None
+            self._contracts.clear()
+            self._subscriptions.clear()
+            self._subscription_roots.clear()
+            with contextlib.suppress(Exception):
+                client.disconnect()
+            raise
         self._attach_events(client)
         self._stream_closed = False
         # A previous disconnect may have enqueued the termination sentinel.
@@ -307,6 +356,7 @@ class IBKRMarketDataStreamer:
             with contextlib.suppress(Exception):
                 self._client.disconnect()
             self._client = None
+        self._contracts.clear()
         self._subscriptions.clear()
         self._subscription_roots.clear()
         await self.connect()
@@ -319,6 +369,7 @@ class IBKRMarketDataStreamer:
             with contextlib.suppress(Exception):
                 client.disconnect()
         self._client = None
+        self._contracts.clear()
         self._subscriptions.clear()
         self._subscription_roots.clear()
         if not self._stream_closed:
@@ -360,25 +411,92 @@ class IBKRMarketDataStreamer:
         currency = spec.currency if spec is not None else "USD"
         return ib_async.Future(symbol=root, exchange=exchange, currency=currency)
 
-    def _subscribe(self, client: _IBClient) -> None:
-        """Subscribe to 5-second bars, tick-by-tick trades, L1 quotes and L2 depth."""
+    async def _subscribe(self, client: _IBClient) -> None:
+        """Qualify every contract, then subscribe to bars/ticks/L1/L2 market data.
+
+        IBKR market-data requests can only be issued with a **qualified**
+        contract (one carrying a ``conId``); the unqualified contract would raise
+        ``ValueError: Contract ... can't be hashed because no 'conId' value
+        exists``. Each root is therefore resolved with
+        ``await client.qualifyContractsAsync(contract)`` first and only the
+        returned qualified contract is used for subscription, cancellation and
+        event attribution. A root that cannot be resolved is skipped with a
+        warning; if no root resolves, an aggregate actionable error is raised and
+        no subscription is made.
+        """
+        failures: list[str] = []
         for root in self._roots:
-            contract = self._contract_for(root)
-            bars = client.reqRealTimeBars(contract, BAR_INTERVAL_SECONDS, "TRADES", False)
-            ticks = client.reqTickByTickData(contract, "AllLast", 0, False)
-            quotes = client.reqMktData(contract, "", False, False)
-            depth = client.reqMktDepth(contract, MARKET_DEPTH_LEVELS, False)
+            raw_contract = self._contract_for(root)
+            qualified = await self._qualify_contract(client, root, raw_contract)
+            if qualified is None:
+                failure = self._qualification_error(root, raw_contract)
+                logger.warning("%s; skipping market-data subscription", failure)
+                failures.append(failure)
+                continue
+            self._contracts[root] = qualified
+            bars = client.reqRealTimeBars(qualified, BAR_INTERVAL_SECONDS, "TRADES", False)
+            ticks = client.reqTickByTickData(qualified, "AllLast", 0, False)
+            quotes = client.reqMktData(qualified, "", False, False)
+            depth = client.reqMktDepth(qualified, MARKET_DEPTH_LEVELS, False)
             self._subscriptions[root] = (bars, ticks, quotes, depth)
             for subscription in (bars, ticks, quotes, depth):
                 req_id = getattr(subscription, "reqId", None)
                 if isinstance(req_id, int):
                     self._subscription_roots[req_id] = root
+        if failures and len(failures) == len(self._roots):
+            raise RuntimeError(
+                "IBKR could not qualify any market-data contract; no subscriptions were "
+                "made. " + " | ".join(failures)
+            )
+
+    async def _qualify_contract(
+        self, client: _IBClient, root: InstrumentId, contract: object
+    ) -> object | None:
+        """Resolve ``contract`` to a qualified conId-bearing contract (or ``None``).
+
+        Real ``ib_async.IB`` clients expose ``qualifyContractsAsync`` (preferred);
+        a synchronous ``qualifyContracts`` is awaited if returned; duck-typed
+        legacy/fake clients without either method keep the raw contract so the
+        offline test harness remains usable.
+        """
+        async_method = getattr(client, "qualifyContractsAsync", None)
+        method = (
+            async_method if callable(async_method) else getattr(client, "qualifyContracts", None)
+        )
+        if not callable(method):
+            logger.debug(
+                "IBKR client has no contract-qualification API; using the raw contract for "
+                "root %r (duck-typed legacy/fake client)",
+                root,
+            )
+            return contract
+        try:
+            result = method(contract)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            logger.warning("IBKR contract qualification failed for root %r: %s", root, exc)
+            return None
+        return _first_qualified_contract(result)
+
+    def _qualification_error(self, root: InstrumentId, contract: object) -> str:
+        """Actionable error text for one unqualifiable root."""
+        spec = self._spec_or_none(root)
+        exchange = (
+            spec.ibkr_exchange
+            if spec is not None
+            else (getattr(contract, "exchange", None) or "unknown exchange")
+        )
+        return (
+            f"IBKR could not resolve a conId for root {root!r} on {exchange}; "
+            "check the contract month/exchange and TWS market-data subscriptions"
+        )
 
     def _cancel_subscriptions(self, client: _IBClient) -> None:
         """Best-effort cancellation of every subscription of ``client``."""
         for root, subscriptions in self._subscriptions.items():
             bars = subscriptions[0]
-            contract = self._contract_for(root)
+            contract = self._contracts.get(root) or self._contract_for(root)
             cancellations: list[Callable[[], None]] = [
                 partial(client.cancelRealTimeBars, bars),
                 partial(client.cancelTickByTickData, contract, "AllLast"),
