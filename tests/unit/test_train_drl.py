@@ -6,11 +6,14 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pytest
+from src.strategies import train_drl as trainer
 from src.strategies._observation import DEFAULT_OBSERVATION_FEATURES
+from src.strategies.envs import FuturesTradingEnv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PATH = REPO_ROOT / "configs" / "strategies" / "drl_ppo_llm_risk.yaml"
@@ -79,9 +82,9 @@ def test_cli_writes_checkpoint_and_metadata(
     assert metadata["model_path"] == str(checkpoint)
     assert metadata["meta_path"] == str(meta_path)
     assert metadata["feature_names"] == list(DEFAULT_OBSERVATION_FEATURES)
-    # Offline synthetic bars are single-expiration: term structure/carry are the
-    # only canonical features the source cannot produce and they are zero-filled.
-    assert set(metadata["feature_fallbacks"]) == {"term_slope", "carry_annualized"}
+    # Phase-10 task-24: the offline source now emits a synthetic F1/F2 curve, so
+    # every canonical feature (incl. term_slope/carry_annualized) is available.
+    assert metadata["feature_fallbacks"] == []
     universe = metadata["universe"]
     assert isinstance(universe, list) and universe
     # observation = n_assets * n_features + n_assets (weights) + 1 (equity ratio)
@@ -236,3 +239,388 @@ def test_cli_cppo_maps_to_ppo(tmp_path: Path) -> None:
     assert summary["algorithm"] == "CPPO"
     assert summary["sb3_algorithm"] == "PPO"
     assert Path(str(tmp_path / "cppo.zip")).is_file()
+
+
+# ---------------------------------------------------------------------------
+# Phase-10: reusable callable, hyperparameter plumbing, reward curve, CLI flags
+# ---------------------------------------------------------------------------
+
+MINI_INSTRUMENTS: tuple[str, ...] = ("ES", "NQ")
+MINI_FEATURES: tuple[str, ...] = ("ret_1d",)
+_CAPTURED_ALLOCATOR_KWARGS: dict[str, object] = {}
+
+
+def _mini_training_data(periods: int = 80) -> trainer.TrainingData:
+    """Tiny deterministic TrainingData used to test plumbing without real bars."""
+    rows = periods
+    prices = np.empty((rows, len(MINI_INSTRUMENTS)), dtype=np.float64)
+    prices[:, 0] = 4800.0 * np.cumprod(np.full(rows, 1.0002))
+    prices[:, 1] = 16800.0 * np.cumprod(np.full(rows, 1.0001))
+    features = np.zeros((rows, len(MINI_INSTRUMENTS), len(MINI_FEATURES)), dtype=np.float64)
+    start = datetime(2024, 1, 2, tzinfo=UTC)
+    timestamps = tuple(start + timedelta(days=index) for index in range(rows))
+    return trainer.TrainingData(
+        prices=prices,
+        features=features,
+        timestamps=timestamps,
+        instrument_ids=MINI_INSTRUMENTS,
+        feature_names=MINI_FEATURES,
+        feature_fallbacks=(),
+        multipliers=(50.0, 20.0),
+        initial_margins=(15_000.0, 20_000.0),
+        maintenance_margins=(13_600.0, 18_100.0),
+        tick_sizes=(0.25, 0.25),
+        periods=periods,
+    )
+
+
+def _mini_env(data: trainer.TrainingData) -> FuturesTradingEnv:
+    return FuturesTradingEnv(
+        prices=data.prices,
+        instrument_ids=data.instrument_ids,
+        features=data.features,
+        feature_names=data.feature_names,
+        multipliers=data.multipliers,
+        initial_margins=data.initial_margins,
+        maintenance_margins=data.maintenance_margins,
+        tick_sizes=data.tick_sizes,
+        initial_equity=1_000_000.0,
+        commission_bps=1.0,
+        slippage_ticks=1.0,
+        max_gross_leverage=1.0,
+        max_margin_utilization=0.6,
+        risk_penalty_lambda=0.5,
+    )
+
+
+class _FakeModel:
+    """SB3 stand-in that persists a dummy checkpoint file."""
+
+    def save(self, path: str) -> None:
+        Path(path).write_bytes(b"fake-sb3-checkpoint")
+
+
+class _FakeAllocator:
+    """DRLAllocator stand-in capturing kwargs and stepping the env deterministically."""
+
+    def __init__(self, **kwargs: object) -> None:
+        _CAPTURED_ALLOCATOR_KWARGS.clear()
+        _CAPTURED_ALLOCATOR_KWARGS.update(kwargs)
+
+    def train(self, env: object, total_timesteps: int | None = None) -> _FakeModel:
+        assert total_timesteps is not None
+        env.reset(seed=7)  # type: ignore[attr-defined]
+        zeros = np.zeros(len(MINI_INSTRUMENTS), dtype=np.float32)
+        for _ in range(int(total_timesteps)):
+            _, _, terminated, truncated, _ = env.step(zeros)  # type: ignore[attr-defined]
+            if terminated or truncated:
+                env.reset()  # type: ignore[attr-defined]
+        return _FakeModel()
+
+
+@pytest.fixture()
+def patched_trainer(monkeypatch: pytest.MonkeyPatch) -> trainer.TrainingData:
+    """Patch the heavy SB3/data stages, keeping the real train_drl orchestration."""
+    data = _mini_training_data()
+    _CAPTURED_ALLOCATOR_KWARGS.clear()
+    monkeypatch.setattr(trainer, "_sb3_version", lambda: "test-sb3-1.0")
+    monkeypatch.setattr(trainer, "_git_commit", lambda: "a" * 40)
+    monkeypatch.setattr(
+        trainer,
+        "build_training_data",
+        lambda config, instruments, *, seed, periods: data,
+    )
+    monkeypatch.setattr(trainer, "build_env", lambda config, data, *, drl: _mini_env(data))
+    monkeypatch.setattr(trainer, "DRLAllocator", _FakeAllocator)
+    return data
+
+
+def test_train_drl_callable_plumbs_algorithm_and_hyperparameters(
+    patched_trainer: trainer.TrainingData, tmp_path: Path
+) -> None:
+    summary = trainer.train_drl(
+        strategy=STRATEGY_PATH,
+        algorithm="a2c",
+        timesteps=8,
+        learning_rate=0.0007,
+        gamma=0.9,
+        llm_reward_penalty_lambda=0.25,
+        checkpoint_name="unit_plumb",
+        output_dir=tmp_path,
+        periods=40,
+        seed=11,
+        device="cpu",
+        reward_curve_windows=4,
+    )
+
+    captured = _CAPTURED_ALLOCATOR_KWARGS
+    assert captured["algorithm"] == "A2C"
+    assert captured["policy"] == "MlpPolicy"
+    assert captured["total_timesteps"] == 8
+    assert captured["learning_rate"] == pytest.approx(0.0007)
+    assert captured["gamma"] == pytest.approx(0.9)
+    assert captured["risk_penalty_lambda"] == pytest.approx(0.25)
+    assert captured["seed"] == 11
+    assert captured["device"] == "cpu"
+    assert captured["feature_names"] == MINI_FEATURES
+
+    assert summary["status"] == "ok"
+    assert summary["algorithm"] == "A2C"
+    assert summary["sb3_algorithm"] == "A2C"
+    assert summary["total_timesteps"] == 8
+    assert summary["learning_rate"] == pytest.approx(0.0007)
+    assert summary["gamma"] == pytest.approx(0.9)
+    assert summary["llm_reward_penalty_lambda"] == pytest.approx(0.25)
+    assert summary["checkpoint_name"] == "unit_plumb"
+    assert summary["hyperparameters"] == {
+        "algorithm": "A2C",
+        "sb3_algorithm": "A2C",
+        "policy": "MlpPolicy",
+        "total_timesteps": 8,
+        "learning_rate": 0.0007,
+        "gamma": 0.9,
+        "llm_reward_penalty_lambda": 0.25,
+        "seed": 11,
+        "device": "cpu",
+        "reward_curve_windows": 4,
+    }
+
+    checkpoint = Path(str(summary["model_path"]))
+    meta_path = Path(str(summary["meta_path"]))
+    curve_path = Path(str(summary["reward_curve_path"]))
+    assert checkpoint == tmp_path / "unit_plumb.zip"
+    assert checkpoint.is_file()
+    assert meta_path == tmp_path / "unit_plumb.zip.meta.json"
+    assert meta_path.is_file()
+    assert curve_path == tmp_path / "unit_plumb.zip.reward_curve.json"
+    assert curve_path.is_file()
+
+    curve = summary["reward_curve"]
+    assert isinstance(curve, dict)
+    assert curve["env_steps"] == 8
+    assert curve["samples"] <= 4
+    assert len(curve["points"]) == curve["samples"]
+    assert layout_ok(curve)
+    assert json.loads(curve_path.read_text(encoding="utf-8")) == curve
+    assert json.loads(meta_path.read_text(encoding="utf-8")) == summary
+
+
+def layout_ok(curve: dict[str, object]) -> bool:
+    """Sanity check for the bounded reward-curve payload layout."""
+    points = curve["points"]
+    means = curve["window_mean_rewards"]
+    assert isinstance(points, list) and isinstance(means, list)
+    assert len(points) == len(means) == int(curve["samples"])  # type: ignore[arg-type]
+    for point, mean in zip(points, means, strict=True):
+        assert isinstance(point, dict)
+        assert point["mean_reward"] == pytest.approx(float(mean))
+    assert curve["final_mean_reward"] == pytest.approx(float(means[-1]))
+    assert curve["best_mean_reward"] == pytest.approx(max(float(value) for value in means))
+    return True
+
+
+def test_train_drl_cppo_maps_to_sb3_ppo(
+    patched_trainer: trainer.TrainingData, tmp_path: Path
+) -> None:
+    summary = trainer.train_drl(
+        strategy=STRATEGY_PATH,
+        algorithm="cppo",
+        timesteps=4,
+        checkpoint_name="unit_cppo",
+        output_dir=tmp_path,
+    )
+    assert _CAPTURED_ALLOCATOR_KWARGS["algorithm"] == "CPPO"
+    assert summary["algorithm"] == "CPPO"
+    assert summary["sb3_algorithm"] == "PPO"
+    assert summary["hyperparameters"]["sb3_algorithm"] == "PPO"
+
+
+def test_train_drl_checkpoint_naming_precedence(
+    patched_trainer: trainer.TrainingData, tmp_path: Path
+) -> None:
+    named = trainer.train_drl(
+        strategy=STRATEGY_PATH,
+        timesteps=4,
+        checkpoint_name="named_model",
+        output_dir=tmp_path / "named",
+    )
+    assert Path(str(named["model_path"])) == tmp_path / "named" / "named_model.zip"
+
+    explicit = trainer.train_drl(
+        strategy=STRATEGY_PATH,
+        timesteps=4,
+        checkpoint_name="ignored_name",
+        output=tmp_path / "explicit_model",
+        output_dir=tmp_path / "unused",
+    )
+    assert Path(str(explicit["model_path"])) == tmp_path / "explicit_model.zip"
+    assert explicit["checkpoint_name"] == "explicit_model"
+    assert not (tmp_path / "unused" / "ignored_name.zip").exists()
+
+    defaulted = trainer.train_drl(
+        strategy=STRATEGY_PATH,
+        algorithm="sac",
+        timesteps=4,
+        output_dir=tmp_path / "defaulted",
+    )
+    assert Path(str(defaulted["model_path"])) == tmp_path / "defaulted" / "drl_ppo_llm_risk_sac.zip"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"algorithm": "DQN"}, "algorithm"),
+        ({"timesteps": 0}, "timesteps"),
+        ({"timesteps": trainer.MAX_TIMESTEPS + 1}, "timesteps"),
+        ({"learning_rate": 0.0}, "learning_rate"),
+        ({"learning_rate": 1.5}, "learning_rate"),
+        ({"gamma": -0.1}, "gamma"),
+        ({"gamma": 1.5}, "gamma"),
+        ({"llm_reward_penalty_lambda": -0.1}, "llm_reward_penalty_lambda"),
+        ({"checkpoint_name": "../evil"}, "checkpoint_name"),
+        ({"checkpoint_name": ""}, "checkpoint_name"),
+        ({"device": "   "}, "device"),
+        ({"periods": 1}, "periods"),
+        ({"seed": -1}, "seed"),
+        ({"reward_curve_windows": 0}, "reward_curve_windows"),
+        ({"offline": False}, "offline"),
+    ],
+)
+def test_train_drl_rejects_invalid_parameters(
+    kwargs: dict[str, object], match: str, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        trainer.train_drl(
+            strategy=STRATEGY_PATH,
+            output=tmp_path / "never.zip",
+            **kwargs,  # type: ignore[arg-type]
+        )
+    assert not (tmp_path / "never.zip").exists()
+
+
+def test_train_drl_reward_curve_is_downsampled_to_requested_windows(
+    patched_trainer: trainer.TrainingData, tmp_path: Path
+) -> None:
+    summary = trainer.train_drl(
+        strategy=STRATEGY_PATH,
+        timesteps=8,
+        reward_curve_windows=3,
+        checkpoint_name="windows",
+        output_dir=tmp_path,
+    )
+    curve = summary["reward_curve"]
+    assert isinstance(curve, dict)
+    assert curve["window_steps"] == 2  # max(1, 8 // 3)
+    assert curve["samples"] <= 3
+    assert curve["env_steps"] == 8
+    assert curve["episode_count"] == 0  # episode is longer than the toy budget
+
+
+def test_train_drl_real_tiny_run_writes_reward_curve(tmp_path: Path) -> None:
+    """Real SB3 run (small budget) exercises the shared callable end to end."""
+    summary = trainer.train_drl(
+        strategy=STRATEGY_PATH,
+        timesteps=8,
+        periods=160,
+        checkpoint_name="real_callable",
+        output_dir=tmp_path,
+        reward_curve_windows=4,
+    )
+    checkpoint = Path(str(summary["model_path"]))
+    meta_path = Path(str(summary["meta_path"]))
+    curve_path = Path(str(summary["reward_curve_path"]))
+    assert checkpoint.is_file() and checkpoint.stat().st_size > 0
+    assert meta_path.is_file() and curve_path.is_file()
+    curve = summary["reward_curve"]
+    assert isinstance(curve, dict)
+    assert int(curve["samples"]) >= 1  # type: ignore[arg-type]
+    assert int(curve["env_steps"]) >= 1  # type: ignore[arg-type]
+    assert summary["feature_fallbacks"] == []
+    assert json.loads(meta_path.read_text(encoding="utf-8")) == summary
+    assert json.loads(curve_path.read_text(encoding="utf-8")) == curve
+
+
+def test_cli_plumbs_new_training_options(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_train(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(trainer, "train_drl", fake_train)
+    exit_code = trainer.main(
+        [
+            "--checkpoint-name",
+            "cli_named",
+            "--output-dir",
+            "artifacts/custom_models",
+            "--learning-rate",
+            "0.001",
+            "--gamma",
+            "0.9",
+            "--llm-reward-penalty-lambda",
+            "0.2",
+            "--reward-curve-windows",
+            "5",
+            "--timesteps",
+            "4",
+            "--seed",
+            "3",
+            "--json",
+        ]
+    )
+    assert exit_code == 0
+    assert captured["checkpoint_name"] == "cli_named"
+    assert captured["output_dir"] == Path("artifacts/custom_models")
+    assert captured["learning_rate"] == pytest.approx(0.001)
+    assert captured["gamma"] == pytest.approx(0.9)
+    assert captured["llm_reward_penalty_lambda"] == pytest.approx(0.2)
+    assert captured["reward_curve_windows"] == 5
+    assert captured["timesteps"] == 4
+    assert captured["seed"] == 3
+    assert captured["offline"] is True
+    assert json.loads(capsys.readouterr().out) == {"status": "ok"}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--checkpoint-name", "../evil"),
+        ("--checkpoint-name", "bad name"),
+        ("--learning-rate", "0"),
+        ("--gamma", "1.5"),
+        ("--llm-reward-penalty-lambda", "-1"),
+        ("--reward-curve-windows", "0"),
+    ],
+)
+def test_cli_parser_rejects_invalid_new_options(
+    arguments: tuple[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    parser = trainer.build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args([*arguments, "--output", "model.zip"])
+    assert excinfo.value.code == 2
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_cli_invalid_checkpoint_name_exits_two_without_traceback(tmp_path: Path) -> None:
+    completed = _run_cli("--checkpoint-name", "../evil", "--output", str(tmp_path / "model.zip"))
+    assert completed.returncode == 2
+    assert "Traceback" not in completed.stderr
+    assert "checkpoint" in completed.stderr.lower()
+
+
+def test_cli_help_lists_new_training_options() -> None:
+    completed = _run_cli("--help")
+    assert completed.returncode == 0
+    for option in (
+        "--checkpoint-name",
+        "--output-dir",
+        "--learning-rate",
+        "--gamma",
+        "--llm-reward-penalty-lambda",
+        "--reward-curve-windows",
+    ):
+        assert option in completed.stdout

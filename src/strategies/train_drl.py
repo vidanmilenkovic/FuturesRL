@@ -54,6 +54,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
+import re
 import subprocess
 import sys
 import time
@@ -61,7 +63,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
+import gymnasium as gym
 import numpy as np
 import polars as pl
 from configs.instruments import InstrumentsConfig, load_instruments
@@ -91,6 +95,18 @@ DEFAULT_OUTPUT_DIR: Path = Path("artifacts/models")
 DEFAULT_PERIODS: int = 512
 #: Default SB3 device (CPU keeps the tiny MLP policies deterministic and fast).
 DEFAULT_DEVICE: str = "cpu"
+#: Hard upper bound for a single training run (guards CLI/API from runaway jobs).
+MAX_TIMESTEPS: int = 2_000_000
+#: Number of reward-curve windows recorded per run (bounded summary size).
+DEFAULT_REWARD_CURVE_WINDOWS: int = 20
+#: Checkpoint stem contract: safe file name, no path separators or traversal.
+CHECKPOINT_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+#: Checkpoint suffixes recognised when resolving/listing model artifacts.
+CHECKPOINT_SUFFIX: str = ".zip"
+#: Sidecar suffix for the machine-readable reward curve (next to the .meta.json).
+REWARD_CURVE_SUFFIX: str = ".reward_curve.json"
+#: Maximum completed-episode returns embedded in the bounded curve summary.
+MAX_RECORDED_EPISODES: int = 100
 #: Filesystem-style repo root, only used for the optional git commit metadata.
 _REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 
@@ -149,6 +165,63 @@ def _algorithm(value: str) -> str:
             f"unsupported algorithm {value!r}; choose from {list(SUPPORTED_ALGORITHMS)}"
         )
     return normalised
+
+
+def _bounded_timesteps(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from exc
+    try:
+        return validate_timesteps(parsed)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _learning_rate_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a float, got {value!r}") from exc
+    try:
+        validated = validate_learning_rate(parsed)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    assert validated is not None
+    return validated
+
+
+def _gamma_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a float, got {value!r}") from exc
+    try:
+        validated = validate_gamma(parsed)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    assert validated is not None
+    return validated
+
+
+def _penalty_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a float, got {value!r}") from exc
+    try:
+        validated = validate_llm_reward_penalty_lambda(parsed)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    assert validated is not None
+    return validated
+
+
+def _checkpoint_name_arg(value: str) -> str:
+    try:
+        return validate_checkpoint_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -211,6 +284,53 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"number of offline daily bars per root (default: {DEFAULT_PERIODS})",
     )
     parser.add_argument(
+        "--checkpoint-name",
+        type=_checkpoint_name_arg,
+        default=None,
+        help=(
+            "checkpoint stem inside --output-dir (default: <strategy_id>_<algorithm>); "
+            "ignored when --output is given"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "directory for the .zip/.meta.json/reward-curve artifacts "
+            f"(default: {DEFAULT_OUTPUT_DIR}; ignored when --output is given)"
+        ),
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=_learning_rate_arg,
+        default=None,
+        help="learning-rate override (default: config.drl.learning_rate; must be in (0, 1])",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=_gamma_arg,
+        default=None,
+        help="discount-factor override (default: config.drl.gamma; must be within [0, 1])",
+    )
+    parser.add_argument(
+        "--llm-reward-penalty-lambda",
+        type=_penalty_arg,
+        default=None,
+        help=(
+            "FinRL semantic-risk reward-shaping lambda override "
+            "(default: config.drl.reward_risk_penalty_lambda; must be >= 0)"
+        ),
+    )
+    parser.add_argument(
+        "--reward-curve-windows",
+        type=_positive_int,
+        default=DEFAULT_REWARD_CURVE_WINDOWS,
+        help=(
+            f"number of reward-curve windows to record (default: {DEFAULT_REWARD_CURVE_WINDOWS})"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="print the summary as a single JSON object on stdout (machine readable)",
@@ -232,12 +352,23 @@ def _resolve_drl_spec(config: StrategyConfig) -> DRLSpec:
     return config.drl
 
 
-def _resolve_checkpoint_path(output: Path | None, config: StrategyConfig, algorithm: str) -> Path:
-    candidate = (
-        output if output is not None else DEFAULT_OUTPUT_DIR / f"{config.id}_{algorithm.lower()}"
-    )
-    candidate = Path(candidate)
-    return candidate if candidate.suffix == ".zip" else Path(f"{candidate}.zip")
+def _resolve_checkpoint_path(
+    output: Path | None,
+    output_dir: Path | None,
+    checkpoint_name: str | None,
+    config: StrategyConfig,
+    algorithm: str,
+) -> Path:
+    """Resolve the checkpoint path (explicit ``--output`` wins over name/dir)."""
+    if output is not None:
+        candidate = Path(output)
+    else:
+        directory = Path(output_dir) if output_dir is not None else DEFAULT_OUTPUT_DIR
+        stem = (
+            checkpoint_name if checkpoint_name is not None else f"{config.id}_{algorithm.lower()}"
+        )
+        candidate = directory / stem
+    return candidate if candidate.suffix == CHECKPOINT_SUFFIX else Path(f"{candidate}.zip")
 
 
 def _prepare_output_path(checkpoint: Path) -> Path:
@@ -282,6 +413,214 @@ def _git_commit() -> str | None:
 def _sb3_version() -> str:
     framework = import_stable_baselines3()
     return str(getattr(framework, "__version__", "unknown"))
+
+
+# ---------------------------------------------------------------------------
+# Parameter validation (shared by the CLI, the callable and the API service)
+# ---------------------------------------------------------------------------
+
+
+def normalise_algorithm(algorithm: str) -> str:
+    """Validate/normalise an algorithm id against the supported SB3 mapping."""
+    candidate = algorithm.strip().upper()
+    if candidate not in SUPPORTED_ALGORITHMS:
+        raise ValueError(
+            f"unsupported algorithm {algorithm!r}; choose from {list(SUPPORTED_ALGORITHMS)}"
+        )
+    return candidate
+
+
+def validate_timesteps(timesteps: int) -> int:
+    """Validate a training budget (bounded to ``MAX_TIMESTEPS``)."""
+    if isinstance(timesteps, bool) or not isinstance(timesteps, int):
+        raise ValueError(f"timesteps must be an integer, got {type(timesteps)!r}")
+    if timesteps < 1 or timesteps > MAX_TIMESTEPS:
+        raise ValueError(f"timesteps must be within [1, {MAX_TIMESTEPS}], got {timesteps}")
+    return timesteps
+
+
+def validate_checkpoint_name(checkpoint_name: str) -> str:
+    """Validate a checkpoint file stem (no traversal, no path separators)."""
+    if not isinstance(checkpoint_name, str):
+        raise ValueError(f"checkpoint_name must be a string, got {type(checkpoint_name)!r}")
+    cleaned = checkpoint_name.strip()
+    if not CHECKPOINT_NAME_PATTERN.fullmatch(cleaned) or ".." in cleaned:
+        raise ValueError(
+            "checkpoint_name must be 1-64 characters of letters, digits, '.', '_' or '-', "
+            f"start with a letter/digit and contain no '..' path traversal; got {checkpoint_name!r}"
+        )
+    return cleaned
+
+
+def validate_learning_rate(learning_rate: float | None) -> float | None:
+    """Validate an optional learning-rate override (strictly positive, <= 1)."""
+    if learning_rate is None:
+        return None
+    value = float(learning_rate)
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        raise ValueError(f"learning_rate must be within (0, 1], got {value!r}")
+    return value
+
+
+def validate_gamma(gamma: float | None) -> float | None:
+    """Validate an optional discount-factor override (within ``[0, 1]``)."""
+    if gamma is None:
+        return None
+    value = float(gamma)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"gamma must be within [0, 1], got {value!r}")
+    return value
+
+
+def validate_llm_reward_penalty_lambda(value: float | None) -> float | None:
+    """Validate an optional FinRL semantic-risk penalty lambda (``>= 0``)."""
+    if value is None:
+        return None
+    penalty = float(value)
+    if not math.isfinite(penalty) or penalty < 0.0:
+        raise ValueError(f"llm_reward_penalty_lambda must be a finite >= 0 number, got {value!r}")
+    return penalty
+
+
+def _validate_seed(seed: int) -> int:
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError(f"seed must be a non-negative integer, got {seed!r}")
+    return seed
+
+
+def _validate_device(device: str) -> str:
+    cleaned = device.strip()
+    if not cleaned:
+        raise ValueError("device must be a non-empty Stable-Baselines3 device string")
+    return cleaned
+
+
+def _validate_periods(periods: int) -> int:
+    if isinstance(periods, bool) or not isinstance(periods, int) or periods < 2:
+        raise ValueError(f"periods must be an integer >= 2, got {periods!r}")
+    return periods
+
+
+def _validate_reward_curve_windows(windows: int, timesteps: int) -> tuple[int, int]:
+    """Return ``(windows, window_steps)`` for the bounded reward-curve summary."""
+    if isinstance(windows, bool) or not isinstance(windows, int) or windows < 1:
+        raise ValueError(f"reward_curve_windows must be a positive integer, got {windows!r}")
+    effective_windows = min(windows, timesteps)
+    window_steps = max(1, timesteps // effective_windows)
+    return effective_windows, window_steps
+
+
+# ---------------------------------------------------------------------------
+# Reward-curve capture (training-time statistics without touching the env)
+# ---------------------------------------------------------------------------
+
+
+class _RewardCurveRecorder(gym.Wrapper[Any, Any, Any, Any]):
+    """Transparent env wrapper recording a bounded reward curve while training.
+
+    Records (a) the mean reward of at most ``windows`` contiguous step windows and
+    (b) the return of every completed episode. Wrapping is transparent to SB3: the
+    observation/action spaces and the step contract are forwarded unchanged, so the
+    policy sees exactly the same environment as without the recorder.
+    """
+
+    def __init__(self, env: gym.Env[Any, Any], *, window_steps: int, max_points: int) -> None:
+        if window_steps < 1:
+            raise ValueError("window_steps must be >= 1")
+        if max_points < 1:
+            raise ValueError("max_points must be >= 1")
+        super().__init__(env)
+        self._window_size = int(window_steps)
+        self._max_points = int(max_points)
+        self._step_index = 0
+        self._window_sum = 0.0
+        self._window_count = 0
+        self._episode_sum = 0.0
+        self.points: list[dict[str, float | int]] = []
+        self.window_mean_rewards: list[float] = []
+        self.episode_rewards: list[float] = []
+
+    @property
+    def window_steps(self) -> int:
+        """Number of environment steps aggregated into one curve point."""
+        return self._window_size
+
+    @property
+    def final_mean_reward(self) -> float | None:
+        """Mean reward of the last recorded window (``None`` when empty)."""
+        return self.window_mean_rewards[-1] if self.window_mean_rewards else None
+
+    @property
+    def best_mean_reward(self) -> float | None:
+        """Best window mean reward observed (``None`` when empty)."""
+        return max(self.window_mean_rewards) if self.window_mean_rewards else None
+
+    def step(self, action: Any) -> tuple[Any, float, bool, bool, dict[str, Any]]:
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        value = float(reward)
+        self._step_index += 1
+        self._window_sum += value
+        self._window_count += 1
+        self._episode_sum += value
+        if terminated or truncated:
+            self.episode_rewards.append(self._episode_sum)
+            self._episode_sum = 0.0
+        if self._window_count >= self._window_size:
+            self._flush_window()
+        return observation, value, terminated, truncated, info
+
+    def flush(self) -> None:
+        """Emit the trailing partial window (call once after training stops)."""
+        self._flush_window()
+
+    def _flush_window(self) -> None:
+        if self._window_count <= 0:
+            return
+        mean_reward = self._window_sum / self._window_count
+        self.points.append({"timestep": self._step_index, "mean_reward": mean_reward})
+        self.window_mean_rewards.append(mean_reward)
+        self._window_sum = 0.0
+        self._window_count = 0
+
+    def curve_payload(self) -> dict[str, object]:
+        """Bounded, JSON-serialisable reward-curve summary embedded in metadata.
+
+        The raw window series is down-sampled to at most ``max_points`` contiguous
+        buckets (SB3 often steps far more than ``total_timesteps`` in its first
+        rollout, e.g. PPO's 2048-step minimum), so a checkpoint sidecar never grows
+        with the training budget. Only the most recent ``MAX_RECORDED_EPISODES``
+        completed-episode returns are embedded; the total count is preserved.
+        """
+        means = list(self.window_mean_rewards)
+        points = [dict(point) for point in self.points]
+        if len(means) > self._max_points:
+            bucket_size = math.ceil(len(means) / self._max_points)
+            downsampled_means: list[float] = []
+            downsampled_points: list[dict[str, float | int]] = []
+            for start in range(0, len(means), bucket_size):
+                chunk = means[start : start + bucket_size]
+                chunk_points = points[start : start + bucket_size]
+                downsampled_means.append(math.fsum(chunk) / len(chunk))
+                downsampled_points.append(
+                    {
+                        "timestep": chunk_points[-1]["timestep"],
+                        "mean_reward": downsampled_means[-1],
+                    }
+                )
+            means = downsampled_means
+            points = downsampled_points
+        episodes = self.episode_rewards
+        return {
+            "window_steps": self._window_size,
+            "points": points,
+            "window_mean_rewards": means,
+            "episode_rewards": episodes[-MAX_RECORDED_EPISODES:],
+            "episode_count": len(episodes),
+            "env_steps": self._step_index,
+            "samples": len(means),
+            "final_mean_reward": means[-1] if means else None,
+            "best_mean_reward": max(means) if means else None,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -466,59 +805,183 @@ def _observation_metadata(env: FuturesTradingEnv) -> tuple[list[int], dict[str, 
     return _box_shape(space), bounds
 
 
-def run_training(args: argparse.Namespace) -> dict[str, object]:
-    """Execute one training run; returns the JSON-serialisable summary."""
+def train_drl(
+    *,
+    strategy: str | Path = DEFAULT_STRATEGY_PATH,
+    algorithm: str | None = None,
+    timesteps: int | None = None,
+    learning_rate: float | None = None,
+    gamma: float | None = None,
+    llm_reward_penalty_lambda: float | None = None,
+    checkpoint_name: str | None = None,
+    output: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    offline: bool = True,
+    seed: int | None = None,
+    device: str = DEFAULT_DEVICE,
+    periods: int | None = None,
+    reward_curve_windows: int = DEFAULT_REWARD_CURVE_WINDOWS,
+) -> dict[str, object]:
+    """Train one DRL checkpoint and return the JSON-serialisable run summary.
+
+    This is the single callable shared by the CLI (:func:`main`) and the REST API
+    (:class:`src.api.drl_service.DRLService`), so both entry points produce
+    byte-identical checkpoints/metadata for the same arguments.
+
+    Parameters
+    ----------
+    strategy:
+        Strategy YAML with a ``drl:`` section (algorithm/policy/seed defaults).
+    algorithm:
+        Optional ``PPO``/``CPPO``/``SAC``/``TD3``/``A2C`` override (case-insensitive).
+    timesteps:
+        Optional training-budget override (bounded to ``MAX_TIMESTEPS``).
+    learning_rate, gamma, llm_reward_penalty_lambda:
+        Optional hyperparameter overrides (validated ranges; config values used
+        when omitted).
+    checkpoint_name:
+        Optional checkpoint stem inside ``output_dir`` (validated; no traversal).
+        Ignored when ``output`` is given.
+    output:
+        Explicit checkpoint path (``.zip`` appended when missing). Highest priority.
+    output_dir:
+        Artifact directory used with ``checkpoint_name``/default naming (default:
+        ``artifacts/models``).
+    offline:
+        Currently the only supported data source is the deterministic offline one;
+        it is recorded in the summary. ``offline=False`` is rejected.
+    seed, device, periods:
+        Optional seed/device/offline-bar-count overrides.
+    reward_curve_windows:
+        Number of windows in the bounded reward-curve summary (default 20).
+
+    Returns
+    -------
+    dict[str, object]
+        The training summary, identical to the ``<checkpoint>.meta.json`` sidecar:
+        model/meta/reward-curve paths, hyperparameters, universe/features, timing
+        and the ``reward_curve`` values (window means + completed-episode returns).
+
+    Raises
+    ------
+    ValueError
+        For invalid algorithm/timesteps/learning_rate/gamma/penalty/checkpoint_name/
+        device/periods/offline arguments (actionable message).
+    RuntimeError
+        For missing strategy/DRL config, missing Stable-Baselines3, unwritable
+        output paths or unusable offline training data.
+    """
+    if offline is not True:
+        raise ValueError(
+            "only deterministic offline training is supported; pass offline=True "
+            "(the CLI --offline flag is accepted for parity)"
+        )
     started = time.perf_counter()
-    strategy_path = Path(args.strategy)
+    strategy_path = Path(strategy)
     try:
         config = load_strategy_config(strategy_path)
     except FileNotFoundError as exc:
         raise RuntimeError(f"strategy config not found: {strategy_path}") from exc
     drl = _resolve_drl_spec(config)
-    algorithm = str(args.algorithm) if args.algorithm is not None else drl.algorithm.upper()
-    timesteps = int(drl.total_timesteps if args.timesteps is None else args.timesteps)
-    seed = int(drl.seed if args.seed is None else args.seed)
-    device = str(args.device)
-    periods = int(args.periods)
-    checkpoint = _prepare_output_path(_resolve_checkpoint_path(args.output, config, algorithm))
+    resolved_algorithm = normalise_algorithm(algorithm if algorithm is not None else drl.algorithm)
+    resolved_timesteps = validate_timesteps(drl.total_timesteps if timesteps is None else timesteps)
+    resolved_learning_rate = validate_learning_rate(
+        drl.learning_rate if learning_rate is None else learning_rate
+    )
+    resolved_gamma = validate_gamma(drl.gamma if gamma is None else gamma)
+    resolved_penalty = validate_llm_reward_penalty_lambda(
+        drl.reward_risk_penalty_lambda
+        if llm_reward_penalty_lambda is None
+        else llm_reward_penalty_lambda
+    )
+    resolved_seed = _validate_seed(drl.seed if seed is None else seed)
+    resolved_device = _validate_device(device)
+    resolved_periods = _validate_periods(DEFAULT_PERIODS if periods is None else periods)
+    resolved_checkpoint_name = (
+        validate_checkpoint_name(checkpoint_name) if checkpoint_name is not None else None
+    )
+    effective_windows, window_steps = _validate_reward_curve_windows(
+        reward_curve_windows, resolved_timesteps
+    )
+    # Effective hyperparameters (config values were already validated by pydantic;
+    # overrides were validated above). Kept as non-optional floats for the summary.
+    effective_learning_rate = 3e-4 if resolved_learning_rate is None else resolved_learning_rate
+    effective_gamma = 0.99 if resolved_gamma is None else resolved_gamma
+    effective_penalty = 0.5 if resolved_penalty is None else resolved_penalty
+    checkpoint = _prepare_output_path(
+        _resolve_checkpoint_path(
+            Path(output) if output is not None else None,
+            Path(output_dir) if output_dir is not None else None,
+            resolved_checkpoint_name,
+            config,
+            resolved_algorithm,
+        )
+    )
     meta_path = Path(f"{checkpoint}.meta.json")
+    reward_curve_path = Path(f"{checkpoint}{REWARD_CURVE_SUFFIX}")
     # Fail fast (and cleanly) when the optional DRL stack is unavailable, before
     # the comparatively expensive offline data build.
     sb3_version = _sb3_version()
 
     instruments = load_instruments()
-    data = build_training_data(config, instruments, seed=seed, periods=periods)
+    data = build_training_data(config, instruments, seed=resolved_seed, periods=resolved_periods)
     env = build_env(config, data, drl=drl)
+    recorder = _RewardCurveRecorder(env, window_steps=window_steps, max_points=effective_windows)
     allocator = DRLAllocator(
-        algorithm=algorithm,
+        algorithm=resolved_algorithm,
         policy=drl.policy,
-        total_timesteps=timesteps,
-        learning_rate=drl.learning_rate,
-        gamma=drl.gamma,
-        seed=seed,
-        risk_penalty_lambda=drl.reward_risk_penalty_lambda,
-        device=device,
+        total_timesteps=resolved_timesteps,
+        learning_rate=effective_learning_rate,
+        gamma=effective_gamma,
+        seed=resolved_seed,
+        risk_penalty_lambda=effective_penalty,
+        device=resolved_device,
         feature_names=data.feature_names,
         verbose=0,
     )
     training_started = time.perf_counter()
-    model = allocator.train(env, total_timesteps=timesteps)
+    model = allocator.train(recorder, total_timesteps=resolved_timesteps)
+    recorder.flush()
     duration_seconds = time.perf_counter() - training_started
     model.save(str(checkpoint))
+    reward_curve = recorder.curve_payload()
+    reward_curve_path.write_text(
+        json.dumps(reward_curve, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     observation_shape, observation_bounds = _observation_metadata(env)
     trained_at = datetime.now(UTC)
+    sb3_algorithm = "PPO" if resolved_algorithm == "CPPO" else resolved_algorithm
+    hyperparameters: dict[str, object] = {
+        "algorithm": resolved_algorithm,
+        "sb3_algorithm": sb3_algorithm,
+        "policy": drl.policy,
+        "total_timesteps": resolved_timesteps,
+        "learning_rate": effective_learning_rate,
+        "gamma": effective_gamma,
+        "llm_reward_penalty_lambda": effective_penalty,
+        "seed": resolved_seed,
+        "device": resolved_device,
+        "reward_curve_windows": effective_windows,
+    }
     summary: dict[str, object] = {
         "status": "ok",
         "strategy_id": config.id,
         "strategy_path": str(strategy_path),
-        "algorithm": algorithm,
-        "sb3_algorithm": "PPO" if algorithm == "CPPO" else algorithm,
+        "algorithm": resolved_algorithm,
+        "sb3_algorithm": sb3_algorithm,
         "policy": drl.policy,
-        "total_timesteps": timesteps,
-        "seed": seed,
-        "device": device,
+        "total_timesteps": resolved_timesteps,
+        "learning_rate": effective_learning_rate,
+        "gamma": effective_gamma,
+        "llm_reward_penalty_lambda": effective_penalty,
+        "seed": resolved_seed,
+        "device": resolved_device,
+        "checkpoint_name": checkpoint.name[: -len(CHECKPOINT_SUFFIX)]
+        if checkpoint.name.endswith(CHECKPOINT_SUFFIX)
+        else checkpoint.name,
         "model_path": str(checkpoint),
         "meta_path": str(meta_path),
+        "reward_curve_path": str(reward_curve_path),
         "universe": list(data.instrument_ids),
         "feature_names": list(data.feature_names),
         "feature_fallbacks": list(data.feature_fallbacks),
@@ -526,7 +989,7 @@ def run_training(args: argparse.Namespace) -> dict[str, object]:
         "observation_bounds": observation_bounds,
         "action_shape": _box_shape(env.action_space),
         "offline": True,
-        "periods": periods,
+        "periods": resolved_periods,
         "usable_rows": data.usable_rows,
         "initial_equity": float(config.backtest.initial_equity)
         if config.backtest is not None
@@ -543,9 +1006,31 @@ def run_training(args: argparse.Namespace) -> dict[str, object]:
         "sb3_version": sb3_version,
         "git_commit": _git_commit(),
         "python_version": sys.version.split()[0],
+        "hyperparameters": hyperparameters,
+        "reward_curve": reward_curve,
     }
     meta_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return summary
+
+
+def run_training(args: argparse.Namespace) -> dict[str, object]:
+    """CLI adapter: map parsed arguments onto :func:`train_drl`."""
+    return train_drl(
+        strategy=Path(args.strategy),
+        algorithm=args.algorithm,
+        timesteps=args.timesteps,
+        learning_rate=args.learning_rate,
+        gamma=args.gamma,
+        llm_reward_penalty_lambda=args.llm_reward_penalty_lambda,
+        checkpoint_name=args.checkpoint_name,
+        output=args.output,
+        output_dir=args.output_dir,
+        offline=True,
+        seed=args.seed,
+        device=args.device,
+        periods=args.periods,
+        reward_curve_windows=args.reward_curve_windows,
+    )
 
 
 def _print_human(summary: dict[str, object]) -> None:
