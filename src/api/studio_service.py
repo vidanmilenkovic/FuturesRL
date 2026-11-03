@@ -127,6 +127,9 @@ class ParameterSpec(_StudioModel):
     choices: list[ScalarChoice] = Field(default_factory=list)
     unit: str | None = None
     optuna_tunable: bool = False
+    #: Additive v1.5.1 flag: true only for the curated parameters pre-selected in
+    #: the Studio's Optuna search-space defaults (exactly six on the live catalog).
+    optuna_default_selected: bool = False
     log_scale: bool = False
     yaml_encoding: str = "scalar"
     #: Cardinality bounds for multiselect params (``None`` for scalar params).
@@ -321,6 +324,7 @@ def _fallback_spec(
     description: str = "",
     unit: str | None = None,
     optuna_tunable: bool = False,
+    optuna_default_selected: bool = False,
     yaml_encoding: str = "scalar",
 ) -> ParameterSpec:
     return ParameterSpec(
@@ -338,6 +342,7 @@ def _fallback_spec(
         choices=list(choices),
         unit=unit,
         optuna_tunable=optuna_tunable,
+        optuna_default_selected=optuna_default_selected,
         yaml_encoding=yaml_encoding,
         path=f"{stage}.params.{param}",
     )
@@ -357,7 +362,7 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             maximum=20,
             step=1,
             description="S_t: keep only the N most liquid eligible roots.",
-            optuna_tunable=True,
+            optuna_tunable=False,
         ),
         _fallback_spec(
             "universe.liquidity.min_volume",
@@ -370,7 +375,7 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             step=10_000.0,
             description="S_t: minimum average daily volume filter.",
             unit="contracts",
-            optuna_tunable=True,
+            optuna_tunable=False,
         ),
         _fallback_spec(
             "allocator.volatility_target.target_annual_volatility",
@@ -383,6 +388,7 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             step=0.01,
             description="A_t: volatility-targeting portfolio risk budget.",
             optuna_tunable=True,
+            optuna_default_selected=True,
         ),
         _fallback_spec(
             "allocator.risk_parity.lookback_days",
@@ -411,6 +417,7 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             description="T_t: TSMOM momentum lookback in trading days.",
             unit="days",
             optuna_tunable=True,
+            optuna_default_selected=True,
         ),
         _fallback_spec(
             "timing.mean_reversion.rsi_period",
@@ -425,6 +432,7 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             description="T_t: RSI period for the panic mean-reversion overlay.",
             unit="bars",
             optuna_tunable=True,
+            optuna_default_selected=True,
         ),
         _fallback_spec(
             "timing.mean_reversion.oversold_threshold",
@@ -460,6 +468,7 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             step=0.01,
             description="R_t: ex-ante portfolio volatility target.",
             optuna_tunable=True,
+            optuna_default_selected=True,
         ),
         _fallback_spec(
             "risk.quant_risk.max_single_instrument_weight",
@@ -472,6 +481,7 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             step=0.05,
             description="R_t: concentration cap per root.",
             optuna_tunable=True,
+            optuna_default_selected=True,
         ),
         _fallback_spec(
             "risk.llm_risk.llm_confidence_threshold",
@@ -506,6 +516,7 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             step=0.01,
             description="Hard margin cushion ceiling η_max.",
             optuna_tunable=True,
+            optuna_default_selected=True,
         ),
     ]
     return specs
@@ -767,6 +778,15 @@ def _coerce_parameter(entry: object) -> ParameterSpec | None:
         return result if math.isfinite(result) else None
 
     tunable = bool(_pick(mapping, "optuna_tunable", "tunable", "optimizable") or False)
+    selected = bool(
+        _pick(
+            mapping,
+            "optuna_default_selected",
+            "optuna_default",
+            "default_selected",
+        )
+        or False
+    )
     return ParameterSpec(
         key=key,
         stage=stage,
@@ -784,6 +804,7 @@ def _coerce_parameter(entry: object) -> ParameterSpec | None:
         choices=choices,
         unit=cast("str | None", _pick(mapping, "unit", "suffix")),
         optuna_tunable=tunable,
+        optuna_default_selected=selected,
         log_scale=bool(_pick(mapping, "log_scale", "log") or False),
         yaml_encoding=str(_pick(mapping, "yaml_encoding", "encoding") or "scalar"),
         min_items=(

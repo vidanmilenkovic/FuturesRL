@@ -114,6 +114,40 @@ def test_catalog_exposes_parameters_stages_and_five_presets(client: TestClient) 
         assert preset["name"]
         assert preset["hypothesis"]
 
+    # Additive v1.5.1 metadata: curated Optuna defaults + tunable hygiene flags.
+    parameters = body["parameters"]
+    assert all(isinstance(parameter["optuna_default_selected"], bool) for parameter in parameters)
+    parameters_by_key = {parameter["key"]: parameter for parameter in parameters}
+    curated = sorted(
+        parameter["key"] for parameter in parameters if parameter["optuna_default_selected"]
+    )
+    assert len(curated) == 6, curated
+    assert set(curated) == {
+        "allocator.volatility_target.target_annual_volatility",
+        "risk.quant_risk.trailing_stop_pct",
+        "timing.carry_filter.min_carry_bps",
+        "timing.kama.window",
+        "timing.tsmom.lookback_fast",
+        "timing.tsmom.lookback_slow",
+    }
+    for key in curated:
+        assert parameters_by_key[key]["optuna_tunable"] is True
+    hygiene_keys = [
+        "universe.liquidity.min_avg_dollar_volume",
+        "universe.liquidity.min_history_days",
+        "universe.liquidity.top_n",
+        "risk.llm_risk.sample_count",
+        "risk.llm_risk.cache_ttl_seconds",
+    ]
+    macro_keys = [
+        key for key in parameters_by_key if key.startswith("risk.llm_risk.macro_lockout_")
+    ]
+    assert macro_keys, "expected macro-lockout hygiene parameters"
+    for key in (*hygiene_keys, *macro_keys):
+        assert key in parameters_by_key, key
+        assert parameters_by_key[key]["optuna_tunable"] is False, key
+        assert parameters_by_key[key]["optuna_default_selected"] is False, key
+
     # Additive Studio UX metadata: stage dropdown choices passed through unchanged.
     stage_choices = body["stage_choices"]
     assert stage_choices["universe"] == ["liquidity", "regime", "composite"]
