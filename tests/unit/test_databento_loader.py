@@ -15,9 +15,13 @@ import pandas as pd
 import polars as pl
 import pytest
 from configs.settings import Settings
+from pydantic import ValidationError
 from src.core.interfaces import HistoricalDataSource
 from src.data import schema as s
 from src.data.databento_loader import (
+    CostEstimate,
+    DatabentoBudgetExceededError,
+    DatabentoCostEstimateError,
     DatabentoIngestError,
     DatabentoLoader,
     OfflineBarSource,
@@ -461,3 +465,264 @@ def test_offline_source_legacy_single_series_mode() -> None:
     assert per_moment["expirations"].unique().to_list() == [1]
     single_expiry = bars[s.EXPIRATION_COLUMN].n_unique()
     assert single_expiry == 2  # one front contract per root
+
+
+# ---------------------------------------------------------------------------
+# Phase-11B: cost estimation + hard per-job budget guard
+# ---------------------------------------------------------------------------
+
+
+class FakeMetadata:
+    """Records ``get_cost``/``get_billable_size`` calls without any vendor network."""
+
+    def __init__(
+        self,
+        cost: float = 0.42,
+        billable_size: int = 123_456,
+        *,
+        cost_error: Exception | None = None,
+        size_error: Exception | None = None,
+    ) -> None:
+        self.cost = cost
+        self.billable_size = billable_size
+        self.cost_error = cost_error
+        self.size_error = size_error
+        self.cost_calls: list[dict[str, Any]] = []
+        self.size_calls: list[dict[str, Any]] = []
+
+    def get_cost(self, **kwargs: Any) -> float:
+        self.cost_calls.append(kwargs)
+        if self.cost_error is not None:
+            raise self.cost_error
+        return self.cost
+
+    def get_billable_size(self, **kwargs: Any) -> int:
+        self.size_calls.append(kwargs)
+        if self.size_error is not None:
+            raise self.size_error
+        return self.billable_size
+
+
+def metadata_client(metadata: FakeMetadata | None = None, *, periods: int = 3) -> Any:
+    client = FakeClient(FakeStore(ohlcv_raw(periods=periods)))
+    client.metadata = metadata if metadata is not None else FakeMetadata()  # type: ignore[attr-defined]
+    return client
+
+
+def test_estimate_cost_uses_metadata_before_any_download(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    metadata = FakeMetadata(cost=0.72, billable_size=2_500_000)
+    client = FakeClient(FakeStore(ohlcv_raw()))
+    client.metadata = metadata  # type: ignore[attr-defined]
+    estimate = loader.estimate_cost_usd(["es"], START, END, client=client)
+    assert isinstance(estimate, CostEstimate)
+    assert estimate.roots == ("ES",)
+    assert estimate.schema == s.DEFAULT_BAR_SCHEMA
+    assert estimate.estimated_cost_usd == pytest.approx(0.72)
+    assert estimate.billable_size_bytes == 2_500_000
+    assert estimate.billable_size_megabytes == pytest.approx(2.5)
+    assert estimate.source == "databento"
+    assert estimate.currency == "USD"
+    assert estimate.dataset == settings.databento_dataset
+    assert estimate.details is not None and estimate.details["metadata_available"] is True
+    cost_call = metadata.cost_calls[0]
+    assert cost_call["dataset"] == settings.databento_dataset
+    assert cost_call["schema"] == s.DEFAULT_BAR_SCHEMA
+    assert cost_call["symbols"] == ["ES.FUT"]
+    assert cost_call["start"] == START and cost_call["end"] == END
+    assert cost_call["unit"] == "usd"
+    assert metadata.size_calls and metadata.size_calls[0]["symbols"] == ["ES.FUT"]
+    assert client.timeseries.calls == []  # estimation never downloads
+    payload = estimate.to_dict()
+    assert payload["roots"] == ["ES"]
+    assert payload["start"] == START.isoformat()
+
+
+def test_estimate_cost_empty_roots_rejected(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    with pytest.raises(ValueError, match="roots must not be empty"):
+        loader.estimate_cost_usd([], START, END, client=metadata_client())
+
+
+def test_estimate_cost_rejects_bad_window_and_schema(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    with pytest.raises(ValueError, match="start"):
+        loader.estimate_cost_usd(["ES"], END, START, client=metadata_client())
+    with pytest.raises(ValueError, match="unsupported Databento schema"):
+        loader.estimate_cost_usd(["ES"], START, END, "bogus", client=metadata_client())
+
+
+def test_estimate_cost_without_api_key_is_actionable(settings: Settings) -> None:
+    loader = make_loader(settings)
+    with pytest.raises(RuntimeError, match="FUTURESRLX_DATABENTO_API_KEY"):
+        loader.estimate_cost_usd(["ES"], START, END)
+
+
+def test_estimate_cost_missing_metadata_methods_falls_back_to_zero(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    loader = make_loader(settings, api_key="fake")
+    client = FakeClient(FakeStore(ohlcv_raw()))
+    with caplog.at_level(logging.WARNING, logger="src.data.databento_loader"):
+        estimate = loader.estimate_cost_usd(["ES"], START, END, client=client)
+    assert estimate.estimated_cost_usd == 0.0
+    assert estimate.billable_size_bytes == 0
+    assert estimate.details is not None and estimate.details["metadata_available"] is False
+    assert client.timeseries.calls == []
+    assert any("no metadata.get_cost" in record.message for record in caplog.records)
+
+
+def test_estimate_cost_metadata_failure_is_actionable(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    client = metadata_client(FakeMetadata(cost_error=RuntimeError("vendor 503")))
+    with pytest.raises(DatabentoCostEstimateError, match=r"metadata\.get_cost failed"):
+        loader.estimate_cost_usd(["ES"], START, END, client=client)
+    assert client.timeseries.calls == []
+
+
+def test_ingest_refuses_over_budget_without_download(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    loader = make_loader(settings, api_key="fake")
+    metadata = FakeMetadata(cost=5.0, billable_size=10_000)
+    client = metadata_client(metadata)
+    with (
+        caplog.at_level(logging.WARNING, logger="src.data.databento_loader"),
+        pytest.raises(DatabentoBudgetExceededError) as excinfo,
+    ):
+        loader.ingest(["ES"], START, END, client=client)
+    error = excinfo.value
+    assert error.estimated_cost_usd == pytest.approx(5.0)
+    assert error.max_cost_usd == pytest.approx(2.0)
+    assert error.roots == ("ES",)
+    assert error.schema == s.DEFAULT_BAR_SCHEMA
+    assert "FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB" in str(error)
+    assert "allow_over_budget=True" in str(error)
+    assert metadata.cost_calls  # estimated first
+    assert client.timeseries.calls == []  # never downloaded on refusal
+
+
+def test_ingest_operator_override_downloads_and_logs(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    loader = make_loader(settings, api_key="fake")
+    metadata = FakeMetadata(cost=5.0)
+    client = metadata_client(metadata)
+    with caplog.at_level(logging.WARNING, logger="src.data.databento_loader"):
+        frame = loader.ingest(["ES"], START, END, client=client, allow_over_budget=True)
+    assert frame.height == 3
+    assert len(client.timeseries.calls) == 1
+    assert any("budget override" in record.message for record in caplog.records)
+    assert metadata.cost_calls  # estimate still ran before download
+
+
+def test_ingest_explicit_max_cost_override(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    client = metadata_client(FakeMetadata(cost=5.0))
+    frame = loader.ingest(["ES"], START, END, client=client, max_cost_usd=10.0)
+    assert frame.height == 3
+    assert len(client.timeseries.calls) == 1
+
+
+def test_ingest_under_budget_proceeds_normally(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    metadata = FakeMetadata(cost=0.5)
+    client = metadata_client(metadata)
+    frame = loader.ingest(["ES"], START, END, client=client)
+    assert frame.height == 3
+    assert len(metadata.cost_calls) == 1
+    assert len(client.timeseries.calls) == 1
+
+
+def test_ingest_negative_max_cost_rejected(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    with pytest.raises(ValueError, match="max_cost_usd must be >= 0"):
+        loader.ingest(["ES"], START, END, client=metadata_client(), max_cost_usd=-1.0)
+
+
+def test_ingest_uses_configured_cap(settings: Settings) -> None:
+    configured = settings.model_copy(update={"databento_max_cost_usd_per_job": 0.25})
+    loader = DatabentoLoader(
+        configured,
+        repository=ParquetRepository(configured),
+        api_key="fake",
+    )
+    client = metadata_client(FakeMetadata(cost=1.0))
+    with pytest.raises(DatabentoBudgetExceededError) as excinfo:
+        loader.ingest(["ES"], START, END, client=client)
+    assert excinfo.value.max_cost_usd == pytest.approx(0.25)
+    assert client.timeseries.calls == []
+
+
+def test_budget_setting_default_and_validation(settings: Settings) -> None:
+    assert Settings(_env_file=None).databento_max_cost_usd_per_job == 2.0
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, databento_max_cost_usd_per_job=-0.01)
+    configured = settings.model_copy(update={"databento_max_cost_usd_per_job": 0.0})
+    loader = DatabentoLoader(
+        configured,
+        repository=ParquetRepository(configured),
+        api_key="fake",
+    )
+    with pytest.raises(DatabentoBudgetExceededError):
+        loader.ingest(["ES"], START, END, client=metadata_client(FakeMetadata(cost=0.01)))
+
+
+def test_ingest_estimates_before_download_in_order(settings: Settings) -> None:
+    order: list[str] = []
+
+    class OrderedMetadata(FakeMetadata):
+        def get_cost(self, **kwargs: Any) -> float:
+            order.append("metadata.get_cost")
+            return super().get_cost(**kwargs)
+
+        def get_billable_size(self, **kwargs: Any) -> int:
+            order.append("metadata.get_billable_size")
+            return super().get_billable_size(**kwargs)
+
+    class OrderedTimeseries(FakeTimeseries):
+        def get_range(self, **kwargs: Any) -> FakeStore:
+            order.append("timeseries.get_range")
+            return super().get_range(**kwargs)
+
+    loader = make_loader(settings, api_key="fake")
+    client = FakeClient()
+    client.timeseries = OrderedTimeseries(FakeStore(ohlcv_raw(periods=2)))
+    client.metadata = OrderedMetadata(cost=0.5)  # type: ignore[attr-defined]
+    loader.ingest(["ES"], START, END, client=client)
+    assert order == ["metadata.get_cost", "metadata.get_billable_size", "timeseries.get_range"]
+
+
+def test_ingest_records_databento_provenance_sidecar(settings: Settings) -> None:
+    import json as _json
+
+    loader = make_loader(settings, api_key="fake")
+    loader.ingest(["ES"], START, END, client=metadata_client(FakeMetadata(cost=0.5)))
+    sidecar = loader.repository.source_sidecar_path("ES", s.DEFAULT_BAR_SCHEMA)
+    assert sidecar.is_file()
+    payload = _json.loads(sidecar.read_text())
+    assert payload["root"] == "ES"
+    assert payload["source"] == "databento"
+    assert payload["schema"] == s.DEFAULT_BAR_SCHEMA
+    inventory = {row.root: row for row in loader.repository.inventory()}
+    assert inventory["ES"].source == "databento"
+    assert inventory["ES"].cached_bars == 3
+
+
+def test_ingest_provenance_failure_does_not_fail_ingest(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = make_loader(settings, api_key="fake")
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("sidecar disk full")
+
+    monkeypatch.setattr(loader.repository, "record_source", boom)
+    frame = loader.ingest(["ES"], START, END, client=metadata_client(FakeMetadata(cost=0.5)))
+    assert frame.height == 3  # persisted data still returned; provenance is best effort

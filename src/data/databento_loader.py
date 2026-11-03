@@ -43,11 +43,12 @@ an expiry.
 
 from __future__ import annotations
 
+import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import polars as pl
@@ -65,6 +66,8 @@ from src.data.contracts import (
 from src.data.storage import ParquetRepository, WriteMode
 from src.data.term_structure import SyntheticTermStructure
 
+logger = logging.getLogger(__name__)
+
 #: Deterministic volume / open-interest scale of the synthetic second month.
 _SECOND_MONTH_VOLUME_SCALE = 0.40
 _SECOND_MONTH_OI_SCALE = 0.45
@@ -74,6 +77,9 @@ _EXPIRY_CHAIN_BUFFER_DAYS = 400
 _DEFINITION_HORIZON_PERIODS = 512
 
 __all__ = [
+    "CostEstimate",
+    "DatabentoBudgetExceededError",
+    "DatabentoCostEstimateError",
     "DatabentoIngestError",
     "DatabentoLoader",
     "OfflineBarSource",
@@ -230,6 +236,62 @@ class DatabentoIngestError(RuntimeError):
     """Raised when a Databento ingestion request cannot be satisfied."""
 
 
+class DatabentoCostEstimateError(RuntimeError):
+    """Raised when the Databento metadata cost/billable-size estimate fails."""
+
+
+class DatabentoBudgetExceededError(DatabentoIngestError):
+    """Raised when a Databento job's estimated cost exceeds the configured cap.
+
+    Exposes the offending :class:`CostEstimate` and cap so the API can return a
+    structured ``402/409`` response and ask the operator for explicit confirmation;
+    the vendor ``timeseries.get_range`` call is never made for a refused job.
+    """
+
+    def __init__(self, message: str, *, estimate: CostEstimate, max_cost_usd: float) -> None:
+        super().__init__(message)
+        self.estimate = estimate
+        self.max_cost_usd = max_cost_usd
+        self.estimated_cost_usd = estimate.estimated_cost_usd
+        self.roots = estimate.roots
+        self.schema = estimate.schema
+        self.start = estimate.start
+        self.end = estimate.end
+
+
+@dataclass(frozen=True, slots=True)
+class CostEstimate:
+    """Estimated Databento cost/billable size for one historical request."""
+
+    roots: tuple[str, ...]
+    schema: str
+    start: datetime
+    end: datetime
+    estimated_cost_usd: float
+    billable_size_bytes: int
+    billable_size_megabytes: float
+    source: Literal["databento"] = "databento"
+    currency: Literal["USD"] = "USD"
+    dataset: str | None = None
+    details: Mapping[str, object] | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-friendly estimate for REST responses/telemetry."""
+        return {
+            "roots": list(self.roots),
+            "schema": self.schema,
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "estimated_cost_usd": self.estimated_cost_usd,
+            "billable_size_bytes": self.billable_size_bytes,
+            "billable_size_megabytes": self.billable_size_megabytes,
+            "source": self.source,
+            "currency": self.currency,
+            "dataset": self.dataset,
+            "details": dict(self.details) if self.details is not None else None,
+        }
+
+
 def synthetic_reference_price(root: InstrumentId) -> float:
     """Deterministic reference price for the synthetic source (fallback 1000.0)."""
     return SYNTHETIC_REFERENCE_PRICES.get(root.strip().upper(), 1_000.0)
@@ -367,6 +429,108 @@ class DatabentoLoader:
         sdk = self._import_sdk()
         return sdk.Historical(api_key=self._require_api_key())
 
+    # -- cost estimation / budget guard ---------------------------------------
+
+    def estimate_cost_usd(
+        self,
+        roots: Sequence[InstrumentId],
+        start: datetime,
+        end: datetime,
+        schema: str = s.DEFAULT_BAR_SCHEMA,
+        *,
+        client: Any | None = None,
+        stype_in: str = "parent",
+        symbols: Sequence[str] | None = None,
+        dataset: str | None = None,
+    ) -> CostEstimate:
+        """Estimate the Databento job cost **before** any download.
+
+        Uses ``client.metadata.get_cost`` (USD) and
+        ``client.metadata.get_billable_size`` for the exact request window/symbols.
+        Never calls ``timeseries.get_range``. A client without either metadata
+        method falls back to a conservative ``$0.00`` estimate (logged warning) so
+        legacy/fake clients remain usable; metadata query errors raise an
+        actionable :class:`DatabentoCostEstimateError`.
+        """
+        if not roots:
+            raise ValueError("roots must not be empty when estimating Databento cost")
+        normalised_roots = s.validate_roots(roots)
+        start_utc, end_utc = _validate_window(start, end)
+        if schema not in s.DATABENTO_SCHEMAS:
+            raise ValueError(
+                f"unsupported Databento schema {schema!r}; expected one of "
+                f"{list(s.DATABENTO_SCHEMAS)}"
+            )
+        resolved_dataset = dataset or self._dataset
+        requested_symbols = (
+            list(symbols)
+            if symbols is not None
+            else self._symbols_for(normalised_roots, stype_in=stype_in)
+        )
+        client_object = client if client is not None else self._client()
+        request_kwargs: dict[str, object] = {
+            "dataset": resolved_dataset,
+            "schema": schema,
+            "symbols": requested_symbols,
+            "start": start_utc,
+            "end": end_utc,
+            "stype_in": stype_in,
+        }
+        metadata = getattr(client_object, "metadata", None)
+        get_cost = getattr(metadata, "get_cost", None)
+        get_billable_size = getattr(metadata, "get_billable_size", None)
+        raw_cost: object | None = None
+        raw_billable_size: object | None = None
+        metadata_available = callable(get_cost) or callable(get_billable_size)
+        if callable(get_cost):
+            try:
+                raw_cost = get_cost(unit="usd", **request_kwargs)
+            except Exception as exc:
+                raise DatabentoCostEstimateError(
+                    "Databento metadata.get_cost failed while estimating the job cost "
+                    f"(dataset={resolved_dataset!r}, schema={schema!r}, "
+                    f"roots={list(normalised_roots)!r}, window=[{start_utc.isoformat()}, "
+                    f"{end_utc.isoformat()}]): {exc}; no data was downloaded."
+                ) from exc
+        if callable(get_billable_size):
+            try:
+                raw_billable_size = get_billable_size(**request_kwargs)
+            except Exception as exc:
+                raise DatabentoCostEstimateError(
+                    "Databento metadata.get_billable_size failed while estimating the job "
+                    f"size (dataset={resolved_dataset!r}, schema={schema!r}, "
+                    f"roots={list(normalised_roots)!r}): {exc}; no data was downloaded."
+                ) from exc
+        if not metadata_available:
+            logger.warning(
+                "Databento client exposes no metadata.get_cost/get_billable_size; "
+                "falling back to a $0.00 cost estimate for dataset=%r schema=%r roots=%r",
+                resolved_dataset,
+                schema,
+                list(normalised_roots),
+            )
+        estimated_cost_usd = float(cast(float, raw_cost)) if raw_cost is not None else 0.0
+        billable_size_bytes = (
+            int(cast(int, raw_billable_size)) if raw_billable_size is not None else 0
+        )
+        return CostEstimate(
+            roots=normalised_roots,
+            schema=schema,
+            start=start_utc,
+            end=end_utc,
+            estimated_cost_usd=estimated_cost_usd,
+            billable_size_bytes=billable_size_bytes,
+            billable_size_megabytes=billable_size_bytes / 1_000_000.0,
+            source="databento",
+            currency="USD",
+            dataset=resolved_dataset,
+            details={
+                "metadata_available": metadata_available,
+                "raw_cost": estimated_cost_usd,
+                "raw_billable_size": billable_size_bytes,
+            },
+        )
+
     # -- symbol resolution -----------------------------------------------------
 
     def _symbols_for(self, roots: Sequence[InstrumentId], *, stype_in: str) -> list[str]:
@@ -450,12 +614,17 @@ class DatabentoLoader:
         mode: WriteMode = "append",
         client: Any | None = None,
         symbols: Sequence[str] | None = None,
+        allow_over_budget: bool = False,
+        max_cost_usd: float | None = None,
     ) -> pl.DataFrame:
         """Fetch ``schema`` for ``roots`` in ``[start, end)`` and cache it.
 
-        Returns the normalised canonical frame (also persisted to the repository).
-        Raises :class:`DatabentoIngestError` on an empty/failed vendor response
-        and :class:`RuntimeError` when the SDK or API key is unavailable.
+        The job cost is estimated (``metadata.get_cost``/``get_billable_size``)
+        **before** ``timeseries.get_range`` is called. Over-budget jobs raise
+        :class:`DatabentoBudgetExceededError` without downloading; only an explicit
+        ``allow_over_budget=True`` (operator-confirmed) bypasses the cap, and the
+        override is logged. ``max_cost_usd`` overrides the configured per-job cap
+        for this call. Returns the normalised canonical frame (also persisted).
         """
         normalised_roots = s.validate_roots(roots)
         start_utc, end_utc = _validate_window(start, end)
@@ -471,6 +640,47 @@ class DatabentoLoader:
             else self._symbols_for(normalised_roots, stype_in=stype_in)
         )
         client_object = client if client is not None else self._client()
+        if max_cost_usd is not None and max_cost_usd < 0.0:
+            raise ValueError("max_cost_usd must be >= 0")
+        estimate = self.estimate_cost_usd(
+            normalised_roots,
+            start_utc,
+            end_utc,
+            schema,
+            client=client_object,
+            stype_in=stype_in,
+            symbols=requested_symbols,
+            dataset=resolved_dataset,
+        )
+        cap = (
+            float(max_cost_usd)
+            if max_cost_usd is not None
+            else float(self._settings.databento_max_cost_usd_per_job)
+        )
+        if estimate.estimated_cost_usd > cap:
+            if not allow_over_budget:
+                raise DatabentoBudgetExceededError(
+                    "Databento ingest refused: estimated cost "
+                    f"${estimate.estimated_cost_usd:.4f} exceeds the per-job cap ${cap:.2f} "
+                    "(FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB); "
+                    f"roots={list(normalised_roots)!r} schema={schema!r} "
+                    f"window=[{start_utc.isoformat()}, {end_utc.isoformat()}] "
+                    f"dataset={resolved_dataset!r}. No data was downloaded; re-run with "
+                    "allow_over_budget=True after operator confirmation, or raise the cap.",
+                    estimate=estimate,
+                    max_cost_usd=cap,
+                )
+            logger.warning(
+                "Databento budget override: estimate $%.4f exceeds cap $%.4f for "
+                "roots=%r schema=%r window=[%s, %s]; proceeding because "
+                "allow_over_budget=True (operator-confirmed)",
+                estimate.estimated_cost_usd,
+                cap,
+                list(normalised_roots),
+                schema,
+                start_utc.isoformat(),
+                end_utc.isoformat(),
+            )
         try:
             store = client_object.timeseries.get_range(
                 dataset=resolved_dataset,
@@ -500,7 +710,30 @@ class DatabentoLoader:
             self._repository.write_bars(frame, dataset=resolved_dataset, schema=schema, mode=mode)
         else:
             self._repository.write_frame(frame, schema=schema, dataset=resolved_dataset, mode=mode)
+        self._record_ingested_source(frame, schema, resolved_dataset)
         return frame
+
+    def _record_ingested_source(self, frame: pl.DataFrame, schema: str, dataset: str) -> None:
+        """Write Databento provenance sidecars for every ingested root (best effort)."""
+        if s.ROOT_SYMBOL_COLUMN not in frame.columns:
+            return
+        roots = sorted(
+            {
+                str(root)
+                for root in frame[s.ROOT_SYMBOL_COLUMN].unique().to_list()
+                if root is not None and str(root)
+            }
+        )
+        for root in roots:
+            try:
+                self._repository.record_source(root, "databento", schema, dataset)
+            except Exception as exc:
+                logger.warning(
+                    "could not record Databento provenance for root %r schema %r: %s",
+                    root,
+                    schema,
+                    exc,
+                )
 
     def ingest_definitions(
         self,

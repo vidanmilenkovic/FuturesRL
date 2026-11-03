@@ -6,6 +6,7 @@ deterministic market-data factories: no network, no Databento, no IBKR.
 
 from __future__ import annotations
 
+import json
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,7 +17,9 @@ from configs.settings import Settings
 from src.data import schema as s
 from src.data.storage import (
     PARTITION_FILE_NAME,
+    SOURCE_SIDECAR_NAME,
     ParquetRepository,
+    RootCacheSummary,
     StorageError,
 )
 
@@ -422,3 +425,134 @@ def test_dedupe_frame_keeps_requested_row() -> None:
     assert last.sort("a")["b"].to_list() == [2.0, 3.0]
     first = s.dedupe_frame(frame, ("a",), keep="first")
     assert first.sort("a")["b"].to_list() == [1.0, 3.0]
+
+
+# ---------------------------------------------------------------------------
+# Phase-11B: per-root inventory + provenance sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_inventory_includes_all_instrument_master_roots(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    inventory = repo.inventory()
+    assert inventory == sorted(inventory, key=lambda row: row.root)
+    roots = [row.root for row in inventory]
+    assert len(roots) == 45  # all instrument-master roots, including empty ones
+    assert roots[:3] == ["6A", "6B", "6C"]
+    assert "ES" in roots and "CL" in roots
+    empty = {row.root: row for row in inventory}
+    es = empty["ES"]
+    assert isinstance(es, RootCacheSummary)
+    assert es.sector == "equity"
+    assert es.schema == s.DEFAULT_BAR_SCHEMA
+    assert es.cached_bars == 0
+    assert es.start_date is None and es.end_date is None
+    assert es.size_bytes == 0
+    assert es.source == "empty"
+    assert empty["CL"].sector == "energy"
+    assert {row.sector for row in inventory} >= {"equity", "rates", "energy", "metals", "fx"}
+
+
+def test_inventory_reads_partition_stats_and_provenance(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(bar_frame(("ES", "NQ"), periods=6))
+    sidecar = repo.record_source("ES", "ibkr")
+    assert sidecar == repo.source_sidecar_path("ES")
+    assert sidecar.name == SOURCE_SIDECAR_NAME
+    payload = json.loads(sidecar.read_text())
+    assert payload["root"] == "ES"
+    assert payload["source"] == "ibkr"
+    assert payload["schema"] == s.DEFAULT_BAR_SCHEMA
+    assert payload["updated_at"].endswith("+00:00")
+
+    inventory = {row.root: row for row in repo.inventory()}
+    es = inventory["ES"]
+    assert es.cached_bars == 6
+    assert es.start_date == FIXED_TIMESTAMP.date()
+    assert es.end_date == (FIXED_TIMESTAMP + timedelta(days=5)).date()
+    assert es.size_bytes > 0
+    assert es.source == "ibkr"
+    # Legacy partition without a sidecar defaults to databento provenance.
+    assert inventory["NQ"].cached_bars == 6
+    assert inventory["NQ"].source == "databento"
+
+
+def test_inventory_degrades_corrupt_partition_with_warning(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    repo = ParquetRepository(settings)
+    broken = repo.partition_path("CL")
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text("this is not parquet")
+    with caplog.at_level(logging.WARNING, logger="src.data.storage"):
+        inventory = {row.root: row for row in repo.inventory()}
+    cl = inventory["CL"]
+    assert cl.cached_bars == 0
+    assert cl.source == "empty"
+    assert cl.start_date is None and cl.end_date is None
+    assert cl.size_bytes > 0
+    assert any("could not read Parquet partition" in record.message for record in caplog.records)
+
+
+def test_inventory_includes_cached_non_master_root(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    unknown = bar_frame(("ES",), periods=2).with_columns(
+        pl.lit("ZZ").alias(s.ROOT_SYMBOL_COLUMN),
+        pl.lit("ZZ_LEGACY").alias(s.INSTRUMENT_ID_COLUMN),
+    )
+    repo.write_bars(unknown)
+    inventory = {row.root: row for row in repo.inventory()}
+    assert inventory["ZZ"].sector == "unknown"
+    assert inventory["ZZ"].cached_bars == 2
+    assert inventory["ZZ"].source == "databento"
+
+
+def test_inventory_respects_dataset_override(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(bar_frame(("ES",), periods=3), dataset="OTHER.DATASET")
+    other = {row.root: row for row in repo.inventory(dataset="OTHER.DATASET")}
+    assert other["ES"].cached_bars == 3
+    assert other["NQ"].cached_bars == 0
+    default = {row.root: row for row in repo.inventory()}
+    assert default["ES"].cached_bars == 0
+
+
+def test_record_source_validates_inputs(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    with pytest.raises(ValueError, match="source must be one of"):
+        repo.record_source("ES", "empty")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="source must be one of"):
+        repo.record_source("ES", "vendor")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="timezone-aware"):
+        repo.record_source("ES", "ibkr", updated_at=datetime(2024, 1, 2))
+
+
+def test_root_cache_summary_to_dict(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(bar_frame(("ES",), periods=2))
+    row = next(item for item in repo.inventory() if item.root == "ES")
+    payload = row.to_dict()
+    assert payload["root"] == "ES"
+    assert payload["sector"] == "equity"
+    assert payload["cached_bars"] == 2
+    assert payload["start_date"] == FIXED_TIMESTAMP.date().isoformat()
+    assert payload["end_date"] == (FIXED_TIMESTAMP + timedelta(days=1)).date().isoformat()
+    assert payload["source"] == "databento"
+    json.dumps(payload)
+
+
+def test_inventory_invalid_sidecar_defaults_to_databento(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    repo = ParquetRepository(settings)
+    repo.write_bars(bar_frame(("ES",), periods=2))
+    sidecar = repo.source_sidecar_path("ES")
+    sidecar.write_text("{not valid json")
+    with caplog.at_level(logging.WARNING, logger="src.data.storage"):
+        row = next(item for item in repo.inventory() if item.root == "ES")
+    assert row.source == "databento"
+    assert any("unreadable source sidecar" in record.message for record in caplog.records)

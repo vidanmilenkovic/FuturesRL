@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     databento_dataset: str = "GLBX.MDP3"
     databento_default_schema: str = "ohlcv-1d"
     databento_live_enabled: bool = False
+    #: Hard per-job Databento spend cap (USD) enforced before ``timeseries.get_range``.
+    #: The loader estimates cost via ``metadata.get_cost``/``get_billable_size`` first
+    #: and refuses over-budget jobs unless the operator passes ``allow_over_budget=True``.
+    databento_max_cost_usd_per_job: float = Field(default=2.00, ge=0.0)
 
     # -- IBKR ----------------------------------------------------------------------
     ibkr_host: str = "127.0.0.1"

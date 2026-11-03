@@ -48,29 +48,51 @@ production.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import logging
+import os
 import re
 import shutil
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal, cast
 
 import duckdb
 import polars as pl
+from configs.instruments import load_instruments
 from configs.settings import Settings, get_settings
 
 from src.core.types import InstrumentId
 from src.data import schema as s
 
-__all__ = ["ParquetRepository", "StorageError", "WriteMode"]
+__all__ = [
+    "PARTITION_FILE_NAME",
+    "SOURCE_SIDECAR_NAME",
+    "ParquetRepository",
+    "RootCacheSummary",
+    "StorageError",
+    "WriteMode",
+]
 
 #: How :meth:`ParquetRepository.write_frame` merges with existing data.
 type WriteMode = Literal["append", "overwrite"]
 
+logger = logging.getLogger(__name__)
+
 #: File name of the single Parquet partition per (dataset, schema, root).
 PARTITION_FILE_NAME = "part.parquet"
+
+#: File name of the provenance sidecar written next to each partition.
+SOURCE_SIDECAR_NAME = f"{PARTITION_FILE_NAME}.meta.json"
+
+#: Valid provenance sources for a cached partition.
+type CacheSource = Literal["databento", "ibkr", "empty"]
+_VALID_RECORDED_SOURCES: frozenset[str] = frozenset({"databento", "ibkr"})
 
 #: Characters allowed in a root symbol (also protects against path traversal).
 _ROOT_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]*$")
@@ -82,6 +104,54 @@ _LOCKS_GUARD = threading.Lock()
 
 class StorageError(RuntimeError):
     """Raised when the on-disk cache cannot satisfy a storage operation."""
+
+
+@dataclass(frozen=True, slots=True)
+class RootCacheSummary:
+    """Inventory row for one futures root in the Parquet cache.
+
+    Returned by :meth:`ParquetRepository.inventory` for every instrument-master
+    root (including roots without a partition) and for any cached non-master root.
+    """
+
+    root: InstrumentId
+    sector: str
+    schema: str
+    cached_bars: int
+    start_date: date | None
+    end_date: date | None
+    size_bytes: int
+    source: CacheSource
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-friendly row (dates rendered as ISO ``YYYY-MM-DD`` strings)."""
+        return {
+            "root": self.root,
+            "sector": self.sector,
+            "schema": self.schema,
+            "cached_bars": self.cached_bars,
+            "start_date": self.start_date.isoformat() if self.start_date is not None else None,
+            "end_date": self.end_date.isoformat() if self.end_date is not None else None,
+            "size_bytes": self.size_bytes,
+            "source": self.source,
+        }
+
+
+def _atomic_write_json(payload: Mapping[str, object], target: Path) -> None:
+    """Atomically write ``payload`` as JSON to ``target`` (temp file + ``os.replace``)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(dict(payload), stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        Path(temp_name).replace(target)
+    except Exception:
+        with contextlib.suppress(OSError):
+            Path(temp_name).unlink()
+        raise
 
 
 def _lock_for(path: Path) -> threading.RLock:
@@ -226,6 +296,12 @@ class ParquetRepository:
         """Absolute path of the single Parquet partition of ``root``."""
         return self.root_dir(root, schema, dataset) / PARTITION_FILE_NAME
 
+    def source_sidecar_path(
+        self, root: InstrumentId, schema: str = s.DEFAULT_BAR_SCHEMA, dataset: str | None = None
+    ) -> Path:
+        """Absolute path of the provenance sidecar written next to the partition."""
+        return self.root_dir(root, schema, dataset) / SOURCE_SIDECAR_NAME
+
     # -- lifecycle -------------------------------------------------------------
 
     def list_datasets(self) -> tuple[str, ...]:
@@ -258,6 +334,131 @@ class ParquetRepository:
     def has_data(self, schema: str = s.DEFAULT_BAR_SCHEMA, dataset: str | None = None) -> bool:
         """Whether ``schema`` contains any data at all."""
         return bool(self.available_roots(schema, dataset))
+
+    def inventory(
+        self, schema: str = s.DEFAULT_BAR_SCHEMA, dataset: str | None = None
+    ) -> list[RootCacheSummary]:
+        """Per-root cache inventory across every instrument-master root.
+
+        Returns one :class:`RootCacheSummary` per root: all instrument-master
+        roots (including roots with no cached partition, reported with
+        ``cached_bars=0``/``source="empty"``) plus any cached non-master roots
+        (sector ``"unknown"``), sorted by root.
+
+        Partition stats (row count, ``timestamp_utc`` min/max, file size) are read
+        from the Parquet metadata; a missing, unreadable or corrupt partition is
+        degraded to an empty row with a warning instead of raising. Provenance is
+        read from the :func:`record_source` sidecar; legacy partitions without a
+        sidecar report ``source="databento"``.
+        """
+        resolved_dataset = dataset or self._default_dataset
+        master = load_instruments(self._settings.instruments_path)
+        cached_roots = set(self.available_roots(schema, resolved_dataset))
+        roots = sorted(set(master.roots()) | cached_roots)
+        summaries: list[RootCacheSummary] = []
+        for root in roots:
+            spec = master.get(root) if master.has(root) else None
+            sector = spec.sector if spec is not None else "unknown"
+            path = self.partition_path(root, schema, resolved_dataset)
+            cached_bars = 0
+            start_date: date | None = None
+            end_date: date | None = None
+            size_bytes = 0
+            source: CacheSource = "empty"
+            if path.is_file():
+                with contextlib.suppress(OSError):
+                    size_bytes = path.stat().st_size
+                cached_bars, start_date, end_date = self._partition_bounds(path)
+                if cached_bars > 0:
+                    source = self._read_partition_source(root, schema, resolved_dataset)
+            summaries.append(
+                RootCacheSummary(
+                    root=root,
+                    sector=sector,
+                    schema=schema,
+                    cached_bars=cached_bars,
+                    start_date=start_date,
+                    end_date=end_date,
+                    size_bytes=size_bytes,
+                    source=source,
+                )
+            )
+        return summaries
+
+    def record_source(
+        self,
+        root: InstrumentId,
+        source: CacheSource,
+        schema: str = s.DEFAULT_BAR_SCHEMA,
+        dataset: str | None = None,
+        *,
+        updated_at: datetime | None = None,
+    ) -> Path:
+        """Record the provenance (``databento``/``ibkr``) of a cached root.
+
+        Writes an atomic ``part.parquet.meta.json`` sidecar next to the partition
+        (creating the root directory when needed) and returns its path. ``inventory``
+        reads this sidecar for :attr:`RootCacheSummary.source`; partitions written
+        before this mechanism (no sidecar) default to ``"databento"``.
+        """
+        if source not in _VALID_RECORDED_SOURCES:
+            raise ValueError(
+                f"source must be one of {sorted(_VALID_RECORDED_SOURCES)}, got {source!r}"
+            )
+        resolved_dataset = dataset or self._default_dataset
+        timestamp = updated_at if updated_at is not None else datetime.now(UTC)
+        if timestamp.tzinfo is None:
+            raise ValueError("updated_at must be timezone-aware (UTC expected)")
+        target = self.source_sidecar_path(root, schema, resolved_dataset)
+        payload: dict[str, object] = {
+            "root": _safe_root(root),
+            "schema": schema,
+            "dataset": resolved_dataset,
+            "source": source,
+            "updated_at": timestamp.isoformat(),
+        }
+        _atomic_write_json(payload, target)
+        return target
+
+    def _read_partition_source(self, root: InstrumentId, schema: str, dataset: str) -> CacheSource:
+        """Read a partition's provenance sidecar (legacy default ``databento``)."""
+        sidecar = self.source_sidecar_path(root, schema, dataset)
+        if not sidecar.is_file():
+            return "databento"
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "ignoring unreadable source sidecar for root %r (%s): %s",
+                root,
+                sidecar,
+                exc,
+            )
+            return "databento"
+        recorded = payload.get("source") if isinstance(payload, dict) else None
+        return cast(CacheSource, recorded) if recorded in _VALID_RECORDED_SOURCES else "databento"
+
+    @staticmethod
+    def _partition_bounds(path: Path) -> tuple[int, date | None, date | None]:
+        """Read ``(row_count, min_date, max_date)`` from a partition (empty on corruption)."""
+        try:
+            lazy = pl.scan_parquet(path)
+            column_names = lazy.collect_schema().names()
+            row_count = int(lazy.select(pl.len()).collect().item())
+            if s.TIMESTAMP_COLUMN not in column_names:
+                return (row_count, None, None)
+            bounds = lazy.select(
+                pl.col(s.TIMESTAMP_COLUMN).min().alias("start"),
+                pl.col(s.TIMESTAMP_COLUMN).max().alias("end"),
+            ).collect()
+            start_value = bounds["start"][0]
+            end_value = bounds["end"][0]
+            start_date = start_value.date() if isinstance(start_value, datetime) else None
+            end_date = end_value.date() if isinstance(end_value, datetime) else None
+            return (row_count, start_date, end_date)
+        except Exception as exc:
+            logger.warning("could not read Parquet partition %s: %s", path, exc)
+            return (0, None, None)
 
     def delete_root(
         self, root: InstrumentId, schema: str = s.DEFAULT_BAR_SCHEMA, dataset: str | None = None
