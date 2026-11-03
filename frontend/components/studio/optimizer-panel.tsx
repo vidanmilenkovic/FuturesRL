@@ -23,6 +23,7 @@ import {
   runOptimization,
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
+import { DATA_MODE_OPTIONS, cachedBarsDetail, dataOriginBadge } from "@/lib/data-cache";
 import { formatInteger, formatNumber, formatPct } from "@/lib/format";
 import {
   activeTunableParameters,
@@ -37,6 +38,8 @@ import {
   structuralParametersForStrategy,
 } from "@/lib/studio";
 import type {
+  CachedBarsMeta,
+  MarketDataMode,
   OptimizationObjective,
   OptimizationRequest,
   OptimizationStudy,
@@ -76,6 +79,7 @@ export function OptimizerPanel({
   const [baseId, setBaseId] = useState("");
   const [objective, setObjective] = useState<OptimizationObjective>("sharpe");
   const [nTrials, setNTrials] = useState(25);
+  const [dataMode, setDataMode] = useState<MarketDataMode>("auto");
   const [wfSplits, setWfSplits] = useState(5);
   const [drawdownPenalty, setDrawdownPenalty] = useState(0.2);
   const [bounds, setBounds] = useState<Record<string, { enabled: boolean; low: number; high: number }>>({});
@@ -213,6 +217,7 @@ export function OptimizerPanel({
       drawdown_penalty_threshold: drawdownPenalty,
       search_space: buildSearchSpace(activeParams, bounds),
       seed: 7,
+      data_mode: dataMode,
     };
     const result = await runOptimization(request);
     setRunning(false);
@@ -383,6 +388,18 @@ export function OptimizerPanel({
                 ]}
               />
             </Field>
+            <Field label="Data mode" htmlFor="opt-data-mode" className="col-span-2">
+              <Select
+                id="opt-data-mode"
+                value={dataMode}
+                onChange={(value) => setDataMode(value as MarketDataMode)}
+                options={DATA_MODE_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
+              />
+            </Field>
+            <div className="col-span-2 rounded border border-hairline bg-canvas/50 px-2 py-1 text-[10px] leading-4 text-zinc-500">
+              Auto uses real cached Parquet bars when the strategy roots have enough history; otherwise the study falls back to the
+              synthetic fixture. Cached-real fails with an actionable error if the cache is insufficient.
+            </div>
             <Field label="Objective" htmlFor="opt-objective">
               <Select
                 id="opt-objective"
@@ -573,7 +590,10 @@ export function OptimizerPanel({
                       className="focus-ring flex min-w-0 flex-1 items-center justify-between gap-2 px-2 py-1.5 text-left text-[10.5px]"
                     >
                       <span className="min-w-0">
-                        <span className="block truncate font-mono text-zinc-300">{entry.study_id}</span>
+                        <span className="flex min-w-0 items-center gap-1.5">
+                          <span className="truncate font-mono text-zinc-300">{entry.study_id}</span>
+                          <StudyDataBadge study={entry} />
+                        </span>
                         <span className="block truncate text-zinc-600">
                           {entry.base_strategy_id} · {entry.objective_metric} · {entry.n_trials} trials
                         </span>
@@ -678,6 +698,7 @@ export function OptimizerPanel({
                   <Badge tone={study.walk_forward ? "accent" : "warn"}>
                     WF · {study.fold_count ?? study.wf_splits} folds
                   </Badge>
+                  <StudyDataBadge study={study} />
                 </span>
               ) : null}
               <Button
@@ -1031,6 +1052,26 @@ export function OptimizerPanel({
         </div>
       ) : null}
     </div>
+  );
+}
+
+function StudyDataBadge({
+  study,
+}: {
+  study: { data_origin?: string | null; data_mode?: string | null; cached_bars?: number | CachedBarsMeta | null };
+}) {
+  const meta = dataOriginBadge(study.data_origin);
+  const detail = cachedBarsDetail(study.cached_bars);
+  return (
+    <span
+      data-testid={meta.real ? "study-data-origin-real" : "study-data-origin-synthetic"}
+      data-origin={meta.real ? "real_parquet" : "synthetic_fixture"}
+      title={[meta.title, detail, study.data_mode ? `mode ${study.data_mode}` : null].filter(Boolean).join(" · ")}
+      className="inline-flex min-w-0 items-center gap-1"
+    >
+      <Badge tone={meta.tone}>{meta.label}</Badge>
+      {detail ? <span className="truncate font-mono text-[8.5px] text-zinc-600">{detail}</span> : null}
+    </span>
   );
 }
 

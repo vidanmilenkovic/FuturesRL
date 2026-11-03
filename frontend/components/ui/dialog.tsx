@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 /**
  * Accessible modal used by the flatten-all confirmation and other destructive
@@ -70,7 +71,7 @@ export function Modal({
 
   if (!open) return null;
 
-  return (
+  const content = (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
       role="presentation"
@@ -117,4 +118,6 @@ export function Modal({
       </div>
     </div>
   );
+
+  return typeof document === "undefined" ? content : createPortal(content, document.body);
 }

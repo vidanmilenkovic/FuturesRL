@@ -53,6 +53,12 @@ import type {
   ArtifactMutationResult,
   BacktestRunConfig,
   BacktestRunSummary,
+  DataCostEstimate,
+  DataCostRequest,
+  DataIngestRequest,
+  DataIngestResult,
+  DataInventoryResponse,
+  DataCacheRoot,
   PaperStateResetResult,
   RiskLockResetResult,
   FlattenAllResponse,
@@ -314,6 +320,203 @@ export function runBacktest(config: BacktestRunConfig): Promise<ApiResult<Backte
     { method: "POST", body: JSON.stringify(config) },
     20_000,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11B — market data cache inventory / cost / ingest
+// ---------------------------------------------------------------------------
+
+function fallbackDataInventory(): DataInventoryResponse {
+  return {
+    roots: [],
+    totals: {
+      cached_roots: 0,
+      total_roots: 45,
+      total_bars: 0,
+      total_size_bytes: 0,
+      start_date: null,
+      end_date: null,
+    },
+    databento_configured: false,
+    ibkr_available: false,
+    schema: "ohlcv-1d",
+    generated_at: null,
+  };
+}
+
+function normalizeCacheRoot(raw: unknown): DataCacheRoot | null {
+  if (!isRecord(raw)) return null;
+  const root = asMessage(raw.root ?? raw.symbol ?? "").toUpperCase();
+  if (!root) return null;
+  return {
+    root,
+    sector: asMessage(raw.sector ?? "") || "unknown",
+    schema: asMessage(raw.schema ?? "ohlcv-1d") || "ohlcv-1d",
+    cached_bars:
+      typeof raw.cached_bars === "number"
+        ? raw.cached_bars
+        : typeof raw.bars === "number"
+          ? raw.bars
+          : 0,
+    start_date: asMessage(raw.start_date ?? raw.start ?? "") || null,
+    end_date: asMessage(raw.end_date ?? raw.end ?? "") || null,
+    size_bytes:
+      typeof raw.size_bytes === "number"
+        ? raw.size_bytes
+        : typeof raw.bytes === "number"
+          ? raw.bytes
+          : 0,
+    source: asMessage(raw.source ?? (Number(raw.cached_bars ?? 0) > 0 ? "databento" : "empty")) || "empty",
+  };
+}
+
+function normalizeDataInventory(raw: unknown): DataInventoryResponse {
+  const root = isRecord(raw) ? raw : {};
+  const roots = asRebalanceArray(root.roots)
+    .map(normalizeCacheRoot)
+    .filter((entry): entry is DataCacheRoot => entry !== null)
+    .sort((a, b) => a.root.localeCompare(b.root));
+  const totalsRaw = isRecord(root.totals) ? root.totals : {};
+  const cached = roots.filter((entry) => entry.cached_bars > 0);
+  return {
+    roots,
+    totals: {
+      cached_roots:
+        typeof totalsRaw.cached_roots === "number" ? totalsRaw.cached_roots : cached.length,
+      total_roots:
+        typeof totalsRaw.total_roots === "number" ? totalsRaw.total_roots : roots.length,
+      total_bars:
+        typeof totalsRaw.total_bars === "number"
+          ? totalsRaw.total_bars
+          : roots.reduce((sum, entry) => sum + entry.cached_bars, 0),
+      total_size_bytes:
+        typeof totalsRaw.total_size_bytes === "number"
+          ? totalsRaw.total_size_bytes
+          : roots.reduce((sum, entry) => sum + entry.size_bytes, 0),
+      start_date: asMessage(totalsRaw.start_date ?? "") || null,
+      end_date: asMessage(totalsRaw.end_date ?? "") || null,
+    },
+    databento_configured: root.databento_configured === true,
+    ibkr_available: root.ibkr_available === true,
+    schema: asMessage(root.schema ?? "ohlcv-1d") || "ohlcv-1d",
+    generated_at: asMessage(root.generated_at ?? "") || null,
+    warnings: asRebalanceArray(root.warnings).map((warning) => asMessage(warning)).filter(Boolean),
+  };
+}
+
+export async function getDataInventory(): Promise<ApiResult<DataInventoryResponse>> {
+  return withFallback<unknown>("/api/data/inventory", fallbackDataInventory, undefined, 15_000).then(
+    (result) => ({
+      ...result,
+      data: result.source === "live" ? normalizeDataInventory(result.data) : fallbackDataInventory(),
+    }),
+  );
+}
+
+function normalizeDataCost(raw: unknown, source: DataCostRequest["source"]): DataCostEstimate {
+  const root = isRecord(raw) ? raw : {};
+  const bytes =
+    typeof root.billable_size_bytes === "number"
+      ? root.billable_size_bytes
+      : typeof root.billable_size === "number"
+        ? root.billable_size
+        : 0;
+  return {
+    estimated_cost_usd:
+      typeof root.estimated_cost_usd === "number" ? root.estimated_cost_usd : 0,
+    billable_size_bytes: bytes,
+    billable_size_mb:
+      typeof root.billable_size_mb === "number"
+        ? root.billable_size_mb
+        : typeof root.billable_size_megabytes === "number"
+          ? root.billable_size_megabytes
+          : bytes / (1024 * 1024),
+    source: asMessage(root.source ?? source) || source,
+    currency: asMessage(root.currency ?? "USD") || "USD",
+    details: isRecord(root.details) ? root.details : null,
+  };
+}
+
+export function estimateDataCost(request: DataCostRequest): Promise<ApiResult<DataCostEstimate>> {
+  return withFallback<unknown>(
+    "/api/data/estimate-cost",
+    () => normalizeDataCost({ estimated_cost_usd: 0, source: "unavailable" }, request.source),
+    {
+      method: "POST",
+      body: JSON.stringify({
+        roots: request.roots,
+        start: request.start,
+        end: request.end,
+        schema: request.schema ?? "ohlcv-1d",
+        source: request.source,
+      }),
+    },
+    60_000,
+  ).then((result) => ({
+    ...result,
+    data: normalizeDataCost(result.data, request.source),
+  }));
+}
+
+function fallbackDataIngest(request: DataIngestRequest): DataIngestResult {
+  return {
+    ok: false,
+    source: request.source,
+    roots_ingested: [],
+    bars_written: 0,
+    start_date: request.start,
+    end_date: request.end,
+    duration_seconds: null,
+    cost_estimate: null,
+    continuous_series: null,
+    warnings: [],
+    message: "Market data ingest requires the FastAPI data API.",
+  };
+}
+
+export function ingestDataCache(request: DataIngestRequest): Promise<ApiResult<DataIngestResult>> {
+  return withFallback<unknown>(
+    "/api/data/ingest",
+    () => fallbackDataIngest(request),
+    {
+      method: "POST",
+      body: JSON.stringify({
+        source: request.source,
+        roots: request.roots,
+        start: request.start,
+        end: request.end,
+        schema: request.schema ?? "ohlcv-1d",
+        allow_over_budget: request.allow_over_budget === true,
+        confirm: request.confirm !== false,
+      }),
+    },
+    300_000,
+  ).then((result) => {
+    if (result.source !== "live") {
+      return { ...result, data: fallbackDataIngest(request) };
+    }
+    const raw = isRecord(result.data) ? result.data : {};
+    const cost = isRecord(raw.cost_estimate)
+      ? normalizeDataCost(raw.cost_estimate, request.source)
+      : null;
+    return {
+      ...result,
+      data: {
+        ok: true,
+        source: asMessage(raw.source ?? request.source) || request.source,
+        roots_ingested: asRebalanceArray(raw.roots_ingested).map((root) => asMessage(root)).filter(Boolean),
+        bars_written: typeof raw.bars_written === "number" ? raw.bars_written : 0,
+        start_date: asMessage(raw.start_date ?? raw.start ?? "") || null,
+        end_date: asMessage(raw.end_date ?? raw.end ?? "") || null,
+        duration_seconds:
+          typeof raw.duration_seconds === "number" ? raw.duration_seconds : null,
+        cost_estimate: cost,
+        continuous_series: asRebalanceArray(raw.continuous_series),
+        warnings: asRebalanceArray(raw.warnings).map((warning) => asMessage(warning)).filter(Boolean),
+        message: asMessage(raw.message ?? "") || "Cache backfill completed.",
+      },
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------

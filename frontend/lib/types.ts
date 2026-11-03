@@ -577,6 +577,8 @@ export interface OptimizationRequest {
   search_space: OptimizationParamRange[];
   /** Optional deterministic seed (defaults to 7 on the backend). */
   seed?: number;
+  /** Phase 11B: auto = real cached bars when sufficient, else synthetic. */
+  data_mode?: MarketDataMode;
 }
 
 export interface OptimizationTrial {
@@ -628,6 +630,10 @@ export interface OptimizationStudy {
   artifact_path?: string | null;
   message?: string | null;
   best_raw_value?: number | null;
+  /** Phase 11B additive real/synthetic provenance. */
+  data_origin?: DataOrigin | null;
+  data_mode?: MarketDataMode | string | null;
+  cached_bars?: number | CachedBarsMeta | null;
 }
 
 export interface OptimizationListResponse {
@@ -823,6 +829,20 @@ export interface BacktestRunConfig {
   wf_splits?: number;
   purge_bars?: number;
   embargo_bars?: number;
+  /** Phase 11B: auto = real cached bars when sufficient, else synthetic. */
+  data_mode?: MarketDataMode;
+}
+
+export type MarketDataMode = "auto" | "cached_real" | "synthetic_offline";
+export type DataOrigin = "real_parquet" | "synthetic_fixture" | string;
+
+export interface CachedBarsMeta {
+  bars?: number | null;
+  bar_count?: number | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  roots?: string[] | null;
+  [key: string]: unknown;
 }
 
 export interface BacktestRunSummary {
@@ -847,6 +867,10 @@ export interface BacktestRunSummary {
   /** QoL: strategy config snapshot captured when the run was created. */
   strategy_config?: Record<string, unknown> | null;
   strategy_yaml?: string | null;
+  /** Phase 11B additive real/synthetic provenance. */
+  data_origin?: DataOrigin | null;
+  data_mode?: MarketDataMode | string | null;
+  cached_bars?: number | CachedBarsMeta | null;
 }
 
 export interface BacktestRunDetail extends BacktestRunSummary {
@@ -1110,4 +1134,77 @@ export interface RebalanceExecuteResponse {
   updated_positions?: RebalancePosition[];
   bridge_updated?: boolean | null;
   message?: string | null;
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 11B — market data cache inventory / cost / ingest
+// ---------------------------------------------------------------------------
+
+export interface DataCacheRoot {
+  root: string;
+  sector: string;
+  schema: string;
+  cached_bars: number;
+  start_date: string | null;
+  end_date: string | null;
+  size_bytes: number;
+  source: "databento" | "ibkr" | "empty" | string;
+}
+
+export interface DataInventoryTotals {
+  cached_roots: number;
+  total_roots: number;
+  total_bars: number;
+  total_size_bytes: number;
+  start_date: string | null;
+  end_date: string | null;
+}
+
+export interface DataInventoryResponse {
+  roots: DataCacheRoot[];
+  totals: DataInventoryTotals;
+  databento_configured: boolean;
+  ibkr_available: boolean;
+  schema: string;
+  generated_at: string | null;
+  warnings?: string[];
+}
+
+export type DataSource = "ibkr" | "databento";
+
+export interface DataCostRequest {
+  source: DataSource;
+  roots: string[];
+  start: string;
+  end: string;
+  schema?: string;
+}
+
+export interface DataCostEstimate {
+  estimated_cost_usd: number;
+  billable_size_bytes: number;
+  billable_size_mb: number;
+  source: DataSource | "unavailable" | string;
+  currency: string;
+  details?: Record<string, unknown> | null;
+}
+
+export interface DataIngestRequest extends DataCostRequest {
+  allow_over_budget?: boolean;
+  confirm?: boolean;
+}
+
+export interface DataIngestResult {
+  ok: boolean;
+  source: DataSource | string;
+  roots_ingested: string[];
+  bars_written: number;
+  start_date: string | null;
+  end_date: string | null;
+  duration_seconds: number | null;
+  cost_estimate: DataCostEstimate | null;
+  continuous_series: unknown[] | null;
+  warnings: string[];
+  message: string;
 }

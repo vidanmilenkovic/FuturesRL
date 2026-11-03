@@ -6,6 +6,8 @@ import { cn } from "@/lib/cn";
 import { resetPaperState, resetRunnerBridge } from "@/lib/api";
 import type { PaperStateResetResult } from "@/lib/types";
 
+import { MarketDataCacheButton } from "@/components/data/market-data-cache";
+
 import { useTelemetry } from "../providers/telemetry-provider";
 import { Modal } from "../ui/dialog";
 import { Badge, Button, Field, TextInput } from "../ui/primitives";
@@ -147,6 +149,17 @@ export function OperatorDrawer({ open, onClose }: { open: boolean; onClose: () =
               >
                 Reset
               </Button>
+            </div>
+          </div>
+          <div className="rounded-md border border-edge bg-canvas/60 p-2">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <p className="text-[11.5px] font-medium text-zinc-200">Market Data Cache</p>
+                <p className="mt-0.5 text-[10px] leading-4 text-zinc-600">
+                  Inspect cached Parquet roots, estimate Databento cost and backfill IBKR/Databento daily bars.
+                </p>
+              </div>
+              <MarketDataCacheButton label="Open" className="shrink-0" testId="operator-market-data-cache" />
             </div>
           </div>
           {receipt ? (

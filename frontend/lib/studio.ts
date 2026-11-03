@@ -1288,6 +1288,13 @@ export function normalizeOptimizationStudy(raw: unknown): OptimizationStudy | nu
     provenance: asString(source.provenance, "") || null,
     artifact_path: asString(source.artifact_path, "") || null,
     message: asString(source.message, "") || null,
+    ...(typeof source.data_origin === "string" ? { data_origin: source.data_origin } : {}),
+    ...(typeof source.data_mode === "string" ? { data_mode: source.data_mode } : {}),
+    cached_bars: isRecord(source.cached_bars)
+      ? (source.cached_bars as Record<string, unknown>)
+      : typeof source.cached_bars === "number"
+        ? source.cached_bars
+        : null,
   };
 }
 
