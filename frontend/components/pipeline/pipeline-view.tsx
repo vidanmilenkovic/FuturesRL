@@ -42,6 +42,58 @@ const REGIME_LABEL: Record<TermRegime, string> = {
   flat: "Flat",
 };
 
+/** Compact regime tags sized for the dense weight matrix. */
+const MATRIX_REGIME_LABEL: Record<TermRegime, string> = {
+  contango: "Contango",
+  backwardation: "Backward.",
+  flat: "Flat",
+};
+
+function signedQuantity(value: number): string {
+  return `${value >= 0 ? "+" : "−"}${Math.abs(value)}`;
+}
+
+/**
+ * Compact standard→micro routing summary, e.g. `ES → +14 ES, +18 MES`.
+ * Older backends do not report `micro_routing`; derive target micro legs from
+ * the instrument rows instead of inventing pairs.
+ */
+function formatMicroRouting(pipeline: PipelineWaterfallResponse): string {
+  if (Array.isArray(pipeline.micro_routing)) {
+    if (pipeline.micro_routing.length === 0) return "Idle · no standard → micro routing";
+    return pipeline.micro_routing
+      .map(
+        (route) =>
+          `${route.standard_root} → ${signedQuantity(route.standard_quantity)} ${route.standard_root}, ${signedQuantity(route.micro_quantity)} ${route.micro_root}`,
+      )
+      .join(" · ");
+  }
+  const microLegs = pipeline.instruments
+    .filter((row) => row.target_contracts !== null && MICRO_ROOTS.has(row.instrument_id))
+    .map((row) => `${signedQuantity(row.target_contracts ?? 0)} ${row.instrument_id}`);
+  return microLegs.length > 0 ? `Active · ${microLegs.join(", ")}` : "n/a · not reported by API";
+}
+
+function formatTrackingError(pipeline: PipelineWaterfallResponse): {
+  value: string;
+  tone: string;
+  title: string;
+} {
+  const reported = pipeline.tracking_error_pct;
+  if (typeof reported === "number" && Number.isFinite(reported)) {
+    return {
+      value: `${reported.toFixed(2)}%`,
+      tone: reported > 5 ? "text-warn" : "text-zinc-200",
+      title: "Realised tracking error of the executed book versus the approved target weights",
+    };
+  }
+  return {
+    value: "n/a · not reported by API",
+    tone: "text-zinc-500",
+    title: "This backend build does not report realised tracking error for the pipeline",
+  };
+}
+
 function heatStyle(value: number, maxAbs: number, muted = false): CSSProperties {
   if (Math.abs(value) < 1e-9) return {};
   const alpha = Math.max(0.06, Math.min(0.32, (Math.abs(value) / Math.max(maxAbs, 1e-9)) * 0.3));
@@ -116,14 +168,6 @@ export function PipelineView() {
     );
   }, [data]);
 
-  const microTargets = useMemo(
-    () =>
-      (data?.instruments ?? [])
-        .filter((row) => row.target_contracts !== null && MICRO_ROOTS.has(row.instrument_id))
-        .map((row) => row.instrument_id),
-    [data],
-  );
-
   if (pipeline.loading && !data) {
     return (
       <div className="grid min-h-full grid-rows-[minmax(0,1fr)] grid-cols-12 gap-3">
@@ -148,6 +192,7 @@ export function PipelineView() {
 
   const overlays = parseOverlays(data);
   const translator = parseTranslator(data);
+  const tracking = formatTrackingError(data);
   const selectedCount = data.instruments.filter((row) => row.selected).length;
 
   return (
@@ -187,14 +232,19 @@ export function PipelineView() {
             />
             <TraceRow
               label="Tracking error"
-              value="n/a · not reported by API"
-              tone="text-zinc-500"
-              title="The pipeline API does not expose realised tracking error; it is computed by the backtest analytics layer."
+              value={tracking.value}
+              tone={tracking.tone}
+              title={tracking.title}
             />
             <TraceRow
               label="Micro routing"
-              value={microTargets.length > 0 ? `Active · ${microTargets.join(", ")}` : "Idle · no micro legs"}
-              tone={microTargets.length > 0 ? "text-zinc-200" : "text-zinc-500"}
+              value={formatMicroRouting(data)}
+              tone={
+                data.micro_routing && data.micro_routing.length > 0
+                  ? "text-zinc-200"
+                  : "text-zinc-500"
+              }
+              title="Standard → micro contract routing applied by the deterministic contract translator"
             />
             <TraceRow label="Margin feasibility" value={parseMargin(data)} />
             <TraceRow label="Translator" value={translator} />
@@ -247,15 +297,33 @@ export function PipelineView() {
         bodyClassName="min-h-0 p-0"
         flush
       >
-        <div className="min-h-0 flex-1 overflow-auto">
-          <table className="data-table">
+        <div
+          className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+          data-testid="weight-matrix-scroll"
+        >
+          <table
+            className="data-table w-full table-fixed text-[10.5px] [&_th]:px-1.5 [&_th]:text-[8.5px] [&_th]:tracking-[0.01em] [&_td]:h-9 [&_td]:px-1.5"
+            data-testid="weight-matrix"
+          >
+            <colgroup>
+              <col style={{ width: "7%" }} />
+              <col style={{ width: "12%" }} />
+              <col style={{ width: "9%" }} />
+              <col style={{ width: "9%" }} />
+              <col style={{ width: "9%" }} />
+              <col style={{ width: "9%" }} />
+              <col style={{ width: "9%" }} />
+              <col style={{ width: "7%" }} />
+              <col style={{ width: "10%" }} />
+              <col style={{ width: "19%" }} />
+            </colgroup>
             <thead>
               <tr>
-                <th className="sticky left-0 z-20 bg-panel">Root</th>
+                <th>Root</th>
                 <th>Regime</th>
                 <th className="text-right">w_base</th>
-                <th className="text-right">w_timing</th>
-                <th className="text-right">Timing Δ</th>
+                <th className="text-right">w_tim</th>
+                <th className="text-right">Tim Δ</th>
                 <th className="text-right">w_risk</th>
                 <th className="text-right">Risk Δ</th>
                 <th className="text-right">N_i,t</th>
@@ -331,17 +399,19 @@ function MatrixRow({
   const quantity = row.target_contracts;
   return (
     <tr className={row.selected ? "" : "opacity-50"}>
-      <td className="sticky left-0 z-10 bg-panel font-medium text-zinc-100">
+      <td className="font-medium text-zinc-100">
         <span className="flex items-center gap-1.5">
-          {row.selected ? <span className="h-1.5 w-1.5 rounded-full bg-accent" /> : null}
-          {row.instrument_id}
+          {row.selected ? <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" /> : null}
+          <span className="truncate">{row.instrument_id}</span>
         </span>
       </td>
       <td>
         {regime ? (
-          <Badge tone={REGIME_TONE[regime]}>{REGIME_LABEL[regime]}</Badge>
+          <Badge tone={REGIME_TONE[regime]} className="px-1 text-[9.5px]" title={REGIME_LABEL[regime]}>
+            {MATRIX_REGIME_LABEL[regime]}
+          </Badge>
         ) : (
-          <span className="text-[11px] text-zinc-600">—</span>
+          <span className="text-[10px] text-zinc-600">—</span>
         )}
       </td>
       <td className="num text-right" style={heatStyle(row.weight_base, maxAbs)}>
@@ -357,7 +427,17 @@ function MatrixRow({
         {Math.abs(row.delta_timing).toFixed(3)}
       </td>
       <td className="num text-right" style={heatStyle(row.weight_risk, maxAbs)}>
-        {formatWeight(row.weight_risk)}
+        <span className="block">{formatWeight(row.weight_risk)}</span>
+        {row.weight_actual !== null && row.weight_actual !== undefined ? (
+          <span
+            className="block text-[9px] leading-3 text-zinc-600"
+            title={`Executed weight (broker-confirmed): ${row.weight_actual >= 0 ? "+" : "−"}${Math.abs(row.weight_actual).toFixed(4)}`}
+            data-testid="weight-actual"
+          >
+            {row.weight_actual >= 0 ? "+" : "−"}
+            {Math.abs(row.weight_actual).toFixed(3)}
+          </span>
+        ) : null}
       </td>
       <td className={cn("num text-right", row.delta_risk >= 0 ? "text-gain/90" : "text-loss/90")}>
         {row.delta_risk >= 0 ? "+" : "−"}
@@ -369,8 +449,10 @@ function MatrixRow({
       <td className="num text-right text-zinc-400">
         {row.notional === null ? "—" : formatCurrency(row.notional, true)}
       </td>
-      <td className="max-w-[220px] truncate text-[11.5px] text-zinc-500" title={row.reason}>
-        {row.reason}
+      <td className="text-[10.5px] text-zinc-500" data-testid="matrix-driver">
+        <span className="block truncate" title={row.reason}>
+          {row.reason}
+        </span>
       </td>
     </tr>
   );

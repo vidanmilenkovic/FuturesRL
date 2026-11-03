@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { useMemo, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 import { getPipeline, listStrategies } from "@/lib/api";
 import { cn } from "@/lib/cn";
@@ -14,7 +14,7 @@ import {
   formatSignedCurrency,
 } from "@/lib/format";
 import { useAsyncData } from "@/lib/use-async-data";
-import type { ConnectionState, HealthResponse } from "@/lib/types";
+import type { ConnectionState, DataModeKey } from "@/lib/types";
 
 import { useAccount } from "../providers/account-provider";
 import { useTelemetry } from "../providers/telemetry-provider";
@@ -37,47 +37,20 @@ function isActive(pathname: string, href: string): boolean {
   return href === "/" ? pathname === "/" : pathname.startsWith(href);
 }
 
-function modeState(
-  backend: "checking" | "online" | "offline",
-  health: HealthResponse | null,
-  isDemo: boolean,
-): { label: string; tone: Tone; title: string } {
-  if (backend === "checking") {
-    return { label: "CONNECTING", tone: "neutral", title: "Connecting to the telemetry API" };
-  }
-  if (isDemo || backend === "offline" || !health) {
-    return {
-      label: "DEMO DATA",
-      tone: "warn",
-      title: "FastAPI backend unreachable — deterministic fixtures + local telemetry simulator",
-    };
-  }
-  if (health.offline_mode) {
-    return {
-      label: "DEMO DATA",
-      tone: "warn",
-      title: "API is serving deterministic offline fixtures (no IBKR/Databento session)",
-    };
-  }
-  if (health.status === "degraded") {
-    return {
-      label: "DEGRADED",
-      tone: "warn",
-      title: "API reports degraded service — some adapters are running on fallbacks",
-    };
-  }
-  if (health.environment === "live") {
-    return { label: "LIVE · IBKR", tone: "gain", title: "Live IBKR execution session" };
-  }
-  return { label: "PAPER · IBKR", tone: "neutral", title: "IBKR paper trading session" };
-}
+const MODE_TONE: Record<DataModeKey, Tone> = {
+  connecting: "neutral",
+  ui_fallback: "warn",
+  offline_engine: "neutral",
+  paper_ibkr: "accent",
+  live_ibkr: "gain",
+};
 
 function connectionState(status: ConnectionState): { label: string; tone: Tone } {
   switch (status) {
     case "live":
       return { label: "Streaming", tone: "gain" };
     case "demo":
-      return { label: "Demo stream", tone: "warn" };
+      return { label: "Simulated stream", tone: "warn" };
     case "connecting":
       return { label: "Connecting", tone: "neutral" };
     default:
@@ -92,15 +65,16 @@ function connectionState(status: ConnectionState): { label: string; tone: Tone }
  */
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const { status, backend, health, events, isDemo, latest } = useTelemetry();
-  const { account, positions, reload } = useAccount();
+  const { status, backend, events, latest } = useTelemetry();
+  const { account, positions, dataMode, reload } = useAccount();
   const strategies = useAsyncData(listStrategies);
   const pipeline = useAsyncData(getPipeline);
   const [flattenOpen, setFlattenOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
-  const mode = useMemo(() => modeState(backend, health, isDemo), [backend, health, isDemo]);
   const connection = connectionState(status);
+  const modeTone = MODE_TONE[dataMode.key];
+  const modeTooltip = `${dataMode.description} · API ${backend} · WS ${status}`;
 
   const marginUtil = account?.margin_utilization ?? 0;
   const dayPnl = account?.day_pnl ?? 0;
@@ -194,14 +168,16 @@ export function AppShell({ children }: { children: ReactNode }) {
             <span className="font-mono text-[10px] tabular-nums text-zinc-600">60%</span>
           </div>
 
-          <div className="hidden items-baseline gap-1.5 xl:flex">
+          <div className="hidden items-baseline gap-1.5 2xl:flex">
             <span className="text-[10px] font-medium uppercase tracking-[0.05em] text-zinc-500">Gross</span>
             <span className="font-mono text-[12px] font-medium tabular-nums text-zinc-100">
               {account ? `${account.gross_leverage.toFixed(2)}×` : "—"}
             </span>
           </div>
 
-          <ModePill label={mode.label} tone={mode.tone} title={mode.title} />
+          <span data-testid="data-mode-badge" data-state={dataMode.key} data-mode={dataMode.label}>
+            <ModePill label={dataMode.label} tone={modeTone} title={modeTooltip} />
+          </span>
 
           <Button
             variant="danger"
@@ -241,10 +217,24 @@ export function AppShell({ children }: { children: ReactNode }) {
           </span>
         </span>
         <span className="ml-auto flex items-center gap-2">
-          <span className={cn("hidden text-[10.5px] lg:inline", isDemo ? "text-amber-400/80" : "text-zinc-600")}>
-            {isDemo
-              ? "DEMO DATA · deterministic fixtures"
-              : `API ${health?.environment ?? "connected"} · ${formatInteger(events.length)} frames`}
+          <span
+            className={cn(
+              "hidden text-[10.5px] lg:inline",
+              dataMode.key === "ui_fallback"
+                ? "text-amber-400/80"
+                : dataMode.key === "live_ibkr"
+                  ? "text-emerald-400/80"
+                  : dataMode.key === "paper_ibkr"
+                    ? "text-blue-300/80"
+                    : "text-zinc-600",
+            )}
+            title={modeTooltip}
+          >
+            {dataMode.key === "ui_fallback"
+              ? "UI FALLBACK · deterministic fixtures"
+              : dataMode.key === "offline_engine"
+                ? `OFFLINE ENGINE · ${formatInteger(events.length)} frames`
+                : `${dataMode.label} · ${formatInteger(events.length)} frames`}
           </span>
           <button
             type="button"

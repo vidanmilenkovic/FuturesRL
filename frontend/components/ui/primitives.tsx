@@ -263,7 +263,9 @@ export function ModePill({
           ? "border-warn/30 bg-warn-soft text-amber-300"
           : tone === "gain"
             ? "border-gain/30 bg-gain-soft text-emerald-300"
-            : "border-edge bg-surface text-zinc-400"
+            : tone === "accent"
+              ? "border-accent/30 bg-accent-soft text-blue-300"
+              : "border-edge bg-surface text-zinc-400"
       }`}
     >
       <StatusDot tone={tone} />

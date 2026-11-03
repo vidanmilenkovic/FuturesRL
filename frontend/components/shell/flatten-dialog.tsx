@@ -53,7 +53,7 @@ export function FlattenDialog({
       const response = await flattenAll();
       setResult(response.data);
       if (response.source === "demo") {
-        setNote("Backend unreachable — flatten was simulated against deterministic demo state.");
+        setNote("Backend unreachable — flatten was simulated against deterministic fixture state.");
       }
       onFlattened();
     } catch (cause) {

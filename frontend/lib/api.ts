@@ -17,9 +17,12 @@ import {
   mockPipeline,
   mockRiskState,
   mockStrategies,
+  mockRecentFills,
+  mockRunnerStatus,
   mockTelemetryStatus,
   mockTearsheet,
   mockTermStructure,
+  mockWorkingOrders,
 } from "./mock";
 import type {
   AccountSnapshotResponse,
@@ -36,9 +39,12 @@ import type {
   RiskThresholds,
   StrategyConfig,
   TearsheetResponse,
+  FillsResponse,
+  RunnerStatus,
   TelemetryEnvelope,
   TelemetryStatusResponse,
   TermStructureResponse,
+  WorkingOrdersResponse,
 } from "./types";
 
 const DEFAULT_TIMEOUT_MS = 2_500;
@@ -172,12 +178,36 @@ export function flattenAll(): Promise<ApiResult<FlattenAllResponse>> {
         quantity: Math.abs(position.quantity),
         status: "FILLED" as const,
         average_price: position.market_price,
-        message: "DEMO: simulated fill (no broker connected)",
+        message: "UI FALLBACK: simulated fill (no broker connected)",
       })),
       execution_locked_until: null,
-      message: "DEMO: flatten-all simulated locally",
+      message: "UI FALLBACK: flatten simulated locally",
     };
   }, { method: "POST" }, 4_000);
+}
+
+// ---------------------------------------------------------------------------
+// Execution bridge: working orders / fills / runner
+// ---------------------------------------------------------------------------
+
+export function getWorkingOrders(): Promise<ApiResult<WorkingOrdersResponse>> {
+  return withFallback("/api/orders/working", mockWorkingOrders);
+}
+
+export function getRecentFills(limit = 50): Promise<ApiResult<FillsResponse>> {
+  return withFallback(`/api/fills/recent?limit=${limit}`, mockRecentFills);
+}
+
+export function getRunnerStatus(): Promise<ApiResult<RunnerStatus>> {
+  return withFallback("/api/runner/status", () => mockRunnerStatus());
+}
+
+export function stepRunner(states = 1): Promise<ApiResult<RunnerStatus>> {
+  return withFallback(
+    "/api/runner/step",
+    () => mockRunnerStatus(states),
+    { method: "POST", body: JSON.stringify({ states }) },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +286,7 @@ export interface TelemetryConnection {
  * On the first socket error/failure the hook starts the deterministic local
  * simulator so the Command Center and Risk views still animate in demo mode.
  * The caller gets `onStatus("live" | "demo")` transitions so the shell can show
- * the `DEMO DATA` indicator.
+ * the `UI FALLBACK` data-mode badge.
  */
 export function connectTelemetry(options: {
   onMessage: (message: TelemetryEnvelope) => void;

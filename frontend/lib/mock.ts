@@ -4,7 +4,7 @@
  * The dashboard must be fully explorable with the FastAPI backend switched off
  * (`npm run dev` standalone, static preview, screenshots, CI). When a REST call
  * fails the API client falls back to the factories below and the shell lights
- * the `DEMO DATA` indicator. Everything here is seeded (mulberry32) so two
+ * the `UI FALLBACK` badge. Everything here is seeded (mulberry32) so two
  * users see identical numbers, and every value is internally consistent
  * (positions sum to the reported NLV, metrics are computed from the generated
  * equity curve, pipeline targets are derived from the final weights).
@@ -40,6 +40,9 @@ import type {
   TermContract,
   TermCurve,
   TermStructureResponse,
+  FillsResponse,
+  RunnerStatus,
+  WorkingOrdersResponse,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -554,6 +557,9 @@ export function mockPipeline(netLiquidation = ACCOUNT_STARTING_NLV): PipelineWat
       delta_risk: risk - timing,
       target_contracts: targetContracts,
       notional: risk * netLiquidation,
+      // Fixture preview: assume the executed book matches the approved target
+      // to 3 decimal places (real backends report the fill-confirmed weight).
+      weight_actual: input.selected ? Number(risk.toFixed(3)) : null,
       reason: input.reason,
     };
   });
@@ -667,6 +673,16 @@ export function mockPipeline(netLiquidation = ACCOUNT_STARTING_NLV): PipelineWat
     instruments,
     diagnostics,
     elapsed_ms: 42.7,
+    tracking_error_pct: 4.21,
+    micro_routing: [
+      {
+        family: "equity",
+        standard_root: "ES",
+        standard_quantity: 14,
+        micro_root: "MES",
+        micro_quantity: 18,
+      },
+    ],
   };
 }
 
@@ -1082,10 +1098,18 @@ function runConfig(strategyId: string, offsetDays: number): BacktestRunConfig {
   };
 }
 
-const RUN_SEEDS: { id: string; strategyId: string; seed: number; vol: number; createdDaysAgo: number; duration: number }[] = [
-  { id: "bt-0031", strategyId: "tsmom_vol_target", seed: 20260101, vol: 0.0082, createdDaysAgo: 1, duration: 184.2 },
-  { id: "bt-0030", strategyId: "drl_ppo_llm_risk", seed: 20260102, vol: 0.0068, createdDaysAgo: 3, duration: 512.7 },
-  { id: "bt-0029", strategyId: "carry_riskparity", seed: 20260103, vol: 0.0096, createdDaysAgo: 7, duration: 121.5 },
+const RUN_SEEDS: {
+  id: string;
+  strategyId: string;
+  seed: number;
+  vol: number;
+  createdDaysAgo: number;
+  duration: number;
+  walkForward: boolean;
+}[] = [
+  { id: "bt-0031", strategyId: "tsmom_vol_target", seed: 20260101, vol: 0.0082, createdDaysAgo: 1, duration: 184.2, walkForward: true },
+  { id: "bt-0030", strategyId: "drl_ppo_llm_risk", seed: 20260102, vol: 0.0068, createdDaysAgo: 3, duration: 512.7, walkForward: true },
+  { id: "bt-0029", strategyId: "carry_riskparity", seed: 20260103, vol: 0.0096, createdDaysAgo: 7, duration: 121.5, walkForward: false },
 ];
 
 export function mockBacktestList(): BacktestListResponse {
@@ -1101,6 +1125,11 @@ export function mockBacktestList(): BacktestListResponse {
       config: runConfig(seed.strategyId, seed.createdDaysAgo),
       metrics,
       error: null,
+      n_trades: null,
+      n_rebalances: null,
+      data_source: "fixture",
+      kind: seed.walkForward ? "walk_forward" : "standard",
+      wf_splits: seed.walkForward ? 5 : null,
     };
   });
   return {
@@ -1137,6 +1166,42 @@ export function mockHealth(): HealthResponse {
     offline_mode: true,
     uptime_seconds: 0,
     server_time: isoFromMs(nowMs()),
+    ibkr_connected: false,
+    runner_bridge_available: false,
+    runner_bridge_stale: false,
+    runner_mode: "fixture",
+  };
+}
+
+export function mockWorkingOrders(): WorkingOrdersResponse {
+  return {
+    as_of: isoFromMs(nowMs()),
+    source: "fixture",
+    mode: "fixture",
+    stale: false,
+    sequence: 0,
+    orders: [],
+  };
+}
+
+export function mockRecentFills(): FillsResponse {
+  return {
+    as_of: isoFromMs(nowMs()),
+    source: "fixture",
+    fills: [],
+  };
+}
+
+export function mockRunnerStatus(advance = 0): RunnerStatus {
+  return {
+    mode: "fixture",
+    available: false,
+    stale: false,
+    sequence: advance,
+    updated_at: isoFromMs(nowMs()),
+    runner_id: "fixture-runner",
+    session_running: false,
+    states_processed: advance,
   };
 }
 
@@ -1237,7 +1302,7 @@ export function demoConnectionLabel(state: ConnectionState): string {
     case "live":
       return "LIVE";
     case "demo":
-      return "DEMO DATA";
+      return "UI FALLBACK";
     case "connecting":
       return "CONNECTING";
     default:

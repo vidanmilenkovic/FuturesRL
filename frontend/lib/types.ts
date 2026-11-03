@@ -43,6 +43,25 @@ export interface HealthResponse {
   offline_mode: boolean;
   uptime_seconds: number;
   server_time: string;
+  /** Phase 9 additive bridge state (absent on older backends). */
+  ibkr_connected?: boolean;
+  runner_bridge_available?: boolean;
+  runner_bridge_stale?: boolean;
+  runner_mode?: string | null;
+}
+
+/** Data provenance shown by the ribbon badge. */
+export type DataModeKey =
+  | "connecting"
+  | "ui_fallback"
+  | "offline_engine"
+  | "paper_ibkr"
+  | "live_ibkr";
+
+export interface DataMode {
+  key: DataModeKey;
+  label: string;
+  description: string;
 }
 
 export interface TelemetryStatusResponse {
@@ -115,6 +134,14 @@ export interface PipelineStage {
   note: string;
 }
 
+export interface MicroRoutingRow {
+  family: string;
+  standard_root: string;
+  standard_quantity: number;
+  micro_root: string;
+  micro_quantity: number;
+}
+
 export interface PipelineInstrumentRow {
   instrument_id: string;
   asset_class: AssetClass;
@@ -128,6 +155,8 @@ export interface PipelineInstrumentRow {
   target_contracts: number | null;
   notional: number | null;
   reason: string;
+  /** Phase 9 additive: broker-confirmed weight after fills (if bridged). */
+  weight_actual?: number | null;
 }
 
 export interface PipelineDiagnostic {
@@ -147,6 +176,10 @@ export interface PipelineWaterfallResponse {
   elapsed_ms: number;
   /** `engine` = real FinRL-X pipeline, `fixture` = documented offline fallback. */
   data_source?: "engine" | "fixture";
+  /** Phase 9 additive: realised tracking error of the executed book (percent). */
+  tracking_error_pct?: number | null;
+  /** Phase 9 additive: standard → micro contract routing applied by the translator. */
+  micro_routing?: MicroRoutingRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +389,10 @@ export interface BacktestRunConfig {
   rebalance_frequency: string;
   walk_forward: boolean;
   random_seed: number;
+  /** Phase 9 additive walk-forward controls. */
+  wf_splits?: number;
+  purge_bars?: number;
+  embargo_bars?: number;
 }
 
 export interface BacktestRunSummary {
@@ -372,6 +409,9 @@ export interface BacktestRunSummary {
   n_rebalances?: number | null;
   /** Additive: `engine` = real BacktestEngine, `fixture` = deterministic seed. */
   data_source?: "engine" | "fixture";
+  /** Phase 9 additive: `walk_forward` runs carry fold metadata. */
+  kind?: "walk_forward" | "standard" | string | null;
+  wf_splits?: number | null;
 }
 
 export interface BacktestRunDetail extends BacktestRunSummary {
@@ -381,6 +421,61 @@ export interface BacktestRunDetail extends BacktestRunSummary {
 export interface BacktestListResponse {
   runs: BacktestRunSummary[];
   available_strategies: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Execution bridge: working orders, fills, runner status
+// ---------------------------------------------------------------------------
+
+export interface WorkingOrder {
+  order_id: string;
+  instrument_id: string;
+  contract_symbol: string | null;
+  side: "BUY" | "SELL";
+  quantity: number;
+  filled_quantity: number;
+  remaining_quantity: number;
+  order_type: string;
+  limit_price: number | null;
+  status: string;
+  updated_at: string;
+}
+
+export interface WorkingOrdersResponse {
+  as_of: string;
+  source: string;
+  mode?: string | null;
+  stale?: boolean;
+  sequence?: number;
+  orders: WorkingOrder[];
+}
+
+export interface Fill {
+  order_id: string;
+  instrument_id: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  price: number;
+  commission: number;
+  slippage_ticks: number;
+  timestamp: string;
+}
+
+export interface FillsResponse {
+  as_of: string;
+  source: string;
+  fills: Fill[];
+}
+
+export interface RunnerStatus {
+  mode: string;
+  available: boolean;
+  stale: boolean;
+  sequence: number;
+  updated_at: string;
+  runner_id: string;
+  session_running: boolean;
+  states_processed: number;
 }
 
 // ---------------------------------------------------------------------------

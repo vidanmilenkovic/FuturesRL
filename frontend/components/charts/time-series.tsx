@@ -307,3 +307,201 @@ export function TimeSeriesChart({
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Multi-series overlay (Backtest Lab: 2–3 runs on one chart)
+// ---------------------------------------------------------------------------
+
+export interface OverlaySeries {
+  id: string;
+  label: string;
+  color: string;
+  data: SeriesPoint[];
+}
+
+/**
+ * Lightweight Charts overlay for 2–3 aligned series (equity / underwater).
+ * Renders one line per run with a shared crosshair tooltip listing every series
+ * value at the hovered timestamp.
+ */
+export function MultiSeriesChart({
+  series,
+  height,
+  formatValue = DEFAULT_FORMAT,
+  formatTime = defaultFormatTime,
+  showTimeAxis = true,
+  ariaLabel,
+  className,
+}: {
+  series: OverlaySeries[];
+  height: number;
+  formatValue?: (value: number) => string;
+  formatTime?: (iso: string) => string;
+  showTimeAxis?: boolean;
+  ariaLabel: string;
+  className?: string;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<import("lightweight-charts").IChartApi | null>(null);
+  const seriesRefs = useRef<Map<string, import("lightweight-charts").ISeriesApi<"Line">>>(new Map());
+  const seriesDataRef = useRef(series);
+  seriesDataRef.current = series;
+  const [tooltip, setTooltip] = useState<{
+    left: number;
+    top: number;
+    time: number;
+    values: { id: string; label: string; color: string; value: number }[];
+  } | null>(null);
+  const idsKey = series.map((entry) => entry.id).join("|");
+
+  useEffect(() => {
+    let disposed = false;
+    const container = containerRef.current;
+    const seriesMap = seriesRefs.current;
+    setTooltip(null);
+
+    void (async () => {
+      const lw = await import("lightweight-charts");
+      if (!container || disposed) return;
+      const monoFamily =
+        getComputedStyle(document.body).getPropertyValue("--font-jetbrains").trim() ||
+        "ui-monospace, monospace";
+      const chart = lw.createChart(container, {
+        height,
+        autoSize: true,
+        layout: {
+          background: { color: "transparent" },
+          textColor: "#71717A",
+          fontSize: 10,
+          fontFamily: `"${monoFamily.replace(/"/g, "")}", ui-monospace, monospace`,
+          attributionLogo: false,
+        },
+        grid: {
+          vertLines: { color: "#1E1E22" },
+          horzLines: { color: "#1E1E22" },
+        },
+        rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.12, bottom: 0.08 } },
+        timeScale: {
+          visible: showTimeAxis,
+          borderVisible: false,
+          timeVisible: true,
+          secondsVisible: false,
+          rightOffset: 2,
+          fixLeftEdge: true,
+        },
+        crosshair: {
+          mode: lw.CrosshairMode.Normal,
+          vertLine: { color: "#3F3F46", width: 1, labelBackgroundColor: "#27272A" },
+          horzLine: { color: "#3F3F46", width: 1, labelBackgroundColor: "#27272A" },
+        },
+        localization: { locale: "en-US", priceFormatter: (price: number) => formatValue(price) },
+        handleScale: { axisPressedMouseMove: { time: true, price: false } },
+      });
+      chartRef.current = chart;
+      seriesMap.clear();
+
+      for (const entry of seriesDataRef.current) {
+        const line = chart.addSeries(lw.LineSeries, {
+          color: entry.color,
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerRadius: 3,
+        });
+        seriesMap.set(entry.id, line);
+        line.setData(toAscending(entry.data));
+      }
+      chart.timeScale().fitContent();
+
+      chart.subscribeCrosshairMove((param) => {
+        if (!param.point || param.time === undefined) {
+          setTooltip(null);
+          return;
+        }
+        const values: { id: string; label: string; color: string; value: number }[] = [];
+        for (const entry of seriesDataRef.current) {
+          const api = seriesMap.get(entry.id);
+          if (!api) continue;
+          const datum = param.seriesData.get(api) as { value?: number } | undefined;
+          if (typeof datum?.value === "number") {
+            values.push({ id: entry.id, label: entry.label, color: entry.color, value: datum.value });
+          }
+        }
+        if (values.length === 0) {
+          setTooltip(null);
+          return;
+        }
+        setTooltip({
+          left: param.point.x,
+          top: param.point.y,
+          time: typeof param.time === "number" ? param.time : Number(param.time),
+          values,
+        });
+      });
+
+      if (disposed) chart.remove();
+    })();
+
+    return () => {
+      disposed = true;
+      seriesMap.clear();
+      chartRef.current?.remove();
+      chartRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idsKey, height, showTimeAxis]);
+
+  // Refresh every series when the data changes (series ids are stable here; the
+  // chart is re-created when the overlay set changes).
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    for (const entry of series) {
+      const api = seriesRefs.current.get(entry.id);
+      api?.setData(toAscending(entry.data));
+    }
+    chart.timeScale().fitContent();
+  }, [series]);
+
+  return (
+    <div className={`relative ${className ?? ""}`} style={{ height }} data-series-count={series.length}>
+      <div ref={containerRef} role="img" aria-label={ariaLabel} className="h-full w-full" />
+      {tooltip ? (
+        <div
+          className="pointer-events-none absolute z-10 min-w-[168px] rounded-md border border-edge bg-surface px-2 py-1.5 shadow-popover"
+          style={{
+            left: Math.min(Math.max(tooltip.left + 12, 8), 720),
+            top: Math.max(tooltip.top - 14 - tooltip.values.length * 15, 4),
+          }}
+        >
+          <div className="text-[10.5px] leading-4 text-zinc-500">
+            {formatTime(new Date(tooltip.time * 1000).toISOString())}
+          </div>
+          {tooltip.values.map((entry) => (
+            <div key={entry.id} className="flex items-center justify-between gap-3">
+              <span className="flex min-w-0 items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: entry.color }} />
+                <span className="truncate text-[10.5px] text-zinc-400">{entry.label}</span>
+              </span>
+              <span className="font-mono text-[11px] tabular-nums text-zinc-100">
+                {formatValue(entry.value)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+
+function toAscending(data: SeriesPoint[]): { time: import("lightweight-charts").UTCTimestamp; value: number }[] {
+  const seen = new Set<number>();
+  return data
+    .map((point) => ({
+      time: Math.floor(new Date(point.time).getTime() / 1000) as import("lightweight-charts").UTCTimestamp,
+      value: point.value,
+    }))
+    .filter((row) => Number.isFinite(row.time) && Number.isFinite(row.value) && !seen.has(row.time) && seen.add(row.time))
+    .sort((a, b) => a.time - b.time);
+}

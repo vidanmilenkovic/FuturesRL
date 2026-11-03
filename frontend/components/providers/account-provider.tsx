@@ -11,7 +11,8 @@ import {
 } from "react";
 
 import { getAccount } from "@/lib/api";
-import type { AccountSnapshotResponse, PositionRow } from "@/lib/types";
+import { mergeTelemetryIntoSeries } from "@/lib/equity-series";
+import type { AccountSnapshotResponse, DataMode, PositionRow } from "@/lib/types";
 
 import { useTelemetry } from "./telemetry-provider";
 
@@ -22,6 +23,8 @@ interface AccountContextValue {
   /** `live` = FastAPI answered, `demo` = deterministic fixture fallback. */
   source: "live" | "demo" | "loading";
   error: string | null;
+  /** Ribbon provenance state (UI FALLBACK / OFFLINE ENGINE / PAPER · IBKR / LIVE · IBKR). */
+  dataMode: DataMode;
   reload: () => void;
 }
 
@@ -33,7 +36,7 @@ const AccountContext = createContext<AccountContextValue | null>(null);
  * `positions`) are merged in so every surface shows the same numbers.
  */
 export function AccountProvider({ children }: { children: ReactNode }) {
-  const { latest } = useTelemetry();
+  const { latest, backend, health, status } = useTelemetry();
   const [account, setAccount] = useState<AccountSnapshotResponse | null>(null);
   const [source, setSource] = useState<"live" | "demo" | "loading">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -61,6 +64,10 @@ export function AccountProvider({ children }: { children: ReactNode }) {
 
   // Merge streaming frames into the account snapshot.
   useEffect(() => {
+    // If the REST snapshot fell back to fixtures but the WS is connected to a
+    // *different* backend, mixing the two sources would fabricate an equity jump.
+    // Keep the deterministic fixture account coherent in that edge case.
+    if (source === "demo" && status === "live") return;
     const pnl = latest.pnl;
     const margin = latest.margin;
     const positions = latest.positions;
@@ -72,13 +79,13 @@ export function AccountProvider({ children }: { children: ReactNode }) {
         next.net_liquidation = pnl.payload.net_liquidation;
         next.day_pnl = pnl.payload.day_pnl;
         next.day_pnl_pct = pnl.payload.day_pnl_pct;
-        const cutoff = new Date(pnl.payload.point.time).getTime();
-        next.equity_curve = [
-          ...previous.equity_curve
-            .filter((point) => new Date(point.time).getTime() < cutoff)
-            .slice(-359),
+        // The provider keeps a *daily* series: live ticks update the last daily
+        // bar in place and never append intraday timestamps (chart-safe).
+        next.equity_curve = mergeTelemetryIntoSeries(
+          previous.equity_curve,
           pnl.payload.point,
-        ];
+          "1M",
+        );
       }
       if (margin && "margin_utilization" in margin.payload) {
         next.initial_margin_used = margin.payload.initial_margin_used;
@@ -93,9 +100,55 @@ export function AccountProvider({ children }: { children: ReactNode }) {
       }
       return next;
     });
-  }, [latest.pnl, latest.margin, latest.positions]);
+  }, [latest.pnl, latest.margin, latest.positions, source, status]);
 
   const reload = useCallback(() => setNonce((value) => value + 1), []);
+
+  const dataMode = useMemo<DataMode>(() => {
+    if (backend === "checking") {
+      return {
+        key: "connecting",
+        label: "CONNECTING",
+        description: "Probing the telemetry API and WebSocket stream",
+      };
+    }
+    if (backend !== "online" || !health) {
+      return {
+        key: "ui_fallback",
+        label: "UI FALLBACK",
+        description:
+          "FastAPI unreachable — deterministic fixtures and a local WebSocket simulator drive the UI",
+      };
+    }
+    if (health.offline_mode) {
+      return {
+        key: "offline_engine",
+        label: "OFFLINE ENGINE",
+        description:
+          "API online — deterministic offline engine (no live IBKR session attached)",
+      };
+    }
+    if (health.ibkr_connected && health.environment === "live") {
+      return {
+        key: "live_ibkr",
+        label: "LIVE · IBKR",
+        description: "Live IBKR execution session connected",
+      };
+    }
+    if (health.ibkr_connected && health.environment === "paper") {
+      return {
+        key: "paper_ibkr",
+        label: "PAPER · IBKR",
+        description: "IBKR paper execution session connected",
+      };
+    }
+    return {
+      key: "offline_engine",
+      label: "OFFLINE ENGINE",
+      description:
+        "API online — no IBKR session connected; the runner bridge may still be active",
+    };
+  }, [backend, health]);
 
   const value = useMemo<AccountContextValue>(
     () => ({
@@ -104,9 +157,10 @@ export function AccountProvider({ children }: { children: ReactNode }) {
       loading: source === "loading" && account === null,
       source,
       error,
+      dataMode,
       reload,
     }),
-    [account, source, error, reload],
+    [account, source, error, dataMode, reload],
   );
 
   return <AccountContext.Provider value={value}>{children}</AccountContext.Provider>;

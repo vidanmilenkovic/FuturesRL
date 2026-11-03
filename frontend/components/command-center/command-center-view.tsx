@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { TimeSeriesChart } from "@/components/charts/time-series";
 import { BulletBars, ExposureBars, WeightBar, type BulletRow } from "@/components/charts/plots";
@@ -8,6 +8,7 @@ import { useAccount } from "@/components/providers/account-provider";
 import { useTelemetry } from "@/components/providers/telemetry-provider";
 import {
   Badge,
+  Button,
   KpiCard,
   Panel,
   Segmented,
@@ -17,35 +18,50 @@ import {
   Skeleton,
   signedColor,
 } from "@/components/ui/primitives";
-import { getRiskState } from "@/lib/api";
+import {
+  getRecentFills,
+  getRiskState,
+  getRunnerStatus,
+  getWorkingOrders,
+  stepRunner,
+} from "@/lib/api";
 import { cn } from "@/lib/cn";
 import {
   formatClock,
   formatCompactUsd,
   formatCurrency,
+  formatDateTime,
   formatInteger,
   formatNumber,
   formatPct,
   formatPctPlain,
   formatSignedCurrency,
 } from "@/lib/format";
+import {
+  deriveUnderwaterSeries,
+  mergeTelemetryIntoSeries,
+  sliceTimeframe,
+  type EquityTimeframe,
+} from "@/lib/equity-series";
 import { summarizeTelemetry } from "@/lib/telemetry";
-import type { PositionRow, RiskThresholds } from "@/lib/types";
+import type {
+  EquityPoint,
+  Fill,
+  PositionRow,
+  RiskThresholds,
+  RunnerStatus,
+  WorkingOrder,
+  WorkingOrdersResponse,
+} from "@/lib/types";
 import { useAsyncData } from "@/lib/use-async-data";
 
-type Timeframe = "1D" | "1W" | "1M" | "3M" | "6M" | "1Y" | "ALL";
+type Timeframe = EquityTimeframe;
 type BookTab = "positions" | "orders" | "fills" | "telemetry";
 type SortKey = "root" | "class" | "qty" | "weight" | "upnl" | "notional" | "dtr";
 
-const TIMEFRAMES: { value: Timeframe; label: string; bars: number }[] = [
-  { value: "1D", label: "1D", bars: 2 },
-  { value: "1W", label: "1W", bars: 5 },
-  { value: "1M", label: "1M", bars: 21 },
-  { value: "3M", label: "3M", bars: 63 },
-  { value: "6M", label: "6M", bars: 126 },
-  { value: "1Y", label: "1Y", bars: 252 },
-  { value: "ALL", label: "ALL", bars: Number.POSITIVE_INFINITY },
-];
+const TIMEFRAMES: { value: Timeframe; label: string }[] = (
+  ["1D", "1W", "1M", "3M", "6M", "1Y", "ALL"] as const
+).map((value) => ({ value, label: value }));
 
 const FALLBACK_THRESHOLDS: RiskThresholds = {
   llm_confidence_threshold: 0.7,
@@ -79,40 +95,47 @@ const BOOK_TABS: { value: BookTab; label: string }[] = [
 ];
 
 export function CommandCenterView() {
-  const { account, positions, loading, source } = useAccount();
-  const { events } = useTelemetry();
+  const { account, positions, loading, source, dataMode } = useAccount();
+  const { events, latest } = useTelemetry();
   const risk = useAsyncData(getRiskState);
   const thresholds = risk.data?.thresholds ?? FALLBACK_THRESHOLDS;
 
   const [timeframe, setTimeframe] = useState<Timeframe>("6M");
   const [showDrawdown, setShowDrawdown] = useState(true);
+  // Working intraday series for the 1D view; daily timeframes use the provider's
+  // in-place-updated daily curve.
+  const [intradaySeries, setIntradaySeries] = useState<EquityPoint[]>([]);
+  const seededSnapshot = useRef<string | null>(null);
   const [bookTab, setBookTab] = useState<BookTab>("positions");
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({
     key: "notional",
     dir: "desc",
   });
 
-  const curve = useMemo(() => {
-    if (!account) return [];
-    return [...account.equity_curve]
-      .filter((point) => Number.isFinite(new Date(point.time).getTime()))
-      .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+  const dailyCurve = useMemo(() => account?.equity_curve ?? [], [account]);
+
+  // Seed the intraday working copy only when a NEW account snapshot arrives (the
+  // provider mutates the daily curve in place on every tick).
+  useEffect(() => {
+    if (!account) return;
+    if (seededSnapshot.current === account.timestamp) return;
+    seededSnapshot.current = account.timestamp;
+    setIntradaySeries(account.equity_curve);
   }, [account]);
 
-  const windowPoints = useMemo(() => {
-    const spec =
-      TIMEFRAMES.find((item) => item.value === timeframe) ?? { value: "6M" as const, label: "6M", bars: 126 };
-    if (!Number.isFinite(spec.bars)) return curve;
-    return curve.slice(-Math.max(2, spec.bars));
-  }, [curve, timeframe]);
+  const pnlFrame = latest.pnl;
+  const pnlPoint =
+    pnlFrame && "net_liquidation" in pnlFrame.payload ? pnlFrame.payload.point : null;
 
-  const drawdownSeries = useMemo(() => {
-    let peak = Number.NEGATIVE_INFINITY;
-    return windowPoints.map((point) => {
-      peak = Math.max(peak, point.value);
-      return { time: point.time, value: peak > 0 ? point.value / peak - 1 : 0 };
-    });
-  }, [windowPoints]);
+  useEffect(() => {
+    if (timeframe !== "1D" || !pnlPoint) return;
+    setIntradaySeries((previous) => mergeTelemetryIntoSeries(previous, pnlPoint, "1D"));
+    // Daily timeframes are handled by AccountProvider (update last bar in place).
+  }, [timeframe, pnlPoint]);
+
+  const chartCurve = timeframe === "1D" ? intradaySeries : dailyCurve;
+  const windowPoints = useMemo(() => sliceTimeframe(chartCurve, timeframe), [chartCurve, timeframe]);
+  const drawdownSeries = useMemo(() => deriveUnderwaterSeries(windowPoints), [windowPoints]);
 
   const period = useMemo(() => {
     const first = windowPoints[0]?.value ?? 0;
@@ -387,6 +410,16 @@ export function CommandCenterView() {
           </div>
         </div>
 
+        <div
+          className="sr-only"
+          data-testid="equity-series-meta"
+          data-timeframe={timeframe}
+          data-points={windowPoints.length}
+          data-first-time={windowPoints[0]?.time ?? ""}
+          data-last-time={windowPoints[windowPoints.length - 1]?.time ?? ""}
+          data-last-value={windowPoints[windowPoints.length - 1]?.value ?? ""}
+          data-intraday={timeframe === "1D" ? "true" : "false"}
+        />
         <TimeSeriesChart
           data={windowPoints}
           kind="area"
@@ -492,7 +525,7 @@ export function CommandCenterView() {
             className="flex-1"
           />
           <div className="shrink-0 text-[11px] text-zinc-600">
-            {source === "demo" ? "DEMO DATA" : "Broker reconciled"} ·{" "}
+            {dataMode.key === "ui_fallback" ? "UI FALLBACK · fixtures" : "Broker reconciled"} ·{" "}
             {formatInteger(positions.reduce((sum, position) => sum + Math.abs(position.quantity), 0))} contracts
           </div>
         </div>
@@ -580,19 +613,9 @@ export function CommandCenterView() {
           </div>
         ) : null}
 
-        {bookTab === "orders" ? (
-          <EmptyState
-            title="No working orders"
-            description="The telemetry API exposes the position book, not the OMS working-order queue. Working orders remain inside the execution engine and are surfaced through the telemetry console when live."
-          />
-        ) : null}
+        {bookTab === "orders" ? <WorkingOrdersTab /> : null}
 
-        {bookTab === "fills" ? (
-          <EmptyState
-            title="No fills endpoint"
-            description="Fill history is not exposed by the telemetry API. Emergency flatten receipts are listed in the Flatten All dialog, and raw execution frames are available in the telemetry console."
-          />
-        ) : null}
+        {bookTab === "fills" ? <RecentFillsTab /> : null}
 
         {bookTab === "telemetry" ? (
           <div className="min-h-0 flex-1 overflow-auto">
@@ -633,6 +656,280 @@ export function CommandCenterView() {
           </div>
         ) : null}
       </Panel>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Execution bridge tabs
+// ---------------------------------------------------------------------------
+
+const ORDER_STATUS_TONE: Record<string, "gain" | "loss" | "warn" | "accent" | "neutral"> = {
+  filled: "gain",
+  partiallyfilled: "accent",
+  submitted: "accent",
+  pending: "accent",
+  cancelled: "neutral",
+  rejected: "loss",
+  inactive: "neutral",
+};
+
+function orderStatusTone(status: string): "gain" | "loss" | "warn" | "accent" | "neutral" {
+  return ORDER_STATUS_TONE[status.replace(/[^a-z]/gi, "").toLowerCase()] ?? "neutral";
+}
+
+function BridgeHeader({
+  title,
+  source,
+  asOf,
+  stale,
+  sequence,
+  runner,
+  onStep,
+  stepping,
+}: {
+  title: string;
+  source: string;
+  asOf: string | null;
+  stale: boolean;
+  sequence: number | null;
+  runner: RunnerStatus | null;
+  onStep: () => void;
+  stepping: boolean;
+}) {
+  return (
+    <div className="flex h-9 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-hairline px-3 text-[11px] text-zinc-500">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="text-[12px] font-medium text-zinc-300">{title}</span>
+        <Badge tone={source === "fixture" ? "warn" : "accent"}>{source || "unknown"}</Badge>
+        {stale ? <Badge tone="warn">stale</Badge> : null}
+        {sequence !== null ? <span className="font-mono text-zinc-600">seq {sequence}</span> : null}
+        <span className="truncate font-mono text-zinc-600">
+          {asOf ? `as of ${formatDateTime(asOf)}` : "no snapshot"}
+        </span>
+      </div>
+      <div className="flex items-center gap-2">
+        <span
+          className="font-mono text-zinc-600"
+          data-testid="runner-status"
+          data-available={runner?.available ? "true" : "false"}
+        >
+          runner {runner ? `${runner.mode} · ${runner.states_processed} states` : "—"}
+        </span>
+        <Button
+          variant="secondary"
+          size="xs"
+          onClick={onStep}
+          disabled={!runner?.available || stepping}
+          title={
+            runner?.available
+              ? "Advance the runner bridge by one state"
+              : "Runner bridge unavailable — no live execution session"
+          }
+          ariaLabel="Step runner"
+        >
+          {stepping ? "Stepping…" : "Step runner"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function WorkingOrdersTab() {
+  const { latest } = useTelemetry();
+  const positionsSequence = latest.positions?.sequence ?? 0;
+  const {
+    data: ordersData,
+    source: ordersSource,
+    loading: ordersLoading,
+    reload: reloadOrders,
+  } = useAsyncData(getWorkingOrders);
+  const { data: runnerData, reload: reloadRunner } = useAsyncData(getRunnerStatus);
+  const [stepping, setStepping] = useState(false);
+
+  useEffect(() => {
+    if (positionsSequence > 0) {
+      reloadOrders();
+      reloadRunner();
+    }
+  }, [positionsSequence, reloadOrders, reloadRunner]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      reloadOrders();
+      reloadRunner();
+    }, 5_000);
+    return () => clearInterval(timer);
+  }, [reloadOrders, reloadRunner]);
+
+  const step = async () => {
+    setStepping(true);
+    try {
+      await stepRunner(1);
+      reloadOrders();
+      reloadRunner();
+    } finally {
+      setStepping(false);
+    }
+  };
+
+  const response: WorkingOrdersResponse | null = ordersData;
+  const rows: WorkingOrder[] = response?.orders ?? [];
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col" data-testid="working-orders-tab">
+      <BridgeHeader
+        title="Working orders"
+        source={ordersSource === "live" ? (response?.source ?? "live") : "fixture"}
+        asOf={response?.as_of ?? null}
+        stale={Boolean(response?.stale)}
+        sequence={response?.sequence ?? null}
+        runner={runnerData}
+        onStep={() => void step()}
+        stepping={stepping}
+      />
+      {ordersLoading && !response ? (
+        <Skeleton className="m-3 h-24" />
+      ) : rows.length === 0 ? (
+        <EmptyState
+          title="No working orders"
+          description={
+            ordersSource === "live"
+              ? "The execution bridge reported an empty working-order queue. Orders appear here while they are working at the broker."
+              : "The execution bridge is unavailable — this tab is rendering the deterministic UI fallback. Start the FastAPI backend to stream the working-order queue."
+          }
+        />
+      ) : (
+        <div className="min-h-0 flex-1 overflow-auto">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th className="w-32">Order</th>
+                <th className="w-16">Root</th>
+                <th className="w-28">Contract</th>
+                <th className="w-16">Side</th>
+                <th className="w-16 text-right">Qty</th>
+                <th className="w-20 text-right">Filled</th>
+                <th className="w-24 text-right">Remaining</th>
+                <th className="w-20">Type</th>
+                <th className="w-24 text-right">Limit</th>
+                <th className="w-24">Status</th>
+                <th className="w-32">Updated</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((order) => (
+                <tr key={order.order_id}>
+                  <td className="num max-w-[128px] truncate text-[11px] text-zinc-400" title={order.order_id}>
+                    {order.order_id}
+                  </td>
+                  <td className="font-medium text-zinc-100">{order.instrument_id}</td>
+                  <td className="num text-[11px] text-zinc-500">{order.contract_symbol ?? "—"}</td>
+                  <td>
+                    <Badge tone={order.side === "BUY" ? "gain" : "loss"}>{order.side}</Badge>
+                  </td>
+                  <td className="num text-right text-zinc-200">{formatInteger(order.quantity)}</td>
+                  <td className="num text-right text-zinc-400">{formatInteger(order.filled_quantity)}</td>
+                  <td className="num text-right text-zinc-300">{formatInteger(order.remaining_quantity)}</td>
+                  <td className="text-[11.5px] text-zinc-400">{order.order_type}</td>
+                  <td className="num text-right text-zinc-400">
+                    {order.limit_price === null ? "MKT" : formatNumber(order.limit_price, 2)}
+                  </td>
+                  <td>
+                    <Badge tone={orderStatusTone(order.status)}>{order.status}</Badge>
+                  </td>
+                  <td className="num text-[11px] text-zinc-500">{formatDateTime(order.updated_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RecentFillsTab() {
+  const { latest } = useTelemetry();
+  const positionsSequence = latest.positions?.sequence ?? 0;
+  const {
+    data: fillsData,
+    source: fillsSource,
+    loading: fillsLoading,
+    reload: reloadFills,
+  } = useAsyncData(() => getRecentFills(50));
+
+  useEffect(() => {
+    if (positionsSequence > 0) reloadFills();
+  }, [positionsSequence, reloadFills]);
+
+  useEffect(() => {
+    const timer = setInterval(() => reloadFills(), 5_000);
+    return () => clearInterval(timer);
+  }, [reloadFills]);
+
+  const rows: Fill[] = fillsData?.fills ?? [];
+  const source = fillsSource === "live" ? (fillsData?.source ?? "live") : "fixture";
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col" data-testid="recent-fills-tab">
+      <BridgeHeader
+        title="Recent fills"
+        source={source}
+        asOf={fillsData?.as_of ?? null}
+        stale={false}
+        sequence={null}
+        runner={null}
+        onStep={() => reloadFills()}
+        stepping={false}
+      />
+      {fillsLoading && !fillsData ? (
+        <Skeleton className="m-3 h-24" />
+      ) : rows.length === 0 ? (
+        <EmptyState
+          title="No recent fills"
+          description={
+            fillsSource === "live"
+              ? "The execution bridge reported no recent fills for the current session."
+              : "Fill history requires the live execution bridge. This tab is rendering the deterministic UI fallback; the flatten-all receipts remain available in the KILL SWITCH dialog."
+          }
+        />
+      ) : (
+        <div className="min-h-0 flex-1 overflow-auto">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th className="w-32">Time</th>
+                <th className="w-16">Root</th>
+                <th className="w-20">Side</th>
+                <th className="w-16 text-right">Qty</th>
+                <th className="w-24 text-right">Price</th>
+                <th className="w-24 text-right">Commission</th>
+                <th className="w-24 text-right">Slippage</th>
+                <th className="w-32">Order</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((fill) => (
+                <tr key={`${fill.order_id}-${fill.timestamp}`}>
+                  <td className="num text-[11px] text-zinc-400">{formatDateTime(fill.timestamp)}</td>
+                  <td className="font-medium text-zinc-100">{fill.instrument_id}</td>
+                  <td>
+                    <Badge tone={fill.side === "BUY" ? "gain" : "loss"}>{fill.side}</Badge>
+                  </td>
+                  <td className="num text-right text-zinc-200">{formatInteger(fill.quantity)}</td>
+                  <td className="num text-right text-zinc-200">{formatNumber(fill.price, 2)}</td>
+                  <td className="num text-right text-zinc-400">{formatNumber(fill.commission, 2)}</td>
+                  <td className="num text-right text-zinc-400">{formatNumber(fill.slippage_ticks, 2)}</td>
+                  <td className="num max-w-[128px] truncate text-[11px] text-zinc-500" title={fill.order_id}>
+                    {fill.order_id}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

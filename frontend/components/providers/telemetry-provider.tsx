@@ -52,17 +52,24 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    getHealth()
-      .then((result) => {
-        if (cancelled) return;
-        setBackend(result.source === "live" ? "online" : "offline");
-        setHealth(result.data);
-      })
-      .catch(() => {
-        if (!cancelled) setBackend("offline");
-      });
+    const probe = () => {
+      getHealth()
+        .then((result) => {
+          if (cancelled) return;
+          setBackend(result.source === "live" ? "online" : "offline");
+          setHealth(result.data);
+        })
+        .catch(() => {
+          if (!cancelled) setBackend("offline");
+        });
+    };
+    probe();
+    // Re-probe periodically so the data-mode badge flips when the backend or an
+    // IBKR session comes up/down without a page reload.
+    const timer = setInterval(probe, 15_000);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
   }, [reconnectNonce]);
 

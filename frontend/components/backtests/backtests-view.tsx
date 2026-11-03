@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { AttributionBars } from "@/components/charts/plots";
-import { TimeSeriesChart } from "@/components/charts/time-series";
+import { MultiSeriesChart, TimeSeriesChart, type OverlaySeries } from "@/components/charts/time-series";
 import {
   Badge,
   Button,
@@ -19,8 +19,6 @@ import {
 import { getTearsheet, listBacktests, listStrategies, runBacktest } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import {
-  formatCompactUsd,
-  formatCurrency,
   formatDateTime,
   formatDuration,
   formatInteger,
@@ -117,6 +115,10 @@ export function BacktestsView() {
   const [end, setEnd] = useState("2025-12-31");
   const [initialEquity, setInitialEquity] = useState(1_000_000);
   const [rebalance, setRebalance] = useState("W-FRI");
+  const [walkForward, setWalkForward] = useState(true);
+  const [wfSplits, setWfSplits] = useState(5);
+  const [purgeBars, setPurgeBars] = useState("");
+  const [embargoBars, setEmbargoBars] = useState("");
   const [running, setRunning] = useState(false);
   const [runnerMessage, setRunnerMessage] = useState<string | null>(null);
   const [runnerDemo, setRunnerDemo] = useState(false);
@@ -171,8 +173,11 @@ export function BacktestsView() {
       end,
       initial_equity: initialEquity,
       rebalance_frequency: rebalance,
-      walk_forward: true,
+      walk_forward: walkForward,
       random_seed: 7,
+      ...(walkForward ? { wf_splits: wfSplits } : {}),
+      ...(purgeBars.trim() !== "" ? { purge_bars: Number(purgeBars) } : {}),
+      ...(embargoBars.trim() !== "" ? { embargo_bars: Number(embargoBars) } : {}),
     };
     const result = await runBacktest(config);
     const run = result.data;
@@ -183,14 +188,15 @@ export function BacktestsView() {
     setRunnerMessage(
       result.source === "live"
         ? `Run ${run.id} completed · ${formatInteger(run.n_trades ?? 0)} trades · ${formatDuration(run.duration_seconds)}`
-        : `Backend unreachable — deterministic demo tear sheet ${run.id}.`,
+        : `Backend unreachable — deterministic UI-fallback tear sheet ${run.id}.`,
     );
     setRunning(false);
   };
 
   const columns = compareRuns.length > 0 ? compareRuns : selectedRun ? [selectedRun] : [];
   const strategiesOptions: StrategyConfig[] = strategies.data ?? [];
-  const invalid = !strategyId || start >= end || initialEquity <= 0;
+  const splitsValid = !walkForward || (Number.isFinite(wfSplits) && wfSplits >= 2 && wfSplits <= 20);
+  const invalid = !strategyId || start >= end || initialEquity <= 0 || !splitsValid;
 
   if (backtests.loading && runs.length === 0) {
     return (
@@ -242,6 +248,61 @@ export function BacktestsView() {
               options={REBALANCE_OPTIONS}
             />
           </Field>
+          <div className="flex items-end gap-2">
+            <label
+              htmlFor="bt-walkforward"
+              className={cn(
+                "flex h-7 items-center gap-1.5 text-[11px] font-medium",
+                walkForward ? "text-zinc-200" : "text-zinc-500",
+              )}
+              title="Purged & embargoed walk-forward validation"
+            >
+              <input
+                id="bt-walkforward"
+                type="checkbox"
+                checked={walkForward}
+                disabled={running}
+                onChange={(event) => setWalkForward(event.target.checked)}
+                className="h-3.5 w-3.5 rounded border border-zinc-600 bg-canvas accent-blue-500"
+              />
+              Walk-forward
+            </label>
+            <Field label="Splits" htmlFor="bt-splits" className="w-[62px]">
+              <TextInput
+                id="bt-splits"
+                type="number"
+                min={2}
+                value={wfSplits}
+                onChange={(value) => setWfSplits(Number(value))}
+                disabled={!walkForward || running}
+                className="text-center"
+              />
+            </Field>
+            <Field label="Purge" htmlFor="bt-purge" className="w-[58px]">
+              <TextInput
+                id="bt-purge"
+                type="number"
+                min={0}
+                value={purgeBars}
+                placeholder="auto"
+                onChange={setPurgeBars}
+                disabled={running}
+                className="text-center"
+              />
+            </Field>
+            <Field label="Embargo" htmlFor="bt-embargo" className="w-[62px]">
+              <TextInput
+                id="bt-embargo"
+                type="number"
+                min={0}
+                value={embargoBars}
+                placeholder="auto"
+                onChange={setEmbargoBars}
+                disabled={running}
+                className="text-center"
+              />
+            </Field>
+          </div>
           <div className="flex items-center gap-2 pb-0.5">
             <Button variant="primary" onClick={() => void submitRun()} disabled={running || invalid}>
               {running ? "Running…" : "Run backtest"}
@@ -250,6 +311,9 @@ export function BacktestsView() {
               Refresh
             </Button>
           </div>
+          {!splitsValid ? (
+            <span className="pb-1 text-[11px] text-loss">Walk-forward splits must be 2–20</span>
+          ) : null}
           <div className="ml-auto flex min-w-0 items-center gap-2 pb-0.5 text-[11px]">
             {runnerMessage ? (
               <span className={cn("truncate", runnerDemo ? "text-amber-400" : "text-emerald-400")} title={runnerMessage}>
@@ -280,6 +344,7 @@ export function BacktestsView() {
                 <th>Strategy</th>
                 <th className="w-24">Status</th>
                 <th className="w-24">Source</th>
+                <th className="w-32">Kind</th>
                 <th className="text-right">CAGR</th>
                 <th className="text-right">Sharpe</th>
                 <th className="text-right">Max DD</th>
@@ -315,9 +380,18 @@ export function BacktestsView() {
                       <Badge tone={STATUS_TONE[run.status] ?? "neutral"}>{run.status}</Badge>
                     </td>
                     <td>
-                      <Badge tone={run.data_source === "engine" ? "gain" : "warn"}>
-                        {run.data_source === "engine" ? "Engine" : "Fixture"}
+                      <Badge tone={run.data_source === "fixture" ? "warn" : "gain"}>
+                        {run.data_source === "fixture" ? "Fixture" : "Engine"}
                       </Badge>
+                    </td>
+                    <td>
+                      {run.kind === "walk_forward" ? (
+                        <Badge tone="accent" title={`Purged & embargoed walk-forward validation · ${run.wf_splits ?? "?"} folds`}>
+                          {`WF · ${run.wf_splits ?? "—"} folds`}
+                        </Badge>
+                      ) : (
+                        <span className="text-[11px] text-zinc-600">—</span>
+                      )}
                     </td>
                     <td className={cn("num text-right", (run.metrics?.cagr ?? 0) >= 0 ? "text-gain" : "text-loss")}>
                       {run.metrics ? formatPct(run.metrics.cagr) : "—"}
@@ -342,7 +416,7 @@ export function BacktestsView() {
               })}
               {runs.length === 0 ? (
                 <tr>
-                  <td colSpan={13} className="py-8 text-center text-zinc-600">
+                  <td colSpan={14} className="py-8 text-center text-zinc-600">
                     No backtest runs yet — start one from the experiment runner.
                   </td>
                 </tr>
@@ -355,7 +429,11 @@ export function BacktestsView() {
       {/* ------------------------------------------------------ chart stack */}
       <Panel
         className="col-span-12 xl:col-span-7"
-        title={selectedRun ? `Tear sheet · ${selectedRun.id}` : "Tear sheet"}
+        title={
+          selectedRun
+            ? `Tear sheet · ${selectedRun.id}${compareRuns.length > 1 ? ` · ${compareRuns.length}-run overlay` : ""}`
+            : "Tear sheet"
+        }
         actions={
           selectedRun?.metrics ? (
             <div className="flex items-center gap-3 font-mono text-[11px] tabular-nums">
@@ -373,7 +451,11 @@ export function BacktestsView() {
         }
       >
         {selectedRunId ? (
-          <TearsheetStack key={selectedRunId} runId={selectedRunId} />
+          <TearsheetOverlay
+            key={`${compareIds.join("|")}|${selectedRunId}`}
+            runs={compareRuns}
+            selectedRun={selectedRun}
+          />
         ) : (
           <EmptyState title="No run selected" description="Select a run from the history table to inspect its tear sheet." />
         )}
@@ -467,70 +549,181 @@ function MetricGroupRows({
   );
 }
 
-function TearsheetStack({ runId }: { runId: string }) {
-  const tearsheet = useAsyncData(() => getTearsheet(runId));
+const OVERLAY_COLORS = ["#3B82F6", "#F59E0B", "#8B5CF6"];
+
+interface FetchedSheet {
+  run: BacktestRunSummary;
+  sheet: TearsheetResponse | null;
+}
+
+/**
+ * Multi-run tear sheet: overlays ALL checked runs on the equity and underwater
+ * charts (rebased equity, aligned by timestamp, distinct colours + legend) and
+ * keeps the rolling-Sharpe / attribution panel for the selected run.
+ */
+function TearsheetOverlay({
+  runs,
+  selectedRun,
+}: {
+  runs: BacktestRunSummary[];
+  selectedRun: BacktestRunSummary | null;
+}) {
+  const [fetched, setFetched] = useState<FetchedSheet[]>([]);
+  const [loading, setLoading] = useState(true);
   const [chartMode, setChartMode] = useState<ChartMode>("sharpe");
 
-  if (tearsheet.loading && !tearsheet.data) {
+  const fetchRunIds = useMemo(() => {
+    const ids = runs.map((run) => run.id);
+    if (selectedRun && !ids.includes(selectedRun.id)) ids.push(selectedRun.id);
+    return ids;
+  }, [runs, selectedRun]);
+  const fetchKey = fetchRunIds.join("|");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    const allRuns = [...runs];
+    if (selectedRun && !allRuns.some((run) => run.id === selectedRun.id)) allRuns.push(selectedRun);
+    void Promise.all(
+      allRuns.map(async (run) => {
+        const result = await getTearsheet(run.id);
+        return { run, sheet: result.data } satisfies FetchedSheet;
+      }),
+    ).then((results) => {
+      if (cancelled) return;
+      setFetched(results);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchKey]);
+
+  const sheetFor = useMemo(() => {
+    const map = new Map<string, TearsheetResponse | null>();
+    for (const entry of fetched) map.set(entry.run.id, entry.sheet);
+    return map;
+  }, [fetched]);
+
+  const overlayRuns = runs.length > 0 ? runs : selectedRun ? [selectedRun] : [];
+  const equitySeries: OverlaySeries[] = [];
+  const underwaterSeries: OverlaySeries[] = [];
+  overlayRuns.forEach((run, index) => {
+    const sheet = sheetFor.get(run.id);
+    if (!sheet) return;
+    const firstEquity = sheet.equity_curve[0]?.value ?? 0;
+    if (firstEquity > 0) {
+      equitySeries.push({
+        id: run.id,
+        label: `${run.id} · ${run.strategy_id}`,
+        color: OVERLAY_COLORS[index % OVERLAY_COLORS.length] ?? "#3B82F6",
+        data: sheet.equity_curve.map((point) => ({
+          time: point.time,
+          value: (point.value / firstEquity) * 100,
+        })),
+      });
+    }
+    if (sheet.underwater.length > 0) {
+      underwaterSeries.push({
+        id: run.id,
+        label: `${run.id} · ${run.strategy_id}`,
+        color: OVERLAY_COLORS[index % OVERLAY_COLORS.length] ?? "#3B82F6",
+        data: sheet.underwater,
+      });
+    }
+  });
+
+  const selectedSheet = selectedRun ? sheetFor.get(selectedRun.id) ?? null : null;
+  const selectedMetrics = selectedRun?.metrics ?? selectedSheet?.metrics ?? null;
+
+  if (loading && fetched.length === 0) {
     return (
       <div className="flex flex-col gap-2">
-        <Skeleton className="h-[168px]" />
-        <Skeleton className="h-[104px]" />
         <Skeleton className="h-[150px]" />
+        <Skeleton className="h-[92px]" />
+        <Skeleton className="h-[118px]" />
       </div>
     );
   }
 
-  const sheet: TearsheetResponse | null = tearsheet.data;
-  if (!sheet) {
+  if (overlayRuns.length === 0) {
     return (
       <EmptyState
-        title="Tear sheet unavailable"
-        description={`The API did not return a tear sheet for run ${runId}.`}
+        title="No tear sheet selected"
+        description="Check runs in the history table to overlay their equity and underwater curves."
       />
     );
   }
-
-  const metrics = sheet.metrics;
 
   return (
     <div className="flex flex-col">
-      <div className="mb-1 flex items-baseline justify-between">
-        <span className="metric-label">Equity curve</span>
-        <span className="font-mono text-[11px] tabular-nums text-zinc-500">
-          {formatCurrency(sheet.equity_curve[0]?.value ?? 0, true)} →{" "}
-          <span className={cn(metrics.cagr >= 0 ? "text-gain" : "text-loss")}>
-            {formatCurrency(sheet.equity_curve[sheet.equity_curve.length - 1]?.value ?? 0, true)}
-          </span>
-        </span>
+      <div
+        className="mb-1 flex flex-wrap items-center justify-between gap-2"
+        data-testid="overlay-legend"
+        data-run-count={equitySeries.length}
+      >
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          {overlayRuns.map((run, index) => {
+            const color = OVERLAY_COLORS[index % OVERLAY_COLORS.length] ?? "#3B82F6";
+            const available = Boolean(sheetFor.get(run.id));
+            return (
+              <span
+                key={run.id}
+                className="flex items-center gap-1.5 text-[11px]"
+                data-run-id={run.id}
+                title={`${run.id} · ${run.strategy_id}${available ? "" : " · tear sheet unavailable"}`}
+              >
+                <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: color }} />
+                <span className="font-mono text-zinc-300">{run.id}</span>
+                <span className="text-zinc-600">{run.strategy_id}</span>
+                {!available ? <Badge tone="warn">unavailable</Badge> : null}
+              </span>
+            );
+          })}
+        </div>
+        <span className="text-[10.5px] text-zinc-600">equity rebased to 100</span>
       </div>
-      <TimeSeriesChart
-        data={sheet.equity_curve}
-        kind="area"
-        height={160}
-        color="#3B82F6"
-        fillColor="rgba(59,130,246,0.14)"
-        formatValue={(value) => formatCompactUsd(value)}
-        ariaLabel="Backtest equity curve"
-      />
+
+      <div data-testid="equity-overlay" data-series-count={equitySeries.length}>
+        {equitySeries.length > 0 ? (
+          <MultiSeriesChart
+            series={equitySeries}
+            height={152}
+            formatValue={(value) => value.toFixed(1)}
+            ariaLabel="Equity curve overlay (rebased to 100) for checked backtest runs"
+          />
+        ) : (
+          <EmptyState title="Equity series unavailable" description="Tear sheets could not be loaded for the checked runs." className="py-6" />
+        )}
+      </div>
 
       <div className="mb-1 mt-2 flex items-baseline justify-between border-t border-hairline pt-2">
         <span className="metric-label">Underwater drawdown</span>
-        <span className="font-mono text-[11px] tabular-nums text-loss">
-          max {formatPctPlain(metrics.max_drawdown)} · {formatNumber(metrics.max_drawdown_duration_days, 0)}d
-        </span>
+        {selectedMetrics ? (
+          <span className="font-mono text-[11px] tabular-nums text-loss">
+            selected max {formatPctPlain(selectedMetrics.max_drawdown)} ·{" "}
+            {formatNumber(selectedMetrics.max_drawdown_duration_days, 0)}d
+          </span>
+        ) : null}
       </div>
-      <TimeSeriesChart
-        data={sheet.underwater}
-        kind="baseline"
-        height={100}
-        showTimeAxis={false}
-        formatValue={(value) => formatPctPlain(value)}
-        ariaLabel="Backtest underwater drawdown"
-      />
+      <div data-testid="underwater-overlay" data-series-count={underwaterSeries.length}>
+        {underwaterSeries.length > 0 ? (
+          <MultiSeriesChart
+            series={underwaterSeries}
+            height={92}
+            showTimeAxis={false}
+            formatValue={(value) => formatPctPlain(value)}
+            ariaLabel="Underwater drawdown overlay for checked backtest runs"
+          />
+        ) : (
+          <EmptyState title="Underwater series unavailable" description="Tear sheets could not be loaded for the checked runs." className="py-5" />
+        )}
+      </div>
 
       <div className="mb-1 mt-2 flex items-center justify-between border-t border-hairline pt-2">
         <span className="metric-label">
+          {selectedRun ? `${selectedRun.id} · ` : ""}
           {chartMode === "sharpe" ? "Rolling Sharpe (63d)" : "Spot vs roll attribution"}
         </span>
         <Segmented
@@ -544,26 +737,30 @@ function TearsheetStack({ runId }: { runId: string }) {
         />
       </div>
       {chartMode === "sharpe" ? (
-        <TimeSeriesChart
-          data={sheet.rolling_sharpe}
-          kind="line"
-          height={132}
-          color="#A1A1AA"
-          formatValue={(value) => value.toFixed(2)}
-          ariaLabel="Rolling Sharpe ratio"
-        />
-      ) : sheet.roll_yield_attribution.length > 0 ? (
+        selectedSheet ? (
+          <TimeSeriesChart
+            data={selectedSheet.rolling_sharpe}
+            kind="line"
+            height={118}
+            color="#A1A1AA"
+            formatValue={(value) => value.toFixed(2)}
+            ariaLabel="Rolling Sharpe ratio for the selected run"
+          />
+        ) : (
+          <EmptyState title="Rolling Sharpe unavailable" description="The selected run has no rolling-Sharpe series." className="py-5" />
+        )
+      ) : selectedSheet && selectedSheet.roll_yield_attribution.length > 0 ? (
         <div className="pt-1">
           <AttributionBars
-            rows={sheet.roll_yield_attribution}
+            rows={selectedSheet.roll_yield_attribution}
             format={(value) => formatSignedCurrency(value, true)}
           />
         </div>
       ) : (
         <EmptyState
           title="No attribution rows"
-          description="The engine reported no per-root spot/roll attribution for this run."
-          className="py-6"
+          description="The engine reported no per-root spot/roll attribution for the selected run."
+          className="py-5"
         />
       )}
     </div>
