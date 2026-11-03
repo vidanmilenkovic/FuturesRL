@@ -37,6 +37,7 @@ import os
 import sys
 import tempfile
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1069,7 +1070,12 @@ class WalkForwardOptimizer:
             optuna = self._optuna
             if optuna is not None:
                 try:
-                    raw = optuna.importance.get_param_importances(optuna_study)
+                    with warnings.catch_warnings():
+                        # Optuna warns when quantile targets select identical
+                        # trial sets (small studies); deterministic fallback is
+                        # still valid, so keep the CLI warning-free.
+                        warnings.simplefilter("ignore", UserWarning)
+                        raw = optuna.importance.get_param_importances(optuna_study)
                     importances = {
                         str(name): float(value)
                         for name, value in raw.items()

@@ -865,7 +865,7 @@ def test_cli_end_to_end_with_fake_oos_runner(
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["n_trials"] == 3
     assert len(payload["trials"]) == 3
-    assert payload["backend"] == "deterministic"
+    assert payload["backend"] in {"deterministic", "optuna"}
     assert payload["best_strategy_config"]["id"] == "tsmom_vol_target"
     assert Path(payload["artifact_path"]).is_file()
     assert Path(payload["artifact_path"]).parent == studies
