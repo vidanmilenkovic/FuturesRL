@@ -678,3 +678,36 @@ flat-study checks pass with zero page errors.
 - **Verification** — front-month qualification/fallback, runner-once, API preview/execute and DRL
   alignment covered by unit + integration tests; hostile-env quality gate green with 0 warnings and
   94%+ coverage; frontend `tsc`/`lint`/`build` and headless 1440/1920 rebalance/DRL flows verified.
+
+
+---
+
+## v1.8.0 — Phase 11B: real-data cache manager, Databento cost guard and repo hygiene
+
+- **Cache inventory.** `RootCacheSummary` + `ParquetRepository.inventory()` enumerate all 45
+  instrument-master roots (empty included) with sector/schema/cached_bars/start_date/end_date/
+  size_bytes/source; provenance sidecars record `databento`/`ibkr` (legacy partitions default
+  databento; corrupt partitions degrade without hiding healthy roots).
+- **Databento cost estimator and hard guard.** `CostEstimate` + `DatabentoLoader.estimate_cost_usd`
+  call `metadata.get_cost(unit="usd")` and `metadata.get_billable_size` before any download.
+  `FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB` (default 2.00) is enforced inside `ingest`; an
+  over-budget job raises an actionable budget error and never calls `get_range` unless the operator
+  explicitly overrides (`allow_over_budget=True`, API requires confirm). Successful ingests write
+  source provenance.
+- **Data API and dashboard manager.** `GET /api/data/inventory` (totals, availability),
+  `POST /api/data/estimate-cost` (IBKR $0 or Databento USD/MB), and `POST /api/data/ingest`
+  (IBKR free historical/connected paper or guarded Databento, continuous F1/F2 summaries, provenance;
+  409 budget/availability, 422 validation). Operator drawer/Backtest Lab expose a Market Data Cache
+  modal with root/sector/date/source selection, cost check and guarded backfill.
+- **Real vs synthetic data modes.** `data_mode=auto|cached_real|synthetic_offline` on backtests and
+  optimization requests; cached real `ohlcv-1d` bars feed the real engine/walk-forward/
+  `WalkForwardOptimizer(bars=...)`. Auto falls back synthetic; cached_real without sufficient data is
+  an actionable error; synthetic_offline never reads the cache. Backtest/study responses and UI carry
+  additive `data_origin` (`real_parquet`/`synthetic_fixture`), `data_mode` and `cached_bars`
+  provenance, badged emerald vs zinc.
+- **Repository hygiene.** `docs/screenshots/` now tracks only the four canonical screenshots linked by
+  `README.md`/`docs/USER_GUIDE.md`; 21 transient verification PNGs were removed and
+  `artifacts/screenshots/` is ignored for future headless runs.
+- **Verification** — independent Phase 11B suite (inventory/provenance, cost guard/no-download,
+  data API, cached-real backtest/Optuna); hostile-env quality gate green with 0 warnings/94%+
+  coverage; frontend `tsc`/`lint`/`build` and headless 1440/1920 cache/badge/toggle flows verified.

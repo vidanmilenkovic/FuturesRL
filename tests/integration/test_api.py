@@ -68,7 +68,7 @@ def test_health_reports_offline_fixture_mode(client: TestClient) -> None:
     body = response.json()
     assert body["status"] in {"ok", "degraded"}
     assert body["app_name"] == "FuturesRL-X"
-    assert body["version"] == "1.7.0"
+    assert body["version"] == "1.8.0"
     assert body["environment"] == "backtest"
     assert body["offline_mode"] is True
     assert body["uptime_seconds"] >= 0.0
@@ -84,7 +84,7 @@ def test_cors_allows_configured_dashboard_origin(client: TestClient) -> None:
 def test_openapi_metadata_and_docs(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     assert schema["info"]["title"] == "FuturesRL-X Telemetry API"
-    assert schema["info"]["version"] == "1.7.0"
+    assert schema["info"]["version"] == "1.8.0"
     paths = schema["paths"]
     for route in (
         "/health",

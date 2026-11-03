@@ -480,6 +480,21 @@ python -m src.backtest.optimizer \
 | `GET /api/optimize/{study_id}` | full trials, importances, best params/config |
 | `POST /api/optimize/{study_id}/apply` | save best params as `<id>_opt` (optional verification backtest) |
 
+**Market Data Cache.** Open the Operator drawer or the Backtest Lab cache badge to see how many of
+the 45 roots have real cached Parquet bars and their date span/size. Choose roots/sectors and a date
+range, then `IBKR Historical (Free)` or `Databento Pay-As-You-Go`; **Check Cost** shows the estimated
+USD and billable MB. **Backfill Parquet Cache** writes `ohlcv-1d` bars into `data/parquet/` and
+builds continuous F1/F2 series. Databento jobs are hard-guarded by
+`FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB` (default $2.00 per job); an over-budget job is refused
+unless you explicitly enable the over-budget confirmation. The UI disables unavailable sources and
+never reports a fake success.
+
+**Real vs synthetic research.** Backtest Lab and the Optuna Auto-Optimizer have a **Data mode**
+selector: `auto` (real cached Parquet when sufficient, otherwise synthetic), `cached_real` (requires
+sufficient cached bars, else an actionable error) and `synthetic_offline` (never reads the cache).
+Runs/studies are badged **REAL PARQUET DATA** or **SYNTHETIC FIXTURE**, with cached-bar counts and
+dates so provenance is always visible.
+
 **Paper rebalance from the dashboard.** Open **Command Center** or **Pipeline & Weights** and use
 the **Rebalance Book** bar: pick a strategy, click **Preview Rebalance (whatIf)** to see current vs
 target contracts, delta orders, projected initial margin against the 60% cap, tracking error and

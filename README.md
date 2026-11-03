@@ -386,6 +386,24 @@ both engines produce identical targets and deltas for identical market states.
   positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
   book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
+### v1.8.0 real-data cache manager & Databento cost guard
+
+- **Parquet cache inventory.** `ParquetRepository.inventory()` reports all 45 roots — sector, schema,
+  cached bars, date range, disk size and provenance (`databento` / `ibkr` / `empty`) — via
+  `GET /api/data/inventory` with totals and Databento/IBKR availability.
+- **Budgeted backfills.** `POST /api/data/estimate-cost` uses Databento's `metadata.get_cost` +
+  `get_billable_size` before any download; `POST /api/data/ingest` backfills free IBKR historical
+  bars (connected TWS paper) or Databento pay-as-you-go data, building continuous F1/F2 series. A
+  hard `FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB` (default **$2.00**) guard refuses any job over
+  budget without an explicit operator override.
+- **Real vs synthetic data modes.** Backtests and Optuna studies accept
+  `data_mode="auto" | "cached_real" | "synthetic_offline"`; `auto` uses real cached Parquet when
+  sufficient, otherwise falls back synthetic. Every run/study is badged **REAL PARQUET DATA**
+  (emerald) or **SYNTHETIC FIXTURE** (zinc), with cached-bar/date provenance.
+- **Dashboard data manager.** The Operator drawer and Backtest Lab expose a **Market Data Cache**
+  modal: cached-root counts/date span, sector/root/date/source selectors, cost check in USD/MB and a
+  guarded **Backfill Parquet Cache** action.
+
 ### v1.7.0 paper execution without tick subscriptions
 
 - **Qualified front-month contracts.** IBKR market data, historical bars and order previews resolve
