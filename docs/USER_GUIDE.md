@@ -480,6 +480,24 @@ python -m src.backtest.optimizer \
 | `GET /api/optimize/{study_id}` | full trials, importances, best params/config |
 | `POST /api/optimize/{study_id}/apply` | save best params as `<id>_opt` (optional verification backtest) |
 
+**Timeframes.** The Market Data Cache, Backtest Lab and Strategy Studio select from eight
+canonical timeframes: **1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w**. Backfills fetch the matching base
+schema/IBKR bar size and the Parquet repository can auto-resample finer cached bars (1m→5m/15m/30m/1h,
+1h→4h, 1d→1w) on read. Backtests/Optuna accept a `timeframe` and annualize volatility, Sharpe,
+Sortino, CAGR and the volatility/risk overlays with the matching `bars_per_year` (1d = 252); daily
+margin settlement and daily-loss resets use UTC calendar days for intraday bars.
+
+**IBKR historical backfill.** With TWS/IB Gateway reachable (paper port), choose **IBKR Historical
+(Free)** and **Backfill Parquet Cache**; the API opens a dedicated IBKR historical session, resolves
+the active front-month contract and writes bars plus `source="ibkr"` provenance. If TWS is
+unreachable the UI shows the exact backend detail (host:port); Databento failures distinguish a
+missing `FUTURESRLX_DATABENTO_API_KEY` (400) from the hard cost guard (402, `$X > $Y cap`) and never
+download data when refused. Databento over-budget jobs require the explicit confirmation toggle.
+
+**Live account consistency.** When IBKR is connected, `/api/pipeline/latest` and the Command
+Center/Pipeline views use the real account NLV (~$1.00M) instead of the offline $4M fixture; cached
+Parquet bars back the latest state/term structure first, with explicit cached/fixture attribution.
+
 **Market Data Cache.** Open the Operator drawer or the Backtest Lab cache badge to see how many of
 the 45 roots have real cached Parquet bars and their date span/size. Choose roots/sectors and a date
 range, then `IBKR Historical (Free)` or `Databento Pay-As-You-Go`; **Check Cost** shows the estimated

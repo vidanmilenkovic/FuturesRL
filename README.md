@@ -386,6 +386,29 @@ both engines produce identical targets and deltas for identical market states.
   positions (stale last-known-good + `stale/stale_reason`), and returns an explicit 503 when no live
   book exists yet. The dashboard exposes an amber `IBKR · RECONNECTING` state.
 
+### v1.9.0 multi-timeframe engine, exact annualization & IBKR backfill
+
+- **Eight canonical timeframes** (`1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, `1w`) with a
+  look-ahead-safe Polars resampler (right-boundary labels, UTC windows, volume-weighted VWAP) and
+  automatic cache resampling: `ParquetRepository.read_timeframe()` derives 5m/15m/30m/1h from 1m,
+  4h from 1h and 1w from 1d, optionally persisting the target cache.
+- **Timeframe-aware quant math.** `BacktestSpec.timeframe`/`MarketState.timeframe` drive
+  `bars_per_year` annualization in volatility targeting, risk parity, TSMOM, the Quant risk overlay,
+  analytics (vol/Sharpe/Sortino/CAGR/alpha/turnover) and the engine; `1d` remains exactly 252.
+  Margin settlement and daily-loss/kill-switch resets are gated on UTC calendar days for intraday
+  bars instead of one-bar-per-day assumptions.
+- **IBKR historical backfill fixed.** `/api/data/ingest` now wires the active IBKR/TWS session
+  (dedicated client id, front-month qualification) instead of failing with a generic 409. Errors are
+  specific: Databento budget **402** with `$X > $Y cap`, missing Databento key **400**, IBKR
+  unreachable **503** naming `host:port`; the cache UI displays the exact backend detail. IBKR
+  historical ingest is free and writes provenance sidecars.
+- **No more $4M fixture split-brain.** When IBKR is connected, the pipeline/term-structure state uses
+  the real live NLV (~$1.00M) rather than the deterministic fixture equity, and cached Parquet bars
+  back the latest state/term structure first with explicit `cached_parquet`/`fixture` origin and
+  fallback attribution.
+- **UI:** Market Data Cache, Backtest Lab and Strategy Studio (Manual + Optuna) gained 1m–1w
+  timeframe selectors; runs/studies display their timeframe and REAL/SYNTHETIC provenance.
+
 ### v1.8.0 real-data cache manager & Databento cost guard
 
 - **Parquet cache inventory.** `ParquetRepository.inventory()` reports all 45 roots — sector, schema,

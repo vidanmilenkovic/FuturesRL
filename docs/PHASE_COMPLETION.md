@@ -711,3 +711,39 @@ flat-study checks pass with zero page errors.
 - **Verification** — independent Phase 11B suite (inventory/provenance, cost guard/no-download,
   data API, cached-real backtest/Optuna); hostile-env quality gate green with 0 warnings/94%+
   coverage; frontend `tsc`/`lint`/`build` and headless 1440/1920 cache/badge/toggle flows verified.
+
+
+---
+
+## v1.9.0 — Spec 1: multi-timeframe engine, exact annualization and IBKR backfill
+
+- **Timeframe registry + resampler.** `src/data/timeframes.py` defines the eight canonical
+  timeframes (1m/5m/15m/30m/1h/4h/1d/1w) with Polars `every`, IBKR bar size, Databento base schema
+  and `bars_per_year` (347760/69552/23184/11592/5796/1449/252/52). `src/data/resampler.py` groups by
+  instrument/root/expiration in right-labelled UTC windows (no look-ahead) with OHLC/volume/OI/VWAP
+  aggregation. `ParquetRepository.read_timeframe/write_timeframe` auto-resample from finer cached
+  bases (1m→5m/15m/30m/1h, 1h→4h, 1d→1w), with new `ohlcv-5m/15m/30m/4h/1w` schema validators.
+- **Timeframe-aware quant math.** `BacktestSpec.timeframe` and `MarketState.timeframe` feed
+  `bars_per_year` annualization through volatility targeting, risk parity, TSMOM, QuantRiskOverlay,
+  analytics metrics, engine/walk-forward metadata and `MarketStateBuilder` covariance (1d exactly
+  252). Intraday margin settlement and daily loss/kill-switch counters reset on UTC calendar-day
+  boundaries, not bar counts. Verified end-to-end: 5m/1d covariance ratio 276 and vol ratio 16.613.
+- **IBKR backfill fix and actionable errors.** DataService is wired to the active IBKR/TWS session
+  (TCP reachability + dedicated client id, front-month qualification, historical fetch) and persists
+  `source="ibkr"` provenance. API errors are specific: budget **402** with exact `$X > $Y cap`,
+  missing key **400**, IBKR unreachable **503** naming host:port; the cache UI renders the backend
+  detail verbatim. Databento never downloads when the guard refuses.
+- **Data API / backtests / Optuna.** Inventory/estimate/ingest accept `timeframe` and echo
+  timeframe/base/target schema plus resampling provenance; backtests/Optuna accept `timeframe` and
+  use cached real bars per timeframe, with additive timeframe metadata. Invalid timeframes return
+  structured 422s.
+- **Equity/term-structure binding.** EngineMarketService uses the live IBKR NLV when connected
+  (~$1M, no $4M fixture split-brain) and builds latest state/term structure from cached Parquet
+  first, exposing `data_origin`, `data_backing` and `X-Data-*` term-structure headers with explicit
+  partial/fallback attribution.
+- **UI.** Timeframe selectors in Market Data Cache, Backtest Lab, Manual Builder and Optuna; exact
+  ingest error messages/statuses (402/400/503) with over-budget confirmation only for budget errors;
+  timeframe/provenance badges on runs and studies.
+- **Verification** — independent Spec-1 suite (34 tests) plus focused 357 passed; hostile-env full
+  gate **2131 passed, 2 skipped, 0 failed, no warnings, coverage 94.30%**; frontend
+  tsc/lint/build clean and headless 1440/1920 timeframe/error flows verified.
