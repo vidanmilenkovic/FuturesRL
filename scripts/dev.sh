@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the FuturesRL-X API (:8000) and dashboard (:3100) with clean shutdown.
+# Start the FuturesRL API (:8000) and dashboard (:3100) with clean shutdown.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,7 +34,7 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
-echo "Starting FuturesRL-X"
+echo "Starting FuturesRL"
 echo "  API:       http://127.0.0.1:8000/docs"
 echo "  Dashboard: http://127.0.0.1:3100"
 echo "Press Ctrl+C to stop both."

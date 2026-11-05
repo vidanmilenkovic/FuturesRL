@@ -378,7 +378,7 @@ class DataService:
         lowered = text.lower()
         if "databento_api_key" in lowered or "api key" in lowered or "not configured" in lowered:
             message = (
-                "Databento API key is required: set FUTURESRLX_DATABENTO_API_KEY "
+                "Databento API key is required: set FUTURESRL_DATABENTO_API_KEY "
                 f"(loader error: {text})"
             )
             return DataServiceError(
@@ -745,7 +745,7 @@ class DataService:
             message = (
                 f"Databento cost guard exceeded (${estimated:.2f} > ${cap:.2f} cap); "
                 "set allow_over_budget=true and confirm=true to override, or raise "
-                "FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB"
+                "FUTURESRL_DATABENTO_MAX_COST_USD_PER_JOB"
             )
             raise DataServiceError(
                 message,

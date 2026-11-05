@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # ---------------------------------------------------------------------------
-# FuturesRL-X FastAPI backend
+# FuturesRL FastAPI backend
 #
 # Build (from the repository root — this Dockerfile needs `src/` + `configs/`):
-#   docker build -f docker/Dockerfile.backend -t futuresrlx/backend:1.0.0 .
+#   docker build -f docker/Dockerfile.backend -t futuresrl/backend:1.0.0 .
 # or simply:
 #   docker compose -f docker/docker-compose.yml build backend
 #
@@ -45,34 +45,34 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH="/opt/venv/bin:$PATH" \
-    FUTURESRLX_ENVIRONMENT=paper \
-    FUTURESRLX_API_HOST=0.0.0.0 \
-    FUTURESRLX_API_PORT=8000 \
-    FUTURESRLX_LOG_LEVEL=INFO \
-    FUTURESRLX_DATA_DIR=/app/data \
-    FUTURESRLX_REPORT_DIR=/app/artifacts
+    FUTURESRL_ENVIRONMENT=paper \
+    FUTURESRL_API_HOST=0.0.0.0 \
+    FUTURESRL_API_PORT=8000 \
+    FUTURESRL_LOG_LEVEL=INFO \
+    FUTURESRL_DATA_DIR=/app/data \
+    FUTURESRL_REPORT_DIR=/app/artifacts
 
 # `curl` powers the container healthcheck; LibreSSL/curl are the only extras.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl tini \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 1000 futuresrlx \
-    && useradd --system --uid 1000 --gid futuresrlx --create-home futuresrlx
+    && groupadd --system --gid 1000 futuresrl \
+    && useradd --system --uid 1000 --gid futuresrl --create-home futuresrl
 
 WORKDIR /app
 
 # Application code: `src` + `configs` are needed at runtime because the
 # instrument master and strategy YAMLs are loaded from disk (not packaged).
-COPY --chown=futuresrlx:futuresrlx src ./src
-COPY --chown=futuresrlx:futuresrlx configs ./configs
-COPY --chown=futuresrlx:futuresrlx docker/entrypoint.backend.sh ./entrypoint.sh
+COPY --chown=futuresrl:futuresrl src ./src
+COPY --chown=futuresrl:futuresrl configs ./configs
+COPY --chown=futuresrl:futuresrl docker/entrypoint.backend.sh ./entrypoint.sh
 COPY --from=builder /opt/venv /opt/venv
 
 RUN chmod +x /app/entrypoint.sh \
     && mkdir -p /app/data/parquet /app/artifacts \
-    && chown -R futuresrlx:futuresrlx /app
+    && chown -R futuresrl:futuresrl /app
 
-USER futuresrlx
+USER futuresrl
 
 EXPOSE 8000
 

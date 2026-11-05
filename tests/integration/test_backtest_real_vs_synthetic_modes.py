@@ -392,7 +392,7 @@ def test_estimate_missing_databento_key_is_400_with_env_name(tmp_path: Path) -> 
     class MissingKeyLoader:
         def estimate_cost_usd(self, *args: object, **kwargs: object) -> object:
             raise RuntimeError(
-                "Databento API key is not configured: set FUTURESRLX_DATABENTO_API_KEY"
+                "Databento API key is not configured: set FUTURESRL_DATABENTO_API_KEY"
             )
 
     service = DataService(
@@ -407,7 +407,7 @@ def test_estimate_missing_databento_key_is_400_with_env_name(tmp_path: Path) -> 
     assert excinfo.value.status_code == 400
     assert excinfo.value.detail is not None
     assert excinfo.value.detail["error"] == "databento_api_key_missing"
-    assert "FUTURESRLX_DATABENTO_API_KEY" in str(excinfo.value.detail["message"])
+    assert "FUTURESRL_DATABENTO_API_KEY" in str(excinfo.value.detail["message"])
 
 
 def test_inventory_timeframe_fields(tmp_path: Path) -> None:
@@ -538,7 +538,7 @@ def test_data_routes_surface_structured_errors(tmp_path: Path) -> None:
     class MissingKeyLoader:
         def estimate_cost_usd(self, *args: object, **kwargs: object) -> object:
             raise RuntimeError(
-                "Databento API key is not configured: set FUTURESRLX_DATABENTO_API_KEY"
+                "Databento API key is not configured: set FUTURESRL_DATABENTO_API_KEY"
             )
 
     missing_service = DataService(
@@ -554,7 +554,7 @@ def test_data_routes_surface_structured_errors(tmp_path: Path) -> None:
         assert missing.status_code == 400, missing.text
         key_detail = missing.json()["detail"]
         assert key_detail["error"] == "databento_api_key_missing"
-        assert "FUTURESRLX_DATABENTO_API_KEY" in key_detail["message"]
+        assert "FUTURESRL_DATABENTO_API_KEY" in key_detail["message"]
 
 
 def test_ingest_ibkr_resamples_to_target_timeframe(tmp_path: Path) -> None:

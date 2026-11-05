@@ -1184,7 +1184,7 @@ export function mockTearsheet(runId: string): TearsheetResponse | null {
 export function mockHealth(): HealthResponse {
   return {
     status: "ok",
-    app_name: "FuturesRL-X",
+    app_name: "FuturesRL",
     version: "1.0.0",
     environment: "paper",
     offline_mode: true,

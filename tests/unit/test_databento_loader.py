@@ -154,7 +154,7 @@ def make_loader(settings: Settings, **kwargs: Any) -> DatabentoLoader:
 
 def test_ingest_without_api_key_raises_actionable_error(settings: Settings) -> None:
     loader = make_loader(settings)
-    with pytest.raises(RuntimeError, match="FUTURESRLX_DATABENTO_API_KEY"):
+    with pytest.raises(RuntimeError, match="FUTURESRL_DATABENTO_API_KEY"):
         loader.ingest(["ES"], START, END)
 
 
@@ -332,7 +332,7 @@ def test_ingest_definitions_and_load(settings: Settings) -> None:
 
 def test_load_definitions_cache_miss_requires_credentials(settings: Settings) -> None:
     loader = make_loader(settings)
-    with pytest.raises(RuntimeError, match="FUTURESRLX_DATABENTO_API_KEY"):
+    with pytest.raises(RuntimeError, match="FUTURESRL_DATABENTO_API_KEY"):
         loader.load_definitions(["ES"], as_of=datetime(2024, 1, 1, tzinfo=UTC))
 
 
@@ -357,7 +357,7 @@ def test_load_incomplete_cache_falls_back_to_ingest(settings: Settings) -> None:
     loader.ingest(
         ["ES"], START, START + timedelta(days=2), client=FakeClient(FakeStore(ohlcv_raw(periods=2)))
     )
-    with pytest.raises(RuntimeError, match="FUTURESRLX_DATABENTO_API_KEY"):
+    with pytest.raises(RuntimeError, match="FUTURESRL_DATABENTO_API_KEY"):
         loader.load(["ES"], START, END)
 
 
@@ -554,7 +554,7 @@ def test_estimate_cost_rejects_bad_window_and_schema(settings: Settings) -> None
 
 def test_estimate_cost_without_api_key_is_actionable(settings: Settings) -> None:
     loader = make_loader(settings)
-    with pytest.raises(RuntimeError, match="FUTURESRLX_DATABENTO_API_KEY"):
+    with pytest.raises(RuntimeError, match="FUTURESRL_DATABENTO_API_KEY"):
         loader.estimate_cost_usd(["ES"], START, END)
 
 
@@ -600,7 +600,7 @@ def test_ingest_refuses_over_budget_without_download(
     assert error.max_cost_usd == pytest.approx(2.0)
     assert error.roots == ("ES",)
     assert error.schema == s.DEFAULT_BAR_SCHEMA
-    assert "FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB" in str(error)
+    assert "FUTURESRL_DATABENTO_MAX_COST_USD_PER_JOB" in str(error)
     assert "allow_over_budget=True" in str(error)
     assert metadata.cost_calls  # estimated first
     assert client.timeseries.calls == []  # never downloaded on refusal

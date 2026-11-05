@@ -1,4 +1,4 @@
-# Build context exclusions for the FuturesRL-X Docker images.
+# Build context exclusions for the FuturesRL Docker images.
 .git
 .github
 .venv

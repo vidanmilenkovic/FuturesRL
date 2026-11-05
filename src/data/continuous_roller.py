@@ -2,7 +2,7 @@
 
 Training DRL/ML models on raw expiring contracts injects artificial price jumps
 at every roll. This module implements the three roll-trigger methodologies and
-the three price-adjustment methodologies required by FuturesRL-X.
+the three price-adjustment methodologies required by FuturesRL.
 
 Roll triggers
 -------------

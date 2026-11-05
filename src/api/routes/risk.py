@@ -86,7 +86,7 @@ async def flatten_all(execution: ExecutionDep) -> FlattenAllResponse:
         "Guarded manual reset of the execution kill switch and the durable risk "
         "state (persisted kill switch/daily-loss latch, starting daily NLV and "
         "HWM/trailing-stop state). Requires body ``confirm`` exactly "
-        '``"RESET RISK LOCK"``; when ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is set the '
+        '``"RESET RISK LOCK"``; when ``FUTURESRL_OPERATOR_RESET_TOKEN`` is set the '
         "matching token must be supplied in the body ``operator_token`` or the "
         "``X-Operator-Token`` header. Refused (409) while an emergency flatten is in "
         "progress or when the adapter cannot reset. Never runs unauthenticated when a "

@@ -1,4 +1,4 @@
-"""Asynchronous IBKR connection/state manager for the FuturesRL-X execution engine.
+"""Asynchronous IBKR connection/state manager for the FuturesRL execution engine.
 
 This module is the *only* place in ``src/execution`` that knows about the IBKR
 wire protocol.  It is deliberately split into three layers:
@@ -1057,8 +1057,8 @@ class IBKRConnectionManager:
         if preferred is not None and preferred != base_currency:
             logger.warning(
                 "IBKR reports its account ledger in %s but account_currency=%s; "
-                "using the broker's ledger currency. Set FUTURESRLX_ACCOUNT_CURRENCY=%s "
-                "and FUTURESRLX_FX_RATES so USD notional sizing stays correct.",
+                "using the broker's ledger currency. Set FUTURESRL_ACCOUNT_CURRENCY=%s "
+                "and FUTURESRL_FX_RATES so USD notional sizing stays correct.",
                 preferred or "(default)",
                 base_currency,
                 preferred or "USD",

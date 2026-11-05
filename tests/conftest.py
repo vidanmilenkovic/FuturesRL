@@ -30,21 +30,21 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Hermetic *at import time* as well: module/session-scoped fixtures and test
 # modules can construct ``Settings()`` before the function-scoped autouse
-# fixture below runs. Strip the developer's exported FUTURESRLX_* variables and
+# fixture below runs. Strip the developer's exported FUTURESRL_* variables and
 # disable the repo ``.env`` before any test fixture is instantiated.
-for _variable in [name for name in os.environ if name.startswith("FUTURESRLX_")]:
+for _variable in [name for name in os.environ if name.startswith("FUTURESRL_")]:
     os.environ.pop(_variable, None)
 Settings.model_config["env_file"] = None
 
 
 @pytest.fixture(autouse=True)
-def isolate_futuresrlx_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def isolate_futuresrl_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Hermetic tests: the developer's shell must never configure the suite.
 
-    Exported ``FUTURESRLX_*`` variables (e.g. ``FUTURESRLX_ENVIRONMENT=paper``
+    Exported ``FUTURESRL_*`` variables (e.g. ``FUTURESRL_ENVIRONMENT=paper``
     or a ``duckdb:`` risk-state URI used for live trading) would otherwise leak
     into ``Settings()`` constructions and change test behaviour depending on the
-    machine. This autouse fixture strips every ``FUTURESRLX_*`` variable and
+    machine. This autouse fixture strips every ``FUTURESRL_*`` variable and
     disables the repo ``.env`` file before each test; a test that *wants* a
     variable can still set it explicitly via its own ``monkeypatch.setenv``.
 
@@ -54,7 +54,7 @@ def isolate_futuresrlx_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[
     from configs.settings import get_settings
 
     for variable in list(os.environ):
-        if variable.startswith("FUTURESRLX_"):
+        if variable.startswith("FUTURESRL_"):
             monkeypatch.delenv(variable, raising=False)
     # Ignore the developer's committed/untracked ``.env`` file too, unless a
     # test deliberately opts back in (none currently do).

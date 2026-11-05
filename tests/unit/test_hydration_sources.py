@@ -2,7 +2,7 @@
 
 Everything here is offline and deterministic: vendor clients/frames are injected
 fakes, the CLI subprocesses run against temporary data directories with every
-``FUTURESRLX_*`` variable stripped, and the offline simulation window is a fixed
+``FUTURESRL_*`` variable stripped, and the offline simulation window is a fixed
 constant (:data:`src.execution.runner.OFFLINE_SIMULATION_END`).
 """
 
@@ -200,13 +200,13 @@ def make_ibkr_fetcher(
 
 def cli_environment(tmp_path: Path) -> dict[str, str]:
     """Hermetic subprocess environment pointing every writable path at ``tmp_path``."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("FUTURESRLX_")}
+    env = {key: value for key, value in os.environ.items() if not key.startswith("FUTURESRL_")}
     env["PYTHONPATH"] = str(REPO_ROOT)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["FUTURESRLX_DATA_DIR"] = str(tmp_path / "data")
-    env["FUTURESRLX_PARQUET_DIR"] = str(tmp_path / "data" / "parquet")
-    env["FUTURESRLX_DUCKDB_PATH"] = str(tmp_path / "data" / "runner.duckdb")
-    env["FUTURESRLX_REPORT_DIR"] = str(tmp_path / "artifacts")
+    env["FUTURESRL_DATA_DIR"] = str(tmp_path / "data")
+    env["FUTURESRL_PARQUET_DIR"] = str(tmp_path / "data" / "parquet")
+    env["FUTURESRL_DUCKDB_PATH"] = str(tmp_path / "data" / "runner.duckdb")
+    env["FUTURESRL_REPORT_DIR"] = str(tmp_path / "artifacts")
     return env
 
 
@@ -220,7 +220,7 @@ def run_cli(
     # real repo-root ``.env`` cannot leak into these hermetic CLI subprocess tests;
     # ``PYTHONPATH`` keeps the repo importable and every configured path is
     # absolute/tmp-scoped.
-    data_dir = env.get("FUTURESRLX_DATA_DIR")
+    data_dir = env.get("FUTURESRL_DATA_DIR")
     cwd = str(Path(data_dir).parent) if data_dir else str(REPO_ROOT)
     return subprocess.run(
         [sys.executable, "-W", "error::RuntimeWarning", "-m", "src.execution.runner", *args],
@@ -320,21 +320,21 @@ def test_auto_with_no_available_source_fails_closed_with_all_hints() -> None:
         chain(("ES",), START, START + timedelta(days=5))
     message = str(excinfo.value)
     assert "no hydration backfill source is available" in message
-    for hint in ("--offline", "IBKR TWS", "FUTURESRLX_ENVIRONMENT", "IBKR_PORT"):
+    for hint in ("--offline", "IBKR TWS", "FUTURESRL_ENVIRONMENT", "IBKR_PORT"):
         assert hint in message
-    assert "FUTURESRLX_DATABENTO_API_KEY" in message
+    assert "FUTURESRL_DATABENTO_API_KEY" in message
     assert HYDRATION_SOURCE_HINTS in message
 
 
 def test_forced_source_unavailable_fails_closed() -> None:
     with pytest.raises(HydrationError) as databento_error:
         build_backfill_chain(source="databento")
-    assert "FUTURESRLX_DATABENTO_API_KEY" in str(databento_error.value)
+    assert "FUTURESRL_DATABENTO_API_KEY" in str(databento_error.value)
 
     with pytest.raises(HydrationError) as ibkr_error:
         build_backfill_chain(source="ibkr")
     message = str(ibkr_error.value)
-    assert "FUTURESRLX_ENVIRONMENT" in message
+    assert "FUTURESRL_ENVIRONMENT" in message
     assert "IBKR_PORT" in message
     assert "TWS" in message
 
@@ -572,8 +572,8 @@ async def test_ibkr_historical_empty_response_is_actionable(settings: Settings) 
     message = str(excinfo.value)
     assert "IBKR returned no daily historical bars" in message
     assert "TWS/IB Gateway" in message
-    assert "FUTURESRLX_ENVIRONMENT" in message
-    assert "FUTURESRLX_IBKR_PORT" in message
+    assert "FUTURESRL_ENVIRONMENT" in message
+    assert "FUTURESRL_IBKR_PORT" in message
 
 
 async def test_ibkr_historical_connect_failure_is_actionable(settings: Settings) -> None:
@@ -627,8 +627,8 @@ def test_describe_hydration_sources_reports_availability(tmp_path: Path) -> None
     }
     reasons = description["unavailable_reasons"]
     assert isinstance(reasons, dict)
-    assert "FUTURESRLX_DATABENTO_API_KEY" in reasons["databento"]
-    assert "FUTURESRLX_ENVIRONMENT" in reasons["ibkr"]
+    assert "FUTURESRL_DATABENTO_API_KEY" in reasons["databento"]
+    assert "FUTURESRL_ENVIRONMENT" in reasons["ibkr"]
     assert "--offline" in reasons["offline"]
     hints = description["hints"]
     assert isinstance(hints, str) and "--offline" in hints
@@ -683,7 +683,7 @@ def test_build_hydration_chain_forced_source_fails_closed(tmp_path: Path) -> Non
             instrument_master=settings.instruments,
             source="databento",
         )
-    assert "FUTURESRLX_DATABENTO_API_KEY" in str(excinfo.value)
+    assert "FUTURESRL_DATABENTO_API_KEY" in str(excinfo.value)
     assert "--offline" in str(excinfo.value)
 
 
@@ -920,9 +920,9 @@ def test_cli_no_source_exits_2_with_actionable_hints(tmp_path: Path) -> None:
     for hint in (
         "--offline",
         "IBKR TWS",
-        "FUTURESRLX_ENVIRONMENT",
+        "FUTURESRL_ENVIRONMENT",
         "IBKR_PORT",
-        "FUTURESRLX_DATABENTO_API_KEY",
+        "FUTURESRL_DATABENTO_API_KEY",
     ):
         assert hint in stderr
     assert "no hydration backfill source" in stderr
@@ -934,7 +934,7 @@ def test_cli_forced_databento_without_key_exits_2_cleanly(tmp_path: Path) -> Non
     )
     assert proc.returncode == 2, proc.stderr
     assert "Traceback" not in proc.stderr
-    assert "FUTURESRLX_DATABENTO_API_KEY" in proc.stderr
+    assert "FUTURESRL_DATABENTO_API_KEY" in proc.stderr
     assert "--offline" in proc.stderr
 
 

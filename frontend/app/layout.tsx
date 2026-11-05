@@ -21,12 +21,12 @@ const jetbrainsMono = JetBrains_Mono({
 
 export const metadata: Metadata = {
   title: {
-    default: "FuturesRL-X · Institutional Futures Workspace",
-    template: "%s · FuturesRL-X",
+    default: "FuturesRL · Institutional Futures Workspace",
+    template: "%s · FuturesRL",
   },
   description:
     "Institutional futures workstation: FinRL-X weight pipeline, LLM Risk-First monitor, term structure, roll calendar and walk-forward backtest tear sheets.",
-  applicationName: "FuturesRL-X",
+  applicationName: "FuturesRL",
   robots: { index: false, follow: false },
   icons: { icon: "/favicon.svg" },
 };

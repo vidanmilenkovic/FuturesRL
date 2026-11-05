@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # ---------------------------------------------------------------------------
-# FuturesRL-X backend entrypoint
+# FuturesRL backend entrypoint
 #
 # Waits for the optional TimescaleDB/Redis sidecars (best effort — the API is
 # designed to run fully offline and must never crash because a dependency is
@@ -8,13 +8,13 @@
 # ---------------------------------------------------------------------------
 set -eu
 
-host="${FUTURESRLX_DB_HOST:-timescaledb}"
-port="${FUTURESRLX_DB_PORT:-5432}"
-timeout="${FUTURESRLX_DB_WAIT_SECONDS:-60}"
+host="${FUTURESRL_DB_HOST:-timescaledb}"
+port="${FUTURESRL_DB_PORT:-5432}"
+timeout="${FUTURESRL_DB_WAIT_SECONDS:-60}"
 
-echo "[entrypoint] FuturesRL-X backend starting (environment=${FUTURESRLX_ENVIRONMENT:-development})"
+echo "[entrypoint] FuturesRL backend starting (environment=${FUTURESRL_ENVIRONMENT:-development})"
 
-if [ "${FUTURESRLX_DB_WAIT:-1}" = "1" ]; then
+if [ "${FUTURESRL_DB_WAIT:-1}" = "1" ]; then
   elapsed=0
   while [ "$elapsed" -lt "$timeout" ]; do
     if (echo > "/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
@@ -30,6 +30,6 @@ if [ "${FUTURESRLX_DB_WAIT:-1}" = "1" ]; then
   fi
 fi
 
-mkdir -p "${FUTURESRLX_DATA_DIR:-/app/data}/parquet" "${FUTURESRLX_REPORT_DIR:-/app/artifacts}"
+mkdir -p "${FUTURESRL_DATA_DIR:-/app/data}/parquet" "${FUTURESRL_REPORT_DIR:-/app/artifacts}"
 
 exec "$@"

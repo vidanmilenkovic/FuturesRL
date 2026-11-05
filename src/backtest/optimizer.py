@@ -1947,7 +1947,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="futuresrl-optimize",
         description=(
-            "Optimise a FuturesRL-X strategy strictly on purged/embargoed walk-forward "
+            "Optimise a FuturesRL strategy strictly on purged/embargoed walk-forward "
             "out-of-sample folds (Optuna when installed, deterministic LHS fallback)."
         ),
     )

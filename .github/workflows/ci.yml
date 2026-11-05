@@ -69,6 +69,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build backend image
-        run: docker build -f docker/Dockerfile.backend -t futuresrl-x-backend:ci .
+        run: docker build -f docker/Dockerfile.backend -t futuresrl-backend:ci .
       - name: Build frontend image
-        run: docker build -f docker/Dockerfile.frontend -t futuresrl-x-frontend:ci .
+        run: docker build -f docker/Dockerfile.frontend -t futuresrl-frontend:ci .

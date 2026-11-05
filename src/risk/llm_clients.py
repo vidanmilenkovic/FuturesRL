@@ -9,11 +9,11 @@ Phase-9 live inference switch: :func:`build_llm_client` maps the process
   risk prompt and answers with the strict JSON contract consumed by
   :class:`~src.risk.llm_risk_overlay.LLMRiskAssessmentBatch.from_json_text`.
 * ``openai`` / ``anthropic`` / ``deepseek`` - the existing async HTTP adapters
-  with ``settings.llm_model`` and the API key from ``FUTURESRLX_LLM_API_KEY``.
+  with ``settings.llm_model`` and the API key from ``FUTURESRL_LLM_API_KEY``.
 * ``vllm`` - the OpenAI-compatible local vLLM adapter (default base URL
   ``http://localhost:8000/v1``).
 
-``Settings.llm_base_url`` (``FUTURESRLX_LLM_BASE_URL``) optionally overrides the
+``Settings.llm_base_url`` (``FUTURESRL_LLM_BASE_URL``) optionally overrides the
 endpoint of any HTTP adapter (OpenAI-compatible proxy, self-hosted gateway,
 custom vLLM host); an empty value keeps the adapter's documented default. The
 offline provider ignores it entirely (no transport is created).
@@ -157,7 +157,7 @@ def build_llm_client(settings: Settings) -> AsyncLLMClient:
     settings:
         Central :class:`~configs.settings.Settings`. ``llm_provider`` selects the
         adapter, ``llm_model`` the model identifier and ``llm_api_key`` the
-        ``FUTURESRLX_LLM_API_KEY`` secret.
+        ``FUTURESRL_LLM_API_KEY`` secret.
 
     Returns
     -------
@@ -176,11 +176,11 @@ def build_llm_client(settings: Settings) -> AsyncLLMClient:
     if provider not in _SUPPORTED_PROVIDERS:
         raise ValueError(
             f"unsupported llm_provider {provider!r}; supported providers: "
-            f"{list(_SUPPORTED_PROVIDERS)} (set FUTURESRLX_LLM_PROVIDER)"
+            f"{list(_SUPPORTED_PROVIDERS)} (set FUTURESRL_LLM_PROVIDER)"
         )
     model = settings.llm_model.strip()
     if not model:
-        raise ValueError("llm_model must be a non-empty model identifier (FUTURESRLX_LLM_MODEL)")
+        raise ValueError("llm_model must be a non-empty model identifier (FUTURESRL_LLM_MODEL)")
     if provider == "offline":
         return OfflineLLMClient()
     api_key = settings.llm_api_key_value
@@ -192,7 +192,7 @@ def build_llm_client(settings: Settings) -> AsyncLLMClient:
         return VLLMClient(model=model, api_key=api_key, base_url=base_url)
     if not api_key:
         raise ValueError(
-            f"llm_provider={provider!r} requires an API key: set FUTURESRLX_LLM_API_KEY "
+            f"llm_provider={provider!r} requires an API key: set FUTURESRL_LLM_API_KEY "
             "(or use llm_provider='offline' for deterministic fixture assessments, or "
             "llm_provider='vllm' for a keyless local server)"
         )

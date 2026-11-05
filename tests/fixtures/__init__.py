@@ -1,1 +1,1 @@
-"""Deterministic offline test-data factories for the FuturesRL-X test suite."""
+"""Deterministic offline test-data factories for the FuturesRL test suite."""

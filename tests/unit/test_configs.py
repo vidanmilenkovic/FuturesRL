@@ -184,10 +184,10 @@ def test_settings_defaults(tmp_path: Path) -> None:
 
 def test_settings_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_settings_cache()
-    monkeypatch.setenv("FUTURESRLX_ENVIRONMENT", "backtest")
-    monkeypatch.setenv("FUTURESRLX_API_PORT", "9123")
-    monkeypatch.setenv("FUTURESRLX_RISK__MAX_MARGIN_UTILIZATION", "0.45")
-    monkeypatch.setenv("FUTURESRLX_DATABENTO_API_KEY", "secret-key")
+    monkeypatch.setenv("FUTURESRL_ENVIRONMENT", "backtest")
+    monkeypatch.setenv("FUTURESRL_API_PORT", "9123")
+    monkeypatch.setenv("FUTURESRL_RISK__MAX_MARGIN_UTILIZATION", "0.45")
+    monkeypatch.setenv("FUTURESRL_DATABENTO_API_KEY", "secret-key")
     settings = Settings(_env_file=None)
     assert settings.environment == "backtest"
     assert settings.api_port == 9123
@@ -288,7 +288,7 @@ def test_get_settings_cached() -> None:
 def test_llm_provider_key_requirements() -> None:
     # Hosted providers need a key.
     for provider in ("openai", "anthropic", "deepseek", "gemini"):
-        with pytest.raises(ValueError, match="FUTURESRLX_LLM_API_KEY"):
+        with pytest.raises(ValueError, match="FUTURESRL_LLM_API_KEY"):
             Settings(_env_file=None, llm_provider=provider)
     # Local vLLM is keyless by design.
     settings = Settings(_env_file=None, llm_provider="vllm", llm_model="local-model")

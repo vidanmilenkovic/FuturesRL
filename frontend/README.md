@@ -1,6 +1,6 @@
-# FuturesRL-X · Frontend (Next.js 15)
+# FuturesRL · Frontend (Next.js 15)
 
-Dark "quant terminal" dashboard for the FuturesRL-X platform. Five views consume
+Dark "quant terminal" dashboard for the FuturesRL platform. Five views consume
 the FastAPI backend over REST and `/ws/telemetry`; when the backend is not
 reachable the app automatically falls back to deterministic demo fixtures and
 shows a persistent **DEMO DATA** indicator, so it can be built and previewed
@@ -74,7 +74,7 @@ Built by `docker/Dockerfile.frontend` (multi-stage `node:22-alpine`, Next.js
 docker build \
   --build-arg NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 \
   -f ../docker/Dockerfile.frontend \
-  -t futuresrlx/frontend:1.0.0 .
+  -t futuresrl/frontend:1.0.0 .
 ```
 
 Or run the whole stack with `docker compose -f ../docker/docker-compose.yml up --build`

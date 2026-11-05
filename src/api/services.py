@@ -1,4 +1,4 @@
-"""Concrete service adapters for the FuturesRL-X telemetry API.
+"""Concrete service adapters for the FuturesRL telemetry API.
 
 Wiring philosophy
 -----------------
@@ -18,7 +18,7 @@ Real wiring
   (``SimulatedBroker``) seeded with the demo book; the kill switch calls the
   real ``flatten_all_sync`` path and locks execution.
 * :class:`IBKRExecutionService` — opt-in real ``IBKRConnectionManager`` +
-  ``OrderManagementSystem`` wiring (``FUTURESRLX_API_ENABLE_IBKR=1``); connects in
+  ``OrderManagementSystem`` wiring (``FUTURESRL_API_ENABLE_IBKR=1``); connects in
   the lifespan, keeps a background liveness/reconnect probe running and serves the
   last-known-good IBKR book (marked ``stale``) while TWS is unavailable -- it never
   silently substitutes simulated positions.
@@ -142,13 +142,13 @@ __all__ = [
 ]
 
 #: Env flag that opts into real IBKR wiring instead of the simulated broker.
-IBKR_ENABLE_ENV: str = "FUTURESRLX_API_ENABLE_IBKR"
+IBKR_ENABLE_ENV: str = "FUTURESRL_API_ENABLE_IBKR"
 
 #: How long the kill switch keeps execution locked after a flatten.
 KILL_SWITCH_LOCK_MINUTES: int = 30
 
 #: Env var holding the optional operator reset token for ``POST /api/risk/reset-lock``.
-OPERATOR_RESET_TOKEN_ENV: str = "FUTURESRLX_OPERATOR_RESET_TOKEN"
+OPERATOR_RESET_TOKEN_ENV: str = "FUTURESRL_OPERATOR_RESET_TOKEN"
 
 #: Environments where the destructive operator paper-state reset is allowed.
 PAPER_STATE_RESET_ENVIRONMENTS: frozenset[str] = frozenset({"development", "paper", "backtest"})
@@ -166,7 +166,7 @@ class OperatorConfirmationError(OperatorResetError, ValueError):
 
 
 class OperatorTokenError(OperatorResetError, PermissionError):
-    """The required ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is missing/wrong (HTTP 403)."""
+    """The required ``FUTURESRL_OPERATOR_RESET_TOKEN`` is missing/wrong (HTTP 403)."""
 
 
 class OperatorActionUnavailableError(OperatorResetError):
@@ -924,7 +924,7 @@ class IBKRBookUnavailableError(RuntimeError):
 class IBKRExecutionService:
     """Opt-in real IBKR wiring that never substitutes a simulated book.
 
-    Enabled with ``FUTURESRLX_API_ENABLE_IBKR=1`` (or ``settings.api_enable_ibkr``).
+    Enabled with ``FUTURESRL_API_ENABLE_IBKR=1`` (or ``settings.api_enable_ibkr``).
     The lifespan calls :meth:`connect` once, then :meth:`start_background` starts a
     throttled liveness probe, so a TWS restart (or the IBKR nightly server reset)
     is recovered automatically without restarting the API process.
@@ -2688,7 +2688,7 @@ class EngineRiskService:
 
     @staticmethod
     def operator_reset_token_required() -> bool:
-        """Whether ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is configured."""
+        """Whether ``FUTURESRL_OPERATOR_RESET_TOKEN`` is configured."""
         return bool(os.environ.get(OPERATOR_RESET_TOKEN_ENV, "").strip())
 
     @staticmethod

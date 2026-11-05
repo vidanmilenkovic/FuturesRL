@@ -1,4 +1,4 @@
-"""Protocol interfaces for the FuturesRL-X architecture.
+"""Protocol interfaces for the FuturesRL architecture.
 
 These ``typing.Protocol`` definitions are the deployment-parity contract: a
 strategy, backtester and live IBKR engine are interchangeable as long as they

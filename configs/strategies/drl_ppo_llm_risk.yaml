@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# FuturesRL-X declarative strategy pipeline
+# FuturesRL declarative strategy pipeline
 #
 # DRL allocator (PPO) with the FinRL Risk-First LLM overlay enabled, so the
 # comparison against tsmom_vol_target isolates the value added by the RL policy

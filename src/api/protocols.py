@@ -1,4 +1,4 @@
-"""Dependency-injection protocols for the FuturesRL-X telemetry API.
+"""Dependency-injection protocols for the FuturesRL telemetry API.
 
 Every route depends on a *protocol*, never on a concrete adapter, so the API is
 testable with deterministic fakes and can run offline with no IBKR session:

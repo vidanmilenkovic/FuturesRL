@@ -34,6 +34,6 @@ async def account_snapshot(container: ContainerDep) -> AccountSnapshotResponse:
             detail=(
                 "account snapshot unavailable: "
                 f"{type(exc).__name__}: {exc}. Check the TWS/IB Gateway session, "
-                "FUTURESRLX_IBKR_HOST/PORT and that the account is fully logged in."
+                "FUTURESRL_IBKR_HOST/PORT and that the account is fully logged in."
             ),
         ) from exc

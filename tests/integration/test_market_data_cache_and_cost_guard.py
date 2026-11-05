@@ -503,7 +503,7 @@ def test_api_estimate_cost_without_databento_key_is_400(tmp_path: Path) -> None:
         assert response.status_code == 400, response.text
         detail = response.json()["detail"]
         assert detail["error"] == "databento_api_key_missing"
-        assert "FUTURESRLX_DATABENTO_API_KEY" in detail["message"]
+        assert "FUTURESRL_DATABENTO_API_KEY" in detail["message"]
 
 
 def test_api_ingest_databento_budget_refusal_and_override(tmp_path: Path) -> None:

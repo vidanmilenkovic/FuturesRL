@@ -135,7 +135,7 @@ def test_loader_serves_cached_synthetic_data_without_credentials(settings: Setti
 def test_loader_never_fakes_vendor_data(settings: Settings) -> None:
     loader = DatabentoLoader(settings, repository=ParquetRepository(settings))
     source = OfflineBarSource(("ES",), periods=8)
-    with pytest.raises(RuntimeError, match="FUTURESRLX_DATABENTO_API_KEY"):
+    with pytest.raises(RuntimeError, match="FUTURESRL_DATABENTO_API_KEY"):
         loader.ingest(["ES"], source.start, source.start + timedelta(days=2))
     assert source.is_synthetic is True
 

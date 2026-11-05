@@ -99,7 +99,7 @@ def _lock_execution(client: TestClient) -> None:
 def test_risk_state_exposes_additive_kill_switch_fields(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("FUTURESRLX_OPERATOR_RESET_TOKEN", raising=False)
+    monkeypatch.delenv("FUTURESRL_OPERATOR_RESET_TOKEN", raising=False)
     body = client.get("/api/risk/state").json()
     assert body["kill_switch_active"] is False
     assert body["kill_switch_reason"] == ""
@@ -146,7 +146,7 @@ def test_reset_lock_requires_exact_confirmation_phrase(client: TestClient) -> No
 def test_reset_lock_requires_operator_token_when_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FUTURESRLX_OPERATOR_RESET_TOKEN", "s3cret")
+    monkeypatch.setenv("FUTURESRL_OPERATOR_RESET_TOKEN", "s3cret")
     with TestClient(create_app(_settings(tmp_path), clock=lambda: FIXED_TIMESTAMP)) as client:
         state = client.get("/api/risk/state").json()
         assert state["operator_reset_token_required"] is True

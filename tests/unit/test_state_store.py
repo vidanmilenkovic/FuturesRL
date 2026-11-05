@@ -263,9 +263,9 @@ def test_redis_store_round_trip_bytes_and_clear() -> None:
 def test_redis_store_rejects_corrupt_payload() -> None:
     client = _FakeRedis()
     store = RedisRiskStateStore(client)
-    client.data["futuresrlx:risk_state"] = "not-json"
+    client.data["futuresrl:risk_state"] = "not-json"
     assert store.load() is None
-    client.data["futuresrlx:risk_state"] = json.dumps([1, 2, 3])
+    client.data["futuresrl:risk_state"] = json.dumps([1, 2, 3])
     assert store.load() is None
 
 

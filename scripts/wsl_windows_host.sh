@@ -4,11 +4,11 @@
 # Use this as the IBKR host when TWS / IB Gateway runs on the Windows host and
 # WSL is in its default NAT networking mode:
 #
-#   export FUTURESRLX_IBKR_HOST="$(./scripts/wsl_windows_host.sh)"
+#   export FUTURESRL_IBKR_HOST="$(./scripts/wsl_windows_host.sh)"
 #   .venv/bin/python -m src.execution.runner --strategy configs/strategies/tsmom_vol_target.yaml
 #
 # With WSL mirrored networking ([wsl2] networkingMode=mirrored in %USERPROFILE%\.wslconfig)
-# the Windows loopback is shared, so FUTURESRLX_IBKR_HOST=127.0.0.1 works instead.
+# the Windows loopback is shared, so FUTURESRL_IBKR_HOST=127.0.0.1 works instead.
 set -euo pipefail
 
 if ! grep -qi microsoft /proc/version 2>/dev/null; then

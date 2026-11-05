@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# FuturesRL-X declarative strategy pipeline
+# FuturesRL declarative strategy pipeline
 #
 # Classical volatility-targeted time-series momentum across the full futures
 # universe, with a carry/term-structure filter and the two-tier risk overlay.

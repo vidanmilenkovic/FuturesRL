@@ -1,6 +1,6 @@
 """Central configuration: ``pydantic-settings`` settings + typed accessors.
 
-Configuration is layered: environment variables (``FUTURESRLX_*``), an optional
+Configuration is layered: environment variables (``FUTURESRL_*``), an optional
 ``.env`` file, then the committed ``configs/*.yaml`` instrument/strategy masters.
 Secrets are held as :class:`pydantic.SecretStr` so they can never leak into logs
 or the telemetry API by accident.
@@ -77,10 +77,10 @@ class RiskSettings(BaseModel):
 
 
 class Settings(BaseSettings):
-    """Runtime settings for the full FuturesRL-X stack."""
+    """Runtime settings for the full FuturesRL stack."""
 
     model_config = SettingsConfigDict(
-        env_prefix="FUTURESRLX_",
+        env_prefix="FUTURESRL_",
         env_file=(".env",),
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     )
 
     # -- application ---------------------------------------------------------------
-    app_name: str = "FuturesRL-X"
+    app_name: str = "FuturesRL"
     environment: Literal["development", "paper", "live", "backtest"] = "development"
     log_level: str = "INFO"
     repo_root: Path = Field(default=REPO_ROOT)
@@ -201,7 +201,7 @@ class Settings(BaseSettings):
         if cleaned and cleaned not in supported:
             raise ValueError(
                 f"unsupported llm_provider {value!r}; supported providers: "
-                f"{sorted(supported)} (set FUTURESRLX_LLM_PROVIDER)"
+                f"{sorted(supported)} (set FUTURESRL_LLM_PROVIDER)"
             )
         return cleaned
 
@@ -281,7 +281,7 @@ class Settings(BaseSettings):
             and self.llm_api_key is None
         ):
             raise ValueError(
-                f"llm_provider={self.llm_provider!r} requires FUTURESRLX_LLM_API_KEY "
+                f"llm_provider={self.llm_provider!r} requires FUTURESRL_LLM_API_KEY "
                 "(use llm_provider=offline for deterministic fixture assessments, or "
                 "llm_provider=vllm for a keyless local server)"
             )

@@ -248,7 +248,7 @@ def _default_ib_factory() -> _IBClient:
     except ImportError as exc:  # pragma: no cover - SDK installed in CI
         raise RuntimeError(
             "The ib_async SDK is not installed. Install the optional live extra "
-            "(`pip install 'futuresrl-x[live]'` or `pip install ib_async`) before "
+            "(`pip install 'futuresrl[live]'` or `pip install ib_async`) before "
             "connecting to IBKR; offline/backtest code must not need it."
         ) from exc
     return cast(_IBClient, ib_async.IB())
@@ -1352,8 +1352,8 @@ class IBKRHistoricalBarFetcher:
       ``HISTORICAL_MAX_REQUEST_DAYS`` windows because IBKR limits the duration of
       a single historical request.
     * **Fail closed**: connection failures and empty responses raise an
-      actionable ``RuntimeError`` naming TWS/IB Gateway, ``FUTURESRLX_ENVIRONMENT``
-      and ``FUTURESRLX_IBKR_PORT`` so the hydration chain can fall back cleanly.
+      actionable ``RuntimeError`` naming TWS/IB Gateway, ``FUTURESRL_ENVIRONMENT``
+      and ``FUTURESRL_IBKR_PORT`` so the hydration chain can fall back cleanly.
     """
 
     def __init__(
@@ -1417,7 +1417,7 @@ class IBKRHistoricalBarFetcher:
         except ImportError as exc:  # pragma: no cover - SDK installed in CI
             raise RuntimeError(
                 "The ib_async SDK is not installed; install the optional live extra "
-                "(`pip install 'futuresrl-x[live]'` or `pip install ib_async`) before "
+                "(`pip install 'futuresrl[live]'` or `pip install ib_async`) before "
                 "fetching IBKR historical data."
             ) from exc
         return cast("_HistoricalIBClient", ib_async.IB())
@@ -1558,7 +1558,7 @@ class IBKRHistoricalBarFetcher:
                         "IBKR historical data unavailable: cannot connect to TWS/IB Gateway at "
                         f"{self._settings.ibkr_host}:{self._settings.ibkr_port} "
                         f"({type(exc).__name__}: {exc}). Start TWS or IB Gateway and set "
-                        "FUTURESRLX_ENVIRONMENT=paper|live plus FUTURESRLX_IBKR_PORT "
+                        "FUTURESRL_ENVIRONMENT=paper|live plus FUTURESRL_IBKR_PORT "
                         "(paper 7497/4002, live 7496/4001)."
                     ) from exc
                 connected_here = True
@@ -1590,8 +1590,8 @@ class IBKRHistoricalBarFetcher:
             raise RuntimeError(
                 "IBKR returned no daily historical bars for roots "
                 f"{list(normalised)!r} between {start.isoformat()} and {end.isoformat()}; "
-                "check that TWS/IB Gateway is running, FUTURESRLX_ENVIRONMENT is paper|live and "
-                "FUTURESRLX_IBKR_PORT matches it, and that the account is entitled to the "
+                "check that TWS/IB Gateway is running, FUTURESRL_ENVIRONMENT is paper|live and "
+                "FUTURESRL_IBKR_PORT matches it, and that the account is entitled to the "
                 "requested futures history"
             )
         frame = pl.DataFrame(rows)
@@ -1624,7 +1624,7 @@ class IBKRHistoricalBarFetcher:
             except BaseException as exc:
                 failures.append(exc)
 
-        worker = threading.Thread(target=_worker, name="futuresrlx-ibkr-history", daemon=True)
+        worker = threading.Thread(target=_worker, name="futuresrl-ibkr-history", daemon=True)
         worker.start()
         worker.join()
         if failures:

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to FuturesRL-X are documented in this file.
+All notable changes to FuturesRL are documented in this file.
 
 The format follows [Keep a Changelog 1.1](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Calendar dates are omitted:
@@ -88,7 +88,7 @@ No unreleased changes.
 
 ### Changed
 
-- IBKR market-data type is configurable (`FUTURESRLX_IBKR_MARKET_DATA_TYPE`, default delayed).
+- IBKR market-data type is configurable (`FUTURESRL_IBKR_MARKET_DATA_TYPE`, default delayed).
 
 ### Fixed
 

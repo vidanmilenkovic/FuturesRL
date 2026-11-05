@@ -904,7 +904,7 @@ export function CommandCenterView() {
                 type="password"
                 value={riskResetToken}
                 onChange={setRiskResetToken}
-                placeholder="FUTURESRLX_OPERATOR_RESET_TOKEN"
+                placeholder="FUTURESRL_OPERATOR_RESET_TOKEN"
                 disabled={riskResetting}
               />
             </Field>
@@ -1040,8 +1040,8 @@ function WorkingOrdersTab() {
       reloadOrders();
       reloadRunner();
     };
-    window.addEventListener("futuresrlx:refresh-execution", handler);
-    return () => window.removeEventListener("futuresrlx:refresh-execution", handler);
+    window.addEventListener("futuresrl:refresh-execution", handler);
+    return () => window.removeEventListener("futuresrl:refresh-execution", handler);
   }, [reloadOrders, reloadRunner]);
 
   const step = async () => {
@@ -1152,8 +1152,8 @@ function RecentFillsTab() {
 
   useEffect(() => {
     const handler = () => reloadFills();
-    window.addEventListener("futuresrlx:refresh-execution", handler);
-    return () => window.removeEventListener("futuresrlx:refresh-execution", handler);
+    window.addEventListener("futuresrl:refresh-execution", handler);
+    return () => window.removeEventListener("futuresrl:refresh-execution", handler);
   }, [reloadFills]);
 
   const rows: Fill[] = fillsData?.fills ?? [];

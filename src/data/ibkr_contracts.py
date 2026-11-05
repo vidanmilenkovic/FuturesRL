@@ -5,7 +5,7 @@ key) with a *bare* ``ib_async.Future``: the contract must be qualified and carry
 positive ``conId``. A bare ``Future(symbol='ES')`` also has no contract month, so
 IBKR may resolve a far/ambiguous series, and every reconnect re-resolves it.
 
-This module is the single place that turns a FuturesRL-X root into the **active
+This module is the single place that turns a FuturesRL root into the **active
 front-month** IBKR contract:
 
 1. derive the explicit contract month (``YYYYMM``) from the instrument master's
@@ -198,7 +198,7 @@ def build_front_contract(
     except ImportError as exc:  # pragma: no cover - SDK installed in CI/live
         raise RuntimeError(
             "The ib_async SDK is not installed; install the optional live extra "
-            "(`pip install 'futuresrl-x[live]'` or `pip install ib_async`) or inject "
+            "(`pip install 'futuresrl[live]'` or `pip install ib_async`) or inject "
             "a raw_contract_factory."
         ) from exc
     exchange = spec.ibkr_exchange if spec is not None else _DEFAULT_EXCHANGE

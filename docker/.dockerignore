@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # docker/.dockerignore
 #
-# Canonical ignore list for the FuturesRL-X backend image. The backend build
+# Canonical ignore list for the FuturesRL backend image. The backend build
 # needs the repository root as context (pyproject.toml + src/ + configs/), so
 # BuildKit only honours a `.dockerignore` located at the *context root*. Use it
 # explicitly when the root file is unavailable:
@@ -9,7 +9,7 @@
 #   docker buildx build \
 #     --ignorefile docker/.dockerignore \
 #     -f docker/Dockerfile.backend \
-#     -t futuresrlx/backend:1.0.0 .
+#     -t futuresrl/backend:1.0.0 .
 #
 # If you add a root `.dockerignore`, mirror this list there. None of these paths
 # are required by the backend runtime image.

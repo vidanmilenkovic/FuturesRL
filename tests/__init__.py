@@ -1,1 +1,1 @@
-"""FuturesRL-X test suite (offline, deterministic fixtures only)."""
+"""FuturesRL test suite (offline, deterministic fixtures only)."""

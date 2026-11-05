@@ -1,4 +1,4 @@
-"""Immutable domain contracts shared by every FuturesRL-X module.
+"""Immutable domain contracts shared by every FuturesRL module.
 
 This module is the narrow waist of the platform: the data layer, the FinRL-X
 composable pipeline, the LLM/quant risk overlays, the futures contract

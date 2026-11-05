@@ -227,7 +227,7 @@ def test_missing_api_key_raises_actionable_error(provider: str) -> None:
     settings = Settings.model_construct(
         llm_provider=provider, llm_model="unit-test-model", llm_api_key=None
     )
-    with pytest.raises(ValueError, match="FUTURESRLX_LLM_API_KEY"):
+    with pytest.raises(ValueError, match="FUTURESRL_LLM_API_KEY"):
         build_llm_client(settings)
 
 
@@ -241,7 +241,7 @@ def test_vllm_works_without_api_key() -> None:
 
 
 def test_settings_requires_api_key_for_non_offline_provider() -> None:
-    with pytest.raises(ValidationError, match="FUTURESRLX_LLM_API_KEY"):
+    with pytest.raises(ValidationError, match="FUTURESRL_LLM_API_KEY"):
         Settings(llm_provider="openai")
     offline = Settings(llm_provider="offline")
     assert offline.llm_api_key_value is None

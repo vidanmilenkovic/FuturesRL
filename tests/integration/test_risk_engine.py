@@ -1,4 +1,4 @@
-"""Integration tests for the FuturesRL-X risk engine.
+"""Integration tests for the FuturesRL risk engine.
 
 These tests exercise the full ``R_t -> N_i,t`` chain built from the Tier-A LLM
 Risk-First overlay, the Tier-B quantitative overlay and the deterministic

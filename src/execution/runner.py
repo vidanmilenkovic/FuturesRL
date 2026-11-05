@@ -2133,7 +2133,7 @@ def _resolve_hydration_source(settings: Settings, source: str | None) -> str:
 
 
 def _databento_configured(settings: Settings) -> bool:
-    """Whether a Databento API key is configured (``FUTURESRLX_DATABENTO_API_KEY``)."""
+    """Whether a Databento API key is configured (``FUTURESRL_DATABENTO_API_KEY``)."""
     return settings.databento_api_key_value is not None
 
 
@@ -2163,11 +2163,11 @@ def describe_hydration_sources(
     }
     reasons: dict[str, str] = {}
     if not available["databento"]:
-        reasons["databento"] = "FUTURESRLX_DATABENTO_API_KEY is not configured"
+        reasons["databento"] = "FUTURESRL_DATABENTO_API_KEY is not configured"
     if not available["ibkr"]:
         reasons["ibkr"] = (
-            "IBKR historical data requires FUTURESRLX_ENVIRONMENT=paper|live with TWS or IB "
-            "Gateway running and FUTURESRLX_IBKR_PORT set (paper 7497/4002, live 7496/4001)"
+            "IBKR historical data requires FUTURESRL_ENVIRONMENT=paper|live with TWS or IB "
+            "Gateway running and FUTURESRL_IBKR_PORT set (paper 7497/4002, live 7496/4001)"
         )
     if not available["offline"]:
         reasons["offline"] = (

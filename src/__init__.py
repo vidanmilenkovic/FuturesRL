@@ -1,4 +1,4 @@
-"""FuturesRL-X: modular algorithmic futures trading platform.
+"""FuturesRL: modular algorithmic futures trading platform.
 
 Package layout mirrors the architecture specification: ``core`` holds the
 immutable contracts, ``data`` the Databento/IBKR market data layer, and the

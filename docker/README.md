@@ -1,4 +1,4 @@
-# FuturesRL-X · Docker deployment
+# FuturesRL · Docker deployment
 
 Containerised deployment of the full platform: FastAPI telemetry backend,
 Next.js dashboard, TimescaleDB, Redis and a headless IB Gateway (paper) for
@@ -36,7 +36,7 @@ docker compose -f docker/docker-compose.yml up --build
 | frontend     | <http://localhost:3100>       | Next.js dashboard; shows DEMO DATA if the API is down       |
 | backend      | <http://localhost:8000>       | REST `/api/*`, `/health`, `/ws/telemetry`, OpenAPI `/docs`  |
 | ib-gateway   | `127.0.0.1:4003` (paper API)  | VNC/noVNC on `127.0.0.1:5900` for the Gateway login screen   |
-| timescaledb  | `127.0.0.1:5432` (loopback)   | internal `timescaledb:5432` on `futuresrlx_net`             |
+| timescaledb  | `127.0.0.1:5432` (loopback)   | internal `timescaledb:5432` on `futuresrl_net`             |
 | redis        | internal `redis:6379`         | not published to the host                                   |
 
 The backend starts in **offline mode** when IBKR/Databento are unavailable: it
@@ -57,7 +57,7 @@ serves deterministic fixture data, so the stack remains demo-able end-to-end.
 > context (`pyproject.toml` + `src/` + `configs/`). Docker only reads a
 > `.dockerignore` from the context root; if the repository has no root
 > `.dockerignore`, pass this one explicitly:
-> `docker buildx build --ignorefile docker/.dockerignore -f docker/Dockerfile.backend -t futuresrlx/backend:1.0.0 .`
+> `docker buildx build --ignorefile docker/.dockerignore -f docker/Dockerfile.backend -t futuresrl/backend:1.0.0 .`
 > The frontend build uses the small `frontend/` context and therefore honours
 > `frontend/.dockerignore`.
 
@@ -68,14 +68,14 @@ lives in `.env.example`; the important ones:
 
 | Variable                       | Default                | Description                                                        |
 | ------------------------------ | ---------------------- | ------------------------------------------------------------------ |
-| `FUTURESRLX_ENVIRONMENT`       | `paper`                | `development` / `paper` / `live` / `backtest`                      |
-| `POSTGRES_USER/PASSWORD/DB`    | `futuresrlx`           | TimescaleDB credentials (change the password)                      |
+| `FUTURESRL_ENVIRONMENT`       | `paper`                | `development` / `paper` / `live` / `backtest`                      |
+| `POSTGRES_USER/PASSWORD/DB`    | `futuresrl`           | TimescaleDB credentials (change the password)                      |
 | `REDIS_PASSWORD`               | `change-me-redis`      | Redis AUTH password                                                |
 | `TWS_USERID` / `TWS_PASSWORD`  | *(empty)*              | IBKR **paper** credentials for the headless gateway                |
 | `IB_GATEWAY_PORT`              | `4003`                 | Published paper Gateway API port (loopback only)                    |
-| `FUTURESRLX_IBKR_HOST`         | `ib-gateway`           | Hostname the backend uses to reach the Gateway                     |
-| `FUTURESRLX_IBKR_PORT`         | `4003`                 | Paper Gateway API port inside the compose network                  |
-| `FUTURESRLX_API_ENABLE_IBKR`   | `0`                    | `1` attempts a real IBKR session (offline simulated fallback stays) |
+| `FUTURESRL_IBKR_HOST`         | `ib-gateway`           | Hostname the backend uses to reach the Gateway                     |
+| `FUTURESRL_IBKR_PORT`         | `4003`                 | Paper Gateway API port inside the compose network                  |
+| `FUTURESRL_API_ENABLE_IBKR`   | `0`                    | `1` attempts a real IBKR session (offline simulated fallback stays) |
 | `DATABENTO_API_KEY`            | *(empty)*              | Optional; blank → offline deterministic fixtures                   |
 | `API_PORT`                     | `8000`                 | Published backend port                                             |
 | `FRONTEND_PORT`                | `3100`                 | Published dashboard port                                           |

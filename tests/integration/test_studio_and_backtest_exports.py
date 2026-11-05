@@ -662,7 +662,7 @@ def _seed_risk_state(settings: Settings) -> None:
 def test_risk_state_fields_and_reset_lock_flow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("FUTURESRLX_OPERATOR_RESET_TOKEN", raising=False)
+    monkeypatch.delenv("FUTURESRL_OPERATOR_RESET_TOKEN", raising=False)
     settings = _reset_settings(tmp_path)
     _seed_risk_state(settings)
     app = create_app(settings, clock=lambda: FIXED_CLOCK)
@@ -723,7 +723,7 @@ def test_risk_state_fields_and_reset_lock_flow(
 def test_reset_lock_operator_token_enforcement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FUTURESRLX_OPERATOR_RESET_TOKEN", "s3cret-token")
+    monkeypatch.setenv("FUTURESRL_OPERATOR_RESET_TOKEN", "s3cret-token")
     try:
         settings = _reset_settings(tmp_path)
         app = create_app(settings, clock=lambda: FIXED_CLOCK)
@@ -751,7 +751,7 @@ def test_reset_lock_operator_token_enforcement(
             )
             assert header_token.status_code == 200, header_token.text
     finally:
-        monkeypatch.delenv("FUTURESRLX_OPERATOR_RESET_TOKEN", raising=False)
+        monkeypatch.delenv("FUTURESRL_OPERATOR_RESET_TOKEN", raising=False)
 
 
 def test_paper_state_reset_clears_bridge_and_store(tmp_path: Path) -> None:

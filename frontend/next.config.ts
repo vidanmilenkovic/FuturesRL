@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 /**
- * FuturesRL-X dashboard build configuration.
+ * FuturesRL dashboard build configuration.
  *
  * - `output: "standalone"` keeps the production Docker image small (only the
  *   server bundle + pruned node_modules are copied into the runner stage).

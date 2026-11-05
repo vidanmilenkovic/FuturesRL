@@ -134,7 +134,7 @@ export function RebalanceBar({
       getPipeline(),
     ]);
     if (typeof window !== "undefined") {
-      window.dispatchEvent(new Event("futuresrlx:refresh-execution"));
+      window.dispatchEvent(new Event("futuresrl:refresh-execution"));
     }
     onExecuted?.();
   };

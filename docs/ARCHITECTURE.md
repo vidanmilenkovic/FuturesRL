@@ -1,12 +1,12 @@
 # Architecture
 
-This document describes how FuturesRL-X is put together, which contracts every module relies on,
+This document describes how FuturesRL is put together, which contracts every module relies on,
 and where to extend it. It is the reference for engineers working on the codebase; operational
 instructions live in [USER_GUIDE.md](USER_GUIDE.md).
 
 ## 1. Design goals
 
-FuturesRL-X is research infrastructure for systematic futures strategies. The design favours:
+FuturesRL is research infrastructure for systematic futures strategies. The design favours:
 
 1. **One interface between research and execution.** Every strategy stage produces or consumes the
    same signed target-weight vector; contract conversion happens exactly once, in a deterministic
@@ -309,7 +309,7 @@ Studio. Live telemetry is delivered over `/ws/telemetry`.
   estimates, sectors, exchange symbols, roll rules and standard↔micro mappings.
 - `configs/strategies/*.yaml` — declarative strategy pipelines: stage names plus scalar parameters.
   `configs/strategy.py` defines the typed models and rejects unknown fields.
-- `configs/settings.py` — layered environment configuration (`FUTURESRLX_*` env vars → `.env` →
+- `configs/settings.py` — layered environment configuration (`FUTURESRL_*` env vars → `.env` →
   defaults) with secret redaction and environment/port consistency validation.
 - `configs/macro_calendar.yaml` — Tier-1 macro event calendar for LLM lockouts.
 
@@ -354,7 +354,7 @@ silently running in the wrong mode.
   live IBKR port and `ibkr_paper=false`; inconsistent settings are rejected.
 - **Data provenance**: API payloads and dashboard badges distinguish live, cached-real, delayed and
   synthetic data. Never present fixture values as a live account.
-- **Risk state**: configure `FUTURESRLX_RISK_STATE_STORE_URI` for durable JSON/DuckDB/Redis state in
+- **Risk state**: configure `FUTURESRL_RISK_STATE_STORE_URI` for durable JSON/DuckDB/Redis state in
   paper/live; without it, risk state is in-memory and resets with the process.
 - **Broker/data adapters**: Databento and IBKR integrations are lazy and opt-in; CI exercises them
   through fakes. Real-feed smoke tests belong in a credentialed paper environment.

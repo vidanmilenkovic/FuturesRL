@@ -1,4 +1,4 @@
-"""FuturesRL-X data layer: canonical schema, Parquet cache, ingestion and features.
+"""FuturesRL data layer: canonical schema, Parquet cache, ingestion and features.
 
 Public API
 ----------

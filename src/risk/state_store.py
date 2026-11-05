@@ -618,7 +618,7 @@ class RedisRiskStateStore:
     sync shim, and tests inject a tiny fake.
     """
 
-    def __init__(self, client: object, *, key: str = "futuresrlx:risk_state") -> None:
+    def __init__(self, client: object, *, key: str = "futuresrl:risk_state") -> None:
         if not key:
             raise ValueError("key must be non-empty")
         for method in ("get", "set", "delete"):
@@ -700,6 +700,6 @@ def build_risk_state_store(
         if redis_client is None:
             raise ValueError("redis: location requires an injected redis client")
         return RedisRiskStateStore(
-            redis_client, key=text[len("redis:") :] or "futuresrlx:risk_state"
+            redis_client, key=text[len("redis:") :] or "futuresrl:risk_state"
         )
     return FileRiskStateStore(text)

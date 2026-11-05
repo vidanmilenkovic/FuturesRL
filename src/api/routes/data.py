@@ -112,7 +112,7 @@ def data_inventory(
         "Invalid roots/windows return 422."
     ),
     responses={
-        400: {"description": "Databento API key/SDK unavailable (FUTURESRLX_DATABENTO_API_KEY)"},
+        400: {"description": "Databento API key/SDK unavailable (FUTURESRL_DATABENTO_API_KEY)"},
         402: {"description": "Databento cost guard exceeded (structured detail + override flag)"},
         422: {"description": "Invalid roots/window/timeframe"},
     },

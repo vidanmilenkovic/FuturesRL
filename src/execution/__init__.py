@@ -1,4 +1,4 @@
-"""FuturesRL-X IBKR execution engine.
+"""FuturesRL IBKR execution engine.
 
 Public surface
 -------------

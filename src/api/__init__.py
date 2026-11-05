@@ -1,6 +1,6 @@
-"""FuturesRL-X telemetry API package.
+"""FuturesRL telemetry API package.
 
-FastAPI application exposing the FuturesRL-X platform over REST + WebSocket:
+FastAPI application exposing the FuturesRL platform over REST + WebSocket:
 
 * real-time account/position telemetry and the emergency flatten-all kill switch,
 * the FinRL-X weight pipeline waterfall (``S_t → w_base → w_timing → w_risk → N_i,t``),

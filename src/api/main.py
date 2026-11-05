@@ -1,4 +1,4 @@
-"""FastAPI application factory for the FuturesRL-X telemetry backend.
+"""FastAPI application factory for the FuturesRL telemetry backend.
 
 Run locally::
 
@@ -103,7 +103,7 @@ def create_app(
         app.state.container = active
         await active.start()
         logger.info(
-            "FuturesRL-X API ready (environment=%s, offline_mode=%s)",
+            "FuturesRL API ready (environment=%s, offline_mode=%s)",
             resolved_settings.environment,
             active.offline_mode,
         )
@@ -113,11 +113,11 @@ def create_app(
             await active.stop()
 
     application = FastAPI(
-        title="FuturesRL-X Telemetry API",
+        title="FuturesRL Telemetry API",
         version=API_VERSION,
         summary="Futures-native FinRL-X telemetry, risk and backtest API.",
         description=(
-            "Real-time REST + WebSocket backend for the FuturesRL-X dashboard. "
+            "Real-time REST + WebSocket backend for the FuturesRL dashboard. "
             "Exposes the FinRL-X weight pipeline trace, the LLM Risk-First state "
             "and kill switch, term structure/roll calendar, declarative strategy "
             "configs and deterministic offline backtest tear sheets. Runs fully "
@@ -128,7 +128,7 @@ def create_app(
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_tags=OPENAPI_TAGS,
-        contact={"name": "FuturesRL-X Team"},
+        contact={"name": "FuturesRL Team"},
         license_info={"name": "Proprietary"},
     )
     # Development convenience: allow the documented dashboard ports

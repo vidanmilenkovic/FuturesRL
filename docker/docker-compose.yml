@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# FuturesRL-X full stack
+# FuturesRL full stack
 #
 #   cp docker/.env.example docker/.env        # fill IBKR/DB secrets
 #   docker compose -f docker/docker-compose.yml up --build
@@ -30,9 +30,9 @@ services:
     image: timescale/timescaledb:2.17.2-pg16
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-futuresrlx}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-futuresrlx}
-      POSTGRES_DB: ${POSTGRES_DB:-futuresrlx}
+      POSTGRES_USER: ${POSTGRES_USER:-futuresrl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-futuresrl}
+      POSTGRES_DB: ${POSTGRES_DB:-futuresrl}
       TIMESCALEDB_TELEMETRY: "off"
     ports:
       # Bound to loopback only: never expose the database to the network.
@@ -43,14 +43,14 @@ services:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U ${POSTGRES_USER:-futuresrlx} -d ${POSTGRES_DB:-futuresrlx}",
+          "pg_isready -U ${POSTGRES_USER:-futuresrl} -d ${POSTGRES_DB:-futuresrl}",
         ]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 20s
     networks:
-      - futuresrlx
+      - futuresrl
     logging: *default-logging
 
   # -------------------------------------------------------------------------
@@ -83,7 +83,7 @@ services:
       retries: 10
       start_period: 10s
     networks:
-      - futuresrlx
+      - futuresrl
     logging: *default-logging
 
   # -------------------------------------------------------------------------
@@ -111,7 +111,7 @@ services:
     volumes:
       - ib_gateway_data:/home/ibgateway/Jts
     networks:
-      - futuresrlx
+      - futuresrl
     logging: *default-logging
 
   # -------------------------------------------------------------------------
@@ -122,31 +122,31 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.backend
-    image: futuresrlx/backend:1.0.0
+    image: futuresrl/backend:1.0.0
     restart: unless-stopped
     environment:
-      FUTURESRLX_ENVIRONMENT: ${FUTURESRLX_ENVIRONMENT:-paper}
-      FUTURESRLX_LOG_LEVEL: ${FUTURESRLX_LOG_LEVEL:-INFO}
-      FUTURESRLX_API_HOST: 0.0.0.0
-      FUTURESRLX_API_PORT: "8000"
-      FUTURESRLX_API_CORS_ORIGINS: '["http://localhost:${FRONTEND_PORT:-3100}","http://127.0.0.1:${FRONTEND_PORT:-3100}"]'
-      FUTURESRLX_TELEMETRY_INTERVAL_SECONDS: "1.0"
+      FUTURESRL_ENVIRONMENT: ${FUTURESRL_ENVIRONMENT:-paper}
+      FUTURESRL_LOG_LEVEL: ${FUTURESRL_LOG_LEVEL:-INFO}
+      FUTURESRL_API_HOST: 0.0.0.0
+      FUTURESRL_API_PORT: "8000"
+      FUTURESRL_API_CORS_ORIGINS: '["http://localhost:${FRONTEND_PORT:-3100}","http://127.0.0.1:${FRONTEND_PORT:-3100}"]'
+      FUTURESRL_TELEMETRY_INTERVAL_SECONDS: "1.0"
       # IBKR (paper gateway inside the compose network)
-      FUTURESRLX_IBKR_HOST: ${FUTURESRLX_IBKR_HOST:-ib-gateway}
-      FUTURESRLX_IBKR_PORT: ${FUTURESRLX_IBKR_PORT:-4003}
-      FUTURESRLX_IBKR_CLIENT_ID: ${FUTURESRLX_IBKR_CLIENT_ID:-42}
-      FUTURESRLX_IBKR_PAPER: "true"
+      FUTURESRL_IBKR_HOST: ${FUTURESRL_IBKR_HOST:-ib-gateway}
+      FUTURESRL_IBKR_PORT: ${FUTURESRL_IBKR_PORT:-4003}
+      FUTURESRL_IBKR_CLIENT_ID: ${FUTURESRL_IBKR_CLIENT_ID:-42}
+      FUTURESRL_IBKR_PAPER: "true"
       # 0 = deterministic offline simulated broker (default); set 1 to let the
       # API attempt a real IBKR session (falls back to simulated if unavailable).
-      FUTURESRLX_API_ENABLE_IBKR: ${FUTURESRLX_API_ENABLE_IBKR:-0}
+      FUTURESRL_API_ENABLE_IBKR: ${FUTURESRL_API_ENABLE_IBKR:-0}
       # Optional data provider (blank → offline deterministic fixtures)
-      FUTURESRLX_DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      FUTURESRL_DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
       # Storage
-      FUTURESRLX_DATA_DIR: /app/data
-      FUTURESRLX_DUCKDB_PATH: /app/data/futuresrl_x.duckdb
-      FUTURESRLX_DB_HOST: timescaledb
-      FUTURESRLX_DB_PORT: "5432"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-futuresrlx}:${POSTGRES_PASSWORD:-change-me-futuresrlx}@timescaledb:5432/${POSTGRES_DB:-futuresrlx}
+      FUTURESRL_DATA_DIR: /app/data
+      FUTURESRL_DUCKDB_PATH: /app/data/futuresrl_x.duckdb
+      FUTURESRL_DB_HOST: timescaledb
+      FUTURESRL_DB_PORT: "5432"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-futuresrl}:${POSTGRES_PASSWORD:-change-me-futuresrl}@timescaledb:5432/${POSTGRES_DB:-futuresrl}
       REDIS_URL: redis://:${REDIS_PASSWORD:-change-me-redis}@redis:6379/0
     ports:
       - "${API_PORT:-8000}:8000"
@@ -168,7 +168,7 @@ services:
       retries: 6
       start_period: 25s
     networks:
-      - futuresrlx
+      - futuresrl
     logging: *default-logging
 
   # -------------------------------------------------------------------------
@@ -181,7 +181,7 @@ services:
       args:
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8000/ws/telemetry}
-    image: futuresrlx/frontend:1.0.0
+    image: futuresrl/frontend:1.0.0
     restart: unless-stopped
     ports:
       - "${FRONTEND_PORT:-3100}:3100"
@@ -200,22 +200,22 @@ services:
       retries: 5
       start_period: 20s
     networks:
-      - futuresrlx
+      - futuresrl
     logging: *default-logging
 
 networks:
-  futuresrlx:
-    name: futuresrlx_net
+  futuresrl:
+    name: futuresrl_net
     driver: bridge
 
 volumes:
   timescaledb_data:
-    name: futuresrlx_timescaledb_data
+    name: futuresrl_timescaledb_data
   redis_data:
-    name: futuresrlx_redis_data
+    name: futuresrl_redis_data
   ib_gateway_data:
-    name: futuresrlx_ib_gateway_data
+    name: futuresrl_ib_gateway_data
   backend_data:
-    name: futuresrlx_backend_data
+    name: futuresrl_backend_data
   backend_artifacts:
-    name: futuresrlx_backend_artifacts
+    name: futuresrl_backend_artifacts

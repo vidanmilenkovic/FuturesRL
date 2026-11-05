@@ -1,7 +1,7 @@
 import type { Config } from "tailwindcss";
 
 /**
- * FuturesRL-X workspace design tokens.
+ * FuturesRL workspace design tokens.
  *
  * The palette is deliberately narrow: one canvas, one panel surface, one hover
  * surface, two hairline weights and a handful of signal colours. Accent blue is

@@ -409,7 +409,7 @@ class DatabentoLoader:
         except ImportError as exc:  # pragma: no cover - SDK is installed in CI
             raise RuntimeError(
                 "The Databento SDK is not installed. Install the optional extra "
-                "(`pip install 'futuresrl-x[databento]'` or `pip install databento`) "
+                "(`pip install 'futuresrl[databento]'` or `pip install databento`) "
                 "or use `OfflineBarSource` for deterministic offline research."
             ) from exc
         return cast(Any, databento)
@@ -418,7 +418,7 @@ class DatabentoLoader:
         """Return the configured Databento API key or raise an actionable error."""
         if not self._api_key:
             raise RuntimeError(
-                "No Databento API key configured: set FUTURESRLX_DATABENTO_API_KEY "
+                "No Databento API key configured: set FUTURESRL_DATABENTO_API_KEY "
                 "(or pass api_key=...) before running historical ingestion. "
                 "Offline research/tests must use `OfflineBarSource` instead."
             )
@@ -662,7 +662,7 @@ class DatabentoLoader:
                 raise DatabentoBudgetExceededError(
                     "Databento ingest refused: estimated cost "
                     f"${estimate.estimated_cost_usd:.4f} exceeds the per-job cap ${cap:.2f} "
-                    "(FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB); "
+                    "(FUTURESRL_DATABENTO_MAX_COST_USD_PER_JOB); "
                     f"roots={list(normalised_roots)!r} schema={schema!r} "
                     f"window=[{start_utc.isoformat()}, {end_utc.isoformat()}] "
                     f"dataset={resolved_dataset!r}. No data was downloaded; re-run with "

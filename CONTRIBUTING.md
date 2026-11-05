@@ -1,14 +1,14 @@
-# Contributing to FuturesRL-X
+# Contributing to FuturesRL
 
-Thanks for helping improve FuturesRL-X. This project values deterministic,
+Thanks for helping improve FuturesRL. This project values deterministic,
 auditable research code: a change should be understandable, testable offline,
 and safe to run against a paper account.
 
 ## Development setup
 
 ```bash
-git clone https://github.com/<your-org>/futuresrl-x.git
-cd futuresrl-x
+git clone https://github.com/<your-org>/futuresrl.git
+cd futuresrl
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[all]"

@@ -107,7 +107,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               <path d="M3.5 14.5v-9l3 5 3-5 3 5 3-5v9" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </span>
-          <span className="text-[13px] font-semibold tracking-[-0.01em] text-zinc-100">FuturesRL-X</span>
+          <span className="text-[13px] font-semibold tracking-[-0.01em] text-zinc-100">FuturesRL</span>
         </div>
 
         <nav aria-label="Views" className="ml-1 flex h-12 shrink-0 items-center">

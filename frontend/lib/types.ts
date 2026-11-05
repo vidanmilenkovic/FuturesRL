@@ -1,5 +1,5 @@
 /**
- * Typed contracts shared by the FuturesRL-X dashboard.
+ * Typed contracts shared by the FuturesRL dashboard.
  *
  * These mirror `src/api/schemas.py` (Pydantic) one-to-one: the backend is the
  * source of truth for field names, the frontend never renames or reshapes a

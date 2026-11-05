@@ -147,7 +147,7 @@ class TelemetryBroadcaster:
         """Start the background publisher task (idempotent)."""
         if self._task is not None and not self._task.done():
             return
-        self._task = asyncio.create_task(self._run(), name="futuresrlx-telemetry-publisher")
+        self._task = asyncio.create_task(self._run(), name="futuresrl-telemetry-publisher")
         logger.info("telemetry broadcaster started (interval=%.3fs)", self._interval)
 
     async def stop(self) -> None:

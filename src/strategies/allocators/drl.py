@@ -20,7 +20,7 @@ install raises a :class:`RuntimeError` with the exact install command instead of
 an ``ImportError`` traceback from deep inside a training loop.
 
 ``CPPO`` (Constrained PPO) is not shipped by Stable-Baselines3 itself; the
-FuturesRL-X implementation is PPO trained against the semantic-risk-shaped
+FuturesRL implementation is PPO trained against the semantic-risk-shaped
 reward implemented by the environment (Module 2 hook), which is mathematically
 the Lagrangian relaxation of the constrained objective. That is stated here
 rather than hidden behind an import alias.

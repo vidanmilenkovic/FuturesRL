@@ -1,5 +1,5 @@
 /**
- * Typed API client for the FuturesRL-X FastAPI backend.
+ * Typed API client for the FuturesRL FastAPI backend.
  *
  * Contract: every call site receives `ApiResult<T>` and therefore always has a
  * renderable value — `source: "live"` when FastAPI answered, `source: "demo"`

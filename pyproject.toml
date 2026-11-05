@@ -3,13 +3,13 @@ requires = ["setuptools>=75", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "futuresrl-x"
+name = "futuresrl"
 version = "1.9.0"
-description = "FuturesRL-X: modular, production-grade algorithmic futures trading platform (FinRL-X weight-centric pipeline, futures-native backtesting, IBKR paper/live execution)."
+description = "FuturesRL: modular, production-grade algorithmic futures trading platform (FinRL-X weight-centric pipeline, futures-native backtesting, IBKR paper/live execution)."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "FuturesRL-X Team" }]
+authors = [{ name = "FuturesRL Team" }]
 dependencies = [
     "numpy>=2.0",
     "polars>=1.0",
@@ -48,15 +48,15 @@ dev = [
 optimize = ["optuna>=3.5"]
 # Install the full research/live stack with: pip install -e ".[all]"
 all = [
-    "futuresrl-x[databento,drl,dev,live,optimize]",
+    "futuresrl[databento,drl,dev,live,optimize]",
 ]
 
 [project.scripts]
-futuresrlx-api = "src.api.cli:main"
-futuresrlx-backtest = "src.backtest.engine:main"
-futuresrlx-optimize = "src.backtest.optimizer:main"
-futuresrlx-runner = "src.execution.runner:main"
-futuresrlx-train-drl = "src.strategies.train_drl:main"
+futuresrl-api = "src.api.cli:main"
+futuresrl-backtest = "src.backtest.engine:main"
+futuresrl-optimize = "src.backtest.optimizer:main"
+futuresrl-runner = "src.execution.runner:main"
+futuresrl-train-drl = "src.strategies.train_drl:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

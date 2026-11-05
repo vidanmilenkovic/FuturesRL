@@ -856,9 +856,9 @@ NEUTRAL_TERM_STRUCTURE_DAYS: int = 90
 #: also prints this block so an operator never sees a bare traceback.
 HYDRATION_SOURCE_HINTS: str = (
     "Options: (1) rerun with --offline for deterministic synthetic history; "
-    "(2) start IBKR TWS or IB Gateway and export FUTURESRLX_ENVIRONMENT=paper|live plus "
-    "FUTURESRLX_IBKR_PORT (paper 7497/4002, live 7496/4001); "
-    "(3) set FUTURESRLX_DATABENTO_API_KEY for Databento GLBX.MDP3 history."
+    "(2) start IBKR TWS or IB Gateway and export FUTURESRL_ENVIRONMENT=paper|live plus "
+    "FUTURESRL_IBKR_PORT (paper 7497/4002, live 7496/4001); "
+    "(3) set FUTURESRL_DATABENTO_API_KEY for Databento GLBX.MDP3 history."
 )
 
 
@@ -1122,7 +1122,7 @@ def build_backfill_chain(
         (``databento`` / ``ibkr`` / ``offline``).
     offline_allowed:
         Whether synthetic offline history may be used as a fallback. ``True``
-        for ``--offline`` / ``FUTURESRLX_HYDRATION_SOURCE=offline`` or when the
+        for ``--offline`` / ``FUTURESRL_HYDRATION_SOURCE=offline`` or when the
         operator explicitly opts in; never silently enabled.
 
     Raises
@@ -1146,13 +1146,13 @@ def build_backfill_chain(
         if configured[resolved] is None:
             reasons = {
                 "databento": (
-                    "FUTURESRLX_DATABENTO_API_KEY is not configured (the Databento SDK/API "
+                    "FUTURESRL_DATABENTO_API_KEY is not configured (the Databento SDK/API "
                     "key is required to fetch GLBX.MDP3 history)"
                 ),
                 "ibkr": (
                     "IBKR historical data requires a paper/live environment with TWS or IB "
-                    "Gateway running: set FUTURESRLX_ENVIRONMENT=paper|live and "
-                    "FUTURESRLX_IBKR_PORT (paper 7497/4002, live 7496/4001)"
+                    "Gateway running: set FUTURESRL_ENVIRONMENT=paper|live and "
+                    "FUTURESRL_IBKR_PORT (paper 7497/4002, live 7496/4001)"
                 ),
                 "offline": (
                     "no offline history provider is wired; offline history is only used with "

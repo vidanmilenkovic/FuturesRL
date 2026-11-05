@@ -1,4 +1,4 @@
-# FuturesRL-X developer entry points
+# FuturesRL developer entry points
 PY ?= .venv/bin/python
 
 .PHONY: install lint format format-check type test cov gate dev up backtest api frontend docker

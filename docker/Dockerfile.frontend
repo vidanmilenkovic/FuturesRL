@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # ---------------------------------------------------------------------------
-# FuturesRL-X dashboard (Next.js 15 + TypeScript + Tailwind)
+# FuturesRL dashboard (Next.js 15 + TypeScript + Tailwind)
 #
 # Built from the `frontend/` directory:
-#   docker build -f ../docker/Dockerfile.frontend -t futuresrlx/frontend:1.0.0 .
+#   docker build -f ../docker/Dockerfile.frontend -t futuresrl/frontend:1.0.0 .
 # or through compose:
 #   docker compose -f docker/docker-compose.yml build frontend
 #

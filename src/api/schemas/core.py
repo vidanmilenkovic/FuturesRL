@@ -1,4 +1,4 @@
-"""Typed Pydantic request/response models for the FuturesRL-X telemetry API.
+"""Typed Pydantic request/response models for the FuturesRL telemetry API.
 
 This module is the **frozen JSON contract**: every field name below is consumed
 by ``frontend/lib/types.ts`` one-to-one. Changing a field is a breaking change
@@ -371,7 +371,7 @@ class RiskStateResponse(APIModel):
     lock_until: datetime | None = None
     #: Whether the execution adapter can accept an operator ``POST /api/risk/reset-lock``.
     reset_available: bool = False
-    #: Whether ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is configured (token required).
+    #: Whether ``FUTURESRL_OPERATOR_RESET_TOKEN`` is configured (token required).
     operator_reset_token_required: bool = False
 
 
@@ -412,7 +412,7 @@ class RiskLockResetRequest(StrictModel):
     confirm: str = Field(
         description=f'Must be exactly "{RISK_LOCK_RESET_CONFIRM}".',
     )
-    #: Operator token; required when ``FUTURESRLX_OPERATOR_RESET_TOKEN`` is set.
+    #: Operator token; required when ``FUTURESRL_OPERATOR_RESET_TOKEN`` is set.
     operator_token: str | None = Field(default=None, repr=False)
     #: Alias of ``operator_token`` (accepted for script/frontend ergonomics).
     token: str | None = Field(default=None, repr=False)

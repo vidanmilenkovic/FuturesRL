@@ -39,7 +39,7 @@ export function StudioView() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     const requested = new URLSearchParams(window.location.search).get("timeframe");
-    const stored = window.localStorage.getItem("futuresrlx:studio-timeframe");
+    const stored = window.localStorage.getItem("futuresrl:studio-timeframe");
     const candidate = [requested, stored].find(
       (value): value is DataTimeframe => value !== null && DATA_TIMEFRAMES.includes(value as DataTimeframe),
     );
@@ -48,7 +48,7 @@ export function StudioView() {
 
   useEffect(() => {
     if (typeof window !== "undefined") {
-      window.localStorage.setItem("futuresrlx:studio-timeframe", timeframe);
+      window.localStorage.setItem("futuresrl:studio-timeframe", timeframe);
     }
   }, [timeframe]);
 

@@ -1,6 +1,6 @@
 """FinRL Risk-First "Module 2" reward-shaping penalty.
 
-The penalty is the exact Lagrangian term specified by the FuturesRL-X
+The penalty is the exact Lagrangian term specified by the FuturesRL
 architecture:
 
     ``penalty = lambda * sum_i |w_i| * I(c_i >= tau) * max(0, S_i - theta_safe)``

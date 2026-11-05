@@ -1,8 +1,8 @@
-# FuturesRL-X — User Guide
+# FuturesRL — User Guide
 
 **How to install, run, configure, and operate the platform** — including Databento historical data, IBKR paper/live trading, the dashboard, and the backtest/risk CLIs.
 
-> FuturesRL-X is research and execution infrastructure, **not investment advice**. Futures are leveraged; you can lose more than your initial margin. Paper-trade and run a full backtest before risking live capital.
+> FuturesRL is research and execution infrastructure, **not investment advice**. Futures are leveraged; you can lose more than your initial margin. Paper-trade and run a full backtest before risking live capital.
 
 ---
 
@@ -12,7 +12,7 @@
 2. [Prerequisites](#2-prerequisites)
 3. [Install](#3-install)
 4. [Quick start: run the app](#4-quick-start-run-the-app)
-5. [Configuration (`.env` / `FUTURESRLX_*`)](#5-configuration)
+5. [Configuration (`.env` / `FUTURESRL_*`)](#5-configuration)
 6. [Data sources: Databento, IBKR, offline](#6-data-sources)
 7. [IBKR broker setup (paper & live)](#7-ibkr-broker-setup)
 8. [Running backtests](#8-running-backtests)
@@ -54,7 +54,7 @@ Everything is **offline-capable**: with no credentials the API/dashboard/backtes
 ### Fresh clone
 
 ```bash
-git clone <your-repo-url> futuresrl-x && cd futuresrl-x
+git clone <your-repo-url> futuresrl && cd futuresrl
 
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
@@ -85,11 +85,11 @@ Two terminals:
 
 ```bash
 # Terminal 1 — backend on :8000 (offline/deterministic by default)
-cd futuresrl-x
+cd futuresrl
 .venv/bin/python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
 
 # Terminal 2 — dashboard on :3100
-cd futuresrl-x/frontend
+cd futuresrl/frontend
 npm run dev            # dev server
 # or: npm run build && npm run start   (production build)
 ```
@@ -107,7 +107,7 @@ Open **http://localhost:3100**.
 **Data mode.** The dashboard reads `/health.offline_mode`:
 - `DEMO DATA` badge → backend not running (pure deterministic mock fixtures).
 - backend running with `offline_mode: true` → real pipeline/broker simulation on fixture market data (no paid vendors).
-- `PAPER · IBKR` / `LIVE · IBKR` → backend attached to a real IBKR session (`FUTURESRLX_API_ENABLE_IBKR=1`).
+- `PAPER · IBKR` / `LIVE · IBKR` → backend attached to a real IBKR session (`FUTURESRL_API_ENABLE_IBKR=1`).
 
 Frontend/API base URL is `NEXT_PUBLIC_API_BASE_URL` (default `http://127.0.0.1:8000`); WebSocket `/ws/telemetry` is derived from it. The API's default CORS allow-list includes the dashboard origins `http://localhost:3100` and `http://127.0.0.1:3100` (plus the the compose-mapped dashboard origin).
 
@@ -132,13 +132,13 @@ Stop servers with `Ctrl-C` in each terminal.
 
 `configs/settings.py` (pydantic-settings) reads, in order of precedence:
 
-1. **Environment variables** `FUTURESRLX_*`
+1. **Environment variables** `FUTURESRL_*`
 2. **`.env`** in the repo root (gitignored)
 3. Defaults in `Settings` / `RiskSettings`
 
-Secrets (`FUTURESRLX_DATABENTO_API_KEY`, IBKR account) are `SecretStr` values, redacted from logs/telemetry. **Never commit `.env`** and never put real keys in `.env.example`.
+Secrets (`FUTURESRL_DATABENTO_API_KEY`, IBKR account) are `SecretStr` values, redacted from logs/telemetry. **Never commit `.env`** and never put real keys in `.env.example`.
 
-Nested risk settings use a double underscore: `FUTURESRLX_RISK__MAX_MARGIN_UTILIZATION=0.5`.
+Nested risk settings use a double underscore: `FUTURESRL_RISK__MAX_MARGIN_UTILIZATION=0.5`.
 
 ### Settings reference
 
@@ -146,93 +146,93 @@ Nested risk settings use a double underscore: `FUTURESRLX_RISK__MAX_MARGIN_UTILI
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FUTURESRLX_ENVIRONMENT` | `development` | `development` / `paper` / `live` / `backtest` (paper/live enforce matching IBKR ports) |
-| `FUTURESRLX_LOG_LEVEL` | `INFO` | Python log level |
-| `FUTURESRLX_DATA_DIR` | `./data` | writable data root |
-| `FUTURESRLX_PARQUET_DIR` | `./data/parquet` | partitioned Parquet cache |
-| `FUTURESRLX_DUCKDB_PATH` | `./data/futuresrl_x.duckdb` | DuckDB file (analytics + optional risk state) |
-| `FUTURESRLX_REPORT_DIR` | `./artifacts` | backtest/tear-sheet output |
-| `FUTURESRLX_INSTRUMENTS_PATH` | `configs/instruments.yaml` | instrument master override |
-| `FUTURESRLX_DATABENTO_API_KEY` | _(unset)_ | Databento key (secret) |
-| `FUTURESRLX_DATABENTO_DATASET` | `GLBX.MDP3` | Databento dataset (CME/CBOT/NYMEX/COMEX) |
-| `FUTURESRLX_DATABENTO_DEFAULT_SCHEMA` | `ohlcv-1d` | default bar schema |
-| `FUTURESRLX_DATABENTO_LIVE_ENABLED` | `false` | Databento live feed (off by default) |
+| `FUTURESRL_ENVIRONMENT` | `development` | `development` / `paper` / `live` / `backtest` (paper/live enforce matching IBKR ports) |
+| `FUTURESRL_LOG_LEVEL` | `INFO` | Python log level |
+| `FUTURESRL_DATA_DIR` | `./data` | writable data root |
+| `FUTURESRL_PARQUET_DIR` | `./data/parquet` | partitioned Parquet cache |
+| `FUTURESRL_DUCKDB_PATH` | `./data/futuresrl_x.duckdb` | DuckDB file (analytics + optional risk state) |
+| `FUTURESRL_REPORT_DIR` | `./artifacts` | backtest/tear-sheet output |
+| `FUTURESRL_INSTRUMENTS_PATH` | `configs/instruments.yaml` | instrument master override |
+| `FUTURESRL_DATABENTO_API_KEY` | _(unset)_ | Databento key (secret) |
+| `FUTURESRL_DATABENTO_DATASET` | `GLBX.MDP3` | Databento dataset (CME/CBOT/NYMEX/COMEX) |
+| `FUTURESRL_DATABENTO_DEFAULT_SCHEMA` | `ohlcv-1d` | default bar schema |
+| `FUTURESRL_DATABENTO_LIVE_ENABLED` | `false` | Databento live feed (off by default) |
 
 #### IBKR
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FUTURESRLX_IBKR_HOST` | `127.0.0.1` | TWS/IB Gateway host |
-| `FUTURESRLX_IBKR_PORT` | `7497` | paper TWS `7497`, paper Gateway `4002`, live TWS `7496`, live Gateway `4001` |
-| `FUTURESRLX_IBKR_CLIENT_ID` | `42` | API client id (unique per session) |
-| `FUTURESRLX_IBKR_PAPER` | `true` | must be `false` with a live port |
-| `FUTURESRLX_IBKR_ACCOUNT` | _(unset)_ | optional account filter |
-| `FUTURESRLX_IBKR_CONNECT_TIMEOUT_SECONDS` | `10` | connect timeout |
-| `FUTURESRLX_IBKR_RECONNECT_MAX_ATTEMPTS` | `10` | reconnect attempts with exponential backoff |
-| `FUTURESRLX_IBKR_NIGHTLY_RESET_START_HOUR_ET` / `END_HOUR_ET` | `23` / `0` | IBKR nightly reset window (pins `:45` boundaries) |
+| `FUTURESRL_IBKR_HOST` | `127.0.0.1` | TWS/IB Gateway host |
+| `FUTURESRL_IBKR_PORT` | `7497` | paper TWS `7497`, paper Gateway `4002`, live TWS `7496`, live Gateway `4001` |
+| `FUTURESRL_IBKR_CLIENT_ID` | `42` | API client id (unique per session) |
+| `FUTURESRL_IBKR_PAPER` | `true` | must be `false` with a live port |
+| `FUTURESRL_IBKR_ACCOUNT` | _(unset)_ | optional account filter |
+| `FUTURESRL_IBKR_CONNECT_TIMEOUT_SECONDS` | `10` | connect timeout |
+| `FUTURESRL_IBKR_RECONNECT_MAX_ATTEMPTS` | `10` | reconnect attempts with exponential backoff |
+| `FUTURESRL_IBKR_NIGHTLY_RESET_START_HOUR_ET` / `END_HOUR_ET` | `23` / `0` | IBKR nightly reset window (pins `:45` boundaries) |
 
 #### Risk engine
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FUTURESRLX_RISK__MAX_MARGIN_UTILIZATION` | `0.60` | hard initial-margin ceiling `η_max` |
-| `FUTURESRLX_RISK__MARGIN_WARNING_THRESHOLD` / `MARGIN_CRITICAL_THRESHOLD` | `0.60` / `0.80` | dashboard gauge zones |
-| `FUTURESRLX_RISK__TARGET_ANNUAL_VOLATILITY` | `0.12` | ex-ante vol target |
-| `FUTURESRLX_RISK__MAX_GROSS_LEVERAGE` | `3.0` | gross leverage cap |
-| `FUTURESRLX_RISK__MAX_SINGLE_INSTRUMENT_WEIGHT` / `MAX_SECTOR_WEIGHT` | `0.50` / `0.40` | concentration caps |
-| `FUTURESRLX_RISK__DAILY_MAX_LOSS_PCT` | `0.03` | intraday kill switch |
-| `FUTURESRLX_RISK__TRAILING_STOP_PCT` / `DRAWDOWN_LIMIT_PCT` | `0.10` / `0.20` | HWM stops |
-| `FUTURESRLX_RISK__LLM_CONFIDENCE_THRESHOLD` | `0.70` | `τ` anti-hallucination threshold |
-| `FUTURESRLX_RISK__LLM_SAFE_SCORE` / `LLM_CRITICAL_SCORE` | `1.5` / `4.5` | `θ_safe` / `κ` |
-| `FUTURESRLX_RISK__LLM_SAMPLE_COUNT` | `3` | K samples for confidence/variance filter |
-| `FUTURESRLX_RISK__LLM_CACHE_TTL_SECONDS` | `60` | async LLM assessment cache TTL |
-| `FUTURESRLX_RISK__MACRO_LOCKOUT_MINUTES_BEFORE` / `AFTER` | `30` / `30` | Tier-1 event lockout window |
-| `FUTURESRLX_RISK__MAX_ORDER_CONTRACTS` | `200` | fat-finger limit per order |
-| `FUTURESRLX_RISK__ORDER_RATE_LIMIT_PER_SECOND` | `5` | token-bucket rate |
-| `FUTURESRLX_RISK__DUPLICATE_ORDER_WINDOW_SECONDS` | `1.0` | duplicate suppression window |
-| `FUTURESRLX_RISK__RECONCILE_GRACE_SECONDS` | `30` | open-order grace before drift halt |
-| `FUTURESRLX_RISK__RECONCILIATION_INTERVAL_SECONDS` | `30` | reconciler period |
+| `FUTURESRL_RISK__MAX_MARGIN_UTILIZATION` | `0.60` | hard initial-margin ceiling `η_max` |
+| `FUTURESRL_RISK__MARGIN_WARNING_THRESHOLD` / `MARGIN_CRITICAL_THRESHOLD` | `0.60` / `0.80` | dashboard gauge zones |
+| `FUTURESRL_RISK__TARGET_ANNUAL_VOLATILITY` | `0.12` | ex-ante vol target |
+| `FUTURESRL_RISK__MAX_GROSS_LEVERAGE` | `3.0` | gross leverage cap |
+| `FUTURESRL_RISK__MAX_SINGLE_INSTRUMENT_WEIGHT` / `MAX_SECTOR_WEIGHT` | `0.50` / `0.40` | concentration caps |
+| `FUTURESRL_RISK__DAILY_MAX_LOSS_PCT` | `0.03` | intraday kill switch |
+| `FUTURESRL_RISK__TRAILING_STOP_PCT` / `DRAWDOWN_LIMIT_PCT` | `0.10` / `0.20` | HWM stops |
+| `FUTURESRL_RISK__LLM_CONFIDENCE_THRESHOLD` | `0.70` | `τ` anti-hallucination threshold |
+| `FUTURESRL_RISK__LLM_SAFE_SCORE` / `LLM_CRITICAL_SCORE` | `1.5` / `4.5` | `θ_safe` / `κ` |
+| `FUTURESRL_RISK__LLM_SAMPLE_COUNT` | `3` | K samples for confidence/variance filter |
+| `FUTURESRL_RISK__LLM_CACHE_TTL_SECONDS` | `60` | async LLM assessment cache TTL |
+| `FUTURESRL_RISK__MACRO_LOCKOUT_MINUTES_BEFORE` / `AFTER` | `30` / `30` | Tier-1 event lockout window |
+| `FUTURESRL_RISK__MAX_ORDER_CONTRACTS` | `200` | fat-finger limit per order |
+| `FUTURESRL_RISK__ORDER_RATE_LIMIT_PER_SECOND` | `5` | token-bucket rate |
+| `FUTURESRL_RISK__DUPLICATE_ORDER_WINDOW_SECONDS` | `1.0` | duplicate suppression window |
+| `FUTURESRL_RISK__RECONCILE_GRACE_SECONDS` | `30` | open-order grace before drift halt |
+| `FUTURESRL_RISK__RECONCILIATION_INTERVAL_SECONDS` | `30` | reconciler period |
 
 #### Live news, LLM provider & runner bridge
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FUTURESRLX_LLM_PROVIDER` | `offline` | `offline` (deterministic fixtures) / `openai` / `anthropic` / `deepseek` / `gemini` / `vllm` |
-| `FUTURESRLX_LLM_MODEL` | `gpt-4o-mini` | model identifier passed to the provider adapter |
-| `FUTURESRLX_LLM_BASE_URL` | _(empty)_ | optional custom endpoint (vLLM / OpenAI-compatible proxy); empty = adapter default |
-| `FUTURESRLX_LLM_API_KEY` | _(unset)_ | provider API key (secret; required for non-offline providers) |
-| `FUTURESRLX_NEWS_RSS_FEEDS` | `[]` | JSON list of financial RSS/Atom feed URLs |
-| `FUTURESRLX_NEWS_MAX_ITEMS` | `20` | max headlines per fetch |
-| `FUTURESRLX_NEWS_POLL_INTERVAL_SECONDS` | `300` | background news refresh cadence in the API |
-| `FUTURESRLX_RUNNER_BRIDGE_ENABLED` | `true` | publish runner snapshots to `data/bridge/runner_state.json` |
+| `FUTURESRL_LLM_PROVIDER` | `offline` | `offline` (deterministic fixtures) / `openai` / `anthropic` / `deepseek` / `gemini` / `vllm` |
+| `FUTURESRL_LLM_MODEL` | `gpt-4o-mini` | model identifier passed to the provider adapter |
+| `FUTURESRL_LLM_BASE_URL` | _(empty)_ | optional custom endpoint (vLLM / OpenAI-compatible proxy); empty = adapter default |
+| `FUTURESRL_LLM_API_KEY` | _(unset)_ | provider API key (secret; required for non-offline providers) |
+| `FUTURESRL_NEWS_RSS_FEEDS` | `[]` | JSON list of financial RSS/Atom feed URLs |
+| `FUTURESRL_NEWS_MAX_ITEMS` | `20` | max headlines per fetch |
+| `FUTURESRL_NEWS_POLL_INTERVAL_SECONDS` | `300` | background news refresh cadence in the API |
+| `FUTURESRL_RUNNER_BRIDGE_ENABLED` | `true` | publish runner snapshots to `data/bridge/runner_state.json` |
 
 #### Account currency / FX
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FUTURESRLX_ACCOUNT_CURRENCY` | `USD` | IBKR base currency; `MarketState.equity` is denominated in it |
-| `FUTURESRLX_FX_RATES` | `{}` | JSON `{"EUR": 1.10}` = USD per 1 unit of currency (USD implicit 1.0) |
+| `FUTURESRL_ACCOUNT_CURRENCY` | `USD` | IBKR base currency; `MarketState.equity` is denominated in it |
+| `FUTURESRL_FX_RATES` | `{}` | JSON `{"EUR": 1.10}` = USD per 1 unit of currency (USD implicit 1.0) |
 
-For a non-USD IBKR account, set both, e.g. `FUTURESRLX_ACCOUNT_CURRENCY=EUR` and `FUTURESRLX_FX_RATES='{"EUR": 1.10}'`. The translator converts `E_t` to USD before sizing; a missing rate fails closed (no orders) rather than mis-sizing.
+For a non-USD IBKR account, set both, e.g. `FUTURESRL_ACCOUNT_CURRENCY=EUR` and `FUTURESRL_FX_RATES='{"EUR": 1.10}'`. The translator converts `E_t` to USD before sizing; a missing rate fails closed (no orders) rather than mis-sizing.
 
 #### Production hardening
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FUTURESRLX_RISK_STATE_STORE_URI` | `""` | durable risk state: `""`/`memory:` = in-memory, path = JSON file, `duckdb:` = DuckDB (uses `DUCKDB_PATH`), `redis:<key>` = injected Redis client |
-| `FUTURESRLX_HYDRATION_LOOKBACK_DAYS` | `400` | history window warmed before the first live bar |
-| `FUTURESRLX_HYDRATION_BACKFILL_ENABLED` | `true` | allow the hydrator to backfill missing history |
-| `FUTURESRLX_HYDRATION_SOURCE` | `auto` | backfill source: `auto` / `databento` / `ibkr` / `offline` |
+| `FUTURESRL_RISK_STATE_STORE_URI` | `""` | durable risk state: `""`/`memory:` = in-memory, path = JSON file, `duckdb:` = DuckDB (uses `DUCKDB_PATH`), `redis:<key>` = injected Redis client |
+| `FUTURESRL_HYDRATION_LOOKBACK_DAYS` | `400` | history window warmed before the first live bar |
+| `FUTURESRL_HYDRATION_BACKFILL_ENABLED` | `true` | allow the hydrator to backfill missing history |
+| `FUTURESRL_HYDRATION_SOURCE` | `auto` | backfill source: `auto` / `databento` / `ibkr` / `offline` |
 
 #### API / dashboard
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FUTURESRLX_API_HOST` / `PORT` | `0.0.0.0` / `8000` | FastAPI bind |
-| `FUTURESRLX_API_CORS_ORIGINS` | `http://localhost:3100`, `http://127.0.0.1:3100`  | dashboard origins |
-| `FUTURESRLX_TELEMETRY_INTERVAL_SECONDS` | `1.0` | WebSocket telemetry cadence |
-| `FUTURESRLX_API_ENABLE_IBKR` | `0` (compose) | opt-in real IBKR session in the API container / local `.env` |
-| `FUTURESRLX_ACCOUNT_CURRENCY` | `USD` | IBKR account base currency for ledger/FX normalization |
+| `FUTURESRL_API_HOST` / `PORT` | `0.0.0.0` / `8000` | FastAPI bind |
+| `FUTURESRL_API_CORS_ORIGINS` | `http://localhost:3100`, `http://127.0.0.1:3100`  | dashboard origins |
+| `FUTURESRL_TELEMETRY_INTERVAL_SECONDS` | `1.0` | WebSocket telemetry cadence |
+| `FUTURESRL_API_ENABLE_IBKR` | `0` (compose) | opt-in real IBKR session in the API container / local `.env` |
+| `FUTURESRL_ACCOUNT_CURRENCY` | `USD` | IBKR account base currency for ledger/FX normalization |
 
 ### Instrument master
 
@@ -272,8 +272,8 @@ data/parquet/<dataset>/<schema>/<root>/part.parquet
 2. Put it in `.env` (never in `.env.example` / git):
 
    ```bash
-   FUTURESRLX_DATABENTO_API_KEY=db-xxxxxxxxxxxxxxxx
-   FUTURESRLX_DATABENTO_DATASET=GLBX.MDP3
+   FUTURESRL_DATABENTO_API_KEY=db-xxxxxxxxxxxxxxxx
+   FUTURESRL_DATABENTO_DATASET=GLBX.MDP3
    ```
 
 3. Ingest history (cache-first; re-runs are cheap because of dedupe):
@@ -291,14 +291,14 @@ data/parquet/<dataset>/<schema>/<root>/part.parquet
    continuous = ContinuousContractBuilder().build_frame(bars, root="ES")
    ```
 
-   Or simply let the runner backfill: set `FUTURESRLX_HYDRATION_SOURCE=databento` (or leave `auto` with a key configured) and start it — the cold-start hydrator fetches the lookback window it needs and persists it.
+   Or simply let the runner backfill: set `FUTURESRL_HYDRATION_SOURCE=databento` (or leave `auto` with a key configured) and start it — the cold-start hydrator fetches the lookback window it needs and persists it.
 
 4. Supported schemas: `ohlcv-1m`, `ohlcv-1h`, `ohlcv-1d`, `tbbo`, `mbp-1`, `mbp-10`, `definition`. If the SDK or key is missing the loader raises an actionable error (never silently fabricates vendor data).
 
 ### IBKR historical / live market data
 
 - **Live/paper streaming**: `src/data/ibkr_data.IBKRMarketDataStreamer` streams 5-second bars, ticks and L1/L2 book updates via `ib_async` (requires a running TWS/Gateway).
-- **Historical backfill**: the hydrator can fetch daily bars through IBKR's `reqHistoricalDataAsync` when `FUTURESRLX_HYDRATION_SOURCE=ibkr` (or `auto` with no Databento key and IBKR configured). Fetched bars are validated against the canonical schema and persisted to Parquet, so the next start is offline-cached.
+- **Historical backfill**: the hydrator can fetch daily bars through IBKR's `reqHistoricalDataAsync` when `FUTURESRL_HYDRATION_SOURCE=ibkr` (or `auto` with no Databento key and IBKR configured). Fetched bars are validated against the canonical schema and persisted to Parquet, so the next start is offline-cached.
 
 ### Offline (no credentials)
 
@@ -311,9 +311,9 @@ data/parquet/<dataset>/<schema>/<root>/part.parquet
 
 Hydration source resolution in `auto` mode:
 
-1. Databento (if `FUTURESRLX_DATABENTO_API_KEY` is set) →
+1. Databento (if `FUTURESRL_DATABENTO_API_KEY` is set) →
 2. IBKR historical (if paper/live is configured and reachable) →
-3. Offline source — only when `--offline` or `FUTURESRLX_HYDRATION_SOURCE=offline` →
+3. Offline source — only when `--offline` or `FUTURESRL_HYDRATION_SOURCE=offline` →
 4. Otherwise: clean CLI error explaining the three ways to provide data (no stack trace).
 
 ---
@@ -329,18 +329,18 @@ Hydration source resolution in `auto` mode:
    - Add `127.0.0.1` to *Trusted IPs*
    - Note the socket port: TWS paper **7497**, TWS live **7496**, Gateway paper **4002**, Gateway live **4001**
 3. Create an API client id (any unique int; default `42`).
-4. (Live only) enable futures trading permissions on the account, and set `FUTURESRLX_IBKR_PAPER=false` with a live port. The settings validator refuses inconsistent paper/live combinations.
+4. (Live only) enable futures trading permissions on the account, and set `FUTURESRL_IBKR_PAPER=false` with a live port. The settings validator refuses inconsistent paper/live combinations.
 
 ### `.env` example (paper)
 
 ```bash
-FUTURESRLX_ENVIRONMENT=paper
-FUTURESRLX_IBKR_HOST=127.0.0.1
-FUTURESRLX_IBKR_PORT=7497          # 4002 for headless IB Gateway
-FUTURESRLX_IBKR_CLIENT_ID=42
-FUTURESRLX_IBKR_PAPER=true
-FUTURESRLX_IBKR_ACCOUNT=           # optional
-FUTURESRLX_RISK_STATE_STORE_URI=duckdb:   # durable intraday risk state
+FUTURESRL_ENVIRONMENT=paper
+FUTURESRL_IBKR_HOST=127.0.0.1
+FUTURESRL_IBKR_PORT=7497          # 4002 for headless IB Gateway
+FUTURESRL_IBKR_CLIENT_ID=42
+FUTURESRL_IBKR_PAPER=true
+FUTURESRL_IBKR_ACCOUNT=           # optional
+FUTURESRL_RISK_STATE_STORE_URI=duckdb:   # durable intraday risk state
 ```
 
 ### Validate before trading
@@ -359,15 +359,15 @@ The API backend runs its deterministic offline engine by default: `/health` repo
 reachable and the live runner works. Enable the API-owned IBKR session explicitly:
 
 ```dotenv
-FUTURESRLX_API_ENABLE_IBKR=1
-FUTURESRLX_ENVIRONMENT=paper
-FUTURESRLX_IBKR_HOST=127.0.0.1
-FUTURESRLX_IBKR_PORT=7497
+FUTURESRL_API_ENABLE_IBKR=1
+FUTURESRL_ENVIRONMENT=paper
+FUTURESRL_IBKR_HOST=127.0.0.1
+FUTURESRL_IBKR_PORT=7497
 ```
 
 Then restart `uvicorn`. `/health` should report `"ibkr_connected": true` and
 `"offline_mode": false`, and the ribbon switches to `PAPER · IBKR` (or `LIVE · IBKR` with
-`FUTURESRLX_ENVIRONMENT=live`). The flag is also honored from `docker/.env` in compose. Without it,
+`FUTURESRL_ENVIRONMENT=live`). The flag is also honored from `docker/.env` in compose. Without it,
 `OFFLINE ENGINE` is correct even if TWS is connected — the dashboard is not attached to the broker.
 Alternatively, run a separate `TradingRunner` (which publishes the runner bridge) and the ribbon also
 reports `PAPER · IBKR` / `LIVE · IBKR` from a fresh bridge snapshot.
@@ -380,8 +380,8 @@ IBKR reports the ledger in the account's base currency. If that is not USD, set 
 currency and the USD-per-unit FX rate so notional/margin math is correct:
 
 ```dotenv
-FUTURESRLX_ACCOUNT_CURRENCY=EUR
-FUTURESRLX_FX_RATES={"EUR": 1.1216}   # reference rate, update periodically
+FUTURESRL_ACCOUNT_CURRENCY=EUR
+FUTURESRL_FX_RATES={"EUR": 1.1216}   # reference rate, update periodically
 ```
 
 Otherwise `fetch_account` cannot find a usable NetLiquidation row (e.g. a EUR ledger is rejected
@@ -489,7 +489,7 @@ margin settlement and daily-loss resets use UTC calendar days for intraday bars.
 (Free)** and **Backfill Parquet Cache**; the API opens a dedicated IBKR historical session, resolves
 the active front-month contract and writes bars plus `source="ibkr"` provenance. If TWS is
 unreachable the UI shows the exact backend detail (host:port); Databento failures distinguish a
-missing `FUTURESRLX_DATABENTO_API_KEY` (400) from the hard cost guard (402, `$X > $Y cap`) and never
+missing `FUTURESRL_DATABENTO_API_KEY` (400) from the hard cost guard (402, `$X > $Y cap`) and never
 download data when refused. Databento over-budget jobs require the explicit confirmation toggle.
 
 **Live account consistency.** When IBKR is connected, `/api/pipeline/latest` and the Command
@@ -501,7 +501,7 @@ the 45 roots have real cached Parquet bars and their date span/size. Choose root
 range, then `IBKR Historical (Free)` or `Databento Pay-As-You-Go`; **Check Cost** shows the estimated
 USD and billable MB. **Backfill Parquet Cache** writes `ohlcv-1d` bars into `data/parquet/` and
 builds continuous F1/F2 series. Databento jobs are hard-guarded by
-`FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB` (default $2.00 per job); an over-budget job is refused
+`FUTURESRL_DATABENTO_MAX_COST_USD_PER_JOB` (default $2.00 per job); an over-budget job is refused
 unless you explicitly enable the over-budget confirmation. The UI disables unavailable sources and
 never reports a fake success.
 
@@ -520,7 +520,7 @@ then refreshes positions/working orders/fills and the runner bridge. `python -m
 src.execution.runner --strategy ... --roots ... --backfill-source ibkr --rebalance-once` performs the
 same one-shot cycle from the console without opening a market-data stream.
 
-**IBKR delayed data / contract resolution.** `FUTURESRLX_IBKR_MARKET_DATA_TYPE` defaults to `3`
+**IBKR delayed data / contract resolution.** `FUTURESRL_IBKR_MARKET_DATA_TYPE` defaults to `3`
 (delayed). The streamer resolves each root's active front month and qualifies its `conId` before any
 subscription; if TWS reports no paid tick bundle (10189/10090/354) it falls back to delayed/historical
 polling and exposes diagnostics instead of crashing. Set the variable to `1` only when the account has
@@ -547,7 +547,7 @@ runs shows a **Parameter Diff** accordion with changed dotted paths and Run A/Ru
 
 **Risk-lock reset & operator controls.** When a kill switch is active the Command Center risk-budget
 drawer shows **Reset Risk Lock / Resume Execution** (double confirmation, plus
-`FUTURESRLX_OPERATOR_RESET_TOKEN` when set: `POST /api/risk/reset-lock`). The operator drawer can
+`FUTURESRL_OPERATOR_RESET_TOKEN` when set: `POST /api/risk/reset-lock`). The operator drawer can
 **Clear Paper State** (`POST /api/maintenance/reset-paper-state`, paper/backtest only) and reset the
 runner bridge; both are guarded, idempotent and return receipts.
 
@@ -565,7 +565,7 @@ the Backtest Lab `WF · N folds` badge binds the actual `n_folds`/`wf_splits`.
 
 ### IBKR reconnects, stale books and the data-mode badge
 
-When `FUTURESRLX_API_ENABLE_IBKR=1`, the backend now reports dynamic liveness:
+When `FUTURESRL_API_ENABLE_IBKR=1`, the backend now reports dynamic liveness:
 `/health` gains `ibkr_enabled`, `ibkr_reconnecting` and `ibkr_last_error`; `offline_mode` is true only
 while the broker session is unavailable. Restarting/logging back into TWS is picked up automatically
 (heartbeat + 5 s liveness probe) and the ribbon returns to `PAPER · IBKR`/`LIVE · IBKR`; while
@@ -578,8 +578,8 @@ cannot block recovery. Link-level ledger reads are serialised and use `accountSu
 request/response source, with the streaming account updates as a fallback.
 
 If the broker reports the ledger in a different base currency than
-`FUTURESRLX_ACCOUNT_CURRENCY`, the API logs a warning and uses the broker's actual ledger currency
-instead of failing; set `FUTURESRLX_ACCOUNT_CURRENCY` and `FUTURESRLX_FX_RATES` to match so USD
+`FUTURESRL_ACCOUNT_CURRENCY`, the API logs a warning and uses the broker's actual ledger currency
+instead of failing; set `FUTURESRL_ACCOUNT_CURRENCY` and `FUTURESRL_FX_RATES` to match so USD
 notional/risk sizing stays correct.
 
 When connected to IBKR, the Command Center's risk-budget **Portfolio volatility** is computed
@@ -623,9 +623,9 @@ WSL reaches the Windows host through the default gateway of its virtual network:
 Set it in `.env` (or export it — shell exports take precedence over `.env`):
 
 ```dotenv
-FUTURESRLX_ENVIRONMENT=paper
-FUTURESRLX_IBKR_HOST=172.20.16.1   # Windows host IP from above
-FUTURESRLX_IBKR_PORT=7497          # 4002 for IB Gateway
+FUTURESRL_ENVIRONMENT=paper
+FUTURESRL_IBKR_HOST=172.20.16.1   # Windows host IP from above
+FUTURESRL_IBKR_PORT=7497          # 4002 for IB Gateway
 ```
 
 In TWS *Global Configuration → API → Settings*: enable *ActiveX and Socket Clients*, use port 7497,
@@ -653,7 +653,7 @@ wsl --shutdown
 ```
 
 Restart WSL (and this workspace). `127.0.0.1:7497` then reaches TWS directly, so keep
-`FUTURESRLX_IBKR_HOST=127.0.0.1` in `.env`, and add `127.0.0.1` to TWS *Trusted IPs* to skip the
+`FUTURESRL_IBKR_HOST=127.0.0.1` in `.env`, and add `127.0.0.1` to TWS *Trusted IPs* to skip the
 prompt.
 
 **Verify the socket explicitly** (this is what triggers TWS's approval prompt):
@@ -682,7 +682,7 @@ Firewall blocks the WSL subnet. As Administrator:
 New-NetFirewallRule -DisplayName "IBKR API 7497" -Direction Inbound -Protocol TCP -LocalPort 7497 -Action Allow
 ```
 
-Shell exports override `.env`: if you previously exported `FUTURESRLX_IBKR_HOST=127.0.0.1`, `unset`
+Shell exports override `.env`: if you previously exported `FUTURESRL_IBKR_HOST=127.0.0.1`, `unset`
 it or export the host IP in the current terminal. Alternatively run a headless **IB Gateway inside
 Docker in WSL** (`docker compose -f docker/docker-compose.yml up ib-gateway`) and use `127.0.0.1`
 with the Gateway port.
@@ -771,9 +771,9 @@ This hydrates from the offline source, builds a simulated broker/streamer, runs 
 ### Paper / live
 
 ```bash
-export FUTURESRLX_ENVIRONMENT=paper
-export FUTURESRLX_IBKR_PORT=7497          # or 4002 for Gateway
-export FUTURESRLX_RISK_STATE_STORE_URI=duckdb:
+export FUTURESRL_ENVIRONMENT=paper
+export FUTURESRL_IBKR_PORT=7497          # or 4002 for Gateway
+export FUTURESRL_RISK_STATE_STORE_URI=duckdb:
 
 .venv/bin/python -m src.execution.runner \
   --strategy configs/strategies/tsmom_vol_target.yaml \
@@ -796,14 +796,14 @@ Startup sequence (in order):
 ### What the live runner needs
 
 - TWS/IB Gateway running and API-enabled (§7)
-- `FUTURESRLX_ENVIRONMENT=paper|live` with matching port
-- a writable Parquet cache (`FUTURESRLX_PARQUET_DIR`) for hydration
-- optionally `FUTURESRLX_RISK_STATE_STORE_URI` so restarts/nightly resets keep risk state
+- `FUTURESRL_ENVIRONMENT=paper|live` with matching port
+- a writable Parquet cache (`FUTURESRL_PARQUET_DIR`) for hydration
+- optionally `FUTURESRL_RISK_STATE_STORE_URI` so restarts/nightly resets keep risk state
 
 ### Live runner ↔ API bridge
 
 The API and a `TradingRunner` process can share live state when both use the same
-`FUTURESRLX_DATA_DIR`. The runner publishes an atomic snapshot to
+`FUTURESRL_DATA_DIR`. The runner publishes an atomic snapshot to
 `data/bridge/runner_state.json` after every processed state (`RunnerBridgeStore`); the API then
 serves the runner's book:
 
@@ -855,26 +855,26 @@ Checkpoint observation layout must match the configured universe/features (recor
 ### Live news & LLM provider
 
 `src/data/news_ingestor.py` resolves headlines in this order: **RSS feeds** (when
-`FUTURESRLX_NEWS_RSS_FEEDS` is set) → **IBKR news** (when an IBKR client is connected) →
+`FUTURESRL_NEWS_RSS_FEEDS` is set) → **IBKR news** (when an IBKR client is connected) →
 **deterministic fixtures** (offline). The API serves them in the Risk & LLM Monitor (`news_source`
 reports provenance).
 
 To switch the LLM Risk-First engine from fixtures to real inference, set in `.env`:
 
 ```bash
-FUTURESRLX_LLM_PROVIDER=openai          # or anthropic / deepseek / gemini / vllm
-FUTURESRLX_LLM_MODEL=gpt-4o-mini
-FUTURESRLX_LLM_API_KEY=sk-...
-# FUTURESRLX_LLM_BASE_URL=http://vllm-host:8000/v1   # optional
+FUTURESRL_LLM_PROVIDER=openai          # or anthropic / deepseek / gemini / vllm
+FUTURESRL_LLM_MODEL=gpt-4o-mini
+FUTURESRL_LLM_API_KEY=sk-...
+# FUTURESRL_LLM_BASE_URL=http://vllm-host:8000/v1   # optional
 ```
 
 Hosted providers (`openai`, `anthropic`, `deepseek`, `gemini`) require
-`FUTURESRLX_LLM_API_KEY`. Google Gemini is supported through its OpenAI-compatible endpoint
+`FUTURESRL_LLM_API_KEY`. Google Gemini is supported through its OpenAI-compatible endpoint
 (default base `https://generativelanguage.googleapis.com/v1beta/openai`, e.g.
-`FUTURESRLX_LLM_MODEL=gemini-2.5-flash`); set `FUTURESRLX_LLM_BASE_URL` only for a proxy.
-The local `vllm` provider is **keyless**: point `FUTURESRLX_LLM_BASE_URL` at the
+`FUTURESRL_LLM_MODEL=gemini-2.5-flash`); set `FUTURESRL_LLM_BASE_URL` only for a proxy.
+The local `vllm` provider is **keyless**: point `FUTURESRL_LLM_BASE_URL` at the
 OpenAI-compatible vLLM server (default `http://localhost:8000/v1`) and leave
-`FUTURESRLX_LLM_API_KEY` empty.
+`FUTURESRL_LLM_API_KEY` empty.
 
 All LLM outputs remain subject to the confidence/variance filter and the deterministic circuit
 breaker; slow multi-sample calls are served from the async TTL cache and never block the pipeline.
@@ -898,7 +898,7 @@ breaker; slow multi-sample calls are served from the async TTL cache and never b
 
 ### Thresholds
 
-Live via dashboard Risk view → *Apply Changes* → `PUT /api/risk/thresholds`, or edit `.env` `FUTURESRLX_RISK__*` and restart. Overrides are validated (e.g. `θ_safe < κ`, warning < critical margin).
+Live via dashboard Risk view → *Apply Changes* → `PUT /api/risk/thresholds`, or edit `.env` `FUTURESRL_RISK__*` and restart. Overrides are validated (e.g. `θ_safe < κ`, warning < critical margin).
 
 ### Macro lockouts
 
@@ -906,7 +906,7 @@ Live via dashboard Risk view → *Apply Changes* → `PUT /api/risk/thresholds`,
 
 ### Durable state
 
-With `FUTURESRLX_RISK_STATE_STORE_URI` set, the following survive restarts and IBKR nightly resets:
+With `FUTURESRL_RISK_STATE_STORE_URI` set, the following survive restarts and IBKR nightly resets:
 
 - `starting_daily_nlv` (daily loss baseline)
 - portfolio & per-instrument high-water marks
@@ -917,7 +917,7 @@ Day roll (UTC date change) resets the daily counter but deliberately keeps high-
 
 ### Reconciliation
 
-Every 30 s (`FUTURESRLX_RISK__RECONCILIATION_INTERVAL_SECONDS`) the reconciler compares internal book vs broker. In-flight working orders (including partial fills) are added to the broker position; drift is only flagged/halted when it is unexplained for longer than `RECONCILE_GRACE_SECONDS`. On drift: automated rebalancing halts, an alert is emitted; investigate and `resume()` after approval.
+Every 30 s (`FUTURESRL_RISK__RECONCILIATION_INTERVAL_SECONDS`) the reconciler compares internal book vs broker. In-flight working orders (including partial fills) are added to the broker position; drift is only flagged/halted when it is unexplained for longer than `RECONCILE_GRACE_SECONDS`. On drift: automated rebalancing halts, an alert is emitted; investigate and `resume()` after approval.
 
 ---
 
@@ -928,7 +928,7 @@ cp docker/.env.example docker/.env      # edit credentials/ports
 docker compose -f docker/docker-compose.yml up --build
 ```
 
-Services: TimescaleDB, Redis, headless IB Gateway (paper), FastAPI backend (:8000), Next.js frontend (:3100). The backend runs offline/demo by default; set `FUTURESRLX_API_ENABLE_IBKR=1` in `docker/.env` to attach a real IBKR session. Healthchecks gate startup order.
+Services: TimescaleDB, Redis, headless IB Gateway (paper), FastAPI backend (:8000), Next.js frontend (:3100). The backend runs offline/demo by default; set `FUTURESRL_API_ENABLE_IBKR=1` in `docker/.env` to attach a real IBKR session. Healthchecks gate startup order.
 
 Without a Docker daemon (e.g. this workspace host) use the local runs in §4/§8/§9 instead; CI (`.github/workflows/ci.yml`) builds both images on push.
 
@@ -941,7 +941,7 @@ Without a Docker daemon (e.g. this workspace host) use the local runs in §4/§8
 ./scripts/quality_gate.sh --cov    # + ≥85% coverage on core/risk/translator modules
 ```
 
-The gate is hermetic: it unsets any inherited `FUTURESRLX_*` variables, and `tests/conftest.py` has an autouse fixture that strips them and ignores `.env` per test — so exporting `FUTURESRLX_ENVIRONMENT=paper` in your shell can never change test results. All tests are offline and deterministic (no paid/vendor calls; adapters are injected fakes).
+The gate is hermetic: it unsets any inherited `FUTURESRL_*` variables, and `tests/conftest.py` has an autouse fixture that strips them and ignores `.env` per test — so exporting `FUTURESRL_ENVIRONMENT=paper` in your shell can never change test results. All tests are offline and deterministic (no paid/vendor calls; adapters are injected fakes).
 
 Useful subsets:
 
@@ -958,15 +958,15 @@ Useful subsets:
 
 | Symptom | Cause / fix |
 |---|---|
-| `HydrationError: ... No Databento API key configured` | Empty cache and no data source. Set `FUTURESRLX_DATABENTO_API_KEY`, start TWS/IB Gateway and use `--backfill-source ibkr`, or pass `--offline` for a synthetic dry run. |
+| `HydrationError: ... No Databento API key configured` | Empty cache and no data source. Set `FUTURESRL_DATABENTO_API_KEY`, start TWS/IB Gateway and use `--backfill-source ibkr`, or pass `--offline` for a synthetic dry run. |
 | Runner prints a long traceback at startup | Fixed: CLI now prints an actionable message and exits `2`. If you see a traceback, check you are on the current branch/build. |
 | `could not connect to IBKR ...` | TWS/Gateway not running, API not enabled, wrong port, or client-id already in use. Check *Global Configuration → API*, ports 7497/4002 (paper) or 7496/4001 (live). |
-| `live environment requires an IBKR live port` | `FUTURESRLX_ENVIRONMENT=live` with paper port (or `ibkr_paper=true`). Fix the env pair. |
+| `live environment requires an IBKR live port` | `FUTURESRL_ENVIRONMENT=live` with paper port (or `ibkr_paper=true`). Fix the env pair. |
 | Dashboard shows `UI FALLBACK` | Backend not running/reachable on `127.0.0.1:8000`. Start terminal 1; refresh. |
 | Port already in use | API: `--port 8001` (+ `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8001`); dashboard is **3100** (`next dev -p 3100`). The Docker Compose frontend also defaults to **3100**. |
 | `RuntimeWarning: 'src.backtest.engine' found in sys.modules` | Fixed by lazy package `__init__`; rebuild/use current commit. |
 | Gym `Box observation space minimum is -infinity` warning | Fixed with finite bounds; use current commit. |
-| Tests fail only on your machine | A host `FUTURESRLX_*` export or `.env` used to leak in — fixed by hermetic fixtures; if you see it, run `git status` / verify conftest on the current commit. |
+| Tests fail only on your machine | A host `FUTURESRL_*` export or `.env` used to leak in — fixed by hermetic fixtures; if you see it, run `git status` / verify conftest on the current commit. |
 | `margin utilization` -> `whatIf` rejection | Order would exceed `η_max` after margin impact; reduce gross/target or raise `RISK__MAX_MARGIN_UTILIZATION` deliberately. |
 | `kill switch engaged: ...` on startup | Persisted lock (daily loss/drawdown/operator). Review `/api/risk/state`, fix the cause, then `oms.reset_kill_switch()` / API reset. |
 | `reconciliation drift` | OMS/broker mismatch, or open orders older than the grace window. Check `/api/positions`, TWS positions, working orders; `approve_drift`/`resume` only after manual verification. |
@@ -975,10 +975,10 @@ Useful subsets:
 | Optimizer absent / slow | `optuna` is optional: install with `pip install -e ".[optimize]"` or rely on the deterministic fallback; use fewer trials/folds for quick studies. |
 | DRL train request times out | Training is synchronous and bounded to 20k timesteps; PPO enforces a 2048-step first rollout, so tiny budgets still take seconds. Use `timesteps>=256` and prefer `device=cpu` for smoke runs. |
 | Dashboard shows `UI FALLBACK` with the API running | Browser origin not in CORS (defaults include :3100) or wrong `NEXT_PUBLIC_API_BASE_URL`; check the API `/health` and browser console. |
-| Orders/fills empty while a runner is active | Runner and API must share `FUTURESRLX_DATA_DIR`; check `/api/runner/status` (bridge stale > 15 s means the runner stopped publishing) and `data/bridge/runner_state.json`. |
+| Orders/fills empty while a runner is active | Runner and API must share `FUTURESRL_DATA_DIR`; check `/api/runner/status` (bridge stale > 15 s means the runner stopped publishing) and `data/bridge/runner_state.json`. |
 | `POST /api/runner/step` returns 503 | `OfflineRunnerSession` unavailable (execution package import failed); check server logs/`pip install -e .`. |
 | DRL training fails | Install the DRL extra (`pip install -e ".[drl]"`); check checkpoint algorithm matches `drl.algorithm`; inspect `<checkpoint>.meta.json`. |
-| Batch/API feed returns fixtures | `news_source`/`data_source` fields state provenance; configure `FUTURESRLX_NEWS_RSS_FEEDS` or IBKR for live news. |
+| Batch/API feed returns fixtures | `news_source`/`data_source` fields state provenance; configure `FUTURESRL_NEWS_RSS_FEEDS` or IBKR for live news. |
 | Databento `403/authentication` | Wrong/expired key, dataset entitlement missing (e.g. `GLBX.MDP3`), or IP restriction. |
 
 Logs: `data/` holds cache; `artifacts/` holds tear sheets; API logs to stdout; runner logs to stderr with `run_id`/state telemetry.
@@ -988,7 +988,7 @@ Logs: `data/` holds cache; `artifacts/` holds tear sheets; API logs to stdout; r
 ## 14. Security & safety notes
 
 - **Never commit `.env`** or real API keys. `.env.example` must stay placeholder-only (the quality gate/tests do not require secrets).
-- Use IBKR **paper** first; set `FUTURESRLX_ENVIRONMENT=live` deliberately and verify ports/account before enabling.
+- Use IBKR **paper** first; set `FUTURESRL_ENVIRONMENT=live` deliberately and verify ports/account before enabling.
 - The pre-trade gate is mandatory: fat-finger size, duplicate/rapid-fire rate limiting, and real-time `whatIfOrder` margin impact. Live trading refuses to start when the persisted kill switch is latched.
 - LLM outputs are schema-validated, confidence-filtered and only applied through bounded deterministic projections. Treat news/macro text as untrusted data.
 - Reconcile and monitor; never disable the pre-trade gate or reconciler on a live account without a documented operator override.

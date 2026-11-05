@@ -1,4 +1,4 @@
-"""Canonical multi-timeframe registry for FuturesRL-X.
+"""Canonical multi-timeframe registry for FuturesRL.
 
 Single source of truth for the supported bar timeframes: the Polars window
 duration, the IBKR historical bar-size string, the Databento schema used to

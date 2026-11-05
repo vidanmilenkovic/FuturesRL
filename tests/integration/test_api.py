@@ -1,4 +1,4 @@
-"""Integration tests for the FuturesRL-X REST telemetry API.
+"""Integration tests for the FuturesRL REST telemetry API.
 
 Every test runs fully offline against the deterministic fixture clock: no
 Databento key, no IBKR/TWS session and no network. The suite exercises the real
@@ -67,7 +67,7 @@ def test_health_reports_offline_fixture_mode(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["status"] in {"ok", "degraded"}
-    assert body["app_name"] == "FuturesRL-X"
+    assert body["app_name"] == "FuturesRL"
     assert body["version"] == "1.9.0"
     assert body["environment"] == "backtest"
     assert body["offline_mode"] is True
@@ -83,7 +83,7 @@ def test_cors_allows_configured_dashboard_origin(client: TestClient) -> None:
 
 def test_openapi_metadata_and_docs(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
-    assert schema["info"]["title"] == "FuturesRL-X Telemetry API"
+    assert schema["info"]["title"] == "FuturesRL Telemetry API"
     assert schema["info"]["version"] == "1.9.0"
     paths = schema["paths"]
     for route in (
@@ -526,7 +526,7 @@ def test_ibkr_wiring_never_serves_simulated_book(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """IBKR enabled without a session: honest unavailable state, never fake positions."""
-    monkeypatch.setenv("FUTURESRLX_API_ENABLE_IBKR", "1")
+    monkeypatch.setenv("FUTURESRL_API_ENABLE_IBKR", "1")
     settings = _settings(tmp_path).model_copy(
         update={
             "ibkr_connect_timeout_seconds": 0.1,

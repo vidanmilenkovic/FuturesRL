@@ -857,7 +857,7 @@ def test_api_estimate_cost_timeframe_and_errors(tmp_path: Path) -> None:
         assert response.status_code == 400, response.text
         detail = response.json()["detail"]
         assert detail["error"] == "databento_api_key_missing"
-        assert "FUTURESRLX_DATABENTO_API_KEY" in detail["message"]
+        assert "FUTURESRL_DATABENTO_API_KEY" in detail["message"]
 
 
 def test_api_ingest_databento_budget_402_and_timeframe_resample(tmp_path: Path) -> None:
@@ -879,7 +879,7 @@ def test_api_ingest_databento_budget_402_and_timeframe_resample(tmp_path: Path) 
         assert detail["message"] == (
             "Databento cost guard exceeded ($5.00 > $2.00 cap); set "
             "allow_over_budget=true and confirm=true to override, or raise "
-            "FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB"
+            "FUTURESRL_DATABENTO_MAX_COST_USD_PER_JOB"
         )
         assert detail["estimated_cost_usd"] == pytest.approx(5.0)
         assert detail["max_cost_usd"] == pytest.approx(2.0)

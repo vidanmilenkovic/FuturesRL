@@ -115,11 +115,11 @@ RENAMED_SCREENSHOTS: dict[str, str] = {
 }
 
 EXPECTED_SCRIPTS = {
-    "futuresrlx-api": "src.api.cli:main",
-    "futuresrlx-backtest": "src.backtest.engine:main",
-    "futuresrlx-optimize": "src.backtest.optimizer:main",
-    "futuresrlx-runner": "src.execution.runner:main",
-    "futuresrlx-train-drl": "src.strategies.train_drl:main",
+    "futuresrl-api": "src.api.cli:main",
+    "futuresrl-backtest": "src.backtest.engine:main",
+    "futuresrl-optimize": "src.backtest.optimizer:main",
+    "futuresrl-runner": "src.execution.runner:main",
+    "futuresrl-train-drl": "src.strategies.train_drl:main",
 }
 EXPECTED_EXTRAS = ("databento", "drl", "dev", "live", "optimize", "all")
 
@@ -368,7 +368,7 @@ def test_pytest_collection_has_no_phase_named_tests() -> None:
 def test_pyproject_metadata_scripts_and_extras() -> None:
     payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = payload["project"]
-    assert project["name"] == "futuresrl-x"
+    assert project["name"] == "futuresrl"
     assert project["version"] == "1.9.0"
     license_value = project.get("license")
     if isinstance(license_value, dict):
@@ -382,7 +382,7 @@ def test_pyproject_metadata_scripts_and_extras() -> None:
         assert extra in extras, f"missing optional dependency extra: {extra}"
         assert extras[extra], f"extra {extra} must not be empty"
     all_extra = " ".join(extras["all"])
-    assert "futuresrl-x[" in all_extra
+    assert "futuresrl[" in all_extra
     for extra in EXPECTED_EXTRAS[:-1]:
         assert extra in all_extra
     # Core dependency list remains importable/production-shaped.

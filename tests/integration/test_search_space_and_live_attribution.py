@@ -20,8 +20,8 @@ tasks 36/37/38/40:
    distinct days, not point count); ex-ante covariance vol finite; offline
    unchanged.
 5. Hostile-environment gate contract: the quality-gate script unsets
-   ``FUTURESRLX_*`` and the app settings/state-store construct under
-   ``FUTURESRLX_ENVIRONMENT=paper`` + ``FUTURESRLX_RISK_STATE_STORE_URI=duckdb:``.
+   ``FUTURESRL_*`` and the app settings/state-store construct under
+   ``FUTURESRL_ENVIRONMENT=paper`` + ``FUTURESRL_RISK_STATE_STORE_URI=duckdb:``.
 
 Everything is offline/deterministic (fakes + ``tmp_path``; never TWS/Databento).
 """
@@ -762,7 +762,7 @@ def test_offline_positions_attribution_unchanged(offline_client: TestClient) -> 
 
 def test_quality_gate_script_unsets_hostile_environment() -> None:
     script = (REPO_ROOT / "scripts" / "quality_gate.sh").read_text(encoding="utf-8")
-    assert "FUTURESRLX_" in script
+    assert "FUTURESRL_" in script
     assert "compgen -e" in script
     assert 'unset "$variable"' in script
     # The unset loop must run before any ruff/mypy/pytest invocation.
@@ -795,8 +795,8 @@ print("ok")
     environment = dict(os.environ)
     environment.update(
         {
-            "FUTURESRLX_ENVIRONMENT": "paper",
-            "FUTURESRLX_RISK_STATE_STORE_URI": "duckdb:",
+            "FUTURESRL_ENVIRONMENT": "paper",
+            "FUTURESRL_RISK_STATE_STORE_URI": "duckdb:",
             "V151_HOSTILE_DUCKDB": str(tmp_path / "hostile.duckdb"),
         }
     )

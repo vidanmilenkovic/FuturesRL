@@ -3407,7 +3407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point: run a declarative strategy offline and write a tear sheet."""
     parser = argparse.ArgumentParser(
         prog="futuresrl-backtest",
-        description="Run a FuturesRL-X declarative strategy backtest (offline, no network).",
+        description="Run a FuturesRL declarative strategy backtest (offline, no network).",
     )
     parser.add_argument(
         "--strategy",

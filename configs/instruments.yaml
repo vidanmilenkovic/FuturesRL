@@ -1,6 +1,6 @@
 version: 1
 # ---------------------------------------------------------------------------
-# FuturesRL-X instrument master
+# FuturesRL instrument master
 #
 # Every futures root traded by the platform is declared here with its CME/IBKR
 # metadata: contract multiplier, tick size, roll methodology, margin estimator
