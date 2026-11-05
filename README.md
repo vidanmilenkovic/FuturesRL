@@ -35,9 +35,9 @@ IBKR paper/live execution through a single weight-centric contract.
 
 ---
 
-## Architecture
+<a id="architecture"></a>
 
-### Core Concept: Weight-Centric + Contract-Translated Architecture
+## Core Concept: Weight-Centric + Contract-Translated Architecture
 
 FuturesRL-X adapts the FinRL-X weight-centric contract to leveraged, expiring futures. A strategy is
 a composition of four contract-preserving stages; the only boundary between research, backtesting
