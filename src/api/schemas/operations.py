@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pydantic import Field
 
-from src.api.schemas import APIModel, StrictModel
+from src.api.schemas.core import APIModel, StrictModel
 
 __all__ = ["ArtifactDeleteResponse", "StrategyIdentityRequest"]
 

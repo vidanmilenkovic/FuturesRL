@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from src.api.schemas import APIModel, StrictModel
+from src.api.schemas.core import APIModel, StrictModel
 
 __all__ = [
     "RebalanceExecuteRequest",

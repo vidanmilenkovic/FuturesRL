@@ -132,15 +132,13 @@ def create_app(
         license_info={"name": "Proprietary"},
     )
     # Development convenience: allow the documented dashboard ports
-    # (next dev :3100, compose :3080) without mutating the frozen settings
+    # (next dev/start and compose :3100) without mutating the frozen settings
     # contract. Paper/live environments use exactly the configured origins.
     cors_origins = list(resolved_settings.api_cors_origins)
     if resolved_settings.environment == "development":
         for extra in (
             "http://localhost:3100",
             "http://127.0.0.1:3100",
-            "http://localhost:3080",
-            "http://127.0.0.1:3080",
         ):
             if extra not in cors_origins:
                 cors_origins.append(extra)

@@ -34,7 +34,7 @@ npm run dev            # http://localhost:3100
 ```
 
 The dev server defaults to port **3100** so it never collides with the
-production compose mapping (`3080`) or the API (`8000`).
+production compose mapping (`3100`) or the API (`8000`).
 
 The API origin is read from `NEXT_PUBLIC_API_BASE_URL` (default
 `http://127.0.0.1:8000`). WebSocket telemetry is derived from it
@@ -78,4 +78,4 @@ docker build \
 ```
 
 Or run the whole stack with `docker compose -f ../docker/docker-compose.yml up --build`
-→ dashboard on <http://localhost:3080>.
+→ dashboard on <http://localhost:3100>.

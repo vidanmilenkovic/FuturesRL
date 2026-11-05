@@ -38,7 +38,7 @@ from configs.settings import Settings
 from fastapi.testclient import TestClient
 from src.api.data_service import DataService
 from src.api.main import create_app
-from src.api.phase11b_schemas import CostEstimateResponse, DataInventoryResponse
+from src.api.schemas import CostEstimateResponse, DataInventoryResponse
 from src.data.databento_loader import (
     CostEstimate,
     DatabentoBudgetExceededError,

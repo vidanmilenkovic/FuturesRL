@@ -30,7 +30,7 @@
 | Component | Entry point | Purpose |
 |---|---|---|
 | FastAPI telemetry backend | `python -m uvicorn src.api.main:app` | REST + `/ws/telemetry` for positions, pipeline, risk, term structure, backtests |
-| Next.js dashboard | `cd frontend && npm run dev` | 5-view quant workstation (Command Center, Pipeline & Weights, Risk & LLM, Term Structure, Backtest Lab) on port **3100** |
+| Next.js dashboard | `cd frontend && npm run dev` | 6-view quant workstation (Command Center, Pipeline & Weights, Risk & LLM, Term Structure, Backtest Lab, Strategy Studio) on port **3100** |
 | Backtest CLI | `python -m src.backtest.engine` | Declarative strategy backtests + walk-forward validation + tear sheets |
 | Live runner | `python -m src.execution.runner` | Cold-start hydration → pipeline → OMS → IBKR paper/live (or `--offline` dry run) |
 | Quality gate | `./scripts/quality_gate.sh --cov` | ruff + format + strict mypy + pytest + coverage |
@@ -54,11 +54,11 @@ Everything is **offline-capable**: with no credentials the API/dashboard/backtes
 ### Fresh clone
 
 ```bash
-git clone <your-repo-url> futures-app && cd futures-app
+git clone <your-repo-url> futuresrl-x && cd futuresrl-x
 
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install -e ".[dev]"          # core + test/lint/type tooling
+.venv/bin/pip install -e ".[all]"          # every extra (or ".[dev]" for core tooling)
 
 # optional extras
 .venv/bin/pip install -e ".[live]"         # ib_async (IBKR paper/live)
@@ -69,11 +69,9 @@ cd frontend && npm install && cd ..
 cp .env.example .env                       # then edit
 ```
 
-### This workspace (already installed)
+### Already-cloned environment
 
-`/home/vidan/futures-app` already has `.venv/` and `frontend/node_modules/`; you can skip the install step and go straight to [Quick start](#4-quick-start-run-the-app).
-
-Verify everything:
+If you already cloned the repository and installed the extras, skip the install step and go straight to [Quick start](#4-quick-start-run-the-app). Verify everything:
 
 ```bash
 ./scripts/quality_gate.sh --cov
@@ -87,11 +85,11 @@ Two terminals:
 
 ```bash
 # Terminal 1 — backend on :8000 (offline/deterministic by default)
-cd /home/vidan/futures-app
+cd futuresrl-x
 .venv/bin/python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
 
 # Terminal 2 — dashboard on :3100
-cd /home/vidan/futures-app/frontend
+cd futuresrl-x/frontend
 npm run dev            # dev server
 # or: npm run build && npm run start   (production build)
 ```
@@ -111,7 +109,7 @@ Open **http://localhost:3100**.
 - backend running with `offline_mode: true` → real pipeline/broker simulation on fixture market data (no paid vendors).
 - `PAPER · IBKR` / `LIVE · IBKR` → backend attached to a real IBKR session (`FUTURESRLX_API_ENABLE_IBKR=1`).
 
-Frontend/API base URL is `NEXT_PUBLIC_API_BASE_URL` (default `http://127.0.0.1:8000`); WebSocket `/ws/telemetry` is derived from it. The API's default CORS allow-list includes the dashboard origins `http://localhost:3100`, `http://127.0.0.1:3100`, `http://localhost:3080`, `http://127.0.0.1:3080` (and legacy 3000).
+Frontend/API base URL is `NEXT_PUBLIC_API_BASE_URL` (default `http://127.0.0.1:8000`); WebSocket `/ws/telemetry` is derived from it. The API's default CORS allow-list includes the dashboard origins `http://localhost:3100` and `http://127.0.0.1:3100` (plus the the compose-mapped dashboard origin).
 
 The ribbon shows a **three-state data-mode badge**:
 - `UI FALLBACK` (amber) — the FastAPI backend is unreachable; the dashboard renders deterministic
@@ -195,7 +193,7 @@ Nested risk settings use a double underscore: `FUTURESRLX_RISK__MAX_MARGIN_UTILI
 | `FUTURESRLX_RISK__RECONCILE_GRACE_SECONDS` | `30` | open-order grace before drift halt |
 | `FUTURESRLX_RISK__RECONCILIATION_INTERVAL_SECONDS` | `30` | reconciler period |
 
-#### Live news, LLM provider & runner bridge (Phase 9)
+#### Live news, LLM provider & runner bridge
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -217,7 +215,7 @@ Nested risk settings use a double underscore: `FUTURESRLX_RISK__MAX_MARGIN_UTILI
 
 For a non-USD IBKR account, set both, e.g. `FUTURESRLX_ACCOUNT_CURRENCY=EUR` and `FUTURESRLX_FX_RATES='{"EUR": 1.10}'`. The translator converts `E_t` to USD before sizing; a missing rate fails closed (no orders) rather than mis-sizing.
 
-#### Production hardening (Phase 7)
+#### Production hardening
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -231,7 +229,7 @@ For a non-USD IBKR account, set both, e.g. `FUTURESRLX_ACCOUNT_CURRENCY=EUR` and
 | Variable | Default | Meaning |
 |---|---|---|
 | `FUTURESRLX_API_HOST` / `PORT` | `0.0.0.0` / `8000` | FastAPI bind |
-| `FUTURESRLX_API_CORS_ORIGINS` | `localhost:3000`, `localhost:3100` | dashboard origins |
+| `FUTURESRLX_API_CORS_ORIGINS` | `http://localhost:3100`, `http://127.0.0.1:3100`  | dashboard origins |
 | `FUTURESRLX_TELEMETRY_INTERVAL_SECONDS` | `1.0` | WebSocket telemetry cadence |
 | `FUTURESRLX_API_ENABLE_IBKR` | `0` (compose) | opt-in real IBKR session in the API container / local `.env` |
 | `FUTURESRLX_ACCOUNT_CURRENCY` | `USD` | IBKR account base currency for ledger/FX normalization |
@@ -374,7 +372,7 @@ Then restart `uvicorn`. `/health` should report `"ibkr_connected": true` and
 Alternatively, run a separate `TradingRunner` (which publishes the runner bridge) and the ribbon also
 reports `PAPER · IBKR` / `LIVE · IBKR` from a fresh bridge snapshot.
 
-![Command Center connected to the IBKR paper account](screenshots/phase9-paper-ibkr-connected.png)
+![Command Center connected to the IBKR paper account](screenshots/command-center-ibkr-paper.png)
 
 ### Non-USD IBKR account base currency
 
@@ -391,13 +389,13 @@ when only USD/currency-less rows are accepted) and `/api/positions` degrades to 
 actionable message. The API reads the ledger via `reqAccountUpdates` with an `accountSummary`
 fallback, so either streaming path is sufficient.
 
-### Strategy Studio (`/studio`), Optuna & DRL trainer (Phase 10)
+### Strategy Studio (`/studio`), Optuna & DRL trainer
 
-![Strategy Studio — manual pipeline builder](screenshots/phase10-strategy-studio.png)
+![Strategy Studio — manual pipeline builder](screenshots/strategy-studio-builder.png)
 
 The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
 
-![Strategy Studio — Manual Builder with stage switcher, sticky YAML and 45-root sector picker](screenshots/phase10ux-studio-1920.png)
+![Strategy Studio — Manual Builder with stage switcher, sticky YAML and 45-root sector picker](screenshots/strategy-studio-universe.png)
 
 1. **Manual Strategy Builder** — pick a preset (trend following TSMOM+KAMA, commodity carry & term
    structure, panic mean-reversion, seasonal commodity cycle, DRL + LLM risk) or an existing YAML.
@@ -420,10 +418,10 @@ The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
 2. **Optuna Auto-Optimizer** — choose the base strategy. Only parameters for the **active**
    selector/allocator/timing/risk stages are listed; structural/data-hygiene parameters (universe
    liquidity/OI/history caps, LLM sample/cache/macro-lockout, translator plumbing) are read-only and
-   excluded, and the curated six core signal/sizing parameters are pre-checked. Checking more than
+   excluded, and the curated five core signal/sizing parameters are pre-checked. Checking more than
    eight parameters shows an overfitting warning ("Recommended: tune 3–6 parameters per study").
-   Existing text: , objective (OOS Sharpe/Sortino/Calmar/CAGR/
-   Rachev/Return-on-Margin), trials (2–200), purged walk-forward folds (locked ON; amber data-snooping
+   Choose the objective (OOS Sharpe/Sortino/Calmar/CAGR/Rachev/Return-on-Margin), trials (2–200),
+   purged walk-forward folds (locked ON; amber data-snooping
    warning if you try to disable), and editable tunable bounds. Results show the trial-vs-objective
    history with a best-so-far frontier, parameter importances, a sortable trial table with the winner
    highlighted, and **Apply Best Parameters**, which saves `<id>_opt.yaml` and (optionally) runs a
@@ -460,7 +458,7 @@ cover the full universe without vendor credentials.
 `src/strategies/parameter_catalog.py` (`encode/decode_parameter_value`,
 `apply_parameter_overrides`) before POSTing UI-native multiselect values.
 
-![Optuna walk-forward optimizer](screenshots/phase10-optuna-optimizer.png)
+![Optuna walk-forward optimizer](screenshots/optuna-walk-forward-optimizer.png)
 
 **Optimizer CLI / API** — every trial is scored only on out-of-sample purged/embargoed folds when
 `walk_forward=True` (default); studies persist under `artifacts/optimizations/` and reload on API
@@ -560,7 +558,7 @@ llm_reward_penalty_lambda, checkpoint_name, seed, device, periods, offline:true}
 `.zip` + `.zip.meta.json` + `.zip.reward_curve.json`. Offline training uses deterministic synthetic
 F1/F2 term structures, so `feature_fallbacks` is empty and term/carry features are non-zero.
 
-**Part-A fixes in this release:** `/api/pipeline/latest` now shows the full Weight matrix from a
+**Studio and pipeline fixes in this release:** `/api/pipeline/latest` now shows the full Weight matrix from a
 fresh runner bridge (same columns as the engine waterfall, including `weight_actual`, `driver`,
 `regime`, `tracking_error_pct`, `micro_routing`); offline DRL training has real synthetic carry; and
 the Backtest Lab `WF · N folds` badge binds the actual `n_folds`/`wf_splits`.
@@ -637,7 +635,7 @@ it first appears. The NAT gateway IP can change after a WSL restart — rerun th
 
 **B. WSL mirrored networking (recommended for stability)**
 
-On Windows 11 22H2+ with WSL 2.0+ (this machine: Windows 11 build 26300, WSL 3.0.3), make WSL share
+On Windows 11 22H2+ with WSL 2.0+ (mirrored networking supported), make WSL share
 the Windows loopback. Create or edit `C:\Users\<You>\.wslconfig`:
 
 ```ini
@@ -802,7 +800,7 @@ Startup sequence (in order):
 - a writable Parquet cache (`FUTURESRLX_PARQUET_DIR`) for hydration
 - optionally `FUTURESRLX_RISK_STATE_STORE_URI` so restarts/nightly resets keep risk state
 
-### Live runner ↔ API bridge (Phase 9)
+### Live runner ↔ API bridge
 
 The API and a `TradingRunner` process can share live state when both use the same
 `FUTURESRLX_DATA_DIR`. The runner publishes an atomic snapshot to
@@ -832,7 +830,7 @@ back to the API's simulated/fixture engine. Start either an external runner:
 or drive it from the dashboard/API with `POST /api/runner/step` (Backtest/Command Center Step
 Runner control). A stale bridge is displayed honestly (`bridge_stale=true`, source falls back).
 
-### DRL training & checkpoints (Phase 9)
+### DRL training & checkpoints
 
 ```bash
 # deterministic offline training (no vendor data needed; requires .[drl] extra)
@@ -854,7 +852,7 @@ allocator params win over `drl.model_path`). `DRLAllocator` loads the checkpoint
 use; missing/corrupt checkpoints or a missing Stable-Baselines3 install raise actionable errors.
 Checkpoint observation layout must match the configured universe/features (recorded in metadata).
 
-### Live news & LLM provider (Phase 9)
+### Live news & LLM provider
 
 `src/data/news_ingestor.py` resolves headlines in this order: **RSS feeds** (when
 `FUTURESRLX_NEWS_RSS_FEEDS` is set) → **IBKR news** (when an IBKR client is connected) →
@@ -930,7 +928,7 @@ cp docker/.env.example docker/.env      # edit credentials/ports
 docker compose -f docker/docker-compose.yml up --build
 ```
 
-Services: TimescaleDB, Redis, headless IB Gateway (paper), FastAPI backend (:8000), Next.js frontend (:3080). The backend runs offline/demo by default; set `FUTURESRLX_API_ENABLE_IBKR=1` in `docker/.env` to attach a real IBKR session. Healthchecks gate startup order.
+Services: TimescaleDB, Redis, headless IB Gateway (paper), FastAPI backend (:8000), Next.js frontend (:3100). The backend runs offline/demo by default; set `FUTURESRLX_API_ENABLE_IBKR=1` in `docker/.env` to attach a real IBKR session. Healthchecks gate startup order.
 
 Without a Docker daemon (e.g. this workspace host) use the local runs in §4/§8/§9 instead; CI (`.github/workflows/ci.yml`) builds both images on push.
 
@@ -964,8 +962,8 @@ Useful subsets:
 | Runner prints a long traceback at startup | Fixed: CLI now prints an actionable message and exits `2`. If you see a traceback, check you are on the current branch/build. |
 | `could not connect to IBKR ...` | TWS/Gateway not running, API not enabled, wrong port, or client-id already in use. Check *Global Configuration → API*, ports 7497/4002 (paper) or 7496/4001 (live). |
 | `live environment requires an IBKR live port` | `FUTURESRLX_ENVIRONMENT=live` with paper port (or `ibkr_paper=true`). Fix the env pair. |
-| Dashboard shows `DEMO DATA` | Backend not running/reachable on `127.0.0.1:8000`. Start terminal 1; refresh. |
-| Port already in use | API: `--port 8001` (+ `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8001`); dashboard is **3100** (`next dev -p 3100`). Port 3080 belongs to a different local UI. |
+| Dashboard shows `UI FALLBACK` | Backend not running/reachable on `127.0.0.1:8000`. Start terminal 1; refresh. |
+| Port already in use | API: `--port 8001` (+ `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8001`); dashboard is **3100** (`next dev -p 3100`). The Docker Compose frontend also defaults to **3100**. |
 | `RuntimeWarning: 'src.backtest.engine' found in sys.modules` | Fixed by lazy package `__init__`; rebuild/use current commit. |
 | Gym `Box observation space minimum is -infinity` warning | Fixed with finite bounds; use current commit. |
 | Tests fail only on your machine | A host `FUTURESRLX_*` export or `.env` used to leak in — fixed by hermetic fixtures; if you see it, run `git status` / verify conftest on the current commit. |
@@ -976,7 +974,7 @@ Useful subsets:
 | Dashboard stuck on `IBKR · RECONNECTING` | TWS/IB Gateway not listening on the configured host/port (WSL NAT vs mirrored — see §7) or account not logged in; inspect `/health.ibkr_last_error`. |
 | Optimizer absent / slow | `optuna` is optional: install with `pip install -e ".[optimize]"` or rely on the deterministic fallback; use fewer trials/folds for quick studies. |
 | DRL train request times out | Training is synchronous and bounded to 20k timesteps; PPO enforces a 2048-step first rollout, so tiny budgets still take seconds. Use `timesteps>=256` and prefer `device=cpu` for smoke runs. |
-| Dashboard shows `UI FALLBACK` with the API running | Browser origin not in CORS (defaults include :3100/:3080) or wrong `NEXT_PUBLIC_API_BASE_URL`; check the API `/health` and browser console. |
+| Dashboard shows `UI FALLBACK` with the API running | Browser origin not in CORS (defaults include :3100) or wrong `NEXT_PUBLIC_API_BASE_URL`; check the API `/health` and browser console. |
 | Orders/fills empty while a runner is active | Runner and API must share `FUTURESRLX_DATA_DIR`; check `/api/runner/status` (bridge stale > 15 s means the runner stopped publishing) and `data/bridge/runner_state.json`. |
 | `POST /api/runner/step` returns 503 | `OfflineRunnerSession` unavailable (execution package import failed); check server logs/`pip install -e .`. |
 | DRL training fails | Install the DRL extra (`pip install -e ".[drl]"`); check checkpoint algorithm matches `drl.algorithm`; inspect `<checkpoint>.meta.json`. |

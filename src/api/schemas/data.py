@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from src.api.schemas import APIModel
+from src.api.schemas.core import APIModel
 
 warnings.filterwarnings(
     "ignore",

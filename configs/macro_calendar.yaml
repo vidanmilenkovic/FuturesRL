@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------
 # Tier-1 macro event calendar used by the LLM Risk-First engine's
-# macro-event lockout windows (AGENTS.md Module 3, Module 3 circuit breaker).
+# macro-event lockout windows (Risk-First circuit breaker).
 #
 # Consumed by:
 #   from src.risk.llm_risk_overlay import MacroEventCalendar

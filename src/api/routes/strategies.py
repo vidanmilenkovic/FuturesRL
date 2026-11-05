@@ -8,9 +8,8 @@ from collections.abc import Mapping
 import yaml
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
-from src.api.phase10_deps import StudioDep
-from src.api.qol_schemas import ArtifactDeleteResponse, StrategyIdentityRequest
-from src.api.schemas import StrategyConfigView
+from src.api.deps import StudioDep
+from src.api.schemas import ArtifactDeleteResponse, StrategyConfigView, StrategyIdentityRequest
 from src.api.studio_service import (
     MAX_STRATEGY_PAYLOAD_BYTES,
     StrategyCatalogResponse,

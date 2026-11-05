@@ -28,7 +28,7 @@ from configs.instruments import InstrumentsConfig
 from configs.settings import Settings
 
 from src.api import fixtures
-from src.api.phase11b_schemas import (
+from src.api.schemas import (
     CacheSource,
     CacheTotals,
     ContinuousSeriesSummary,

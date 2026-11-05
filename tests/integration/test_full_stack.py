@@ -1,4 +1,4 @@
-"""Lead-owned full-stack integration test.
+"""End-to-end API/execution full-stack integration test.
 
 Wires the *real* modules together offline:
 offline data source -> feature processor -> point-in-time MarketState builder ->

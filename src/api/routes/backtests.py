@@ -11,8 +11,8 @@ from starlette.concurrency import run_in_threadpool
 
 from src.api.backtests_service import CachedDataUnavailableError
 from src.api.deps import BacktestDep
-from src.api.qol_schemas import ArtifactDeleteResponse
 from src.api.schemas import (
+    ArtifactDeleteResponse,
     BacktestListResponse,
     BacktestRunConfig,
     BacktestRunSummary,

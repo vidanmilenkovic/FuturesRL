@@ -64,5 +64,3 @@ docker/.env.*
 *.md
 !README.md
 scripts
-AGENTS.md
-Instructions.md

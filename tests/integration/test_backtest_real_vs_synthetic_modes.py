@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from src.api import fixtures
 from src.api.data_service import DataService, DataServiceError
 from src.api.main import create_app
-from src.api.phase11b_schemas import EstimateCostRequest, IngestRequest
+from src.api.schemas import EstimateCostRequest, IngestRequest
 from src.data.storage import ParquetRepository
 
 pytestmark = pytest.mark.integration

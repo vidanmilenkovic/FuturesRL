@@ -4,7 +4,7 @@
 #   cp docker/.env.example docker/.env        # fill IBKR/DB secrets
 #   docker compose -f docker/docker-compose.yml up --build
 #
-#   frontend  → http://localhost:3080   (Next.js dashboard, demo mode if backend down)
+#   frontend  → http://localhost:3100   (Next.js dashboard, demo mode if backend down)
 #   backend   → http://localhost:8000   (FastAPI + /ws/telemetry, docs at /docs)
 #   gateway   → 127.0.0.1:4003 (paper)  (headless IB Gateway, 5900 VNC)
 #   timescaledb / redis are internal only.
@@ -129,7 +129,7 @@ services:
       FUTURESRLX_LOG_LEVEL: ${FUTURESRLX_LOG_LEVEL:-INFO}
       FUTURESRLX_API_HOST: 0.0.0.0
       FUTURESRLX_API_PORT: "8000"
-      FUTURESRLX_API_CORS_ORIGINS: '["http://localhost:${FRONTEND_PORT:-3080}","http://127.0.0.1:${FRONTEND_PORT:-3080}"]'
+      FUTURESRLX_API_CORS_ORIGINS: '["http://localhost:${FRONTEND_PORT:-3100}","http://127.0.0.1:${FRONTEND_PORT:-3100}"]'
       FUTURESRLX_TELEMETRY_INTERVAL_SECONDS: "1.0"
       # IBKR (paper gateway inside the compose network)
       FUTURESRLX_IBKR_HOST: ${FUTURESRLX_IBKR_HOST:-ib-gateway}
@@ -184,17 +184,17 @@ services:
     image: futuresrlx/frontend:1.0.0
     restart: unless-stopped
     ports:
-      - "${FRONTEND_PORT:-3080}:3000"
+      - "${FRONTEND_PORT:-3100}:3100"
     environment:
       NODE_ENV: production
-      PORT: "3000"
+      PORT: "3100"
       HOSTNAME: 0.0.0.0
     depends_on:
       backend:
         # Dashboard still serves the DEMO DATA experience while the API boots.
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3100/ || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 5

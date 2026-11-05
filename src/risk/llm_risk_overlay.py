@@ -1,7 +1,6 @@
 """Tier A of the FinRL Risk-First engine: LLM structural constraint overlay.
 
-This module implements the three modules of the FinRL Risk-First LLM architecture
-described in ``AGENTS.md`` Module 3:
+This module implements the three modules of the FinRL Risk-First LLM architecture:
 
 Module 1 - Empirical confidence & variance filter (anti-hallucination)
     Each root is sampled ``K`` times from the LLM. If the mean confidence is below

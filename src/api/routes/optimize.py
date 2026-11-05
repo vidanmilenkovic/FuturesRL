@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from starlette.concurrency import run_in_threadpool
 
+from src.api.deps import OptimizeDep
 from src.api.optimize_service import (
     OptimizationApplyRequest,
     OptimizationApplyResponse,
@@ -13,8 +14,7 @@ from src.api.optimize_service import (
     OptimizationStudySummary,
     OptimizeRequest,
 )
-from src.api.phase10_deps import OptimizeDep
-from src.api.qol_schemas import ArtifactDeleteResponse
+from src.api.schemas import ArtifactDeleteResponse
 
 router = APIRouter(tags=["optimize"])
 

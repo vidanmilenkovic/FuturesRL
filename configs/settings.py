@@ -158,14 +158,9 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8000, ge=1, le=65535)
     api_cors_origins: tuple[str, ...] = (
-        # Local dashboard (next dev/start runs on 3100) and compose mapping (3080).
+        # Local dashboard (next dev/start and docker compose both use 3100).
         "http://localhost:3100",
         "http://127.0.0.1:3100",
-        "http://localhost:3080",
-        "http://127.0.0.1:3080",
-        # Legacy/alternative dashboard port kept for backward compatibility.
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
     )
     telemetry_interval_seconds: float = Field(default=1.0, gt=0.0)
 

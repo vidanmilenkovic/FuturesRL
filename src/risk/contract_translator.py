@@ -1,10 +1,10 @@
 """Deterministic translation of target notional weights into discrete futures contracts.
 
-This module implements the ``w_t -> N_i,t`` stage of the FinRL-X pipeline described
-in ``AGENTS.md`` section 1.2. It is the single place where a continuous, signed
-notional weight vector becomes an executable set of integer futures contracts, so
-the backtest engine and the live IBKR execution engine observe *identical* targets
-for an identical :class:`~src.core.types.MarketState`.
+This module implements the ``w_t -> N_i,t`` stage of the FinRL-X pipeline. It is
+the single place where a continuous, signed notional weight vector becomes an
+executable set of integer futures contracts, so the backtest engine and the live
+IBKR execution engine observe *identical* targets for an identical
+:class:`~src.core.types.MarketState`.
 
 Algorithm
 ---------

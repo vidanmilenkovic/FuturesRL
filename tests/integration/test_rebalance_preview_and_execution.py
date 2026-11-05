@@ -17,9 +17,8 @@ import pytest
 from configs.settings import Settings
 from fastapi.testclient import TestClient
 from src.api.main import create_app
-from src.api.phase11_schemas import RebalanceExecuteRequest
 from src.api.rebalance_service import RebalanceError, RebalanceService
-from src.api.schemas import AccountSnapshotResponse
+from src.api.schemas import AccountSnapshotResponse, RebalanceExecuteRequest
 from src.core.types import (
     InstrumentId,
     OrderEvent,

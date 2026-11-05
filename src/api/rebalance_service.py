@@ -25,7 +25,8 @@ from configs.instruments import InstrumentsConfig
 from configs.settings import Settings
 
 from src.api import fixtures
-from src.api.phase11_schemas import (
+from src.api.protocols import MarketDataService, StrategyCatalog
+from src.api.schemas import (
     RebalanceExecuteRequest,
     RebalanceExecuteResponse,
     RebalanceFillRow,
@@ -36,7 +37,6 @@ from src.api.phase11_schemas import (
     RebalancePreviewResponse,
     RebalanceTargetRow,
 )
-from src.api.protocols import MarketDataService, StrategyCatalog
 from src.api.services import build_pipeline_parts, discretization_details
 from src.core.types import (
     AccountSnapshot,

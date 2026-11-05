@@ -6,7 +6,7 @@ broker connectivity.
 
 ```
 ┌──────────────────┐   REST + WS    ┌──────────────────┐
-│ frontend :3080   │ ─────────────► │ backend :8000    │
+│ frontend :3100   │ ─────────────► │ backend :8000    │
 │ Next.js standalone│               │ FastAPI + /ws    │
 └──────────────────┘                └────┬──────┬──────┘
                                           │      │
@@ -33,7 +33,7 @@ docker compose -f docker/docker-compose.yml up --build
 
 | Service      | URL / port                    | Notes                                                       |
 | ------------ | ----------------------------- | ----------------------------------------------------------- |
-| frontend     | <http://localhost:3080>       | Next.js dashboard; shows DEMO DATA if the API is down       |
+| frontend     | <http://localhost:3100>       | Next.js dashboard; shows DEMO DATA if the API is down       |
 | backend      | <http://localhost:8000>       | REST `/api/*`, `/health`, `/ws/telemetry`, OpenAPI `/docs`  |
 | ib-gateway   | `127.0.0.1:4003` (paper API)  | VNC/noVNC on `127.0.0.1:5900` for the Gateway login screen   |
 | timescaledb  | `127.0.0.1:5432` (loopback)   | internal `timescaledb:5432` on `futuresrlx_net`             |
@@ -78,7 +78,7 @@ lives in `.env.example`; the important ones:
 | `FUTURESRLX_API_ENABLE_IBKR`   | `0`                    | `1` attempts a real IBKR session (offline simulated fallback stays) |
 | `DATABENTO_API_KEY`            | *(empty)*              | Optional; blank → offline deterministic fixtures                   |
 | `API_PORT`                     | `8000`                 | Published backend port                                             |
-| `FRONTEND_PORT`                | `3080`                 | Published dashboard port                                           |
+| `FRONTEND_PORT`                | `3100`                 | Published dashboard port                                           |
 | `NEXT_PUBLIC_API_BASE_URL`     | `http://localhost:8000`| Browser-visible API origin, baked into the Next.js bundle at build |
 | `NEXT_PUBLIC_WS_URL`           | `ws://localhost:8000/ws/telemetry` | Browser-visible telemetry WebSocket URL                 |
 

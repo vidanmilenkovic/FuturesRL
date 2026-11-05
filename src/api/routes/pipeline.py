@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from src.api.deps import ContainerDep
-from src.api.phase10_deps import BridgePipelineDep
+from src.api.deps import BridgePipelineDep, ContainerDep
 from src.api.schemas import PipelineWaterfallResponse
 
 router = APIRouter(tags=["pipeline"])

@@ -4,7 +4,7 @@ The service is deliberately standalone: it is constructed from
 :class:`~configs.settings.Settings` / artifact paths only, owns no FastAPI state
 and does not touch the live execution container. The REST router
 (:mod:`src.api.routes.drl`) is mounted by the app factory through
-``src/api/routes/__init__.py`` (Lead-owned); the module-level dependency
+``src/api/routes/__init__.py``; the module-level dependency
 :func:`get_drl_service` resolves a service from, in priority order:
 
 1. ``app.state.drl_service`` (tests / embedding),

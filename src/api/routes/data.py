@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
 from src.api.data_service import DataService, DataServiceError
-from src.api.phase11b_schemas import (
+from src.api.schemas import (
     CostEstimateResponse,
     DataInventoryResponse,
     EstimateCostRequest,
