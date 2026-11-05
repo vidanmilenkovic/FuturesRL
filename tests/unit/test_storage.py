@@ -556,3 +556,270 @@ def test_inventory_invalid_sidecar_defaults_to_databento(
         row = next(item for item in repo.inventory() if item.root == "ES")
     assert row.source == "databento"
     assert any("unreadable source sidecar" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Spec 1: multi-timeframe repository cache (auto-resample from finer base)
+# ---------------------------------------------------------------------------
+
+MINUTE_ANCHOR = datetime(2024, 1, 2, 21, 1, tzinfo=UTC)
+
+
+def minute_frame(
+    root: str = "ES", periods: int = 12, *, instrument: str | None = None
+) -> pl.DataFrame:
+    """Deterministic 1-minute canonical bars for one root."""
+    return pl.DataFrame(
+        [
+            {
+                s.TIMESTAMP_COLUMN: MINUTE_ANCHOR + timedelta(minutes=index),
+                s.INSTRUMENT_ID_COLUMN: instrument or f"{root}_FUT",
+                s.ROOT_SYMBOL_COLUMN: root,
+                s.EXPIRATION_COLUMN: DEFAULT_EXPIRATION,
+                s.OPEN_COLUMN: 100.0 + index,
+                s.HIGH_COLUMN: 101.0 + index,
+                s.LOW_COLUMN: 99.0 + index,
+                s.CLOSE_COLUMN: 100.5 + index,
+                s.VOLUME_COLUMN: float(index + 1),
+                s.OPEN_INTEREST_COLUMN: 1_000.0 + index,
+                s.SETTLEMENT_COLUMN: 100.0 + index,
+            }
+            for index in range(periods)
+        ]
+    )
+
+
+def test_schema_for_timeframe_and_extended_validators(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    assert [
+        repo.schema_for_timeframe(tf) for tf in ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
+    ] == [
+        "ohlcv-1m",
+        "ohlcv-5m",
+        "ohlcv-15m",
+        "ohlcv-30m",
+        "ohlcv-1h",
+        "ohlcv-4h",
+        "ohlcv-1d",
+        "ohlcv-1w",
+    ]
+    for schema in ("ohlcv-5m", "ohlcv-15m", "ohlcv-30m", "ohlcv-4h", "ohlcv-1w"):
+        assert s.is_bar_schema(schema)
+        validated = s.validator_for_schema(schema)(minute_frame(periods=2))
+        assert validated.columns[: len(s.BAR_COLUMNS)] == list(s.BAR_COLUMNS)
+
+
+def test_read_timeframe_auto_resamples_from_minute_base(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(minute_frame(periods=12), schema="ohlcv-1m")
+    assert repo.available_roots("ohlcv-5m") == ()
+    frame = repo.read_timeframe("5m", roots=("ES",))
+    assert frame.height == 3
+    assert frame[s.TIMESTAMP_COLUMN].to_list() == [
+        datetime(2024, 1, 2, 21, 5, tzinfo=UTC),
+        datetime(2024, 1, 2, 21, 10, tzinfo=UTC),
+        datetime(2024, 1, 2, 21, 15, tzinfo=UTC),
+    ]
+    assert frame[s.VOLUME_COLUMN].to_list() == [15.0, 40.0, 23.0]
+    assert frame[s.OPEN_COLUMN].to_list() == [100.0, 105.0, 110.0]
+    assert frame[s.CLOSE_COLUMN].to_list() == [104.5, 109.5, 111.5]
+    # Right-labeled bars never look ahead of their source rows.
+    source_max = minute_frame(periods=12)[s.TIMESTAMP_COLUMN].max()
+    assert frame[s.TIMESTAMP_COLUMN].max() >= source_max
+    assert repo.available_roots("ohlcv-5m") == ()  # read-only unless persist=True
+
+
+def test_read_timeframe_persist_caches_and_cache_wins(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(minute_frame(periods=12), schema="ohlcv-1m")
+    repo.read_timeframe("5m", roots=("ES",), persist=True)
+    assert repo.available_roots("ohlcv-5m") == ("ES",)
+    # Once cached, read_timeframe uses the target partition rather than resampling.
+    explicit = minute_frame(periods=3).with_columns(
+        *[
+            (pl.col(column) + 50.0).alias(column)
+            for column in (
+                s.OPEN_COLUMN,
+                s.HIGH_COLUMN,
+                s.LOW_COLUMN,
+                s.CLOSE_COLUMN,
+            )
+        ]
+    )
+    repo.write_timeframe("5m", explicit, mode="overwrite")
+    cached = repo.read_timeframe("5m", roots=("ES",))
+    assert cached[s.CLOSE_COLUMN].to_list() == explicit[s.CLOSE_COLUMN].to_list()
+
+
+def test_read_timeframe_filters_window_and_roots(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(minute_frame("ES", periods=12), schema="ohlcv-1m")
+    repo.write_bars(minute_frame("NQ", periods=12), schema="ohlcv-1m")
+    only_nq = repo.read_timeframe("5m", roots=("NQ",))
+    assert only_nq[s.ROOT_SYMBOL_COLUMN].unique().to_list() == ["NQ"]
+    window = repo.read_timeframe(
+        "5m",
+        roots=("ES",),
+        start=datetime(2024, 1, 2, 21, 6, tzinfo=UTC),
+        end=datetime(2024, 1, 2, 21, 16, tzinfo=UTC),
+    )
+    assert window.height == 2
+    assert window[s.TIMESTAMP_COLUMN].to_list() == [
+        datetime(2024, 1, 2, 21, 10, tzinfo=UTC),
+        datetime(2024, 1, 2, 21, 15, tzinfo=UTC),
+    ]
+
+
+def test_read_timeframe_partial_target_resamples_only_missing_roots(
+    settings: Settings,
+) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(minute_frame("ES", periods=12), schema="ohlcv-1m")
+    repo.write_bars(minute_frame("NQ", periods=12), schema="ohlcv-1m")
+    repo.write_timeframe("5m", repo.read_timeframe("5m", roots=("ES",)))
+    combined = repo.read_timeframe("5m", roots=("ES", "NQ"))
+    assert set(combined[s.ROOT_SYMBOL_COLUMN].unique().to_list()) == {"ES", "NQ"}
+    assert combined.height == 6
+
+
+def test_read_timeframe_roots_none_uses_available_base_roots(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(minute_frame("ES", periods=12), schema="ohlcv-1m")
+    repo.write_bars(minute_frame("NQ", periods=12), schema="ohlcv-1m")
+    frame = repo.read_timeframe("15m")
+    assert set(frame[s.ROOT_SYMBOL_COLUMN].unique().to_list()) == {"ES", "NQ"}
+
+
+def test_read_timeframe_empty_returns_canonical_empty_frame(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    frame = repo.read_timeframe("1w", roots=("ES",))
+    assert frame.height == 0
+    assert frame.columns[: len(s.BAR_COLUMNS)] == list(s.BAR_COLUMNS)
+    assert frame.schema[s.TIMESTAMP_COLUMN] == pl.Datetime("us", "UTC")
+
+
+def test_read_timeframe_rejects_naive_window_and_unknown_timeframe(
+    settings: Settings,
+) -> None:
+    repo = ParquetRepository(settings)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        repo.read_timeframe("5m", roots=("ES",), start=datetime(2024, 1, 2))
+    with pytest.raises(ValueError, match="unsupported timeframe"):
+        repo.read_timeframe("7m", roots=("ES",))
+    with pytest.raises(ValueError, match="must not be after"):
+        repo.read_timeframe(
+            "5m",
+            roots=("ES",),
+            start=datetime(2024, 1, 3, tzinfo=UTC),
+            end=datetime(2024, 1, 2, tzinfo=UTC),
+        )
+
+
+def test_write_timeframe_round_trip_and_inventory(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    repo.write_bars(minute_frame(periods=12), schema="ohlcv-1m")
+    fifteen = repo.read_timeframe("15m", roots=("ES",))
+    written = repo.write_timeframe("15m", fifteen)
+    assert written == fifteen.height == 1
+    round_trip = repo.read_timeframe("15m", roots=("ES",))
+    assert round_trip.equals(fifteen)
+    inventory = {row.root: row for row in repo.inventory(schema="ohlcv-15m")}
+    assert inventory["ES"].cached_bars == 1
+    assert inventory["NQ"].cached_bars == 0
+
+
+def test_read_timeframe_four_hours_from_hourly_base(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    hourly = pl.DataFrame(
+        [
+            {
+                s.TIMESTAMP_COLUMN: datetime(2024, 1, 2, 13 + index, tzinfo=UTC),
+                s.INSTRUMENT_ID_COLUMN: "ES_FUT",
+                s.ROOT_SYMBOL_COLUMN: "ES",
+                s.EXPIRATION_COLUMN: DEFAULT_EXPIRATION,
+                s.OPEN_COLUMN: 100.0 + index,
+                s.HIGH_COLUMN: 101.0 + index,
+                s.LOW_COLUMN: 99.0 + index,
+                s.CLOSE_COLUMN: 100.5 + index,
+                s.VOLUME_COLUMN: 10.0,
+                s.OPEN_INTEREST_COLUMN: 1_000.0,
+                s.SETTLEMENT_COLUMN: 100.0 + index,
+            }
+            for index in range(4)
+        ]
+    )
+    repo.write_bars(hourly, schema="ohlcv-1h")
+    frame = repo.read_timeframe("4h", roots=("ES",))
+    assert frame.height == 1
+    assert frame[s.VOLUME_COLUMN].to_list() == [40.0]
+    assert frame[s.OPEN_COLUMN].to_list() == [100.0]
+    assert frame[s.CLOSE_COLUMN].to_list() == [103.5]
+
+
+def test_read_timeframe_weekly_from_daily_base(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    daily = pl.DataFrame(
+        [
+            {
+                s.TIMESTAMP_COLUMN: datetime(2024, 1, 2, tzinfo=UTC) + timedelta(days=index),
+                s.INSTRUMENT_ID_COLUMN: "ES_FUT",
+                s.ROOT_SYMBOL_COLUMN: "ES",
+                s.EXPIRATION_COLUMN: DEFAULT_EXPIRATION,
+                s.OPEN_COLUMN: 100.0,
+                s.HIGH_COLUMN: 101.0,
+                s.LOW_COLUMN: 99.0,
+                s.CLOSE_COLUMN: 100.5,
+                s.VOLUME_COLUMN: 1.0,
+                s.OPEN_INTEREST_COLUMN: 10.0,
+                s.SETTLEMENT_COLUMN: 100.5,
+            }
+            for index in range(14)
+        ]
+    )
+    repo.write_bars(daily, schema="ohlcv-1d")
+    weekly = repo.read_timeframe("1w", roots=("ES",))
+    assert weekly.height == 2
+    assert weekly[s.VOLUME_COLUMN].to_list() == [7.0, 7.0]
+
+
+def test_read_bars_accepts_extended_timeframe_schema(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    frame = repo.read_timeframe("30m", roots=("ES",))  # empty canonical frame
+    assert frame.height == 0
+    repo.write_bars(minute_frame(periods=4), schema="ohlcv-30m")
+    stored = repo.read_bars(("ES",), schema="ohlcv-30m")
+    assert stored.height == 4
+
+
+def test_read_timeframe_native_daily_target_uses_existing_partition(
+    settings: Settings,
+) -> None:
+    repo = ParquetRepository(settings)
+    daily = pl.DataFrame(
+        [
+            {
+                s.TIMESTAMP_COLUMN: datetime(2024, 1, 2 + index, tzinfo=UTC),
+                s.INSTRUMENT_ID_COLUMN: "ES_FUT",
+                s.ROOT_SYMBOL_COLUMN: "ES",
+                s.EXPIRATION_COLUMN: DEFAULT_EXPIRATION,
+                s.OPEN_COLUMN: 100.0,
+                s.HIGH_COLUMN: 101.0,
+                s.LOW_COLUMN: 99.0,
+                s.CLOSE_COLUMN: 100.5,
+                s.VOLUME_COLUMN: 1.0,
+                s.OPEN_INTEREST_COLUMN: 10.0,
+                s.SETTLEMENT_COLUMN: 100.5,
+            }
+            for index in range(3)
+        ]
+    )
+    repo.write_bars(daily, schema="ohlcv-1d")
+    frame = repo.read_timeframe("1d", roots=("ES",))
+    assert frame.height == 3
+    assert frame[s.TIMESTAMP_COLUMN].to_list() == daily[s.TIMESTAMP_COLUMN].to_list()
+
+
+def test_write_timeframe_rejects_unknown_timeframe(settings: Settings) -> None:
+    repo = ParquetRepository(settings)
+    with pytest.raises(ValueError, match="unsupported timeframe"):
+        repo.write_timeframe("7m", minute_frame(periods=1))

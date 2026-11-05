@@ -42,6 +42,7 @@ from src.core.types import (
 )
 from src.data import schema as s
 from src.data.feature_processor import FeatureProcessor
+from src.data.timeframes import bars_per_year, get_timeframe
 
 __all__ = ["MarketStateBuilder"]
 
@@ -64,8 +65,9 @@ class MarketStateBuilder:
         Number of trailing 1-day returns exposed per instrument in
         ``MarketState.returns``.
     annualize_covariance:
-        Multiply the daily EWMA covariance by 252 (annualised, as required by
-        the volatility-targeting risk overlay).
+        Multiply the EWMA covariance of per-bar returns by ``bars_per_year`` for
+        the configured timeframe (252 for daily), producing an annualised
+        covariance as required by the volatility-targeting risk overlay.
     initial_equity:
         Default equity assigned to every state when the caller does not pass
         ``equity=``.
@@ -81,6 +83,7 @@ class MarketStateBuilder:
         covariance_min_periods: int = 20,
         returns_window: int = 252,
         annualize_covariance: bool = True,
+        timeframe: str = "1d",
         initial_equity: float | None = None,
     ) -> None:
         if covariance_halflife <= 0:
@@ -93,6 +96,14 @@ class MarketStateBuilder:
             raise ValueError("returns_window must be >= 1")
         if initial_equity is not None and initial_equity <= 0:
             raise ValueError("initial_equity must be strictly positive")
+        #: Canonical bar timeframe stamped on every built MarketState (default daily,
+        #: preserving all existing behaviour; intraday states must carry their own
+        #: timeframe so strategy/risk annualisation uses the matching bars_per_year).
+        self._timeframe = get_timeframe(timeframe).name
+        #: Annualisation factor for the EWMA covariance of per-bar returns.
+        #: Daily states keep the historical 252 factor exactly; intraday states
+        #: use the matching observations/year so covariance stays annualised.
+        self._annualization_factor = bars_per_year(self._timeframe)
         self._master = instrument_master
         self._feature_processor = feature_processor
         self._covariance_halflife = float(covariance_halflife)
@@ -103,6 +114,11 @@ class MarketStateBuilder:
         self._initial_equity = initial_equity
 
     # -- properties ------------------------------------------------------------
+
+    @property
+    def timeframe(self) -> str:
+        """Canonical bar timeframe stamped on every built :class:`MarketState`."""
+        return self._timeframe
 
     @property
     def instrument_master(self) -> InstrumentsConfig:
@@ -210,6 +226,7 @@ class MarketStateBuilder:
         resolved_equity = equity if equity is not None else self._initial_equity
         return MarketState(
             timestamp=moment,
+            timeframe=self._timeframe,
             instruments={snapshot.instrument_id: snapshot for snapshot in snapshots},
             equity=resolved_equity,
             covariance=covariance,
@@ -326,7 +343,7 @@ class MarketStateBuilder:
         weights = weights / weights.sum()
         covariance = (centred * weights[:, None]).T @ centred
         if self._annualize_covariance:
-            covariance = covariance * float(_TRADING_DAYS)
+            covariance = covariance * float(self._annualization_factor)
         covariance = (covariance + covariance.T) / 2.0
         return (covariance, roots)
 

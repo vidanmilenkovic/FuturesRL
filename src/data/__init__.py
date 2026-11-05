@@ -79,6 +79,7 @@ from src.data.ibkr_contracts import (
 from src.data.ibkr_data import IBKRMarketDataStreamer
 from src.data.market_state_builder import MarketStateBuilder
 from src.data.news_ingestor import NewsHeadline, NewsIngestor, Severity, SourceKind
+from src.data.resampler import resample_bars
 from src.data.storage import ParquetRepository, StorageError, WriteMode
 from src.data.term_structure import (
     CarryProfile,
@@ -87,8 +88,16 @@ from src.data.term_structure import (
     TermStructureCurve,
     offline_term_structure_metadata,
 )
+from src.data.timeframes import (
+    TIMEFRAMES,
+    TimeframeSpec,
+    bars_per_year,
+    get_timeframe,
+    supported_timeframes,
+)
 
 __all__ = [
+    "TIMEFRAMES",
     "CalendarRollSchedule",
     "CarryProfile",
     "ContinuousContractBuilder",
@@ -111,13 +120,18 @@ __all__ = [
     "SyntheticTermStructure",
     "TermRegime",
     "TermStructureCurve",
+    "TimeframeSpec",
     "VolumeOICrossoverRollSchedule",
     "WriteMode",
+    "bars_per_year",
     "build_front_contract",
     "clear_front_future_cache",
     "front_contract_month",
+    "get_timeframe",
     "offline_term_structure_metadata",
     "qualify_front_future",
+    "resample_bars",
     "schema",
+    "supported_timeframes",
     "synthetic_reference_price",
 ]

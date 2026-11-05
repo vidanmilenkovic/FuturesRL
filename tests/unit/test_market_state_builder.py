@@ -12,6 +12,7 @@ from src.core.types import AssetClass, MarketState
 from src.data import schema as s
 from src.data.feature_processor import FeatureProcessor
 from src.data.market_state_builder import MarketStateBuilder
+from src.data.timeframes import bars_per_year
 
 from tests.fixtures.market import FIXED_TIMESTAMP, make_bars_frame
 
@@ -278,3 +279,99 @@ def test_instrument_master_is_lazy(settings: Settings) -> None:
     assert builder.feature_processor.feature_names == s.ALL_FEATURES
     builder_with_master = MarketStateBuilder(feature_processor=FeatureProcessor())
     assert builder_with_master.feature_processor is not None
+
+
+# ---------------------------------------------------------------------------
+# Spec 1: timeframe stamping (strategy/risk annualisation contract)
+# ---------------------------------------------------------------------------
+
+
+def test_builder_defaults_to_daily_timeframe() -> None:
+    builder = MarketStateBuilder(initial_equity=1_000_000.0)
+    assert builder.timeframe == "1d"
+    state = builder.build(fixture_bars(), moment(200))
+    assert state.timeframe == "1d"
+
+
+def test_builder_stamps_requested_canonical_timeframe() -> None:
+    builder = MarketStateBuilder(initial_equity=1_000_000.0, timeframe="5m")
+    assert builder.timeframe == "5m"
+    state = builder.build(fixture_bars(), moment(200))
+    assert state.timeframe == "5m"
+
+
+def test_builder_canonicalises_timeframe_aliases() -> None:
+    builder = MarketStateBuilder(timeframe=" 1HOUR ")
+    assert builder.timeframe == "1h"
+    assert builder.build(fixture_bars(), moment(200)).timeframe == "1h"
+
+
+def test_builder_rejects_unknown_timeframe() -> None:
+    with pytest.raises(ValueError, match="unsupported timeframe"):
+        MarketStateBuilder(timeframe="7m")
+
+
+def test_build_series_stamps_every_state_with_timeframe() -> None:
+    builder = MarketStateBuilder(timeframe="1w")
+    states = builder.build_series(fixture_bars(), [moment(150), moment(200), moment(230)])
+    assert [state.timeframe for state in states] == ["1w", "1w", "1w"]
+
+
+def test_covariance_annualization_scales_with_timeframe() -> None:
+    """Intraday builder states must annualise covariance by bars_per_year, not 252."""
+    from src.data.timeframes import bars_per_year
+
+    bars = fixture_bars()
+    daily = MarketStateBuilder(timeframe="1d").build(bars, moment(200))
+    intraday = MarketStateBuilder(timeframe="5m").build(bars, moment(200))
+    assert daily.timeframe == "1d"
+    assert intraday.timeframe == "5m"
+    assert daily.covariance is not None and intraday.covariance is not None
+    expected = bars_per_year("5m") / bars_per_year("1d")
+    ratio = np.diag(intraday.covariance) / np.diag(daily.covariance)
+    assert np.allclose(ratio, expected, rtol=1e-12)
+    for root in ROOTS:
+        assert intraday.annualized_vol(root) / daily.annualized_vol(root) == pytest.approx(
+            expected**0.5, rel=1e-12
+        )
+
+
+# ---------------------------------------------------------------------------
+# Spec 1: covariance annualisation follows the state timeframe (not hard-coded 252)
+# ---------------------------------------------------------------------------
+
+
+def _build_at_timeframe(timeframe: str) -> MarketState:
+    bars = fixture_bars()
+    builder = MarketStateBuilder(initial_equity=1_000_000.0, timeframe=timeframe)
+    return builder.build(bars, moment(200))
+
+
+def test_daily_covariance_annualisation_preserves_historical_252() -> None:
+    bars = fixture_bars()
+    annualised = MarketStateBuilder(timeframe="1d").build(bars, moment(200))
+    raw = MarketStateBuilder(timeframe="1d", annualize_covariance=False).build(bars, moment(200))
+    assert annualised.covariance is not None and raw.covariance is not None
+    assert np.allclose(annualised.covariance, raw.covariance * 252.0)
+
+
+@pytest.mark.parametrize("timeframe", ["5m", "15m", "30m", "1h", "4h", "1w"])
+def test_covariance_scales_with_bars_per_year(timeframe: str) -> None:
+    daily = _build_at_timeframe("1d")
+    intraday = _build_at_timeframe(timeframe)
+    assert daily.covariance is not None and intraday.covariance is not None
+    expected_factor = bars_per_year(timeframe) / bars_per_year("1d")
+    daily_diagonal = np.diag(daily.covariance)
+    intraday_diagonal = np.diag(intraday.covariance)
+    assert np.allclose(intraday_diagonal / daily_diagonal, expected_factor)
+
+
+@pytest.mark.parametrize("timeframe", ["5m", "1h", "1w"])
+def test_annualized_volatility_scales_with_sqrt_bars_per_year(timeframe: str) -> None:
+    daily = _build_at_timeframe("1d")
+    other = _build_at_timeframe(timeframe)
+    expected_ratio = np.sqrt(bars_per_year(timeframe) / bars_per_year("1d"))
+    for root in daily.ids:
+        assert other.annualized_vol(root) / daily.annualized_vol(root) == pytest.approx(
+            expected_ratio, rel=1e-9
+        )

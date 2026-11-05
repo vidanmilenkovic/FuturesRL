@@ -362,6 +362,19 @@ SNAPSHOT_FEATURES: tuple[str, ...] = (*REQUIRED_FEATURES, *TECHNICAL_FEATURES)
 #: Bar schemas consumed by :class:`src.data.storage.ParquetRepository`.
 DATABENTO_BAR_SCHEMAS: tuple[str, ...] = ("ohlcv-1m", "ohlcv-1h", "ohlcv-1d")
 
+#: Derived multi-timeframe bar schemas cached by the repository (resampled from
+#: the Databento base schemas). They share the canonical bar schema/validator.
+TIMEFRAME_BAR_SCHEMAS: tuple[str, ...] = (
+    "ohlcv-5m",
+    "ohlcv-15m",
+    "ohlcv-30m",
+    "ohlcv-4h",
+    "ohlcv-1w",
+)
+
+#: Every supported canonical bar schema (vendor base + derived timeframes).
+ALL_BAR_SCHEMAS: tuple[str, ...] = (*DATABENTO_BAR_SCHEMAS, *TIMEFRAME_BAR_SCHEMAS)
+
 #: Tick/quote schemas normalised to :data:`QUOTE_COLUMNS`.
 DATABENTO_QUOTE_SCHEMAS: tuple[str, ...] = ("tbbo",)
 
@@ -382,8 +395,13 @@ DATABENTO_SCHEMAS: tuple[str, ...] = (
 #: Bar interval in seconds for every supported bar schema.
 BAR_SCHEMA_INTERVALS: Mapping[str, int] = {
     "ohlcv-1m": 60,
+    "ohlcv-5m": 300,
+    "ohlcv-15m": 900,
+    "ohlcv-30m": 1_800,
     "ohlcv-1h": 3_600,
+    "ohlcv-4h": 14_400,
     "ohlcv-1d": 86_400,
+    "ohlcv-1w": 604_800,
 }
 
 #: Databento native continuous symbology suffixes (volume / calendar).
@@ -391,8 +409,12 @@ NATIVE_CONTINUOUS_SUFFIXES: Mapping[str, str] = {"volume": ".v.0", "calendar": "
 
 
 def is_bar_schema(schema: str) -> bool:
-    """Whether ``schema`` is one of the supported OHLCV bar schemas."""
-    return schema in DATABENTO_BAR_SCHEMAS
+    """Whether ``schema`` is one of the supported OHLCV bar schemas.
+
+    Covers the Databento base schemas (``ohlcv-1m/1h/1d``) plus the derived
+    multi-timeframe cache schemas (``ohlcv-5m/15m/30m/4h/1w``).
+    """
+    return schema in ALL_BAR_SCHEMAS
 
 
 def bar_interval(schema: str) -> timedelta:
@@ -401,7 +423,7 @@ def bar_interval(schema: str) -> timedelta:
         return timedelta(seconds=BAR_SCHEMA_INTERVALS[schema])
     except KeyError as exc:
         raise ValueError(
-            f"{schema!r} is not a bar schema; expected one of {list(DATABENTO_BAR_SCHEMAS)}"
+            f"{schema!r} is not a bar schema; expected one of {list(ALL_BAR_SCHEMAS)}"
         ) from exc
 
 
@@ -591,7 +613,7 @@ def dedupe_frame(
 
 def validator_for_schema(schema: str) -> FrameValidator:
     """Return the canonical frame validator for a repository ``schema`` name."""
-    if schema in DATABENTO_BAR_SCHEMAS or schema in {"bars", "ohlcv"}:
+    if schema in ALL_BAR_SCHEMAS or schema in {"bars", "ohlcv"}:
         return ensure_bars_schema
     if schema == DATABENTO_DEFINITION_SCHEMA:
         return ensure_definitions_schema

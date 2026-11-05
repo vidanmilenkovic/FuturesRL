@@ -69,6 +69,8 @@ from configs.settings import Settings, get_settings
 
 from src.core.types import InstrumentId
 from src.data import schema as s
+from src.data import timeframes as tf
+from src.data.resampler import resample_bars
 
 __all__ = [
     "PARTITION_FILE_NAME",
@@ -490,7 +492,7 @@ class ParquetRepository:
         """Validate ``frame`` as canonical bars and persist it partitioned by root."""
         if not s.is_bar_schema(schema):
             raise ValueError(
-                f"write_bars requires a bar schema {list(s.DATABENTO_BAR_SCHEMAS)}, got {schema!r}"
+                f"write_bars requires a bar schema {list(s.ALL_BAR_SCHEMAS)}, got {schema!r}"
             )
         return self.write_frame(frame, schema=schema, dataset=dataset, mode=mode)
 
@@ -544,6 +546,105 @@ class ParquetRepository:
         return self.write_frame(
             frame, schema=s.DATABENTO_DEFINITION_SCHEMA, dataset=dataset, mode=mode
         )
+
+    # -- multi-timeframe cache ---------------------------------------------------
+
+    def schema_for_timeframe(self, timeframe: str) -> str:
+        """Repository schema for ``timeframe`` (e.g. ``5m`` -> ``ohlcv-5m``)."""
+        return tf.schema_for_timeframe(timeframe)
+
+    def write_timeframe(
+        self,
+        timeframe: str,
+        frame: pl.DataFrame,
+        *,
+        dataset: str | None = None,
+        mode: WriteMode = "append",
+    ) -> int:
+        """Validate canonical bars as ``timeframe`` and persist them in its partition.
+
+        Returns the number of input rows written. ``frame`` must already be at the
+        target timeframe (use :func:`src.data.resampler.resample_bars` first).
+        """
+        spec = tf.get_timeframe(timeframe)
+        validated = s.ensure_bars_schema(frame, context=f"write_timeframe[{spec.name}]")
+        return self.write_bars(
+            validated, dataset=dataset, schema=self.schema_for_timeframe(spec.name), mode=mode
+        )
+
+    def read_timeframe(
+        self,
+        timeframe: str,
+        roots: Sequence[InstrumentId] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        dataset: str | None = None,
+        *,
+        persist: bool = False,
+    ) -> pl.DataFrame:
+        """Read cached ``timeframe`` bars, auto-resampling a finer base cache.
+
+        If a requested root has no target-timeframe partition but its finer base
+        timeframe is cached (``5m/15m/30m/1h`` from ``1m``, ``4h`` from ``1h``,
+        ``1w`` from ``1d``), the base bars are resampled look-ahead-safely via
+        :func:`src.data.resampler.resample_bars`. ``persist=True`` additionally
+        writes the resampled rows into the target schema cache.
+
+        Returns a canonical bar frame for the target timeframe (empty canonical
+        frame when neither the target nor a base partition exists).
+        """
+        spec = tf.get_timeframe(timeframe)
+        if start is not None and start.tzinfo is None:
+            raise ValueError("start must be timezone-aware (UTC expected)")
+        if end is not None and end.tzinfo is None:
+            raise ValueError("end must be timezone-aware (UTC expected)")
+        if start is not None and end is not None and start > end:
+            raise ValueError(
+                f"start ({start.isoformat()}) must not be after end ({end.isoformat()})"
+            )
+        target_schema = self.schema_for_timeframe(spec.name)
+        resolved_roots = tuple(s.validate_roots(roots)) if roots is not None else None
+        cached = self.read_bars(resolved_roots, start, end, schema=target_schema, dataset=dataset)
+        target_roots = set(self.available_roots(target_schema, dataset))
+        resampled_frames: list[pl.DataFrame] = []
+        base_source = spec.resample_from
+        if base_source is not None:
+            base_schema = self.schema_for_timeframe(base_source)
+            base_roots = set(self.available_roots(base_schema, dataset))
+            candidates = (
+                base_roots - target_roots
+                if resolved_roots is None
+                else set(resolved_roots) - target_roots
+            )
+            missing_roots: list[InstrumentId] = sorted(
+                root for root in candidates if root in base_roots
+            )
+            if missing_roots:
+                base = self.read_bars(
+                    missing_roots,
+                    start,
+                    end,
+                    schema=base_schema,
+                    dataset=dataset,
+                )
+                if not base.is_empty():
+                    resampled = resample_bars(base, spec.name, source_timeframe=base_source)
+                    resampled_frames.append(resampled)
+                    if persist:
+                        self.write_bars(
+                            resampled,
+                            dataset=dataset,
+                            schema=target_schema,
+                            mode="append",
+                        )
+        frames = [frame for frame in [cached, *resampled_frames] if not frame.is_empty()]
+        if not frames:
+            return self._empty_frame(target_schema)
+        merged = pl.concat(frames, how="vertical_relaxed")
+        merged = s.validator_for_schema(target_schema)(merged)
+        if start is not None or end is not None:
+            merged = s.filter_time_window(merged, start, end)
+        return s.dedupe_frame(merged, s.BAR_KEY_COLUMNS, keep="last")
 
     # -- reading ---------------------------------------------------------------
 
@@ -602,7 +703,7 @@ class ParquetRepository:
         """Read canonical bars for ``roots`` in the half-open window ``[start, end)``."""
         if not s.is_bar_schema(schema):
             raise ValueError(
-                f"read_bars requires a bar schema {list(s.DATABENTO_BAR_SCHEMAS)}, got {schema!r}"
+                f"read_bars requires a bar schema {list(s.ALL_BAR_SCHEMAS)}, got {schema!r}"
             )
         frame = self.read_frame(schema, roots=roots, start=start, end=end, dataset=dataset)
         return s.ensure_bars_schema(frame, context=f"read_bars[{schema}]")
@@ -657,7 +758,7 @@ class ParquetRepository:
 
     def _empty_frame(self, schema: str) -> pl.DataFrame:
         """Empty frame carrying the canonical schema for ``schema``."""
-        if schema in s.DATABENTO_BAR_SCHEMAS or schema in {"bars", "ohlcv"}:
+        if s.is_bar_schema(schema) or schema in {"bars", "ohlcv"}:
             return s.empty_bars_frame()
         if schema == s.DATABENTO_DEFINITION_SCHEMA:
             return s.empty_definitions_frame()
