@@ -1,371 +1,351 @@
-# FuturesRL-X
+<p align="center">
+  <img src="docs/screenshots/command-center-ibkr-paper.png" alt="FuturesRL-X Command Center connected to an IBKR paper account" width="920" />
+</p>
 
-FuturesRL-X is a modular, production-oriented algorithmic **futures** trading platform. It adapts
-the FinRL-X weight-centric composable pipeline to leveraged, expiring futures contracts and ships
-one interface for **historical backtesting**, **IBKR paper trading** and **IBKR live execution**.
+<h1 align="center">FuturesRL-X</h1>
 
-The pipeline is the contract:
+<p align="center"><b>An AI-Native Modular Infrastructure for Quantitative Futures Trading</b></p>
 
-```
-w_t = R_t( T_t( A_t( S_t( X_{≤t} ) ) ) )
-        │       │       │       └── S_t  universe selection   (liquidity, open interest, regime)
-        │       │       └────────── A_t  portfolio allocation (risk parity, vol target, DRL)
-        │       └────────────────── T_t  timing & term structure (TSMOM, KAMA, carry, seasonality)
-        └────────────────────────── R_t  risk overlays        (LLM Risk-First, quant risk)
-```
+<p align="center">
+A deployment-consistent algorithmic futures platform that unifies multi-timeframe market data,
+continuous contract rolling, composable strategy generation, purged walk-forward optimization, and
+IBKR paper/live execution through a single weight-centric contract.
+</p>
 
-The same approved target weight vector `w_t` flows into **both** the backtest engine and the IBKR
-execution engine through the deterministic `ContractTranslator`, which converts signed notional
-weights into discrete futures contracts with automatic standard→micro routing and a hard initial-
-margin utilisation ceiling (`η_max = 0.60` by default). That property is exercised by the parity
-suite in `tests/parity/`.
+<p align="center">
+  <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white" />
+  <img alt="Next.js 15" src="https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white" />
+  <img alt="Type Checked: mypy strict" src="https://img.shields.io/badge/Type%20Checked-mypy%20strict-2A6DB2" />
+  <img alt="Code Style: ruff" src="https://img.shields.io/badge/Code%20Style-ruff-261230" />
+  <img alt="Broker: IBKR ib_async" src="https://img.shields.io/badge/Broker-IBKR%20ib__async-D8122A" />
+  <img alt="Data: Databento / Parquet" src="https://img.shields.io/badge/Data-Databento%20%2F%20Parquet-4B8BBE" />
+  <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow" />
+</p>
 
-## Documentation
+<p align="center">
+  <a href="#architecture">Architecture</a> ·
+  <a href="#why-futuresrl-x">Why FuturesRL-X?</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#workstation-ui">Workstation UI</a> ·
+  <a href="#strategy-use-cases">Strategy Use Cases</a> ·
+  <a href="#python-api">Python API</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#citation">Citation</a>
+</p>
 
-| Document | Contents |
-| --- | --- |
-| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Installation, configuration reference, data and IBKR setup, dashboard, backtests, live/paper runner, risk operations, troubleshooting |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, module responsibilities, invariants, extension points |
-| [CHANGELOG.md](CHANGELOG.md) | Versioned release notes (SemVer) |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, quality gate, pull-request expectations |
-| [LICENSE](LICENSE) | MIT license |
-
-## Feature highlights
-
-**Data layer** (`src/data/`)
-- Databento historical ingestion (`ohlcv-1m/1h/1d`, `tbbo`, `mbp-1`, `mbp-10`, `definition`) with a
-  lazy SDK import and a deterministic offline source for reproducible research.
-- Immutable canonical Polars/Parquet schema keyed by
-  `(timestamp_utc, instrument_id, root_symbol, expiration_date)` with a partitioned Parquet cache
-  and a DuckDB query layer.
-- Continuous futures roll engine: volume/OI crossover, calendar N-days before FND/LTD and Databento
-  native symbology cross-checks, with Panama additive, proportional ratio and unadjusted + explicit
-  carry/term-slope adjustment modes; strictly zero look-ahead.
-- Feature processor: MACD, RSI, CCI, ADX, Bollinger, ATR, Garman-Klass, term-structure slope,
-  annualised roll yield, volume/OI ratio, order-flow imbalance and the Mahalanobis turbulence index.
-- Eight canonical timeframes (`1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, `1w`) with a look-ahead-safe
-  Polars resampler (right-boundary labels, UTC windows, volume-weighted VWAP) and automatic cache
-  resampling from the finest available base timeframe.
-- Cache inventory and budgeted backfills: IBKR historical data first, Databento pay-as-you-go with
-  an explicit cost estimate and hard per-job budget guard; provenance recorded per root.
-
-**Strategy pipeline** (`src/strategies/`)
-- Strict Protocols for `UniverseSelector`, `PortfolioAllocator`, `TimingOverlay` and `RiskOverlay`.
-- Selectors: liquidity, slow/fast adaptive regime, composite, with optional explicit root allow-lists.
-- Allocators: equal weight, equal-risk-contribution risk parity, mean-variance, volatility target and
-  DRL (PPO / CPPO / SAC / TD3 / A2C via Stable-Baselines3).
-- Timing overlays: TSMOM, KAMA, carry/term-structure filter, mean reversion, seasonality, composite.
-- Gymnasium `FuturesTradingEnv` with futures margin dynamics, transaction costs and the FinRL
-  Risk-First semantic-risk reward penalty.
-- Timeframe-aware quant math: `MarketState.timeframe` / `BacktestSpec.timeframe` drive
-  `bars_per_year` annualisation (daily remains exactly 252 trading bars per year).
-
-**Risk engine** (`src/risk/`)
-- LLM Risk-First engine: structured Pydantic assessments, multi-sample confidence and variance
-  anti-hallucination filter, reward shaping, a deterministic post-hoc circuit breaker
-  (`S ≥ κ ∧ c ≥ τ ⇒ w = 0`, linear de-risking between `θ_safe` and `κ`) and macro-event lockouts.
-- Quantitative overlay: EWMA covariance volatility targeting, gross/single-instrument/sector caps,
-  high-water-mark trailing stops, UTC daily max-loss kill switch and drawdown limits.
-- `ContractTranslator`: notional → discrete contracts, micro routing, margin feasibility projection
-  and FX-normalised sizing for non-USD accounts.
-
-**Backtesting & analytics** (`src/backtest/`, `src/analytics/`)
-- Vectorized Polars mode for parameter sweeps and an event-driven bar mode that reuses the exact
-  `BrokerAdapter` protocol used live.
-- Daily mark-to-market settlement (UTC calendar days for intraday bars), initial/maintenance margin
-  tracking, forced-liquidation simulation, roll execution costs, tick-aware slippage and tiered
-  IBKR/CME fee schedules, plus purged and embargoed walk-forward validation.
-- Institutional metrics: CAGR, volatility, Sharpe, Sortino, Calmar, Omega, max drawdown and
-  duration, historical/parametric VaR 95/99, CVaR, Rachev ratio, return-on-margin, margin
-  efficiency, implementation shortfall and spot-vs-roll attribution.
-
-**Execution** (`src/execution/`)
-- Async IBKR connection manager on `ib_async` (TWS/Gateway, paper and live ports), heartbeat,
-  exponential-backoff reconnects, IBKR nightly reset-window handling and `whatIfOrder` margin checks.
-- OMS with a mandatory pre-trade hard gate (fat-finger limits, duplicate/rapid-fire rate limiter,
-  real-time margin impact) and an emergency `flatten_all()` kill switch.
-- Automated contract rolls through native IBKR `BAG` calendar spreads with a two-legged fallback.
-- State reconciliation that includes in-flight working-order deltas and halts automated rebalancing
-  on unexplained drift.
-- Cold-start hydration from the Parquet cache before the first live bar, durable risk/kill-switch
-  state across restarts, and one-shot paper rebalances that never open tick subscriptions.
-
-**Telemetry, API & dashboard** (`src/api/`, `frontend/`)
-- FastAPI REST + WebSocket (`/ws/telemetry`) backend with dependency-injected, offline-capable
-  services: positions, pipeline waterfall, risk state/thresholds, term structure, strategies,
-  backtests, optimizer, DRL trainer and market-data cache endpoints.
-- Next.js 15 + TypeScript + TailwindCSS + TradingView Lightweight Charts dashboard: Command Center,
-  Pipeline & Weights, Risk & LLM Monitor, Term Structure & Roll Calendar, Backtest Lab and a
-  Strategy Studio (manual builder, walk-forward Optuna optimizer, DRL trainer).
-- Docker Compose stack: TimescaleDB, Redis, headless IB Gateway, FastAPI backend and Next.js
-  frontend.
-
-## Repository layout
-
-```text
-futuresrl-x/
-├── configs/
-│   ├── settings.py                  # Pydantic BaseSettings + .env loader
-│   ├── instruments.py(.yaml)        # futures master: multipliers, ticks, margins, roll/micro rules
-│   ├── strategy.py                  # typed declarative strategy config models
-│   ├── macro_calendar.yaml          # Tier-1 macro event lockout calendar (editable template)
-│   └── strategies/                  # YAML pipelines (tsmom_vol_target, drl_ppo_llm_risk)
-├── src/
-│   ├── core/                        # immutable contracts, Protocols, async event bus
-│   ├── data/                        # vendor adapters, cache, roll engine, features, resampling
-│   ├── strategies/                  # pipeline composer, selectors, allocators, timing, envs
-│   ├── risk/                        # LLM Risk-First engine, quant overlay, contract translator
-│   ├── backtest/                    # engine, margin/cost simulators, walk-forward, simulated broker
-│   ├── execution/                   # IBKR client, OMS pre-trade gate, BAG roller, reconciler
-│   ├── analytics/                   # metrics, tearsheets
-│   └── api/                         # FastAPI REST routes + WebSocket telemetry
-├── frontend/                        # Next.js 15 dashboard
-├── docker/                          # Dockerfiles + compose stack
-├── docs/                            # user guide, architecture, screenshots
-├── tests/
-│   ├── unit/                        # offline deterministic unit tests
-│   ├── integration/                 # cross-module end-to-end tests
-│   └── parity/                      # backtest vs live ContractTarget parity proofs
-├── scripts/quality_gate.sh          # lint + format + strict mypy + pytest (+ coverage gate)
-├── CHANGELOG.md                     # versioned release notes
-├── CONTRIBUTING.md
-├── LICENSE                          # MIT
-├── Makefile                         # developer entry points
-├── pyproject.toml
-└── README.md
-```
-
-## Quickstart
-
-### 1. Python environment
-
-```bash
-git clone <repo-url> futuresrl-x && cd futuresrl-x
-python3.12 -m venv .venv
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install -e ".[all]"             # every optional extra
-# or choose extras individually:
-#   .venv/bin/pip install -e ".[dev]"          core + test/lint/type tooling
-#   .venv/bin/pip install -e ".[live]"         ib_async (IBKR paper/live)
-#   .venv/bin/pip install -e ".[databento]"    Databento historical ingestion
-#   .venv/bin/pip install -e ".[drl]"          gymnasium + stable-baselines3 (torch)
-#   .venv/bin/pip install -e ".[optimize]"     Optuna
-cp .env.example .env                           # then edit credentials
-```
-
-### 2. Verify the environment
-
-```bash
-./scripts/quality_gate.sh          # ruff + ruff format --check + mypy strict + pytest
-./scripts/quality_gate.sh --cov    # additionally enforce ≥85% coverage on core/risk/translator
-```
-
-### 3. Explore offline (no credentials required)
-
-```bash
-# deterministic offline fixture source + declarative strategy config
-.venv/bin/python -m src.backtest.engine \
-  --strategy configs/strategies/tsmom_vol_target.yaml \
-  --offline --output artifacts/tsmom_tearsheet.json
-```
-
-## Configuration
-
-Configuration is layered: environment variables (`FUTURESRLX_*`), an optional `.env` file, then the
-committed `configs/*.yaml` masters. Secrets use `pydantic.SecretStr` and are redacted from logs and
-telemetry (`Settings.model_dump_redacted()`). The full reference is in
-[docs/USER_GUIDE.md](docs/USER_GUIDE.md#5-configuration); the most common variables are:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `FUTURESRLX_ENVIRONMENT` | `development` | `development` / `paper` / `live` / `backtest` |
-| `FUTURESRLX_DATABENTO_API_KEY` | _(unset)_ | Databento historical ingestion key |
-| `FUTURESRLX_DATA_DIR` / `PARQUET_DIR` / `DUCKDB_PATH` | `./data/...` | market-data cache |
-| `FUTURESRLX_IBKR_HOST/PORT/CLIENT_ID` | `127.0.0.1:7497:42` | TWS/Gateway (paper 7497/4002, live 7496/4001) |
-| `FUTURESRLX_IBKR_PAPER` | `true` | must be `false` with a live port |
-| `FUTURESRLX_RISK__MAX_MARGIN_UTILIZATION` | `0.60` | hard initial-margin ceiling `η_max` |
-| `FUTURESRLX_RISK__TARGET_ANNUAL_VOLATILITY` | `0.12` | ex-ante volatility target |
-| `FUTURESRLX_RISK__LLM_CONFIDENCE_THRESHOLD` | `0.70` | `τ` for the anti-hallucination filter |
-| `FUTURESRLX_RISK__LLM_CRITICAL_SCORE` | `4.5` | `κ` circuit-breaker threshold |
-| `FUTURESRLX_RISK__DAILY_MAX_LOSS_PCT` | `0.03` | UTC daily kill switch |
-| `FUTURESRLX_API_HOST` / `PORT` | `0.0.0.0:8000` | FastAPI telemetry backend |
-| `FUTURESRLX_ACCOUNT_CURRENCY` | `USD` | IBKR account base currency (NLV denomination) |
-| `FUTURESRLX_FX_RATES` | `{}` | JSON map `{"EUR": 1.10}` = USD per 1 unit |
-| `FUTURESRLX_RISK_STATE_STORE_URI` | `""` | durable risk state: `""`/`memory:`/file path/`duckdb:`/`redis:` |
-| `FUTURESRLX_HYDRATION_LOOKBACK_DAYS` | `400` | cold-start history window before live trading |
-
-The futures instrument master (`configs/instruments.yaml`) is the single source of truth for the
-45-root universe: multipliers, tick sizes, margin estimates, roll rules, sectors and standard↔micro
-pairs (ES↔MES, NQ↔MNQ, CL↔MCL, GC↔MGC, …). Margins are conservative estimates; live orders are
-always confirmed against IBKR `whatIfOrder` before transmission. Declarative strategy pipelines live
-in `configs/strategies/*.yaml` and describe stages by name and parameters — no executable code, so
-runs are reproducible and sweepable.
-
-`configs/macro_calendar.yaml` is the editable Tier-1 macro release calendar used by the LLM
-Risk-First lockout windows (FOMC/CPI/NFP/EIA/WASDE/OPEC, UTC timestamps). LLM adapters support
-OpenAI, Anthropic, DeepSeek, Gemini and local vLLM endpoints; they are only used when explicitly
-configured, and every signal passes through the confidence/variance filter and the deterministic
-circuit-breaker projection before it can affect weights.
-
-## Running the platform
-
-### Backtests
-
-```bash
-# declarative config, offline deterministic data
-.venv/bin/python -m src.backtest.engine --strategy configs/strategies/tsmom_vol_target.yaml --offline
-
-# purged + embargoed walk-forward validation (per-fold reports + aggregate means)
-.venv/bin/python -m src.backtest.engine --strategy configs/strategies/tsmom_vol_target.yaml \
-  --offline --walk-forward --wf-splits 5 --purge-bars 5 --embargo-bars 5 \
-  --output artifacts/wf_tsmom.json --html artifacts/wf_tsmom.html
-```
-
-The walk-forward report contains per-fold train/test ranges and metrics, aggregate mean/std
-statistics and a compounded out-of-sample equity curve. See the
-[user guide](docs/USER_GUIDE.md#8-running-backtests) for all flags.
-
-### Paper / live trading (IBKR)
-
-```bash
-# deterministic end-to-end dry run: no IBKR, no Databento key, no network
-.venv/bin/python -m src.execution.runner --offline --max-states 30 \
-  --strategy configs/strategies/tsmom_vol_target.yaml
-
-# TWS or headless IB Gateway must be running and API-enabled
-FUTURESRLX_ENVIRONMENT=paper FUTURESRLX_IBKR_PORT=7497 \
-  .venv/bin/python -m src.execution.runner --backfill-source auto
-```
-
-Hydration source resolution: `auto` = Databento (API key) → IBKR historical (paper/live) → offline
-(only when explicitly allowed). If no source is available the CLI exits with an actionable message
-(never a raw traceback) explaining `--offline`, IBKR TWS setup and `FUTURESRLX_DATABENTO_API_KEY`.
-See the [user guide](docs/USER_GUIDE.md#9-running-live--paper-trading).
-
-The OMS always runs the pre-trade gate (fat finger → `whatIfOrder` margin → rate limiter) before
-transmitting; the dashboard's **EMERGENCY FLATTEN ALL** calls `flatten_all()` (cancel all, close
-all, lock).
-
-### API + dashboard
-
-```bash
-# backend (offline-capable; deterministic fixtures when no live engine is attached)
-.venv/bin/python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000
-
-# frontend
-cd frontend && npm install && npm run dev     # http://localhost:3100
-```
-
-REST surface: `/health`, `/api/positions`, `/api/pipeline/latest`, `/api/risk/state`,
-`PUT /api/risk/thresholds`, `POST /api/risk/flatten-all`, `/api/term-structure`,
-`/api/strategies[/{id}]`, `/api/backtests[ POST, /{id}, /{id}/tearsheet]`, `/api/telemetry/status`,
-`/api/orders/working`, `/api/fills/recent`, `/api/runner/status`, `POST /api/runner/step`,
-`/api/strategies/schema/catalog`, `POST/PUT /api/strategies[ /{id}]`,
-`/api/optimize[ POST, /{id}, /{id}/apply]`, `/api/drl/models`, `POST /api/drl/train`,
-`/api/data/inventory`, `POST /api/data/estimate-cost`, `POST /api/data/ingest`, plus
-`WS /ws/telemetry`. The backend runs **offline by default** (`/health.offline_mode=true`,
-deterministic fixtures, `data_source` recorded on every pipeline/backtest payload); set
-`FUTURESRLX_API_ENABLE_IBKR=1` to attach a real IBKR paper/live session. The dashboard shows a
-visible data-mode badge whenever it is not talking to a live backend.
-
-### Docker stack
-
-```bash
-docker compose -f docker/docker-compose.yml up --build
-# TimescaleDB + Redis + IB Gateway (paper) + FastAPI backend + Next.js frontend
-```
-
-## Strategy Studio, optimizer & DRL trainer
-
-The `/studio` view provides three workflows on top of the same typed strategy configuration:
-
-- **Manual builder.** A five-stage pipeline builder (Universe → Allocator → Timing → Risk/LLM →
-  Translator) with live YAML preview, 45-root sector picker, overlay enable/disable toggles and
-  slider + numeric inputs. Presets cover trend following, commodity carry/term structure, panic
-  mean-reversion, seasonal commodity cycle and DRL + LLM risk.
-- **Walk-forward optimizer.** `src/backtest/optimizer.py::WalkForwardOptimizer` supports Optuna plus
-  a deterministic Latin-Hypercube fallback. Every trial is scored on purged/embargoed
-  **out-of-sample** folds, a drawdown penalty suppresses overfit trials, flat/zero-activity trials
-  receive a hard penalty and can never be selected as best, and studies persist to
-  `artifacts/optimizations/<study_id>.json`. Apply writes the tuned strategy, reloads the catalog and
-  persists a verification walk-forward run.
-- **DRL trainer.** `POST /api/drl/train` and `python -m src.strategies.train_drl` train PPO / CPPO /
-  SAC / TD3 / A2C on `FuturesTradingEnv`, writing `<checkpoint>.zip`, `<checkpoint>.zip.meta.json`
-  (universe, features, shapes, hyperparameters) and a bounded reward curve. `DRLAllocator` loads
-  checkpoints lazily and aligns observations/actions to the checkpoint's trained universe.
-
-`GET /api/strategies/schema/catalog` exposes every configurable parameter with a plain-English
-description, bounds, defaults, YAML encoding and preset templates. The current catalog has 121
-parameters across universe/allocator/timing/risk/translator; structural/data-hygiene parameters are
-not tunable, 85 parameters are Optuna-tunable, and five curated core parameters are pre-selected by
-default. The catalog module is importable without Gymnasium/Stable-Baselines3.
-
-## Quality gates
-
-Every pull request must pass (see `scripts/quality_gate.sh`):
-
-```bash
-.venv/bin/ruff check .                 # zero lint errors
-.venv/bin/ruff format --check .        # formatting
-.venv/bin/python -m mypy src configs   # strict static typing
-.venv/bin/python -m pytest tests/      # hermetic suite + coverage gate
-```
-
-All unit tests are **offline and deterministic**: they never call paid Databento endpoints or a live
-IBKR session. Networked/adapter code is exercised through injected fakes.
+---
 
 ## Architecture
 
-The complete design document is [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). In brief:
+### Core Concept: Weight-Centric + Contract-Translated Architecture
 
-- `src/core/types.py` is the narrow waist of the platform: immutable, validated contracts
-  (`MarketState`, `WeightVector`, `ContractTarget(Set)`, `OrderEvent`, `Fill`, `RiskAssessment`,
-  `PipelineResult`, …) exchanged by every module.
-- `src/core/interfaces.py` defines the structural Protocols shared by backtest and live execution;
-  the pipeline composer in `src/strategies/pipeline.py` wires `S_t → A_t → T_t → R_t`.
-- `src/risk/contract_translator.py` is the only place that turns weights into discrete contracts;
-  parity tests assert identical targets and deltas from the backtest and IBKR paths.
-- `src/api/` exposes the same state to the dashboard through typed REST/WebSocket contracts and
-  labels every payload with its data origin.
+FuturesRL-X adapts the FinRL-X weight-centric contract to leveraged, expiring futures. A strategy is
+a composition of four contract-preserving stages; the only boundary between research, backtesting
+and execution is the approved target-weight vector. A deterministic `ContractTranslator` then maps
+continuous weights into discrete CME contracts.
 
-## Testing philosophy
+```text
+w_t = R_t( T_t( A_t( S_t( X_{≤t} ) ) ) )  ──►  N_{i,t} = C_t( w_t, E_t, P_t, M, IM )
+        │       │       │       │                        │
+        │       │       │       └── S_t  Universe Selection (liquidity, OI, regime)
+        │       │       └────────── A_t  Portfolio Allocation (vol target, risk parity, MV, DRL)
+        │       └────────────────── T_t  Timing & Term Structure (TSMOM, KAMA, carry, mean-rev, seasonality)
+        └────────────────────────── R_t  Risk Overlays (LLM Risk-First circuit breaker, quant hard caps)
+                                                         └── C_t  ContractTranslator (standard↔micro routing, η_max ≤ 60% margin ceiling)
+```
 
-- **Offline & deterministic** — seeded synthetic fixtures in `tests/fixtures/market.py`; adapters
-  are injected. No network, no paid APIs, no wall-clock races.
-- **Property-based** — `hypothesis` proves the translator never exceeds the margin ceiling across
-  arbitrary equity/price/weight shocks.
-- **Accounting identity** — the backtest integration test asserts
-  `Ending Equity = Starting Equity + Price PnL + Roll PnL − Commissions − Slippage`.
-- **Anti-look-ahead** — roll/feature/resampling/walk-forward tests mutate future data and assert
-  nothing changes in the past.
-- **Parity** — identical `MarketState` ⇒ identical `ContractTarget`s (and OMS deltas) from the
-  backtest and IBKR paths.
-- **Hardening** — hydrate-before-first-bar ordering, restart-safe risk latches, open-order
-  reconciliation grace windows, non-blocking TTL LLM cache and EUR↔USD sizing parity are covered in
-  `tests/integration/test_production_hardening.py` and `tests/integration/test_fx_normalization.py`.
-- **Ablation** — LLM hallucination fixtures (low confidence) are ignored, while high-confidence
-  critical alerts deterministically zero exposure.
+- **Contract-preserving composability.** Swap any universe selector, classical allocator, or
+  Stable-Baselines3 policy (PPO / CPPO / SAC / TD3 / A2C) without touching downstream risk,
+  portfolio-construction, or execution code.
+- **Futures-native discretization.** `ContractTranslator` converts continuous signed weights `w_t`
+  into integer contracts with FX base-currency normalization, automatic standard-to-micro spillover
+  (`ES→MES`, `NQ→MNQ`, `CL→MCL`, `GC→MGC`) and a mathematical initial-margin ceiling (`η_max = 0.60`).
+- **Zero backtest-to-live drift.** Identical `MarketState` inputs produce bit-for-bit identical
+  `ContractTargetSet` deltas in the event-driven backtester and the live IBKR Order Management System,
+  enforced by `tests/parity/`.
 
-## Release history
+| Layer | Responsibility | Key components |
+| --- | --- | --- |
+| **Data** | Point-in-time bars, contract metadata, rolls and cache | Databento + IBKR adapters, canonical Polars/Parquet schema, 8-timeframe resampler, continuous roller, feature processor |
+| **Strategy** | `S_t → A_t → T_t` weight construction | Liquidity/regime selectors, risk-parity/vol-target/mean-variance/DRL allocators, TSMOM/KAMA/carry/mean-reversion overlays |
+| **Risk & Translation** | `R_t` approval and `C_t` contract mapping | LLM Risk-First circuit breaker, quant limits, EWMA covariance, deterministic `ContractTranslator` |
+| **Backtest & Optimization** | Event/vectorized simulation and OOS search | Event-driven engine, margin/cost/roll simulators, purged & embargoed walk-forward, Optuna |
+| **Execution & Telemetry** | Broker parity and operator visibility | IBKR OMS + `whatIfOrder`, reconciler, kill switch, runner bridge, FastAPI + Next.js |
 
-Versions follow [Semantic Versioning](https://semver.org/) and release notes follow
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The complete history — from the first
-foundation release through the current multi-timeframe engine — is maintained in
-[CHANGELOG.md](CHANGELOG.md).
+## Why FuturesRL-X?
+
+| Capability | Backtrader / Zipline | Classic DRL repos | FinRL-Trading (Equities) | FuturesRL-X (Futures) |
+| --- | --- | --- | --- | --- |
+| **Primary asset class** | Equities | Mixed / equities | Equities | **45+ CME leveraged futures across 7 sectors** |
+| **Interface contract** | Ad-hoc signals | Raw gym actions | Weight vector `w_t` | **Weight vector `w_t` + discrete `ContractTranslator` `N_{i,t}`** |
+| **Continuous contract rolling** | Manual | Rarely handled | Not applicable | **Zero-lookahead Panama, proportional and unadjusted + explicit F1–F6 carry** |
+| **Multi-timeframe support** | Fixed bar source | Fixed environment | Fixed daily bars | **1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w with dynamic `√N` annualization** |
+| **Standard ↔ micro routing** | None | None | None | **Automatic ES↔MES, NQ↔MNQ, CL↔MCL, GC↔MGC** |
+| **Pre-trade & semantic risk** | None / basic | None | Basic portfolio constraints | **LLM anti-hallucination + post-hoc circuit breaker + IBKR `whatIfOrder` margin gate** |
+| **Hyperparameter optimization** | In-sample grid | Manual tuning | In-sample grid | **Purged & embargoed walk-forward Optuna OOS optimizer** |
+
+## Annotated Repository Structure
+
+```text
+futuresrl-x/
+├── ⚙️ configs/                     # typed settings, 45-root instrument master, declarative strategies
+│   ├── settings.py
+│   ├── instruments.yaml
+│   └── strategies/                 # tsmom_vol_target.yaml, drl_ppo_llm_risk.yaml
+├── 🗄️ src/data/                    # Databento/IBKR adapters, Parquet cache, rolls, 8 timeframes, features
+├── 🧠 src/strategies/              # S_t selectors, A_t allocators, T_t overlays, DRL env/training
+├── 🛡️ src/risk/                    # LLM Risk-First, quant overlay, ContractTranslator, state store
+├── 📊 src/backtest/                # event/vectorized engine, margin/cost simulators, walk-forward
+├── 📈 src/analytics/               # institutional metrics, tearsheets, attribution
+├── ⚡ src/execution/                # IBKR client/OMS, pre-trade gate, BAG rolls, reconciler, runner
+├── 🌐 src/api/                     # FastAPI app, domain routes, schemas, telemetry, services
+├── 🖥️ frontend/                    # Next.js 15 workstation: Command Center, Pipeline, Risk, Studio
+├── 🧪 tests/                       # unit/, integration/, parity/ — hermetic, deterministic suites
+├── 🐳 docker/                      # backend/frontend images, TimescaleDB/Redis/IB Gateway compose
+├── 📚 docs/                        # USER_GUIDE.md, ARCHITECTURE.md, screenshots/
+├── scripts/                        # quality_gate.sh, dev.sh, WSL/Windows host helper
+├── CHANGELOG.md                    # Keep a Changelog + Semantic Versioning
+├── CONTRIBUTING.md                 # setup, quality gate, architectural invariants and PR rules
+├── LICENSE                         # MIT
+└── pyproject.toml                  # package metadata, extras and CLI entry points
+```
+
+## Quick Start
+
+### Option A — One-command full-stack launch
+
+```bash
+git clone https://github.com/<your-org>/futuresrl-x.git
+cd futuresrl-x
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[all]"
+
+./scripts/dev.sh        # or: make dev
+```
+
+`dev.sh` creates `.env` from `.env.example` when needed, then starts the FastAPI backend on
+**http://127.0.0.1:8000** and the Next.js workstation on **http://127.0.0.1:3100** with clean
+`SIGINT`/`SIGTERM` shutdown. The default configuration runs deterministically offline — **no API
+keys and no broker connection are required** to explore the platform.
+
+### Option B — CLI entry points
+
+Installing the package exposes first-class commands:
+
+```bash
+futuresrlx-api                         # FastAPI backend (uvicorn)
+futuresrlx-backtest --strategy configs/strategies/tsmom_vol_target.yaml --offline
+futuresrlx-optimize --strategy configs/strategies/tsmom_vol_target.yaml --trials 25 --objective sharpe --offline
+futuresrlx-train-drl --strategy configs/strategies/drl_ppo_llm_risk.yaml --timesteps 20000 --offline
+futuresrlx-runner --check              # validate settings, instruments, strategy and hydration config
+futuresrlx-runner --strategy configs/strategies/tsmom_vol_target.yaml --roots ES,NQ,CL,GC,ZN --rebalance-once --dry-run
+```
+
+### Option C — Docker Compose stack
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+```
+
+The compose stack starts TimescaleDB, Redis, a headless IB Gateway (paper), the FastAPI backend and
+the Next.js workstation. Set `FUTURESRLX_API_ENABLE_IBKR=1` in `docker/.env` to attach a live IBKR
+paper session; otherwise the stack runs in offline/deterministic mode.
+
+<a id="workstation-ui"></a>
+
+## Workstation UI Showcase
+
+<table>
+  <tr>
+    <td width="50%" align="center"><img src="docs/screenshots/command-center-ibkr-paper.png" alt="Command Center with IBKR paper telemetry" /></td>
+    <td width="50%" align="center"><img src="docs/screenshots/strategy-studio-universe.png" alt="Strategy Studio universe and sector picker" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Command Center</b> — live NLV, margin budget, positions, risk drawer and guarded flatten/reset controls.</sub></td>
+    <td align="center"><sub><b>Strategy Studio</b> — 45-root universe, sector filters, stage switcher and declarative preview.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%" align="center"><img src="docs/screenshots/strategy-studio-builder.png" alt="Strategy Studio manual builder" /></td>
+    <td width="50%" align="center"><img src="docs/screenshots/optuna-walk-forward-optimizer.png" alt="Optuna walk-forward optimizer" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Manual Builder</b> — compose selectors, allocators, overlays and risk stages with an editable YAML contract.</sub></td>
+    <td align="center"><sub><b>Optuna Auto-Optimizer</b> — purged/embargoed OOS trials, activity-guarded best selection and live provenance.</sub></td>
+  </tr>
+</table>
+
+The workstation follows the six core views: **Command Center** (live/paper telemetry), **Pipeline &
+Weights** (the `S → A → T → R → N` waterfall), **Risk & LLM** (semantic assessments and breaker
+state), **Term Structure** (F1–F6 curves and roll calendar), **Strategy Studio** (manual and Optuna
+workflows), and **Backtest Lab** (walk-forward/diagnostic tear sheets and comparisons).
+
+<a id="strategy-use-cases"></a>
+
+## Composable Strategy Use Cases
+
+### Use Case 1 — Volatility-targeted time-series momentum + carry filter
+
+`configs/strategies/tsmom_vol_target.yaml` runs a classical multi-sector TSMOM book with KAMA
+confirmation, a carry/term-structure filter, and both quantitative and LLM risk overlays.
+
+| Component | Implementation |
+| --- | --- |
+| Universe `S_t` | Liquidity selector with explicit root allow-list and sector caps |
+| Allocation `A_t` | Volatility target with EWMA covariance and gross-leverage ceiling |
+| Timing `T_t` | TSMOM (fast/slow), KAMA confirmation, carry filter |
+| Risk `R_t` | Quant trailing stop/vol target + LLM Risk-First circuit breaker |
+| Translation `C_t` | Discrete contracts, micro routing, 60% margin ceiling |
+
+```bash
+futuresrlx-backtest --strategy configs/strategies/tsmom_vol_target.yaml --offline --walk-forward --html reports/tsmom_walk_forward.html
+```
+
+### Use Case 2 — Risk-constrained DRL + LLM Risk-First circuit breaker
+
+`configs/strategies/drl_ppo_llm_risk.yaml` binds a Stable-Baselines3 policy to the futures
+environment while keeping the deterministic risk overlay and semantic circuit breaker in the loop.
+
+| Component | Implementation |
+| --- | --- |
+| Universe `S_t` | Regime selector with crypto/agri options and top-N cap |
+| Allocation `A_t` | PPO or CPPO policy trained on `FuturesTradingEnv` (SAC/TD3/A2C also supported) |
+| Timing `T_t` | Optional TSMOM/KAMA overlay for policy stabilization |
+| Risk `R_t` | LLM confidence filter, deterministic breaker, quant hard limits |
+| Translation `C_t` | Same `ContractTranslator` and pre-trade margin gate used by classical books |
+
+```bash
+futuresrlx-train-drl --strategy configs/strategies/drl_ppo_llm_risk.yaml --algorithm CPPO --timesteps 20000 --offline --checkpoint-name cppo_llm_risk
+futuresrlx-runner --strategy configs/strategies/drl_ppo_llm_risk.yaml --check
+```
+
+### Use Case 3 — Purged walk-forward Optuna + multi-timeframe resampling
+
+Optimize a strategy strictly on out-of-sample folds, then run the same configuration across intraday
+or weekly bars. The data layer auto-resamples finer cached Parquet (1m→5m/15m/30m/1h, 1h→4h,
+1d→1w) and annualizes metrics with the matching trading-bar count.
+
+| Component | Implementation |
+| --- | --- |
+| Search | Optuna TPE with deterministic LHS fallback, activity-penalized objectives |
+| Validation | Purged + embargoed walk-forward, OOS-only best-trial selection |
+| Data | Parquet cache with cost-guarded Databento/IBKR backfills and provenance |
+| Timeframes | 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w with `bars_per_year` annualization |
+| Artifacts | Persisted studies, verification backtests and apply-to-strategy workflow |
+
+```bash
+futuresrlx-optimize --strategy configs/strategies/tsmom_vol_target.yaml --trials 40 --objective sharpe --splits 5 --offline
+```
+
+<a id="python-api"></a>
+
+## Python API & Extending the Pipeline
+
+The pipeline is importable and testable without the dashboard. The 25-line program below loads a
+declarative strategy, implements a protocol-compatible timing overlay, runs a deterministic
+backtest, and verifies the accounting identity:
+
+```python
+from datetime import UTC, datetime
+
+from configs.instruments import load_instruments
+from configs.strategy import load_strategy_config
+from src.backtest.engine import build_states_from_bars, run_from_config
+from src.core.interfaces import TimingOverlay
+from src.core.types import MarketState, WeightVector
+from src.data.databento_loader import OfflineBarSource
+
+class NoopTiming:
+    """Protocol-compatible T_t overlay: pass through allocator weights."""
+
+    name = "noop"
+
+    def adjust_timing(self, weights: WeightVector, state: MarketState) -> WeightVector:
+        return weights
+
+config = load_strategy_config("configs/strategies/tsmom_vol_target.yaml")
+master = load_instruments()
+source = OfflineBarSource(roots=("ES", "NQ", "CL", "GC", "ZN"), periods=600)
+bars = source.load(source.roots, datetime(2024, 1, 2, tzinfo=UTC), datetime(2025, 1, 2, tzinfo=UTC))
+states = build_states_from_bars(bars, master, initial_equity=1_000_000)
+result = run_from_config(config, states=states, instrument_master=master)
+result.check_accounting_identity()
+assert isinstance(NoopTiming(), TimingOverlay)
+```
+
+For production composition, use `src.strategies.pipeline.build_pipeline` with the same config and
+inject custom stages through their registries. The protocol definitions live in
+`src/core/interfaces.py`; a custom allocator implements `allocate(candidates, state)` and a custom
+timing overlay implements `adjust_timing(weights, state)`.
+
+## Configuration
+
+Runtime settings are Pydantic settings loaded from environment variables or `.env`; never commit
+`.env` or credentials.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `FUTURESRLX_ENVIRONMENT` | `backtest` / `paper` / `live` execution mode | `backtest` |
+| `FUTURESRLX_DATABENTO_API_KEY` | Databento historical data access | empty |
+| `FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB` | Hard per-job Databento cost guard | `2.00` |
+| `FUTURESRLX_IBKR_HOST` / `_PORT` / `_CLIENT_ID` | TWS/IB Gateway connection | `127.0.0.1` / `7497` / `42` |
+| `FUTURESRLX_IBKR_PAPER` | Paper (`true`) vs live (`false`) account | `true` |
+| `FUTURESRLX_ACCOUNT_CURRENCY` | Broker account base currency | `USD` |
+| `FUTURESRLX_FX_RATES` | JSON FX table for non-USD NLV normalization | `{}` |
+| `FUTURESRLX_LLM_PROVIDER` / `_MODEL` / `_API_KEY` | LLM Risk-First provider | `offline` / `gpt-4o-mini` / empty |
+| `FUTURESRLX_RUNNER_BRIDGE_ENABLED` | Publish runner snapshots to the dashboard | `true` |
+| `FUTURESRLX_IBKR_MARKET_DATA_TYPE` | IBKR market-data type (`1` live … `3` delayed) | `3` |
+
+## Quality Gates
+
+Every change must pass the hermetic quality gate:
+
+```bash
+./scripts/quality_gate.sh --cov
+cd frontend && npm run build && npm run lint
+```
+
+The gate runs `ruff check`, `ruff format --check`, strict `mypy`, the full deterministic test suite,
+and an 85% coverage floor. Tests never require TWS, paid market data, network access, or a populated
+cache.
+
+## Acknowledgements
+
+FuturesRL-X is inspired by **FinRL-X / FinRL-Trading** from the
+[AI4Finance Foundation](https://github.com/AI4Finance-Foundation), especially the weight-centric
+composable `S → A → T → R` abstraction:
+
+> Yang et al., *FinRL-X: An AI-Native Modular Infrastructure for Quantitative Trading*,
+> arXiv:2603.21330.
+
+The portfolio-construction and risk design also draw on Grinold & Kahn, *Active Portfolio Management*
+(1999), and López de Prado, *Advances in Financial Machine Learning* (2018).
+
+## Citation
+
+If you use FuturesRL-X in research, please cite the project and its lineage:
+
+```bibtex
+@misc{futuresrlx2026,
+  title  = {FuturesRL-X: An AI-Native Modular Infrastructure for Quantitative Futures Trading},
+  author = {{FuturesRL-X Contributors}},
+  year   = {2026},
+  url    = {https://github.com/<your-org>/futuresrl-x}
+}
+
+@misc{finrlx2026,
+  title        = {FinRL-X: An AI-Native Modular Infrastructure for Quantitative Trading},
+  author       = {{AI4Finance Foundation}},
+  year         = {2026},
+  eprint       = {2603.21330},
+  archivePrefix = {arXiv}
+}
+```
 
 ## Disclaimer
 
-This software is research infrastructure, **not investment advice**. Futures are leveraged; losses
-can exceed the initial margin. Test on paper for a meaningful period before live use.
-
-Live trading requires the explicit `FUTURESRLX_ENVIRONMENT=live` opt-in, a live IBKR port and
-`ibkr_paper=false`; the settings validator refuses inconsistent configurations. The pre-trade gate is
-mandatory and cannot be bypassed by strategy code. LLM outputs are untrusted data: they are
-schema-validated, confidence-filtered and only ever applied through bounded deterministic
-projections. The Databento SDK and live IBKR socket paths are lazy, opt-in adapters; unit/CI tests
-exercise them through injected fakes and never contact vendors. Real-feed smoke tests belong in a
-credentialed paper environment.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+FuturesRL-X is provided for **educational and research purposes only**. It is not investment advice,
+a solicitation, or a guarantee of performance. Futures trading involves substantial leverage,
+margin calls, liquidity risk and the potential loss of more than the initial deposit. Backtest,
+paper and simulated results do not guarantee live results. You are solely responsible for regulatory
+compliance, broker permissions, risk limits and any capital deployed. Use at your own risk.
