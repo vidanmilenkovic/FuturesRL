@@ -577,6 +577,7 @@ class CachedBarsSummary(APIModel):
     start_date: date | None = None
     end_date: date | None = None
     schema_name: str = Field(default="ohlcv-1d", alias="schema")
+    timeframe: str = "1d"
 
 
 class BacktestRunConfig(StrictModel):
@@ -596,6 +597,8 @@ class BacktestRunConfig(StrictModel):
     #: cached_real requires real cached Parquet bars, synthetic_offline never reads
     #: the cache.
     data_mode: Literal["auto", "cached_real", "synthetic_offline"] = "auto"
+    #: Bar timeframe selector (Spec-1); synthetic runs propagate it for annualization.
+    timeframe: str = "1d"
 
     @model_validator(mode="after")
     def _ordered_dates(self) -> BacktestRunConfig:
@@ -685,6 +688,7 @@ class BacktestRunSummary(APIModel):
     data_origin: Literal["real_parquet", "synthetic_fixture"] = "synthetic_fixture"
     data_mode: Literal["auto", "cached_real", "synthetic_offline"] = "auto"
     cached_bars: CachedBarsSummary | None = None
+    timeframe: str = "1d"
 
 
 class BacktestListResponse(APIModel):

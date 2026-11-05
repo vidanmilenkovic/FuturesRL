@@ -26,6 +26,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
@@ -39,6 +40,7 @@ from configs.strategy import StrategyConfig
 from pydantic import ValidationError
 
 from src.api import fixtures
+from src.api.data_service import resample_frame
 from src.api.protocols import StrategyCatalog
 from src.api.schemas import (
     AttributionRow,
@@ -653,6 +655,17 @@ def _strategy_roots(config: StrategyConfig) -> tuple[str, ...] | None:
     return None
 
 
+def _config_with_timeframe(config: StrategyConfig, timeframe: str) -> StrategyConfig:
+    """Copy a strategy config with its backtest spec timeframe canonicalised."""
+    spec = config.backtest
+    if spec is None:
+        return config
+    normalized = (timeframe or "1d").strip().lower()
+    if spec.timeframe == normalized:
+        return config
+    return config.model_copy(update={"backtest": spec.model_copy(update={"timeframe": normalized})})
+
+
 def _strategy_config_snapshot(config: StrategyConfig) -> dict[str, object]:
     """JSON-safe snapshot of the exact validated config used for a run."""
     return config.model_dump(mode="json")
@@ -775,7 +788,8 @@ class EngineBacktestService:
     def _cached_real_market(
         self, config: StrategyConfig, request: BacktestRunConfig
     ) -> tuple[fixtures.OfflineMarket, CachedBarsSummary] | None:
-        """Load real cached ``ohlcv-1d`` bars and build an offline market, if sufficient."""
+        """Load real cached bars for the requested timeframe, if sufficiently warm."""
+        from src.api.data_service import _base_schema, _target_schema
         from src.data.storage import ParquetRepository
 
         roots = _strategy_roots(config)
@@ -785,14 +799,30 @@ class EngineBacktestService:
         selected = tuple(root for root in roots if master.has(root))
         if not selected or len(selected) != len(roots):
             return None
-        repository = ParquetRepository(self._settings)
+        repository = ParquetRepository(settings := self._settings)
+        timeframe = (request.timeframe or "1d").strip().lower()
+        target_schema = _target_schema(timeframe)
         start = datetime.combine(request.start - timedelta(days=520), dt_time.min, tzinfo=UTC)
         end = datetime.combine(request.end, dt_time(23, 59, 59), tzinfo=UTC)
         try:
-            frame = repository.read_bars(selected, start, end, schema="ohlcv-1d")
+            reader = getattr(repository, "read_timeframe", None)
+            if callable(reader):
+                frame = reader(timeframe, selected, start, end)
+            else:
+                base_schema = _base_schema(timeframe)
+                frame = repository.read_bars(selected, start, end, schema=base_schema)
+                if target_schema != base_schema:
+                    frame = resample_frame(
+                        frame,
+                        timeframe,
+                        base_timeframe={"ohlcv-1m": "1m", "ohlcv-1h": "1h", "ohlcv-1d": "1d"}.get(
+                            base_schema, "1d"
+                        ),
+                    )
         except Exception as exc:  # pragma: no cover - corrupt cache is a data error
             logger.warning("cached_real read failed: %s", exc)
             return None
+        del settings
         if frame.is_empty():
             return None
         minimum = 200
@@ -826,7 +856,8 @@ class EngineBacktestService:
                 "bar_count": frame.height,
                 "start_date": timestamps[0].date(),
                 "end_date": timestamps[-1].date(),
-                "schema": "ohlcv-1d",
+                "schema": target_schema,
+                "timeframe": timeframe,
             }
         )
         market = fixtures.OfflineMarket(
@@ -860,14 +891,23 @@ class EngineBacktestService:
             seed=request.random_seed,
             warmup_bars=260,
         )
+        requested_timeframe = (request.timeframe or "1d").strip().lower()
+        # Real cached intraday bars annualise covariance in the builder; synthetic
+        # fixture bars are daily, so keep the builder's 1d covariance and only stamp
+        # the requested timeframe on the states (spec parity with the risk suite).
+        builder_timeframe = requested_timeframe if cached_bars is not None else "1d"
         states = fixtures.build_rebalance_states(
             window,
             rebalance_frequency=request.rebalance_frequency,
             initial_equity=request.initial_equity,
+            timeframe=builder_timeframe,
         )
+        if cached_bars is None:
+            states = [replace(state, timeframe=requested_timeframe) for state in states]
         if not states:
             raise ValueError("no market states available for the requested window")
-        variable = fixture_backtest_config(config)
+        timeframe = (request.timeframe or "1d").strip().lower()
+        variable = _config_with_timeframe(fixture_backtest_config(config), timeframe)
         pipeline, translator = build_pipeline_parts(
             variable,
             self._master,
@@ -875,6 +915,8 @@ class EngineBacktestService:
             clock=lambda: self._market.as_of,
             state=states[-1],
         )
+        from src.data.timeframes import bars_per_year
+
         engine = BacktestEngine(
             pipeline,
             translator,
@@ -882,6 +924,8 @@ class EngineBacktestService:
             instrument_master=self._master,
             initial_equity=request.initial_equity,
             rebalance_schedule=RebalanceSchedule.from_frequency(request.rebalance_frequency),
+            annualization_factor=bars_per_year(timeframe),
+            timeframe=timeframe,
         )
         # Warm-up bars are only for feature history: the result curve covers the
         # exact requested window.
@@ -890,7 +934,9 @@ class EngineBacktestService:
         result = engine.run(states=states, start=start_moment, end=end_moment)
         from src.analytics.metrics import compute_metrics_from_result
 
-        performance = compute_metrics_from_result(result)
+        performance = compute_metrics_from_result(
+            result, timeframe=str(result.metadata.get("timeframe", timeframe))
+        )
         tearsheet = self._engine_tearsheet(result, performance)
         metrics = _performance_metrics(performance)
         summary = BacktestRunSummary(
@@ -909,6 +955,7 @@ class EngineBacktestService:
             data_origin="real_parquet" if cached_bars is not None else "synthetic_fixture",
             data_mode=request.data_mode,
             cached_bars=cached_bars,
+            timeframe=(request.timeframe or "1d").strip().lower(),
         )
         return summary, tearsheet
 
@@ -930,7 +977,12 @@ class EngineBacktestService:
             equity[:-1], dtype=np.float64
         )
         window = min(ROLLING_WINDOW, max(2, returns.size))
-        rolling = rolling_sharpe(returns, window) if returns.size >= 2 else np.asarray([])
+        timeframe = str(result.metadata.get("timeframe", "1d"))
+        rolling = (
+            rolling_sharpe(returns, window, timeframe=timeframe)
+            if returns.size >= 2
+            else np.asarray([])
+        )
         rolling_points = [
             SeriesPoint(time=timestamps[index + 1], value=round(float(value), 6))
             for index, value in enumerate(rolling)
@@ -1027,14 +1079,24 @@ class EngineBacktestService:
             seed=request.random_seed,
             warmup_bars=260,
         )
+        requested_timeframe = (request.timeframe or "1d").strip().lower()
+        # Real cached intraday bars annualise covariance in the builder; synthetic
+        # fixture bars are daily, so keep the builder's 1d covariance and only stamp
+        # the requested timeframe on the states (spec parity with the risk suite).
+        builder_timeframe = requested_timeframe if cached_bars is not None else "1d"
         states = fixtures.build_rebalance_states(
             window,
             rebalance_frequency=request.rebalance_frequency,
             initial_equity=request.initial_equity,
+            timeframe=builder_timeframe,
         )
+        if cached_bars is None:
+            states = [replace(state, timeframe=requested_timeframe) for state in states]
         if not states:
             raise ValueError("no market states available for the requested walk-forward window")
-        variable = fixture_backtest_config(config)
+        variable = _config_with_timeframe(
+            fixture_backtest_config(config), (request.timeframe or "1d").strip().lower()
+        )
         report = self._call_walk_forward(run_walk_forward, variable, request, window, states)
         report_dict = _object_mapping(report)
         attributes = _report_attributes(report)
@@ -1055,7 +1117,7 @@ class EngineBacktestService:
             initial_equity=request.initial_equity,
         )
         values = [value for _, value in curve]
-        fallback_metrics = self._metrics_for(values, timestamps)
+        fallback_metrics = self._metrics_for(values, timestamps, request.timeframe)
         metrics = self._walk_forward_metrics(report, report_dict, fallback_metrics)
         folds = [
             _fold_from_payload(index + 1, payload) for index, payload in enumerate(fold_payloads)
@@ -1097,6 +1159,7 @@ class EngineBacktestService:
             data_origin="real_parquet" if cached_bars is not None else "synthetic_fixture",
             data_mode=request.data_mode,
             cached_bars=cached_bars,
+            timeframe=(request.timeframe or "1d").strip().lower(),
         )
         return summary, tearsheet
 
@@ -1211,7 +1274,7 @@ class EngineBacktestService:
             initial_equity=request.initial_equity,
         )
         values = [value for _, value in curve]
-        metrics = self._metrics_for(values, timestamps)
+        metrics = self._metrics_for(values, timestamps, request.timeframe)
         folds = _synthesize_walk_forward_folds(timestamps, values, request.wf_splits)
         tearsheet = self._fixture_tearsheet(run_id, timestamps, values, metrics)
         tearsheet = tearsheet.model_copy(update={"folds": folds})
@@ -1232,6 +1295,7 @@ class EngineBacktestService:
             strategy_config=self._config_snapshot_for(request.strategy_id),
             data_mode=request.data_mode,
             data_origin="synthetic_fixture",
+            timeframe=(request.timeframe or "1d").strip().lower(),
         )
         self._store_run(summary, tearsheet)
         return summary
@@ -1251,7 +1315,7 @@ class EngineBacktestService:
             request.strategy_id, seed=request.random_seed, initial_equity=request.initial_equity
         )
         values = [value for _, value in curve]
-        metrics = self._metrics_for(values, timestamps)
+        metrics = self._metrics_for(values, timestamps, request.timeframe)
         tearsheet = self._fixture_tearsheet(run_id, timestamps, values, metrics)
         summary = BacktestRunSummary(
             id=run_id,
@@ -1269,6 +1333,7 @@ class EngineBacktestService:
             strategy_config=self._config_snapshot_for(request.strategy_id),
             data_mode=request.data_mode,
             data_origin="synthetic_fixture",
+            timeframe=(request.timeframe or "1d").strip().lower(),
         )
         self._store_run(summary, tearsheet)
         return summary
@@ -1342,7 +1407,12 @@ class EngineBacktestService:
             timestamps,
         )
 
-    def _metrics_for(self, values: Sequence[float], timestamps: Sequence[datetime]) -> MetricsSet:
+    def _metrics_for(
+        self,
+        values: Sequence[float],
+        timestamps: Sequence[datetime],
+        timeframe: str = "1d",
+    ) -> MetricsSet:
         try:
             from src.analytics.metrics import compute_metrics
 
@@ -1350,6 +1420,7 @@ class EngineBacktestService:
                 [float(value) for value in values],
                 timestamps=list(timestamps),
                 initial_equity=float(values[0]) if values else None,
+                timeframe=(timeframe or "1d").strip().lower(),
             )
         except Exception:
             return _simple_metrics(values)

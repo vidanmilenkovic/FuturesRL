@@ -50,6 +50,192 @@ _DEFAULT_SCHEMA = "ohlcv-1d"
 _SOURCE_SIDECAR_NAME = "part.parquet.meta.json"
 
 
+#: Fallback timeframe registry (data-eng task-67 helpers are imported lazily when present).
+_TIMEFRAME_FALLBACK: dict[str, tuple[str, str, str]] = {
+    # timeframe -> (target schema, databento base schema, ibkr bar size)
+    "1m": ("ohlcv-1m", "ohlcv-1m", "1 min"),
+    "5m": ("ohlcv-5m", "ohlcv-1m", "5 mins"),
+    "15m": ("ohlcv-15m", "ohlcv-1m", "15 mins"),
+    "30m": ("ohlcv-30m", "ohlcv-1m", "30 mins"),
+    "1h": ("ohlcv-1h", "ohlcv-1m", "1 hour"),
+    "4h": ("ohlcv-4h", "ohlcv-1h", "4 hours"),
+    "1d": ("ohlcv-1d", "ohlcv-1d", "1 day"),
+    "1w": ("ohlcv-1w", "ohlcv-1d", "1 week"),
+}
+
+
+def _tf_entry(timeframe: str) -> tuple[str, str, str]:
+    normalized = (timeframe or "1d").strip().lower()
+    entry = _TIMEFRAME_FALLBACK.get(normalized)
+    if entry is None:
+        raise DataServiceError(
+            f"unsupported timeframe {timeframe!r}; supported: {sorted(_TIMEFRAME_FALLBACK)}",
+            status_code=422,
+            detail={
+                "error": "unsupported_timeframe",
+                "message": f"unsupported timeframe {timeframe!r}",
+                "supported_timeframes": sorted(_TIMEFRAME_FALLBACK),
+            },
+        )
+    try:
+        import importlib
+
+        tf_module = importlib.import_module("src.data.timeframes")
+        spec = tf_module.get_timeframe(normalized)
+        schema = getattr(spec, "schema", None) or tf_module.schema_for_timeframe(normalized)
+        base = tf_module.databento_base_schema(normalized)
+        bar_size = tf_module.ibkr_bar_size(normalized)
+        return (str(schema), str(base), str(bar_size))
+    except Exception:
+        return entry
+
+
+def _target_schema(timeframe: str) -> str:
+    return _tf_entry(timeframe)[0]
+
+
+def _canonical_timeframe(timeframe: str) -> str:
+    normalized = (timeframe or "1d").strip().lower()
+    try:
+        import importlib
+
+        tf_module = importlib.import_module("src.data.timeframes")
+        return str(tf_module.get_timeframe(normalized).name)
+    except Exception:
+        return normalized
+
+
+def _base_schema(timeframe: str) -> str:
+    return _tf_entry(timeframe)[1]
+
+
+_SCHEMA_TIMEFRAMES: dict[str, str] = {
+    "ohlcv-1m": "1m",
+    "ohlcv-5m": "5m",
+    "ohlcv-15m": "15m",
+    "ohlcv-30m": "30m",
+    "ohlcv-1h": "1h",
+    "ohlcv-4h": "4h",
+    "ohlcv-1d": "1d",
+    "ohlcv-1w": "1w",
+}
+
+
+def _timeframe_for_schema(schema: str) -> str:
+    return _SCHEMA_TIMEFRAMES.get(schema, "1d")
+
+
+def _ibkr_base_timeframe(timeframe: str) -> str | None:
+    """Finer timeframe IBKR must fetch before resampling to ``timeframe``."""
+    normalized = (timeframe or "1d").strip().lower()
+    try:
+        import importlib
+
+        tf_module = importlib.import_module("src.data.timeframes")
+        base = tf_module.base_timeframe(normalized)
+        return str(base) if base else None
+    except Exception:
+        return {
+            "5m": "1m",
+            "15m": "1m",
+            "30m": "1m",
+            "1h": "1m",
+            "4h": "1h",
+            "1w": "1d",
+        }.get(normalized)
+
+
+def _ibkr_bar_size(timeframe: str) -> str:
+    normalized = (timeframe or "1d").strip().lower()
+    base_tf = _ibkr_base_timeframe(normalized) or normalized
+    try:
+        import importlib
+
+        tf_module = importlib.import_module("src.data.timeframes")
+        return str(tf_module.ibkr_bar_size(base_tf))
+    except Exception:
+        return _TIMEFRAME_FALLBACK.get(base_tf, _TIMEFRAME_FALLBACK["1d"])[2]
+
+
+def _ibkr_unreachable_message(settings: Settings) -> str:
+    return (
+        f"IBKR TWS/Gateway unreachable on {settings.ibkr_host}:{settings.ibkr_port}; "
+        "start TWS or IB Gateway (paper port) and retry"
+    )
+
+
+def _ibkr_unreachable_detail(settings: Settings) -> dict[str, object]:
+    return {
+        "error": "ibkr_unreachable",
+        "message": _ibkr_unreachable_message(settings),
+        "host": settings.ibkr_host,
+        "port": settings.ibkr_port,
+    }
+
+
+def resample_frame(
+    frame: pl.DataFrame, target_timeframe: str, *, base_timeframe: str | None = None
+) -> pl.DataFrame:
+    """Resample canonical bars to ``target_timeframe`` (look-ahead-safe).
+
+    Uses the data-eng ``src.data.resampler`` helper when deployed; otherwise a
+    deterministic Polars ``group_by_dynamic`` fallback with right-closed/right-labeled
+    UTC windows. Returns the input unchanged when the target is already the source.
+    """
+    normalized = (target_timeframe or "1d").strip().lower()
+    source = (base_timeframe or normalized).strip().lower()
+    if normalized == source:
+        return frame
+    try:
+        import importlib
+
+        resample_module = importlib.import_module("src.data.resampler")
+        resampled = resample_module.resample_bars(frame, normalized)
+        if isinstance(resampled, pl.DataFrame):
+            return resampled
+    except Exception:
+        pass
+    every = {
+        "1m": "1m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1d",
+        "1w": "1w",
+    }.get(normalized)
+    if every is None:
+        return frame
+    from src.data import schema as bar_schema
+
+    time_col = bar_schema.TIMESTAMP_COLUMN
+    try:
+        grouped = (
+            frame.sort(time_col)
+            .group_by_dynamic(
+                time_col,
+                every=every,
+                period=every,
+                label="right",
+                closed="right",
+                group_by=["instrument_id", "root_symbol", "expiration_date"],
+            )
+            .agg(
+                pl.col("open").first().alias("open"),
+                pl.col("high").max().alias("high"),
+                pl.col("low").min().alias("low"),
+                pl.col("close").last().alias("close"),
+                pl.col("volume").sum().alias("volume"),
+                pl.col("open_interest").last().alias("open_interest"),
+                pl.col("settlement").last().alias("settlement"),
+            )
+        )
+    except Exception:
+        return frame
+    return grouped.sort([time_col, "root_symbol"])
+
+
 class DataServiceError(RuntimeError):
     """API-mappable data-cache error (``status_code`` + optional detail payload)."""
 
@@ -105,7 +291,7 @@ class DataService:
         instrument_master: InstrumentsConfig | None = None,
         clock: fixtures.Clock = fixtures.utc_now,
         databento_loader_provider: Callable[[], object] | None = None,
-        ibkr_fetcher_provider: Callable[[], object] | None = None,
+        ibkr_fetcher_provider: Callable[..., object] | None = None,
         ibkr_available_provider: Callable[[], bool] | None = None,
     ) -> None:
         self._settings = settings
@@ -171,21 +357,52 @@ class DataService:
             instrument_master=self._master,
         )
 
-    def _fetcher(self) -> object:
-        if self._ibkr_provider is not None:
-            return self._ibkr_provider()
+    def _fetcher(self, timeframe: str = "1d") -> object:
+        provider = self._ibkr_provider
+        if provider is not None:
+            try:
+                return provider(timeframe)
+            except TypeError:
+                return provider()
         from src.data.ibkr_data import IBKRHistoricalBarFetcher
 
-        return IBKRHistoricalBarFetcher(self._settings, instrument_master=self._master)
+        return IBKRHistoricalBarFetcher(
+            self._settings,
+            instrument_master=self._master,
+            bar_size=_ibkr_bar_size(timeframe),
+        )
+
+    @staticmethod
+    def _databento_error(exc: BaseException) -> DataServiceError:
+        text = f"{type(exc).__name__}: {exc}"
+        lowered = text.lower()
+        if "databento_api_key" in lowered or "api key" in lowered or "not configured" in lowered:
+            message = (
+                "Databento API key is required: set FUTURESRLX_DATABENTO_API_KEY "
+                f"(loader error: {text})"
+            )
+            return DataServiceError(
+                message,
+                status_code=400,
+                detail={"error": "databento_api_key_missing", "message": message},
+            )
+        return DataServiceError(
+            f"Databento cost estimate failed: {text}",
+            status_code=422,
+            detail={"error": "databento_estimate_failed", "message": text},
+        )
 
     # -- inventory -------------------------------------------------------------
 
-    def inventory(self, *, schema: str = s.DEFAULT_BAR_SCHEMA) -> DataInventoryResponse:
+    def inventory(
+        self, *, timeframe: str = "1d", schema: str | None = None
+    ) -> DataInventoryResponse:
+        target_schema = schema or _target_schema(timeframe)
         rows: list[RootCacheSummary] = []
         helper = getattr(self._repository, "inventory", None)
         if callable(helper):
             try:
-                entries = helper(schema)
+                entries = helper(target_schema)
             except TypeError:
                 entries = helper()
             except Exception as exc:  # pragma: no cover - repository helper is tolerant
@@ -195,9 +412,9 @@ class DataService:
                 entries = None
             if entries is not None:
                 for entry in entries:
-                    rows.append(self._summary_from_entry(entry, schema))
+                    rows.append(self._summary_from_entry(entry, target_schema, timeframe))
         if not rows:
-            rows = self._filesystem_inventory(schema)
+            rows = self._filesystem_inventory(target_schema, timeframe)
         rows.sort(key=lambda row: row.root)
         totals = self._totals(rows)
         return DataInventoryResponse(
@@ -205,11 +422,15 @@ class DataService:
             totals=totals,
             databento_configured=self._databento_configured(),
             ibkr_available=self._ibkr_is_available(),
-            schema=schema,
+            schema=target_schema,
+            timeframe=(timeframe or "1d").strip().lower(),
+            base_schema=_base_schema(timeframe),
             generated_at=self._clock(),
         )
 
-    def _summary_from_entry(self, entry: object, schema: str) -> RootCacheSummary:
+    def _summary_from_entry(
+        self, entry: object, schema: str, timeframe: str = "1d"
+    ) -> RootCacheSummary:
         root = str(_field(entry, "root", "") or "").strip().upper()
         return RootCacheSummary(
             root=root,
@@ -220,9 +441,10 @@ class DataService:
             end_date=_as_date(_field(entry, "end_date")),
             size_bytes=int(cast(int, _field(entry, "size_bytes", 0) or 0)),
             source=cast(CacheSource, str(_field(entry, "source", "empty") or "empty")),
+            timeframe=(timeframe or "1d").strip().lower(),
         )
 
-    def _filesystem_inventory(self, schema: str) -> list[RootCacheSummary]:
+    def _filesystem_inventory(self, schema: str, timeframe: str = "1d") -> list[RootCacheSummary]:
         roots = list(self._master.roots())
         schema_dir = self._repository.schema_dir(schema)
         if schema_dir.is_dir():
@@ -235,7 +457,12 @@ class DataService:
             path = self._repository.partition_path(root, schema)
             if not path.is_file():
                 rows.append(
-                    RootCacheSummary(root=root, sector=self._sector_for(root), schema=schema)
+                    RootCacheSummary(
+                        root=root,
+                        sector=self._sector_for(root),
+                        schema=schema,
+                        timeframe=timeframe,
+                    )
                 )
                 continue
             try:
@@ -247,7 +474,12 @@ class DataService:
             except Exception as exc:  # pragma: no cover - corrupt partition must not crash
                 logger.warning("corrupt cache partition %s: %s", path, exc)
                 rows.append(
-                    RootCacheSummary(root=root, sector=self._sector_for(root), schema=schema)
+                    RootCacheSummary(
+                        root=root,
+                        sector=self._sector_for(root),
+                        schema=schema,
+                        timeframe=timeframe,
+                    )
                 )
                 continue
             sidecar = self._sidecar_path(path)
@@ -261,6 +493,7 @@ class DataService:
                     end_date=end_date,
                     size_bytes=path.stat().st_size,
                     source=self._sidecar_source(sidecar),
+                    timeframe=timeframe,
                 )
             )
         return rows
@@ -299,10 +532,17 @@ class DataService:
         self._validate_window(request.start, request.end)
         start = _as_aware(request.start)
         end = _as_aware(request.end, end_of_day=True)
+        # Validate/canonicalise the timeframe before any source-specific shortcut.
+        _tf_entry(request.timeframe)
+        timeframe = _canonical_timeframe(request.timeframe)
+        target_schema = _target_schema(request.timeframe)
+        base_schema = _base_schema(request.timeframe)
         if request.source == "ibkr":
             return CostEstimateResponse(
                 roots=roots,
-                schema=request.schema,
+                schema=target_schema,
+                timeframe=timeframe,
+                base_schema=base_schema,
                 start=request.start,
                 end=request.end,
                 estimated_cost_usd=0.0,
@@ -321,31 +561,40 @@ class DataService:
                 status_code=400,
             )
         try:
-            estimate = estimator(roots, start, end, request.schema)
+            estimate = estimator(roots, start, end, base_schema)
         except Exception as exc:
-            status_code = (
-                400 if "databento" in str(exc).lower() or "key" in str(exc).lower() else 422
-            )
-            raise DataServiceError(
-                f"Databento cost estimate failed: {type(exc).__name__}: {exc}",
-                status_code=status_code,
-            ) from exc
-        return self._estimate_response(estimate, roots, request)
+            raise self._databento_error(exc) from exc
+        return self._estimate_response(
+            estimate,
+            roots,
+            request,
+            target_schema=target_schema,
+            base_schema=base_schema,
+        )
 
     def _estimate_response(
         self,
         estimate: object,
         roots: Sequence[str],
         request: EstimateCostRequest,
+        *,
+        target_schema: str | None = None,
+        base_schema: str | None = None,
     ) -> CostEstimateResponse:
         estimate_roots = cast(Sequence[object], _field(estimate, "roots", ()) or ())
         billable = int(cast(int, _field(estimate, "billable_size_bytes", 0) or 0))
         megabytes = float(
             cast(float, _field(estimate, "billable_size_megabytes", billable / 1_000_000) or 0.0)
         )
+        resolved_target = target_schema or request.schema
+        resolved_base = base_schema or str(
+            _field(estimate, "schema", request.schema) or request.schema
+        )
         return CostEstimateResponse(
             roots=[str(root) for root in estimate_roots] or list(roots),
-            schema=str(_field(estimate, "schema", request.schema) or request.schema),
+            schema=resolved_target,
+            timeframe=(request.timeframe or "1d").strip().lower(),
+            base_schema=resolved_base,
             start=_as_date(_field(estimate, "start")) or request.start,
             end=_as_date(_field(estimate, "end")) or request.end,
             estimated_cost_usd=float(
@@ -363,13 +612,34 @@ class DataService:
     def ingest(self, request: IngestRequest) -> IngestResponse:
         roots = self._normalise_roots(request.roots)
         self._validate_window(request.start, request.end)
+        _tf_entry(request.timeframe)
+        target_timeframe = _canonical_timeframe(request.timeframe)
+        target_schema = _target_schema(target_timeframe)
+        base_schema = _base_schema(target_timeframe)
         started = time.perf_counter()
         warnings: list[str] = []
         cost: CostEstimateResponse | None = None
+        resampled = False
         if request.source == "ibkr":
             frame = self._ingest_ibkr(roots, request, warnings)
+            ibkr_base_tf = _ibkr_base_timeframe(target_timeframe)
+            if (
+                ibkr_base_tf is not None
+                and ibkr_base_tf != target_timeframe
+                and not frame.is_empty()
+            ):
+                frame = resample_frame(frame, target_timeframe, base_timeframe=ibkr_base_tf)
+                resampled = True
+            if not frame.is_empty():
+                try:
+                    self._repository.write_bars(frame, schema=target_schema)
+                except Exception as exc:  # pragma: no cover - cache write failure
+                    warnings.append(f"target-timeframe cache write failed: {exc}")
+                self._record_sources(roots, "ibkr", target_schema, warnings)
         else:
-            frame, cost = self._ingest_databento(roots, request, warnings)
+            frame, cost, resampled = self._ingest_databento(
+                roots, request, warnings, target_schema=target_schema, base_schema=base_schema
+            )
         duration = round(time.perf_counter() - started, 3)
         written = frame.height if frame is not None else 0
         series = self._continuous_series(frame, roots, warnings)
@@ -380,6 +650,9 @@ class DataService:
             start=request.start,
             end=request.end,
             cost_estimate=cost,
+            timeframe=target_timeframe,
+            base_schema=base_schema,
+            resampled=resampled,
             continuous_series=series,
             duration_seconds=duration,
             warnings=warnings,
@@ -395,11 +668,11 @@ class DataService:
             )
         if not self._ibkr_is_available():
             raise DataServiceError(
-                "IBKR paper/TWS session is not available; start IB Gateway/TWS "
-                "(paper port) or use source='databento'",
-                status_code=409,
+                _ibkr_unreachable_message(self._settings),
+                status_code=503,
+                detail=_ibkr_unreachable_detail(self._settings),
             )
-        fetcher = self._fetcher()
+        fetcher = self._fetcher(request.timeframe)
         fetch = getattr(fetcher, "fetch_bars_sync", None)
         if not callable(fetch):
             raise DataServiceError(
@@ -411,21 +684,30 @@ class DataService:
             frame = fetch(roots, start, end)
         except RuntimeError as exc:
             raise DataServiceError(
-                f"IBKR historical ingest failed: {exc}", status_code=409
+                _ibkr_unreachable_message(self._settings),
+                status_code=503,
+                detail={
+                    **_ibkr_unreachable_detail(self._settings),
+                    "reason": f"{type(exc).__name__}: {exc}",
+                },
             ) from exc
         if not isinstance(frame, pl.DataFrame):
             raise DataServiceError("IBKR fetcher returned an invalid frame", status_code=502)
         if frame.is_empty():
             warnings.append("IBKR returned no bars for the requested window")
-            return frame
-        written = self._repository.write_bars(frame, schema=request.schema)
-        del written
-        self._record_sources(roots, "ibkr", request.schema, warnings)
         return frame
 
     def _ingest_databento(
-        self, roots: Sequence[str], request: IngestRequest, warnings: list[str]
-    ) -> tuple[pl.DataFrame, CostEstimateResponse]:
+        self,
+        roots: Sequence[str],
+        request: IngestRequest,
+        warnings: list[str],
+        *,
+        target_schema: str | None = None,
+        base_schema: str | None = None,
+    ) -> tuple[pl.DataFrame, CostEstimateResponse, bool]:
+        resolved_target = target_schema or _target_schema(request.timeframe)
+        resolved_base = base_schema or _base_schema(request.timeframe)
         loader = self._loader()
         estimator = getattr(loader, "estimate_cost_usd", None)
         ingest = getattr(loader, "ingest", None)
@@ -437,15 +719,9 @@ class DataService:
         start = _as_aware(request.start)
         end = _as_aware(request.end, end_of_day=True)
         try:
-            estimate = estimator(roots, start, end, request.schema)
+            estimate = estimator(roots, start, end, resolved_base)
         except Exception as exc:
-            status_code = (
-                400 if "databento" in str(exc).lower() or "key" in str(exc).lower() else 422
-            )
-            raise DataServiceError(
-                f"Databento cost estimate failed: {type(exc).__name__}: {exc}",
-                status_code=status_code,
-            ) from exc
+            raise self._databento_error(exc) from exc
         estimate_response = self._estimate_response(
             estimate,
             roots,
@@ -454,22 +730,32 @@ class DataService:
                     "roots": list(roots),
                     "start": request.start,
                     "end": request.end,
-                    "schema": request.schema,
+                    "schema": resolved_target,
+                    "timeframe": request.timeframe,
                     "source": "databento",
                 }
             ),
+            target_schema=resolved_target,
+            base_schema=resolved_base,
         )
         cap = float(self._settings.databento_max_cost_usd_per_job)
         over_budget = estimate_response.estimated_cost_usd > cap
         if over_budget and not request.allow_over_budget:
+            estimated = float(estimate_response.estimated_cost_usd)
+            message = (
+                f"Databento cost guard exceeded (${estimated:.2f} > ${cap:.2f} cap); "
+                "set allow_over_budget=true and confirm=true to override, or raise "
+                "FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB"
+            )
             raise DataServiceError(
-                f"Databento budget exceeded: estimate ${estimate_response.estimated_cost_usd:.2f} "
-                f"> cap ${cap:.2f}; confirm the operator override (allow_over_budget+confirm) "
-                "or raise FUTURESRLX_DATABENTO_MAX_COST_USD_PER_JOB",
-                status_code=409,
+                message,
+                status_code=402,
                 detail={
-                    "estimate": estimate_response.model_dump(mode="json"),
+                    "error": "databento_budget_exceeded",
+                    "message": message,
+                    "estimated_cost_usd": estimated,
                     "max_cost_usd": cap,
+                    "cap": cap,
                     "override_allowed": True,
                 },
             )
@@ -484,7 +770,7 @@ class DataService:
                 roots,
                 start,
                 end,
-                request.schema,
+                resolved_base,
                 allow_over_budget=bool(
                     over_budget and request.allow_over_budget and request.confirm
                 ),
@@ -493,7 +779,13 @@ class DataService:
             name = type(exc).__name__
             if "Budget" in name:
                 raise DataServiceError(
-                    f"Databento budget guard refused the download: {exc}", status_code=409
+                    f"Databento cost guard exceeded: {exc}",
+                    status_code=402,
+                    detail={
+                        "error": "databento_budget_exceeded",
+                        "message": str(exc),
+                        "override_allowed": True,
+                    },
                 ) from exc
             raise DataServiceError(
                 f"Databento ingest failed: {name}: {exc}", status_code=502
@@ -503,12 +795,44 @@ class DataService:
                 f"operator budget override used: estimate ${estimate_response.estimated_cost_usd:.2f} "
                 f"> cap ${cap:.2f}"
             )
+        result_frame = frame if isinstance(frame, pl.DataFrame) else pl.DataFrame()
+        resampled = resolved_target != resolved_base and not result_frame.is_empty()
+        if resampled:
+            result_frame = resample_frame(
+                result_frame,
+                (request.timeframe or "1d").strip().lower(),
+                base_timeframe=_timeframe_for_schema(resolved_base),
+            )
+            self._persist_target(result_frame, request, resolved_target, warnings)
         if isinstance(frame, pl.DataFrame) and not frame.is_empty():
-            self._record_sources(roots, "databento", request.schema, warnings)
-        return (
-            frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(),
-            estimate_response,
-        )
+            self._record_sources(roots, "databento", resolved_target, warnings)
+        return (result_frame, estimate_response, resampled)
+
+    def _persist_target(
+        self,
+        resampled: pl.DataFrame,
+        request: IngestRequest,
+        target_schema: str,
+        warnings: list[str],
+    ) -> None:
+        """Persist the resampled target timeframe (helper-first, tolerant fallback)."""
+        writer = getattr(self._repository, "write_timeframe", None)
+        if callable(writer):
+            try:
+                writer(request.timeframe, resampled)
+                return
+            except TypeError:
+                try:
+                    writer(resampled, request.timeframe)
+                    return
+                except Exception as exc:  # pragma: no cover - helper API variant
+                    warnings.append(f"target-timeframe cache write failed: {exc}")
+            except Exception as exc:  # pragma: no cover - best effort
+                warnings.append(f"target-timeframe cache write failed: {exc}")
+        try:
+            self._repository.write_bars(resampled, schema=target_schema)
+        except Exception as exc:
+            warnings.append(f"target-timeframe cache write failed: {exc}")
 
     def _record_sources(
         self, roots: Sequence[str], source: str, schema: str, warnings: list[str]

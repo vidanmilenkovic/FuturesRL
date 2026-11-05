@@ -501,7 +501,9 @@ def test_api_estimate_cost_without_databento_key_is_400(tmp_path: Path) -> None:
             },
         )
         assert response.status_code == 400, response.text
-        assert "Databento" in response.json()["detail"]
+        detail = response.json()["detail"]
+        assert detail["error"] == "databento_api_key_missing"
+        assert "FUTURESRLX_DATABENTO_API_KEY" in detail["message"]
 
 
 def test_api_ingest_databento_budget_refusal_and_override(tmp_path: Path) -> None:
@@ -516,10 +518,12 @@ def test_api_ingest_databento_budget_refusal_and_override(tmp_path: Path) -> Non
                 "end": "2026-01-10",
             },
         )
-        assert refused.status_code == 409, refused.text
+        assert refused.status_code == 402, refused.text
         detail = refused.json()["detail"]
+        assert detail["error"] == "databento_budget_exceeded"
         assert detail["max_cost_usd"] == pytest.approx(2.00)
-        assert detail["estimate"]["estimated_cost_usd"] == pytest.approx(5.0)
+        assert detail["estimated_cost_usd"] == pytest.approx(5.0)
+        assert "$5.00 > $2.00 cap" in detail["message"]
         assert detail["override_allowed"] is True
         assert loader.ingest_calls == [], "a refused job must never download"
 
@@ -555,7 +559,7 @@ def test_api_ingest_databento_budget_refusal_and_override(tmp_path: Path) -> Non
         assert body["bars_written"] > 0
         assert body["cost_estimate"]["estimated_cost_usd"] == pytest.approx(5.0)
         assert loader.ingest_calls and loader.ingest_calls[0]["allow_over_budget"] is True
-        assert any("budget override" in warning for warning in body["warnings"])
+        assert any("override" in warning for warning in body["warnings"])
         # The override ingest recorded provenance for the written roots.
         inventory = service.repository.inventory("ohlcv-1d")
         by_root = {row.root: row for row in inventory}
@@ -575,8 +579,12 @@ def test_api_ingest_ibkr_unavailable_and_success(tmp_path: Path) -> None:
                 "end": "2026-01-10",
             },
         )
-        assert refused.status_code == 409, refused.text
-        assert "not available" in refused.json()["detail"]
+        assert refused.status_code == 503, refused.text
+        detail = refused.json()["detail"]
+        assert detail["error"] == "ibkr_unreachable"
+        assert (
+            f"{_settings(tmp_path).ibkr_host}:{_settings(tmp_path).ibkr_port}" in detail["message"]
+        )
         assert fetcher.fetch_calls == []
 
     with _data_app(tmp_path / "up", fetcher=fetcher, ibkr_available=True) as (client, service):
@@ -757,7 +765,9 @@ def test_contract_fields_for_frontend_badges(tmp_path: Path) -> None:
             "start_date",
             "end_date",
             "schema",
+            "timeframe",
         }
+        assert body["timeframe"] == "1d"
 
     with _data_app(tmp_path / "data") as (client, _service):
         inventory = client.get("/api/data/inventory").json()

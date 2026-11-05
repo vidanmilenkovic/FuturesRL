@@ -130,6 +130,7 @@ class OptimizeRequest(_StudyModel):
     search_space: list[OptimizeParameterRange] = Field(default_factory=list)
     seed: int = 7
     data_mode: Literal["auto", "cached_real", "synthetic_offline"] = "auto"
+    timeframe: str = "1d"
 
 
 class TrialView(_StudyModel):
@@ -183,6 +184,7 @@ class OptimizationStudySummary(_StudyModel):
     data_origin: Literal["real_parquet", "synthetic_fixture"] = "synthetic_fixture"
     data_mode: Literal["auto", "cached_real", "synthetic_offline"] = "auto"
     cached_bars: CachedBarsSummary | None = None
+    timeframe: str = "1d"
 
 
 class OptimizationStudy(OptimizationStudySummary):
@@ -219,8 +221,19 @@ class OptimizationApplyResponse(_StudyModel):
     backtest_run_id: str | None = None
 
 
-def _cached_real_bars(settings: Settings, config: StrategyConfig) -> CachedBarsSummary | None:
-    """Load real cached daily bars for a cached_real/auto optimization study."""
+def _config_with_timeframe(config: StrategyConfig, timeframe: str) -> StrategyConfig:
+    """Copy a strategy config with its backtest spec timeframe set for the engine."""
+    spec = config.backtest
+    normalized = (timeframe or "1d").strip().lower()
+    if spec is None or spec.timeframe == normalized:
+        return config
+    return config.model_copy(update={"backtest": spec.model_copy(update={"timeframe": normalized})})
+
+
+def _cached_real_bars(
+    settings: Settings, config: StrategyConfig, timeframe: str = "1d"
+) -> CachedBarsSummary | None:
+    """Load real cached bars for a cached_real/auto optimization study."""
     from datetime import datetime
 
     import polars as pl
@@ -239,9 +252,26 @@ def _cached_real_bars(settings: Settings, config: StrategyConfig) -> CachedBarsS
     master = settings.instruments
     if any(not master.has(root) for root in roots):
         return None
+    from src.api.data_service import _base_schema, _target_schema, resample_frame
+
+    normalized_tf = (timeframe or "1d").strip().lower()
+    target_schema = _target_schema(normalized_tf)
     repository = ParquetRepository(settings)
     try:
-        frame = repository.read_bars(roots, schema="ohlcv-1d")
+        reader = getattr(repository, "read_timeframe", None)
+        if callable(reader):
+            frame = reader(normalized_tf, roots)
+        else:
+            base_schema = _base_schema(normalized_tf)
+            frame = repository.read_bars(roots, schema=base_schema)
+            if target_schema != base_schema:
+                frame = resample_frame(
+                    frame,
+                    normalized_tf,
+                    base_timeframe={"ohlcv-1m": "1m", "ohlcv-1h": "1h", "ohlcv-1d": "1d"}.get(
+                        base_schema, "1d"
+                    ),
+                )
     except Exception:
         return None
     if frame.is_empty():
@@ -258,7 +288,8 @@ def _cached_real_bars(settings: Settings, config: StrategyConfig) -> CachedBarsS
             "bar_count": frame.height,
             "start_date": start_value.date() if isinstance(start_value, datetime) else None,
             "end_date": end_value.date() if isinstance(end_value, datetime) else None,
-            "schema": "ohlcv-1d",
+            "schema": target_schema,
+            "timeframe": normalized_tf,
         }
     )
 
@@ -889,7 +920,10 @@ class OptimizationService:
             raise OptimizationError(
                 f"unknown base strategy {request.base_strategy_id!r}", status_code=404
             )
-        if request.data_mode == "cached_real" and _cached_real_bars(self._settings, base) is None:
+        if (
+            request.data_mode == "cached_real"
+            and _cached_real_bars(self._settings, base, request.timeframe) is None
+        ):
             raise OptimizationError(
                 "no sufficient cached real ohlcv-1d bars for this strategy/window; "
                 "ingest data via POST /api/data/ingest or use data_mode='auto'",
@@ -957,10 +991,11 @@ class OptimizationService:
         if not callable(optimizer_class):
             raise OptimizationError(f"{OPTIMIZER_MODULE} does not expose WalkForwardOptimizer")
         request_class = getattr(module, "OptimizationRequest", None)
+        config = _config_with_timeframe(config, request.timeframe)
         cached_bars: CachedBarsSummary | None = None
         real_bars = None
         if request.data_mode in ("auto", "cached_real"):
-            cached_bars = _cached_real_bars(self._settings, config)
+            cached_bars = _cached_real_bars(self._settings, config, request.timeframe)
             if cached_bars is None and request.data_mode == "cached_real":
                 raise OptimizationError(
                     "no sufficient cached real ohlcv-1d bars for this strategy/window; "
@@ -988,6 +1023,7 @@ class OptimizationService:
         # ``choices`` and it has no ``seed`` field (the seed is a constructor arg).
         payload.pop("seed", None)
         payload.pop("data_mode", None)  # API-only Phase-11B selector, not an engine field
+        payload.pop("timeframe", None)  # API-only Spec-1 timeframe selector
         payload["search_space"] = _engine_search_space(payload.get("search_space"))
         if not payload.get("search_space"):
             default_builder = getattr(module, "default_search_space", None)
@@ -1056,6 +1092,7 @@ class OptimizationService:
         result_payload.setdefault(
             "cached_bars", cached_bars.model_dump(mode="json") if cached_bars else None
         )
+        result_payload.setdefault("timeframe", (request.timeframe or "1d").strip().lower())
         artifact = result_payload.get("artifact_path")
         artifact_path = Path(str(artifact)) if isinstance(artifact, str) and artifact else None
         if artifact_path is None or not artifact_path.is_file():
@@ -1211,6 +1248,7 @@ class OptimizationService:
             message=message,
             data_origin="synthetic_fixture",
             data_mode=request.data_mode,
+            timeframe=(request.timeframe or "1d").strip().lower(),
             trials=trials,
             param_importances=importances,
             best_strategy_config=best_config,

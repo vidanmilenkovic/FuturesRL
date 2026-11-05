@@ -37,8 +37,9 @@ import math
 import os
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -91,6 +92,8 @@ from src.api.schemas import (
     StrategyConfigUpdate,
     StrategyConfigView,
     TelemetryStatusResponse,
+    TermContract,
+    TermCurve,
     TermStructureResponse,
 )
 from src.api.telemetry import TelemetryBroadcaster
@@ -109,6 +112,7 @@ from src.core.types import (
     Position,
     WeightVector,
 )
+from src.data import schema as data_schema
 from src.risk.state_store import PersistedRiskState, RiskStateStore, build_risk_state_store
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports of optional layers
@@ -174,6 +178,18 @@ DEFAULT_STRATEGY_ID: str = "tsmom_vol_target"
 
 #: Default initial equity for the offline account/pipeline fixtures.
 INITIAL_EQUITY: float = fixtures.DEFAULT_INITIAL_EQUITY
+
+#: Trailing window (calendar days) read from the cached Parquet bars for state/curves.
+CACHED_STATE_LOOKBACK_DAYS: int = 520
+
+#: Parquet schema used for cached market state/term-structure binding.
+CACHED_BAR_SCHEMA: str = data_schema.DEFAULT_BAR_SCHEMA
+
+#: Minimum rows per root before cached bars are trusted for the market backing.
+#: Short/partial roots are still usable for term-structure curves; a too-short
+#: history for the state builder degrades to the deterministic fixture state with
+#: an explicit warning instead of crashing.
+CACHED_MIN_BARS_PER_ROOT: int = 2
 
 #: Deterministic average-price offsets for the fixture book (entry slippage).
 _ENTRY_OFFSETS: Mapping[str, float] = {
@@ -538,6 +554,17 @@ class SimulatedExecutionService:
         """Provenance reported by the API for this execution adapter."""
         return "simulated"
 
+    @property
+    def net_liquidation(self) -> float | None:
+        """Account NLV from the simulated broker book (fixture-grade, but not hardcoded)."""
+        try:
+            snapshot = self._broker.get_account_sync(self._market.as_of)
+        except Exception:  # pragma: no cover - defensive broker failure
+            logger.warning("simulated broker account snapshot failed", exc_info=True)
+            return None
+        value = float(snapshot.net_liquidation)
+        return value if math.isfinite(value) and value > 0.0 else None
+
     def working_orders_snapshot(self) -> list[dict[str, object]]:
         """Working orders as plain rows for ``GET /api/orders/working``."""
         as_of = self._market.as_of
@@ -738,6 +765,13 @@ class FixtureExecutionService:
     def source_name(self) -> str:
         """Provenance reported by the API for this execution adapter."""
         return "fixture"
+
+    @property
+    def net_liquidation(self) -> float | None:
+        """Deterministic arithmetic account NLV (never hardcoded in the engine)."""
+        snapshot = self._snapshot()
+        value = float(snapshot.net_liquidation)
+        return value if math.isfinite(value) and value > 0.0 else None
 
     def working_orders_snapshot(self) -> list[dict[str, object]]:
         """A pure fixture adapter never carries working orders."""
@@ -999,6 +1033,19 @@ class IBKRExecutionService:
     def has_last_good_book(self) -> bool:
         """Whether at least one live IBKR account snapshot has been cached."""
         return self._last_good_account is not None
+
+    @property
+    def net_liquidation(self) -> float | None:
+        """Real IBKR NLV from the last successful fetch (``None`` before the first).
+
+        This is the durable last-known-good ledger value, so the pipeline/risk views
+        never fall back to the synthetic fixture equity once a live book exists.
+        """
+        cached = self._last_good_account
+        if cached is None:
+            return None
+        value = float(cached.net_liquidation)
+        return value if math.isfinite(value) and value > 0.0 else None
 
     @property
     def source_name(self) -> str:
@@ -1599,6 +1646,38 @@ def discretization_details(
     return (round(max(0.0, float(tracking)), 6), routing, achieved, "translator")
 
 
+@dataclass(frozen=True, slots=True)
+class _MarketDataBacking:
+    """Resolved market-data backing for state/pipeline/term-structure views."""
+
+    frame: pl.DataFrame
+    as_of: datetime
+    roots: tuple[str, ...]
+    origin: Literal["cached_parquet", "fixture"]
+    cached_roots: tuple[str, ...] = ()
+    fallback_roots: tuple[str, ...] = ()
+
+    @property
+    def partial(self) -> bool:
+        """Whether some roots were served from the deterministic fixture fallback."""
+        return bool(self.fallback_roots)
+
+
+def _execution_net_liquidation(execution: object) -> float | None:
+    """Return a live account NLV from an execution adapter, or ``None`` if unavailable."""
+    raw = getattr(execution, "net_liquidation", None)
+    if callable(raw):
+        try:
+            raw = raw()
+        except Exception:  # pragma: no cover - defensive adapter
+            logger.warning("execution net_liquidation provider failed", exc_info=True)
+            return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) and value > 0.0 else None
+
+
 class EngineMarketService:
     """Real FinRL-X pipeline executed against the deterministic offline market."""
 
@@ -1609,32 +1688,255 @@ class EngineMarketService:
         settings: Settings,
         catalog: StrategyCatalog,
         clock: fixtures.Clock = fixtures.utc_now,
+        equity_provider: Callable[[], float | None] | None = None,
+        account_provider: Callable[[], object] | None = None,
+        repository: object | None = None,
     ) -> None:
         self._market = market
         self._master = market.instrument_master
         self._settings = settings
         self._catalog = catalog
         self._clock = clock
-        self._state_cache: dict[date, MarketState] = {}
-        self._pipeline_cache: dict[date, PipelineWaterfallResponse] = {}
-        self._term_cache: dict[date, TermStructureResponse] = {}
+        self._equity_provider = equity_provider
+        self._account_provider = account_provider
+        self._repository = repository
+        self._backing_cache: _MarketDataBacking | None = None
+        self._backing_signature: tuple[tuple[str, int, int], ...] | None = None
+        self._state_cache: dict[str, MarketState] = {}
+        self._pipeline_cache: dict[tuple[str, float], PipelineWaterfallResponse] = {}
+        self._term_cache: dict[str, TermStructureResponse] = {}
         self._warnings: list[str] = []
+        #: Set when a cached-Parquet state build failed and fixture bars were used.
+        self._state_degraded_reason: str | None = None
 
     @property
     def warnings(self) -> tuple[str, ...]:
         """Non-fatal wiring warnings recorded while building the view."""
         return tuple(self._warnings)
 
+    # -- injectable account equity / data backing ------------------------------
+
+    def set_equity_provider(self, provider: Callable[[], float | None] | None) -> None:
+        """Inject the live account NLV provider (late wiring from the Container)."""
+        self._equity_provider = provider
+        self._state_cache.clear()
+        self._pipeline_cache.clear()
+
+    def set_account_provider(self, provider: Callable[[], object] | None) -> None:
+        """Inject a live account-snapshot provider (``net_liquidation`` is read)."""
+        self._account_provider = provider
+        self._state_cache.clear()
+        self._pipeline_cache.clear()
+
+    def _provider_equity(self) -> float | None:
+        for provider in (self._equity_provider, self._account_provider):
+            if provider is None:
+                continue
+            try:
+                raw = provider()
+            except Exception:
+                logger.warning("market equity provider failed", exc_info=True)
+                continue
+            if isinstance(raw, bool):
+                continue
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                value = float(raw)
+            else:
+                candidate = getattr(raw, "net_liquidation", None)
+                if candidate is None and isinstance(raw, Mapping):
+                    candidate = raw.get("net_liquidation", raw.get("nlv"))
+                value = float(candidate) if isinstance(candidate, int | float) else 0.0
+            if math.isfinite(value) and value > 0.0:
+                return value
+        return None
+
+    def _resolved_equity(self) -> float:
+        """Live account NLV when available, else the deterministic fixture equity."""
+        return self._provider_equity() or INITIAL_EQUITY
+
+    @property
+    def equity_source(self) -> str:
+        """``live-account`` when the injected provider supplies NLV, else ``fixture``."""
+        return "live-account" if self._provider_equity() is not None else "fixture"
+
+    @property
+    def data_origin(self) -> str:
+        """Market-data backing: ``cached_parquet`` (incl. partial) or ``fixture``."""
+        if self._state_degraded_reason is not None:
+            return "fixture"
+        return self._backing().origin
+
+    @property
+    def data_backing(self) -> Mapping[str, object]:
+        """Structured provenance of the bars backing state/pipeline/term-structure."""
+        backing = self._backing()
+        return {
+            "origin": self.data_origin,
+            "partial": backing.partial,
+            "as_of": backing.as_of.isoformat(),
+            "roots": list(backing.roots),
+            "cached_roots": list(backing.cached_roots),
+            "fallback_roots": list(backing.fallback_roots),
+            "equity_source": self.equity_source,
+            "degraded_reason": self._state_degraded_reason,
+        }
+
+    def refresh_data(self) -> None:
+        """Drop cached views so a newly ingested Parquet batch is picked up."""
+        self._backing_cache = None
+        self._backing_signature = None
+        self._state_degraded_reason = None
+        self._state_cache.clear()
+        self._pipeline_cache.clear()
+        self._term_cache.clear()
+
+    # -- data backing ----------------------------------------------------------
+
+    def _repository_obj(self) -> object | None:
+        if self._repository is not None:
+            return self._repository
+        try:
+            from src.data.storage import ParquetRepository
+
+            self._repository = ParquetRepository(self._settings)
+        except Exception:  # pragma: no cover - data layer always importable today
+            logger.warning("ParquetRepository unavailable for cached market data", exc_info=True)
+            return None
+        return self._repository
+
+    def _cache_signature(self) -> tuple[tuple[str, int, int], ...]:
+        repository = self._repository_obj()
+        if repository is None:
+            return ()
+        signature: list[tuple[str, int, int]] = []
+        for root in self._master.roots():
+            try:
+                path = repository.partition_path(root, CACHED_BAR_SCHEMA)  # type: ignore[attr-defined]
+                stats = path.stat()
+            except (OSError, AttributeError):
+                continue
+            signature.append((root, int(stats.st_mtime_ns), int(stats.st_size)))
+        return tuple(signature)
+
+    def _fixture_backing(self) -> _MarketDataBacking:
+        return _MarketDataBacking(
+            frame=self._market.bars,
+            as_of=self._market.as_of,
+            roots=tuple(self._market.roots),
+            origin="fixture",
+        )
+
+    def _backing(self) -> _MarketDataBacking:
+        signature = self._cache_signature()
+        if self._backing_cache is not None and signature == self._backing_signature:
+            return self._backing_cache
+        backing = self._build_backing()
+        self._backing_cache = backing
+        self._backing_signature = signature
+        self._state_degraded_reason = None
+        self._state_cache.clear()
+        self._pipeline_cache.clear()
+        self._term_cache.clear()
+        return backing
+
+    def _build_backing(self) -> _MarketDataBacking:
+        repository = self._repository_obj()
+        if repository is None:
+            return self._fixture_backing()
+        cached_roots: list[str] = []
+        try:
+            inventory = repository.inventory(CACHED_BAR_SCHEMA)  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning("Parquet cache inventory failed; using fixtures", exc_info=True)
+            return self._fixture_backing()
+        for entry in inventory:
+            root = str(getattr(entry, "root", "") or "").upper()
+            cached_bars = int(getattr(entry, "cached_bars", 0) or 0)
+            if root and cached_bars > 0 and self._master.has(root):
+                cached_roots.append(root)
+        if not cached_roots:
+            return self._fixture_backing()
+        try:
+            frame = repository.read_bars(cached_roots, schema=CACHED_BAR_SCHEMA)  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning("cached Parquet bars could not be read; using fixtures", exc_info=True)
+            return self._fixture_backing()
+        if not isinstance(frame, pl.DataFrame) or frame.is_empty():
+            return self._fixture_backing()
+        timestamp_column = data_schema.TIMESTAMP_COLUMN
+        root_column = data_schema.ROOT_SYMBOL_COLUMN
+        frame = frame.filter(pl.col(timestamp_column).is_not_null())
+        if frame.is_empty():
+            return self._fixture_backing()
+        as_of = frame[timestamp_column].max()
+        if not isinstance(as_of, datetime):
+            return self._fixture_backing()
+        as_of = as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=UTC)
+        cutoff = as_of - timedelta(days=CACHED_STATE_LOOKBACK_DAYS)
+        frame = frame.filter(pl.col(timestamp_column) >= cutoff)
+        usable_roots: list[str] = []
+        for root in cached_roots:
+            rows = frame.filter(pl.col(root_column) == root).height
+            if rows >= CACHED_MIN_BARS_PER_ROOT:
+                usable_roots.append(root)
+        if not usable_roots:
+            return self._fixture_backing()
+        frame = frame.filter(pl.col(root_column).is_in(usable_roots))
+        fallback_roots = [root for root in self._market.roots if root not in usable_roots]
+        if fallback_roots:
+            fixture_frame = self._market.bars.filter(
+                pl.col(root_column).is_in(fallback_roots) & (pl.col(timestamp_column) <= as_of)
+            )
+            if not fixture_frame.is_empty():
+                frame = pl.concat([frame, fixture_frame], how="vertical_relaxed")
+            else:
+                fallback_roots = []
+        roots = tuple(sorted({str(value) for value in frame[root_column].to_list()}))
+        return _MarketDataBacking(
+            frame=frame,
+            as_of=as_of,
+            roots=roots,
+            origin="cached_parquet",
+            cached_roots=tuple(sorted(usable_roots)),
+            fallback_roots=tuple(sorted(fallback_roots)),
+        )
+
+    # -- state / pipeline / term structure ------------------------------------
+
     def latest_state(self) -> MarketState:
-        """Point-in-time ``MarketState`` for the latest offline bar."""
-        key = self._market.as_of.date()
-        cached = self._state_cache.get(key)
-        if cached is not None:
-            return cached
+        """Point-in-time ``MarketState`` backed by cached Parquet bars first.
+
+        Equity comes from the injected live account NLV provider when available (so
+        ``/api/pipeline/latest`` agrees with ``/api/positions``); only when no live NLV
+        exists does the deterministic fixture equity apply. Bars come from the cached
+        ParquetRepository when present (partial cache merges fixture bars for missing
+        roots) and from the deterministic offline fixtures otherwise.
+        """
         from src.data.market_state_builder import MarketStateBuilder
 
-        builder = MarketStateBuilder(instrument_master=self._master, initial_equity=INITIAL_EQUITY)
-        state = builder.build(self._market.bars, self._market.as_of, equity=INITIAL_EQUITY)
+        backing = self._backing()
+        equity = self._resolved_equity()
+        key = backing.origin
+        cached = self._state_cache.get(key)
+        if cached is not None:
+            if cached.equity == equity:
+                return cached
+            adjusted = dataclass_replace(cached, equity=equity)
+            self._state_cache[key] = adjusted
+            return adjusted
+        builder = MarketStateBuilder(instrument_master=self._master, initial_equity=equity)
+        try:
+            state = builder.build(backing.frame, backing.as_of, equity=equity)
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            self._warnings.append(f"cached Parquet state build failed ({reason}); fixtures used")
+            logger.warning("cached Parquet state build failed; using fixtures: %s", reason)
+            self._state_degraded_reason = reason
+            self._state_cache.pop(key, None)
+            fixture = self._fixture_backing()
+            state = builder.build(fixture.frame, fixture.as_of, equity=equity)
+            self._state_cache["fixture"] = state
+            return state
         self._state_cache[key] = state
         return state
 
@@ -1661,8 +1963,10 @@ class EngineMarketService:
         return pipeline, translator
 
     def pipeline(self) -> PipelineWaterfallResponse:
-        """Run the real FinRL-X pipeline on the latest offline state."""
-        key = self._market.as_of.date()
+        """Run the real FinRL-X pipeline on the latest cached/fixture state."""
+        state = self.latest_state()
+        equity = state.equity or INITIAL_EQUITY
+        key = (self.data_origin, round(float(equity), 2))
         cached = self._pipeline_cache.get(key)
         if cached is not None:
             return cached
@@ -1672,7 +1976,6 @@ class EngineMarketService:
                 "no declarative strategy config available under configs/strategies; "
                 "the pipeline inspector requires at least one YAML config"
             )
-        state = self.latest_state()
         pipeline, translator = self._pipeline_for(config, state)
         result = pipeline.run(state)
         response = self._map_pipeline(config, state, result, translator)
@@ -1807,7 +2110,44 @@ class EngineMarketService:
         eligible = len(state.instruments)
         applied_risk = _metadata_names(result.diagnostics, "risk_overlays")
         skipped_risk = _metadata_names(result.diagnostics, "skipped_risk_stages")
+        backing = self._backing()
         diagnostics: list[PipelineDiagnostic] = [
+            PipelineDiagnostic(
+                stage="Data backing",
+                detail=(
+                    f"{self.data_origin} bars as_of {backing.as_of.isoformat()}; "
+                    f"cached roots {len(backing.cached_roots)}/{len(backing.roots)}"
+                    + (
+                        f"; fixture fallback for {', '.join(backing.fallback_roots)}"
+                        if backing.fallback_roots
+                        else ""
+                    )
+                    + (
+                        f"; state build degraded ({self._state_degraded_reason})"
+                        if self._state_degraded_reason is not None
+                        else ""
+                    )
+                ),
+                value=self.data_origin,
+                status="ok"
+                if self.data_origin == "cached_parquet" and not backing.partial
+                else "info"
+                if self.data_origin == "cached_parquet"
+                else "warn",
+            ),
+            PipelineDiagnostic(
+                stage="Equity source",
+                detail=(
+                    f"equity {equity:,.2f} from {self.equity_source}"
+                    + (
+                        "; deterministic fixture fallback (no live account NLV)"
+                        if self.equity_source == "fixture"
+                        else " (live account net liquidation value)"
+                    )
+                ),
+                value=f"{equity:,.2f}",
+                status="ok" if self.equity_source == "live-account" else "warn",
+            ),
             PipelineDiagnostic(
                 stage="Universe selector",
                 detail=(
@@ -1912,13 +2252,132 @@ class EngineMarketService:
         return diagnostics
 
     def term_structure(self) -> TermStructureResponse:
-        """Deterministic forward curves + roll calendar (real instrument master)."""
-        key = self._market.as_of.date()
+        """Forward curves + roll calendar, cached Parquet first then fixtures.
+
+        Roots with cached multi-expiry daily bars publish real observed prices/slopes;
+        roots without enough expiries (or missing from the cache) use the deterministic
+        synthetic curve from the *latest available* front price, so a partial cache is
+        attributable and never crashes the endpoint.
+        """
+        backing = self._backing()
+        key = backing.origin
         cached = self._term_cache.get(key)
-        if cached is None:
-            cached = fixtures.term_structure(self._market)
-            self._term_cache[key] = cached
-        return cached
+        if cached is not None:
+            return cached
+        if backing.origin == "fixture":
+            response = fixtures.term_structure(self._market)
+        else:
+            response = self._cached_term_structure(backing)
+        self._term_cache[key] = response
+        return response
+
+    def _cached_term_structure(self, backing: _MarketDataBacking) -> TermStructureResponse:
+        frame = backing.frame
+        root_column = data_schema.ROOT_SYMBOL_COLUMN
+        close_column = data_schema.CLOSE_COLUMN
+        timestamp_column = data_schema.TIMESTAMP_COLUMN
+        latest_prices: dict[str, float] = {}
+        for root in backing.roots:
+            root_frame = frame.filter(pl.col(root_column) == root)
+            if root_frame.is_empty():
+                continue
+            row = root_frame.sort(timestamp_column).select(pl.col(close_column).last()).row(0)
+            price = float(row[0]) if row[0] is not None else 0.0
+            if math.isfinite(price) and price > 0.0:
+                latest_prices[root] = price
+        if not latest_prices:
+            return fixtures.term_structure(self._market)
+        synthetic_market = fixtures.OfflineMarket(
+            instrument_master=self._master,
+            bars=frame,
+            timestamps=tuple(
+                sorted(
+                    {
+                        value
+                        for value in frame[timestamp_column].to_list()
+                        if isinstance(value, datetime)
+                    }
+                )
+            ),
+            prices=latest_prices,
+            seed=self._market.seed,
+        )
+        synthetic = fixtures.term_structure(synthetic_market)
+        curves_by_root: dict[str, TermCurve] = {curve.root: curve for curve in synthetic.curves}
+        for root in backing.cached_roots:
+            root_frame = frame.filter(pl.col(root_column) == root)
+            real_curve = self._real_term_curve(root, root_frame, backing.as_of.date())
+            if real_curve is not None:
+                curves_by_root[root] = real_curve
+        curves = [curves_by_root[root] for root in sorted(curves_by_root)]
+        return TermStructureResponse(
+            as_of=backing.as_of,
+            curves=curves,
+            roll_calendar=synthetic.roll_calendar,
+        )
+
+    def _real_term_curve(
+        self, root: str, frame: pl.DataFrame, as_of_date: date
+    ) -> TermCurve | None:
+        """Real forward curve from cached multi-expiry bars (``None`` when insufficient)."""
+        if not self._master.has(root):
+            return None
+        spec = self._master.get(root)
+        expiration_column = data_schema.EXPIRATION_COLUMN
+        timestamp_column = data_schema.TIMESTAMP_COLUMN
+        close_column = data_schema.CLOSE_COLUMN
+        open_interest_column = data_schema.OPEN_INTEREST_COLUMN
+        latest_by_expiry: dict[date, tuple[datetime, float, float]] = {}
+        for record in frame.sort(timestamp_column).iter_rows(named=True):
+            expiration = record.get(expiration_column)
+            if not isinstance(expiration, date) or isinstance(expiration, datetime):
+                continue
+            if expiration < as_of_date:
+                continue
+            timestamp = record.get(timestamp_column)
+            close = record.get(close_column)
+            if not isinstance(timestamp, datetime) or not isinstance(close, int | float):
+                continue
+            price = float(close)
+            if not math.isfinite(price) or price <= 0.0:
+                continue
+            open_interest = record.get(open_interest_column)
+            oi = float(open_interest) if isinstance(open_interest, int | float) else 0.0
+            previous = latest_by_expiry.get(expiration)
+            if previous is None or timestamp >= previous[0]:
+                latest_by_expiry[expiration] = (timestamp, price, oi)
+        if len(latest_by_expiry) < 2:
+            return None
+        expiries = sorted(latest_by_expiry)
+        contracts = [
+            TermContract(
+                expiration=expiration,
+                price=latest_by_expiry[expiration][1],
+                days_to_expiry=max((expiration - as_of_date).days, 0),
+                is_front=index == 0,
+                open_interest=max(0, round(latest_by_expiry[expiration][2])),
+            )
+            for index, expiration in enumerate(expiries)
+        ]
+        first, second = contracts[0], contracts[1]
+        observed_slope = (second.price - first.price) / first.price if first.price > 0.0 else 0.0
+        days_between = max(second.days_to_expiry - first.days_to_expiry, 1)
+        roll_yield = -(observed_slope * 365.0) / days_between
+        regime: Literal["contango", "backwardation", "flat"] = (
+            "flat"
+            if abs(observed_slope) < 0.0004
+            else "contango"
+            if observed_slope > 0.0
+            else "backwardation"
+        )
+        return TermCurve(
+            root=root,
+            asset_class=spec.asset_class,
+            regime=regime,
+            slope=round(observed_slope, 8),
+            roll_yield_annualized=round(roll_yield, 8),
+            contracts=contracts,
+        )
 
 
 class FixtureMarketService:
@@ -1936,17 +2395,78 @@ class FixtureMarketService:
         settings: Settings,
         reason: str,
         clock: fixtures.Clock = fixtures.utc_now,
+        equity_provider: Callable[[], float | None] | None = None,
+        account_provider: Callable[[], object] | None = None,
     ) -> None:
         self._market = market
         self._master = market.instrument_master
         self._settings = settings
         self._reason = reason
         self._clock = clock
+        self._equity_provider = equity_provider
+        self._account_provider = account_provider
         self._state: MarketState | None = None
+
+    # -- injectable account equity (same contract as EngineMarketService) ------
+
+    def set_equity_provider(self, provider: Callable[[], float | None] | None) -> None:
+        """Inject the live account NLV provider (late wiring from the Container)."""
+        self._equity_provider = provider
+        self._state = None
+
+    def set_account_provider(self, provider: Callable[[], object] | None) -> None:
+        """Inject a live account-snapshot provider (``net_liquidation`` is read)."""
+        self._account_provider = provider
+        self._state = None
+
+    def _provider_equity(self) -> float | None:
+        for provider in (self._equity_provider, self._account_provider):
+            if provider is None:
+                continue
+            try:
+                raw = provider()
+            except Exception:
+                logger.warning("fixture market equity provider failed", exc_info=True)
+                continue
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                value = float(raw)
+            else:
+                candidate = getattr(raw, "net_liquidation", None)
+                if candidate is None and isinstance(raw, Mapping):
+                    candidate = raw.get("net_liquidation", raw.get("nlv"))
+                value = float(candidate) if isinstance(candidate, int | float) else 0.0
+            if math.isfinite(value) and value > 0.0:
+                return value
+        return None
+
+    def _resolved_equity(self) -> float:
+        return self._provider_equity() or INITIAL_EQUITY
+
+    @property
+    def equity_source(self) -> str:
+        return "live-account" if self._provider_equity() is not None else "fixture"
+
+    @property
+    def data_origin(self) -> str:
+        """Fixture-backed service (real cached bars are only used by the engine service)."""
+        return "fixture"
+
+    @property
+    def data_backing(self) -> Mapping[str, object]:
+        return {
+            "origin": "fixture",
+            "partial": False,
+            "as_of": self._market.as_of.isoformat(),
+            "roots": list(self._market.roots),
+            "cached_roots": [],
+            "fallback_roots": list(self._market.roots),
+            "equity_source": self.equity_source,
+            "degraded_reason": self._reason,
+        }
 
     def latest_state(self) -> MarketState:
         """Lightweight state from the deterministic fixtures."""
-        if self._state is None:
+        if self._state is None or self._state.equity != self._resolved_equity():
             from src.core.types import InstrumentSnapshot
 
             snapshots: dict[str, InstrumentSnapshot] = {}
@@ -1966,7 +2486,7 @@ class FixtureMarketService:
             self._state = MarketState(
                 timestamp=self._market.as_of,
                 instruments=snapshots,
-                equity=INITIAL_EQUITY,
+                equity=self._resolved_equity(),
             )
         return self._state
 
@@ -1981,17 +2501,15 @@ class FixtureMarketService:
             base = 0.3 if root in selected else 0.0
             timing = base * (1.0 + 0.08 * math.sin(index + 1.0))
             risk = timing * 0.92
-            quantity = (
-                round(risk * INITIAL_EQUITY / (state.price(root) * 50.0))
-                if root in selected
-                else None
-            )
             spec = self._master.get(root) if self._master.has(root) else None
             multiplier = spec.multiplier if spec is not None else 50.0
+            quantity = (
+                round(risk * equity / (state.price(root) * multiplier))
+                if root in selected and equity > 0.0
+                else None
+            )
             achieved = (
-                (quantity or 0) * state.price(root) * multiplier / INITIAL_EQUITY
-                if equity > 0
-                else 0.0
+                (quantity or 0) * state.price(root) * multiplier / equity if equity > 0 else 0.0
             )
             instruments.append(
                 PipelineInstrumentRow(
@@ -2006,7 +2524,7 @@ class FixtureMarketService:
                     delta_timing=timing - base,
                     delta_risk=risk - timing,
                     target_contracts=quantity,
-                    notional=risk * INITIAL_EQUITY,
+                    notional=round(risk * equity, 2),
                     driver="fixture fallback: real pipeline layer unavailable",
                     regime=state.regime,
                     reason="fixture fallback: real pipeline layer unavailable",
@@ -2073,11 +2591,30 @@ class FixtureMarketService:
             instruments=instruments,
             diagnostics=[
                 PipelineDiagnostic(
+                    stage="Data backing",
+                    detail="fixture market service (no cached Parquet binding available)",
+                    value="fixture",
+                    status="warn",
+                ),
+                PipelineDiagnostic(
+                    stage="Equity source",
+                    detail=(
+                        f"equity {equity:,.2f} from {self.equity_source}"
+                        + (
+                            "; deterministic fixture fallback (no live account NLV)"
+                            if self.equity_source == "fixture"
+                            else " (live account net liquidation value)"
+                        )
+                    ),
+                    value=f"{equity:,.2f}",
+                    status="ok" if self.equity_source == "live-account" else "warn",
+                ),
+                PipelineDiagnostic(
                     stage="Pipeline wiring",
                     detail=f"real FinRL-X pipeline unavailable — {self._reason}",
                     value="fixture",
                     status="warn",
-                )
+                ),
             ],
             elapsed_ms=0.0,
             data_source="fixture",
@@ -2567,6 +3104,17 @@ class Container:
             outcome = starter()
             if inspect.isawaitable(outcome):
                 await outcome
+        if bool(getattr(self.execution, "ibkr_enabled", False)):
+            # Warm the live NLV/last-good book so the very first pipeline/term
+            # request values the account with the real broker NLV, not the fixture.
+            try:
+                await self.live.account()
+            except Exception as exc:
+                logger.warning(
+                    "initial IBKR account snapshot unavailable (%s); fixture equity applies "
+                    "until the live book is fetched",
+                    type(exc).__name__,
+                )
         await self.telemetry.start()
         await self.news.start()
         await self.live.start()
@@ -2619,14 +3167,27 @@ def _build_market_service(
     catalog: StrategyCatalog,
     clock: fixtures.Clock,
     warnings: list[str],
+    equity_provider: Callable[[], float | None] | None = None,
 ) -> MarketDataService:
     try:
-        return EngineMarketService(market=market, settings=settings, catalog=catalog, clock=clock)
+        return EngineMarketService(
+            market=market,
+            settings=settings,
+            catalog=catalog,
+            clock=clock,
+            equity_provider=equity_provider,
+        )
     except Exception as exc:
         reason = f"{type(exc).__name__}: {exc}"
         warnings.append(f"FinRL-X pipeline wiring failed: {reason}")
         logger.exception("FinRL-X pipeline wiring failed; using fixture pipeline")
-        return FixtureMarketService(market=market, settings=settings, reason=reason, clock=clock)
+        return FixtureMarketService(
+            market=market,
+            settings=settings,
+            reason=reason,
+            clock=clock,
+            equity_provider=equity_provider,
+        )
 
 
 def _warm_optional_imports() -> None:
@@ -2663,12 +3224,19 @@ def build_container(
     execution = _build_execution_service(
         settings=resolved_settings, market=market, clock=resolved_clock, warnings=warnings
     )
+    # The engine/risk pipeline must value the account with the SAME live NLV as the
+    # Command Center positions view; only an IBKR-enabled session provides a real
+    # live account snapshot (offline/backtest keeps the deterministic fixture equity).
+    equity_provider: Callable[[], float | None] | None = None
+    if bool(getattr(execution, "ibkr_enabled", False)):
+        equity_provider = lambda: _execution_net_liquidation(execution)  # noqa: E731 - late-bound provider
     market_service = _build_market_service(
         settings=resolved_settings,
         market=market,
         catalog=catalog,
         clock=resolved_clock,
         warnings=warnings,
+        equity_provider=equity_provider,
     )
     try:
         risk_state_store: RiskStateStore | None = build_risk_state_store(

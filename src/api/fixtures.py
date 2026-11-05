@@ -540,6 +540,7 @@ def build_rebalance_states(
     *,
     rebalance_frequency: str,
     initial_equity: float,
+    timeframe: str = "1d",
 ) -> list[MarketState]:
     """Build one market state per bar, full-featured at rebalance timestamps.
 
@@ -557,7 +558,7 @@ def build_rebalance_states(
         raise RuntimeError(f"market state builder unavailable: {exc}") from exc
 
     decisions = schedule_decisions(market.timestamps, rebalance_frequency=rebalance_frequency)
-    builder = MarketStateBuilder(instrument_master=market.instrument_master)
+    builder = MarketStateBuilder(instrument_master=market.instrument_master, timeframe=timeframe)
     full_states: dict[datetime, MarketState] = {}
     if decisions:
         for timestamp, state in zip(

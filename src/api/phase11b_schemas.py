@@ -45,6 +45,7 @@ class RootCacheSummary(APIModel):
     end_date: date | None = None
     size_bytes: int = Field(default=0, ge=0)
     source: CacheSource = "empty"
+    timeframe: str = "1d"
 
 
 class CacheTotals(APIModel):
@@ -66,6 +67,8 @@ class DataInventoryResponse(APIModel):
     databento_configured: bool = False
     ibkr_available: bool = False
     schema: str = Field(default="ohlcv-1d")  # type: ignore[assignment]
+    timeframe: str = "1d"
+    base_schema: str = "ohlcv-1d"
     generated_at: datetime
 
 
@@ -76,6 +79,7 @@ class EstimateCostRequest(APIModel):
     start: date
     end: date
     schema: str = Field(default="ohlcv-1d")  # type: ignore[assignment]
+    timeframe: str = "1d"
     source: Literal["databento", "ibkr"] = "databento"
 
 
@@ -84,6 +88,8 @@ class CostEstimateResponse(APIModel):
 
     roots: list[str] = Field(default_factory=list)
     schema: str = Field(default="ohlcv-1d")  # type: ignore[assignment]
+    timeframe: str = "1d"
+    base_schema: str = "ohlcv-1d"
     start: date
     end: date
     estimated_cost_usd: float = 0.0
@@ -102,6 +108,7 @@ class IngestRequest(APIModel):
     start: date
     end: date
     schema: str = Field(default="ohlcv-1d")  # type: ignore[assignment]
+    timeframe: str = "1d"
     allow_over_budget: bool = False
     confirm: bool = True
 
@@ -124,6 +131,9 @@ class IngestResponse(APIModel):
     start: date
     end: date
     cost_estimate: CostEstimateResponse | None = None
+    timeframe: str = "1d"
+    base_schema: str = "ohlcv-1d"
+    resampled: bool = False
     continuous_series: list[ContinuousSeriesSummary] = Field(default_factory=list)
     duration_seconds: float = 0.0
     warnings: list[str] = Field(default_factory=list)
