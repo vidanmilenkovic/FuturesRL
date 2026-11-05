@@ -2,6 +2,11 @@
 
 Two ideas, in this order:
 
+The annualisation used by :func:`~src.strategies._numeric.covariance_matrix`
+follows ``state.timeframe`` via the canonical timeframe registry, so the same
+ex-ante *annual* volatility target is enforced on 1m/5m/1h/1d/1w states (the
+``"1d"`` default keeps the exact historical 252-trading-day behaviour).
+
 1. **Inverse-volatility sizing.** Each root receives a weight inversely
    proportional to its annualised volatility, correcting for correlation when a
    covariance matrix is available. High-volatility energy roots therefore get a

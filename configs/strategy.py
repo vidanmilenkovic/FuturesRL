@@ -83,6 +83,17 @@ class BacktestSpec(BaseModel):
     slippage_ticks: float = Field(default=1.0, ge=0.0)
     random_seed: int = 7
     walk_forward: WalkForwardConfig | None = None
+    #: Bar timeframe of the backtest (canonical registry: 1m/5m/15m/30m/1h/4h/1d/1w).
+    #: ``"1d"`` preserves the classic daily behavior (252 trading bars/year).
+    timeframe: str = "1d"
+
+    @field_validator("timeframe")
+    @classmethod
+    def _known_timeframe(cls, value: str) -> str:
+        # Lazy import keeps the config modules free of a hard data-package import.
+        from src.data.timeframes import get_timeframe
+
+        return get_timeframe(value).name
 
     @model_validator(mode="after")
     def _ordered_dates(self) -> BacktestSpec:

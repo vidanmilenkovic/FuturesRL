@@ -12,6 +12,11 @@ fast/slow pair is a whipsaw, and the correct position size is zero). The
 ``target_vol / vol`` scaling is the classic Moskowitz-Ooi-Pedersen TSMOM sizing:
 the same dollar risk budget is deployed in every root regardless of its vol.
 
+The volatility used for the ``target_vol / vol`` sizing is annualised with
+``bars_per_year(state.timeframe)`` (:func:`~src.strategies._numeric.annualized_volatility`),
+so a 5m state deploys the same annual risk budget as a daily one; ``"1d"`` keeps
+the exact historical ``sqrt(252)`` behaviour.
+
 The overlay only ever *scales* existing legs — it never introduces an instrument
 the allocator did not select — so ``gross`` can shrink to zero but the universe
 is preserved.

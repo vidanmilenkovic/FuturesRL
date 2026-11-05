@@ -18,7 +18,13 @@ The overlay implements the ``R_t`` statistical side of the FinRL-X risk stage:
 * **Intraday daily max-loss kill switch** - when equity falls by
   ``daily_max_loss_pct`` from the starting daily NLV the overlay flattens the
   book and latches until :meth:`QuantRiskOverlay.reset_day` or the next trading
-  session.
+  session. Sessions are **UTC calendar days** (not "one bar == one day"), so
+  intraday bars within the same UTC day accumulate into the daily loss, and the
+  first bar of a new UTC day re-bases the daily starting NLV / clears the latch
+  while the portfolio (and per-instrument) high-water marks survive.
+* **Timeframe-aware annualisation** - the EWMA/diagonal volatility maths
+  annualises with ``bars_per_year(timeframe)`` (default ``"1d"`` = 252) so a 5m
+  or 1h state targets the same *annual* volatility as a daily one.
 * **Drawdown limit** - a portfolio drawdown from the equity high-water mark of
   ``drawdown_limit_pct`` flattens the book while the breach persists.
 * **Durable state (Phase 7)** - an optional
@@ -44,9 +50,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 from configs.instruments import InstrumentsConfig, InstrumentSpec, load_instruments
 from numpy.typing import NDArray
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.core.types import TRADING_DAYS_PER_YEAR, InstrumentId, MarketState, WeightVector
+from src.data.timeframes import bars_per_year, get_timeframe
 from src.risk.state_store import PersistedRiskState, RiskStateStore
 
 if TYPE_CHECKING:
@@ -86,10 +93,31 @@ class QuantRiskConfig(BaseModel):
     volatility_targeting_enabled: bool = True
     daily_loss_kill_switch_enabled: bool = True
     min_portfolio_volatility: float = Field(default=1e-8, gt=0.0)
+    #: Bar timeframe used to derive the annualisation factor (canonical registry
+    #: names: 1m/5m/15m/30m/1h/4h/1d/1w). ``"1d"`` preserves 252.
+    timeframe: str = "1d"
+    #: Trading bars per year for the volatility-targeting covariance math. When
+    #: left at the daily default and ``timeframe != "1d"`` it is derived from the
+    #: registry; an explicit non-default value always wins (override).
     annualization_factor: int = Field(default=TRADING_DAYS_PER_YEAR, gt=0)
 
+    @field_validator("timeframe")
     @classmethod
-    def from_risk_settings(cls, settings: RiskSettings) -> QuantRiskConfig:
+    def _known_timeframe(cls, value: str) -> str:
+        return get_timeframe(value).name
+
+    @model_validator(mode="after")
+    def _resolve_annualization(self) -> QuantRiskConfig:
+        """Derive the annualisation factor from the timeframe unless overridden."""
+        spec = get_timeframe(self.timeframe)
+        if self.annualization_factor == TRADING_DAYS_PER_YEAR and spec.name != "1d":
+            object.__setattr__(self, "annualization_factor", int(bars_per_year(spec)))
+        return self
+
+    @classmethod
+    def from_risk_settings(
+        cls, settings: RiskSettings, *, timeframe: str = "1d"
+    ) -> QuantRiskConfig:
         """Build the overlay configuration from the central risk settings."""
         return cls(
             target_annual_volatility=settings.target_annual_volatility,
@@ -100,6 +128,7 @@ class QuantRiskConfig(BaseModel):
             daily_max_loss_pct=settings.daily_max_loss_pct,
             trailing_stop_pct=settings.trailing_stop_pct,
             drawdown_limit_pct=settings.drawdown_limit_pct,
+            timeframe=timeframe,
         )
 
 
@@ -503,6 +532,21 @@ class QuantRiskOverlay:
     def _instrument_master(self) -> InstrumentsConfig:
         return self._instruments if self._instruments is not None else load_instruments()
 
+    def _annualization_factor(self, state: MarketState) -> float:
+        """Bars/year for the state's timeframe (explicit config fallback).
+
+        The state's timeframe is authoritative when it is intraday (a 5m state is
+        annualised with 69,552 bars/year); the config ``timeframe`` supplies the
+        factor when the state is still daily, and an explicit
+        ``annualization_factor`` override on the config wins for daily states.
+        """
+        timeframe = state.timeframe
+        if timeframe and timeframe != "1d":
+            return float(bars_per_year(timeframe))
+        if self._config.timeframe != "1d":
+            return float(bars_per_year(self._config.timeframe))
+        return float(self._config.annualization_factor)
+
     def _normalise(
         self, weights: WeightVector
     ) -> tuple[dict[InstrumentId, float], dict[InstrumentId, InstrumentSpec]]:
@@ -553,11 +597,13 @@ class QuantRiskOverlay:
         return changed
 
     def _roll_session(self, moment: datetime, equity: float | None) -> bool:
-        """Roll the daily counters when ``moment`` starts a new trading session.
+        """Roll the daily counters when ``moment`` starts a new UTC calendar day.
 
-        Mirrors :meth:`PersistedRiskState.rolled_to_day`: the daily loss latch and
-        instrument stops are cleared, while the portfolio high-water mark and the
-        operator/OMS kill-switch latch survive.
+        Sessions are UTC calendar days (not bar counts / "1 bar = 1 day"), so
+        intraday bars within one UTC day keep accumulating the daily loss while
+        the first bar of the next UTC day re-bases the daily starting NLV and
+        clears the latch/stops. The portfolio high-water mark and the
+        operator/OMS kill-switch latch survive the roll.
         """
         session = moment.astimezone(UTC).date()
         if self._session_date is None:
@@ -726,7 +772,7 @@ class QuantRiskOverlay:
         means = weights @ matrix
         centered = matrix - means
         covariance = (centered * weights[:, None]).T @ centered
-        return np.asarray(covariance * float(self._config.annualization_factor), dtype=np.float64)
+        return np.asarray(covariance * self._annualization_factor(state), dtype=np.float64)
 
     def _diagonal_volatility(
         self,
@@ -746,9 +792,7 @@ class QuantRiskOverlay:
                 series = state.returns.get(root)
                 if series is not None and series.size >= 2:
                     values = np.asarray(series, dtype=np.float64)
-                    variance = float(np.var(values, ddof=1)) * float(
-                        self._config.annualization_factor
-                    )
+                    variance = float(np.var(values, ddof=1)) * self._annualization_factor(state)
             if variance is None:
                 return None
             variances.append(max(variance, 0.0))

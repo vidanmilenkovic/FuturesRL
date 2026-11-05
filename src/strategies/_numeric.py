@@ -9,11 +9,14 @@ translator or, worse, silently flatten a live book).
 Conventions
 -----------
 * Volatilities and covariances are **annualised** unless a function name says
-  ``daily``; ``sqrt(252)`` is the annualisation factor.
-* ``state.returns`` are **daily** simple returns.
+  ``daily``. The annualisation factor is ``sqrt(bars_per_year(state.timeframe))``
+  from the canonical registry (:mod:`src.data.timeframes`); the ``"1d"`` default
+  is exactly 252, so classic daily behaviour is unchanged, while a 5m/1h state
+  annualises with its own trading-bar count.
+* ``state.returns`` are **per-bar** simple returns.
 * ``state.covariance`` (when present) is an annualised covariance matrix whose
   ordering is given by ``state.covariance_instruments``.
-* ``vol_20d`` / ``vol_60d`` features are daily volatilities and are annualised
+* ``vol_20d`` / ``vol_60d`` features are per-bar volatilities and are annualised
   on read.
 """
 
@@ -27,6 +30,7 @@ from numpy.typing import NDArray
 
 from src.core.types import TRADING_DAYS_PER_YEAR, InstrumentId, MarketState, WeightVector
 from src.data.schema import VOL_20D, VOL_60D
+from src.data.timeframes import bars_per_year
 
 ANNUALIZATION_FACTOR: float = math.sqrt(float(TRADING_DAYS_PER_YEAR))
 
@@ -40,6 +44,26 @@ MIN_ANNUAL_VOLATILITY: float = 0.002
 VOLATILITY_FEATURES: tuple[str, ...] = (VOL_20D, VOL_60D)
 
 type FloatArray = NDArray[np.float64]
+
+
+def bars_per_year_for(timeframe: str | None = None) -> float:
+    """Trading bars per year for a canonical timeframe (``None``/``1d`` -> 252)."""
+    return float(bars_per_year("1d" if timeframe is None else timeframe))
+
+
+def annualization_factor_for(timeframe: str | None = None) -> float:
+    """``sqrt(bars_per_year(timeframe))`` (exact ``sqrt(252)`` for the daily default)."""
+    return math.sqrt(bars_per_year_for(timeframe))
+
+
+def _resolved_bars_per_year(state: MarketState, override: float | None) -> float:
+    """Timeframe's bars/year, unless the caller supplied an explicit override."""
+    if override is None:
+        return bars_per_year_for(state.timeframe)
+    value = float(override)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"periods_per_year must be a finite positive number, got {override!r}")
+    return value
 
 
 def finite_or(value: float, default: float) -> float:
@@ -78,8 +102,14 @@ def trailing_volatility(
     window: int,
     *,
     annualize: bool = True,
+    periods_per_year: float | None = None,
 ) -> float | None:
-    """Realised volatility of the last ``window`` daily returns."""
+    """Realised volatility of the last ``window`` per-bar returns.
+
+    ``periods_per_year`` overrides the timeframe-derived annualisation (useful for
+    caller-specific conventions); by default the factor comes from
+    ``state.timeframe`` (daily states keep the exact ``sqrt(252)`` behaviour).
+    """
     series = returns_series(state, instrument_id)
     if series is None or series.size < 3:
         return None
@@ -88,15 +118,23 @@ def trailing_volatility(
     if not math.isfinite(variance) or variance < 0.0:
         return None
     volatility = math.sqrt(variance)
-    return volatility * ANNUALIZATION_FACTOR if annualize else volatility
+    if not annualize:
+        return volatility
+    return volatility * math.sqrt(_resolved_bars_per_year(state, periods_per_year))
 
 
-def feature_volatility(state: MarketState, instrument_id: InstrumentId) -> float | None:
+def feature_volatility(
+    state: MarketState,
+    instrument_id: InstrumentId,
+    *,
+    periods_per_year: float | None = None,
+) -> float | None:
     """Annualised volatility implied by the ``vol_20d`` / ``vol_60d`` features."""
+    factor = math.sqrt(_resolved_bars_per_year(state, periods_per_year))
     for feature_name in VOLATILITY_FEATURES:
         value = state.feature(instrument_id, feature_name, math.nan)
         if math.isfinite(value) and value > 0.0:
-            return value * ANNUALIZATION_FACTOR
+            return value * factor
     return None
 
 
@@ -105,6 +143,7 @@ def annualized_volatility(
     instrument_id: InstrumentId,
     *,
     lookback: int = 60,
+    periods_per_year: float | None = None,
 ) -> float | None:
     """Best available annualised volatility estimate for one instrument.
 
@@ -114,10 +153,12 @@ def annualized_volatility(
     covariance_vol = state.annualized_vol(instrument_id)
     if math.isfinite(covariance_vol) and covariance_vol > 0.0:
         return covariance_vol
-    realised = trailing_volatility(state, instrument_id, lookback)
+    realised = trailing_volatility(
+        state, instrument_id, lookback, periods_per_year=periods_per_year
+    )
     if realised is not None and realised > 0.0:
         return realised
-    return feature_volatility(state, instrument_id)
+    return feature_volatility(state, instrument_id, periods_per_year=periods_per_year)
 
 
 def _correlation_from_returns(
@@ -210,8 +251,14 @@ def covariance_matrix(
     shrinkage: float = 0.0,
     min_volatility: float = MIN_ANNUAL_VOLATILITY,
     default_volatility: float = DEFAULT_ANNUAL_VOLATILITY,
+    periods_per_year: float | None = None,
 ) -> FloatArray:
     """Annualised covariance matrix aligned to ``candidates``.
+
+    Annualisation follows ``state.timeframe`` via the canonical registry (the
+    explicit ``periods_per_year`` override is for callers that need a different
+    convention); the ``"1d"`` default is exactly the historical 252-trading-day
+    behaviour.
 
     Uses the state's covariance sub-matrix when every candidate is covered;
     otherwise rebuilds one from realised volatilities and correlations. The
@@ -231,7 +278,9 @@ def covariance_matrix(
         )
     volatilities = np.empty(count, dtype=np.float64)
     for index, instrument_id in enumerate(candidates):
-        estimate = annualized_volatility(state, instrument_id, lookback=lookback)
+        estimate = annualized_volatility(
+            state, instrument_id, lookback=lookback, periods_per_year=periods_per_year
+        )
         volatilities[index] = (
             estimate if estimate is not None and estimate > 0.0 else default_volatility
         )
@@ -251,9 +300,12 @@ def annualized_volatility_vector(
     candidates: Sequence[InstrumentId],
     *,
     lookback: int = 60,
+    periods_per_year: float | None = None,
 ) -> FloatArray:
     """Annualised volatility per candidate, derived from the regularised covariance."""
-    covariance = covariance_matrix(state, candidates, lookback=lookback)
+    covariance = covariance_matrix(
+        state, candidates, lookback=lookback, periods_per_year=periods_per_year
+    )
     variances = np.clip(np.diag(covariance), MIN_ANNUAL_VOLATILITY**2, None)
     return np.sqrt(variances)
 

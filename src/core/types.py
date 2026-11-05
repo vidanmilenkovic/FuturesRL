@@ -309,6 +309,10 @@ class MarketState:
     account_currency: str = "USD"
     #: ``currency -> USD per one unit`` rates used to normalise non-USD accounts.
     fx_rates: Mapping[str, float] = field(default_factory=dict)
+    #: Bar timeframe of the state (canonical registry name; ``"1d"`` = daily).
+    #: ``returns`` and ``covariance``/volatility features are in *bar* units, so
+    #: annualisation must use ``bars_per_year(timeframe)`` (1d keeps 252).
+    timeframe: str = "1d"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamp", ensure_utc(self.timestamp))
@@ -357,6 +361,12 @@ class MarketState:
             normalise_currency(self.account_currency, name="account_currency"),
         )
         object.__setattr__(self, "fx_rates", freeze_fx_rates(self.fx_rates))
+        # Lazy import: configs/data modules import this contract module, and the
+        # canonical timeframe registry is dependency-free, but keeping the import
+        # inside __post_init__ avoids any import cycle at module load time.
+        from src.data.timeframes import get_timeframe
+
+        object.__setattr__(self, "timeframe", get_timeframe(self.timeframe).name)
 
     # -- convenience accessors -------------------------------------------------
 

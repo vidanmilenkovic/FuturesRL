@@ -22,6 +22,11 @@ Futures-specific robustness
   negative “risk contribution” and breaks the budget identity). The timing
   overlays apply the directional view; this allocator sizes risk.
 
+The covariance matrix is annualised with ``bars_per_year(state.timeframe)``
+(:mod:`src.data.timeframes`): the risk budgets are timeframe-invariant, while the
+optional volatility target is enforced on an *annual* basis for every supported
+timeframe (the ``"1d"`` default is exactly 252).
+
 The result is scaled either to a gross leverage target or, when
 ``target_annual_volatility`` is given, so the ex-ante portfolio volatility
 matches the target (capped by ``max_gross_leverage``).
