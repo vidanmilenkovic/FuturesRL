@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from configs.instruments import InstrumentsConfig
 
@@ -36,6 +36,52 @@ from src.core.types import (
     Position,
     ensure_utc,
 )
+
+
+def utc_calendar_day(timestamp: datetime) -> date:
+    """UTC calendar day of ``timestamp`` (daily settlement boundary)."""
+    return ensure_utc(timestamp).date()
+
+
+def is_new_utc_day(previous_timestamp: datetime | None, timestamp: datetime) -> bool:
+    """Whether ``timestamp`` crosses into a later UTC calendar day than ``previous``.
+
+    Intraday bars within the same UTC day return ``False``; the first bar of a new
+    UTC day (or any bar when no previous timestamp is supplied) returns ``True``.
+    """
+    current = utc_calendar_day(timestamp)
+    if previous_timestamp is None:
+        return True
+    return current > utc_calendar_day(previous_timestamp)
+
+
+@dataclass(slots=True)
+class DailySettlementClock:
+    """UTC calendar-day gate enforcing at most one daily settlement per day.
+
+    The event-driven backtester uses this for intraday bars so mark-to-market
+    settlement fires on UTC-day boundaries instead of once per bar. Daily (or
+    coarser) bars keep their legacy per-bar settlement behaviour.
+    """
+
+    last_settled_day: date | None = None
+    settlements: int = 0
+
+    def due(self, timestamp: datetime) -> bool:
+        """Whether a daily settlement is due at ``timestamp`` (not yet today)."""
+        day = utc_calendar_day(timestamp)
+        return self.last_settled_day is None or day > self.last_settled_day
+
+    def mark(self, timestamp: datetime) -> None:
+        """Record that the UTC day of ``timestamp`` has been settled."""
+        self.last_settled_day = utc_calendar_day(timestamp)
+        self.settlements += 1
+
+    def reset(self) -> None:
+        """Clear the gate (new backtest run)."""
+        self.last_settled_day = None
+        self.settlements = 0
+
 
 # ---------------------------------------------------------------------------
 # Typed result containers

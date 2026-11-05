@@ -56,6 +56,69 @@ RACHEV_ALPHA: float = 0.05
 #: Fraction of periods used for the "upper/lower tail" conventions.
 DEFAULT_ANNUALIZATION: int = TRADING_DAYS_PER_YEAR
 
+#: Canonical timeframe -> bars/year, used only while ``src.data.timeframes`` (task-67)
+#: is unavailable; the registry is authoritative when importable.
+_TIMEFRAME_BARS_PER_YEAR_FALLBACK: dict[str, int] = {
+    "1m": 347_760,
+    "5m": 69_552,
+    "15m": 23_184,
+    "30m": 11_592,
+    "1h": 5_796,
+    "4h": 1_449,
+    "1d": 252,
+    "1w": 52,
+}
+
+
+def canonical_timeframe(timeframe: str) -> str:
+    """Canonical timeframe name (``"1d"``) validated via ``src.data.timeframes``.
+
+    Falls back to the local canonical table while the data registry is missing.
+    """
+    if not isinstance(timeframe, str) or not timeframe.strip():
+        raise ValueError("timeframe must be a non-empty string")
+    key = timeframe.strip().lower()
+    try:
+        from src.data.timeframes import get_timeframe
+
+        return get_timeframe(key).name
+    except ImportError:
+        pass
+    if key in _TIMEFRAME_BARS_PER_YEAR_FALLBACK:
+        return key
+    supported = ", ".join(sorted(_TIMEFRAME_BARS_PER_YEAR_FALLBACK))
+    raise ValueError(f"unknown timeframe {timeframe!r}; supported: {supported}")
+
+
+def resolve_periods_per_year(
+    timeframe: str = "1d",
+    periods_per_year: int | None = None,
+) -> int:
+    """Resolve bars/year from a timeframe, honouring an explicit override.
+
+    ``periods_per_year`` wins when supplied (legacy callers/tests keep exact
+    control); otherwise :func:`src.data.timeframes.bars_per_year` is used, with a
+    local canonical fallback if the data registry is not importable. ``1d``
+    resolves to the historical 252 exactly.
+    """
+    if periods_per_year is not None:
+        if not isinstance(periods_per_year, int) or isinstance(periods_per_year, bool):
+            raise ValueError("periods_per_year must be a positive int")
+        if periods_per_year < 1:
+            raise ValueError("periods_per_year must be a positive int")
+        return periods_per_year
+    key = canonical_timeframe(timeframe)
+    try:
+        from src.data.timeframes import bars_per_year
+
+        resolved = bars_per_year(key)
+        if isinstance(resolved, int) and resolved >= 1:
+            return resolved
+    except ImportError:
+        pass
+    return _TIMEFRAME_BARS_PER_YEAR_FALLBACK[key]
+
+
 _NORMAL = NormalDist()
 
 #: Any dispersion below this is numerically zero (constant series convention).
@@ -113,6 +176,7 @@ class PerformanceMetrics:
     alpha: float | None = None
     benchmark_total_return: float | None = None
     metadata: dict[str, object] = field(default_factory=dict)
+    timeframe: str = "1d"
 
     def __post_init__(self) -> None:
         for metric in fields(self):
@@ -255,7 +319,12 @@ def _annualized_return(initial: float, ending: float, years: float) -> float:
     growth = ending / initial
     if growth <= 0.0:
         return 0.0
-    return float(growth ** (1.0 / years) - 1.0)
+    try:
+        return float(growth ** (1.0 / years) - 1.0)
+    except OverflowError:
+        # Ultra-short intraday samples can imply absurd annualised growth; return
+        # the largest finite float so the frozen metric contract stays finite/JSON-safe.
+        return float(np.finfo(np.float64).max)
 
 
 def compute_metrics(
@@ -264,7 +333,8 @@ def compute_metrics(
     timestamps: Sequence[datetime] | None = None,
     initial_equity: float | None = None,
     risk_free_rate: float = 0.0,
-    periods_per_year: int = DEFAULT_ANNUALIZATION,
+    periods_per_year: int | None = None,
+    timeframe: str = "1d",
     margin_used: Sequence[float] | pl.Series | NDArray[np.float64] | None = None,
     margin_utilization: Sequence[float] | pl.Series | NDArray[np.float64] | None = None,
     trade_shortfall_ticks: Sequence[float] | None = None,
@@ -284,8 +354,17 @@ def compute_metrics(
     """
     if not math.isfinite(risk_free_rate):
         raise ValueError("risk_free_rate must be finite")
-    if not isinstance(periods_per_year, int) or periods_per_year < 1:
-        raise ValueError("periods_per_year must be a positive int")
+    if periods_per_year is None:
+        resolved_timeframe = canonical_timeframe(timeframe)
+    else:
+        try:
+            resolved_timeframe = canonical_timeframe(timeframe)
+        except ValueError:
+            # Explicit ppy override wins; keep the raw label for metadata only.
+            resolved_timeframe = (
+                timeframe.strip().lower() if isinstance(timeframe, str) else timeframe
+            )
+    periods_per_year = resolve_periods_per_year(timeframe, periods_per_year)
 
     frame: pl.DataFrame | None = equity_curve if isinstance(equity_curve, pl.DataFrame) else None
     equity, frame_timestamps = _extract_equity(equity_curve)
@@ -440,6 +519,8 @@ def compute_metrics(
         "conventions": "zero-variance ratios -> 0; no downside -> sortino 0, omega 1; "
         "zero drawdown -> calmar 0; VaR/CVaR are positive loss fractions",
         "rachev_alpha": RACHEV_ALPHA,
+        "timeframe": resolved_timeframe,
+        "periods_per_year": periods_per_year,
     }
     return PerformanceMetrics(
         n_periods=n_returns,
@@ -489,6 +570,7 @@ def compute_metrics(
         alpha=alpha,
         benchmark_total_return=benchmark_total_return,
         metadata=metadata,
+        timeframe=str(resolved_timeframe),
     )
 
 
@@ -496,7 +578,8 @@ def compute_metrics_from_result(
     result: BacktestResult,
     *,
     risk_free_rate: float = 0.0,
-    periods_per_year: int = DEFAULT_ANNUALIZATION,
+    periods_per_year: int | None = None,
+    timeframe: str = "1d",
     benchmark_returns: Sequence[float] | None = None,
 ) -> PerformanceMetrics:
     """Compute metrics directly from a :class:`~src.backtest.engine.BacktestResult`."""
@@ -509,6 +592,7 @@ def compute_metrics_from_result(
         initial_equity=result.initial_equity,
         risk_free_rate=risk_free_rate,
         periods_per_year=periods_per_year,
+        timeframe=timeframe,
         trade_shortfall_ticks=shortfall_ticks,
         traded_notional=result.turnover,
         commissions=result.total_commissions,
@@ -523,15 +607,15 @@ def rolling_sharpe(
     returns: Sequence[float] | NDArray[np.float64],
     window: int,
     *,
-    periods_per_year: int = DEFAULT_ANNUALIZATION,
+    periods_per_year: int | None = None,
+    timeframe: str = "1d",
     risk_free_rate: float = 0.0,
 ) -> NDArray[np.float64]:
     """Rolling annualised Sharpe ratio (``nan`` until the window is full)."""
     values = np.asarray(list(returns), dtype=np.float64)
     if window < 2:
         raise ValueError("window must be >= 2")
-    if periods_per_year < 1:
-        raise ValueError("periods_per_year must be >= 1")
+    periods_per_year = resolve_periods_per_year(timeframe, periods_per_year)
     output = np.full(values.shape, np.nan, dtype=np.float64)
     rf_daily = (1.0 + risk_free_rate) ** (1.0 / periods_per_year) - 1.0
     for index in range(window - 1, values.size):

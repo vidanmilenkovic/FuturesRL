@@ -12,12 +12,15 @@ import polars as pl
 import pytest
 from src.analytics.metrics import (
     PerformanceMetrics,
+    canonical_timeframe,
     compute_metrics,
     compute_metrics_from_result,
+    resolve_periods_per_year,
     rolling_sharpe,
     underwater_curve,
 )
 from src.backtest.engine import EQUITY_CURVE_SCHEMA, BacktestMode, BacktestResult
+from src.data.timeframes import bars_per_year, supported_timeframes
 
 PPY = 252
 
@@ -381,6 +384,85 @@ def make_curve() -> pl.DataFrame:
     return pl.DataFrame(rows).select(
         [pl.col(column).cast(dtype) for column, dtype in EQUITY_CURVE_SCHEMA.items()]
     )
+
+
+def _timeframe_returns() -> tuple[list[float], list[float]]:
+    # Small per-bar returns so the CAGR exponent stays finite for 1m bars
+    # (annualising 10 minutes of returns would otherwise overflow by construction).
+    returns = [1.0e-5, -2.0e-6, 4.0e-6, 0.0, -3.0e-6, 8.0e-6, 1.0e-6, -1.0e-6, 5.0e-6, 2.0e-6]
+    return returns, equity_from_returns(100_000.0, returns)
+
+
+@pytest.mark.parametrize("timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"])
+def test_timeframe_annualization_scaling_is_exact(timeframe: str) -> None:
+    returns, equity = _timeframe_returns()
+    ppy = bars_per_year(timeframe)
+    metrics = compute_metrics(equity, timeframe=timeframe)
+    samples = np.asarray(returns, dtype=np.float64)
+    mean = float(np.mean(samples))
+    std = float(np.std(samples, ddof=1))
+    downside = np.minimum(samples, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(downside**2)))
+    assert metrics.periods_per_year == ppy
+    assert metrics.timeframe == timeframe
+    assert metrics.metadata["timeframe"] == timeframe
+    assert metrics.metadata["periods_per_year"] == ppy
+    assert metrics.annualized_volatility == pytest.approx(std * math.sqrt(ppy))
+    assert metrics.sharpe == pytest.approx(mean / std * math.sqrt(ppy))
+    assert metrics.sortino == pytest.approx(mean / downside_deviation * math.sqrt(ppy))
+    years = len(returns) / ppy
+    assert metrics.cagr == pytest.approx((equity[-1] / equity[0]) ** (1.0 / years) - 1.0)
+    # 1d must stay byte-identical to the historical 252 annualization.
+    if timeframe == "1d":
+        assert ppy == 252
+        assert metrics.sharpe == pytest.approx(compute_metrics(equity, periods_per_year=PPY).sharpe)
+
+
+def test_timeframe_resolution_aliases_and_override() -> None:
+    assert canonical_timeframe("1d") == "1d"
+    assert canonical_timeframe("daily") == "1d"
+    assert canonical_timeframe(" 1hour ") == "1h"
+    assert resolve_periods_per_year("1w") == 52
+    assert resolve_periods_per_year("1m") == 347_760
+    assert resolve_periods_per_year("1m", 252) == 252
+    # Default (no timeframe) is the historical 252 period/year behaviour.
+    _returns, equity = _timeframe_returns()
+    baseline = compute_metrics(equity, periods_per_year=PPY)
+    default = compute_metrics(equity)
+    assert default.periods_per_year == 252
+    assert default.timeframe == "1d"
+    assert default.sharpe == pytest.approx(baseline.sharpe)
+    # Explicit periods_per_year override wins over the timeframe bars/year.
+    overridden = compute_metrics(equity, timeframe="1m", periods_per_year=252)
+    assert overridden.periods_per_year == 252
+    assert overridden.timeframe == "1m"
+    assert overridden.sharpe == pytest.approx(baseline.sharpe)
+    with pytest.raises(ValueError):
+        compute_metrics(equity, timeframe="2m")
+    with pytest.raises(ValueError):
+        resolve_periods_per_year("bogus")
+    assert set(supported_timeframes()) == {"1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}
+
+
+def test_rolling_sharpe_timeframe_scaling() -> None:
+    returns, _equity = _timeframe_returns()
+    daily = rolling_sharpe(returns, 3)
+    hourly = rolling_sharpe(returns, 3, timeframe="1h")
+    explicit = rolling_sharpe(returns, 3, periods_per_year=bars_per_year("1h"))
+    assert np.allclose(hourly, explicit, equal_nan=True)
+    expected_ratio = math.sqrt(bars_per_year("1h") / 252)
+    for daily_value, hourly_value in zip(daily, hourly, strict=True):
+        if np.isfinite(daily_value):
+            assert hourly_value == pytest.approx(daily_value * expected_ratio)
+    with pytest.raises(ValueError):
+        rolling_sharpe(returns, 3, timeframe="2m")
+
+
+def test_compute_metrics_from_result_timeframe() -> None:
+    result = make_result(make_curve())
+    metrics = compute_metrics_from_result(result, timeframe="1h")
+    assert metrics.periods_per_year == bars_per_year("1h")
+    assert metrics.timeframe == "1h"
 
 
 def test_compute_metrics_from_result() -> None:

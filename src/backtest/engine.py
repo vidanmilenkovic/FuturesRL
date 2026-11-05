@@ -57,7 +57,7 @@ from configs.strategy import StrategyConfig, load_strategy_config
 from numpy.typing import NDArray
 
 from src.backtest.cost_model import CostModel
-from src.backtest.margin_simulator import MarginSimulator
+from src.backtest.margin_simulator import MarginSimulator, utc_calendar_day
 from src.backtest.simulated_broker import (
     BarQuote,
     FillRecord,
@@ -772,6 +772,7 @@ def build_states_from_bars(
     instrument_master: InstrumentsConfig | None = None,
     *,
     initial_equity: float | None = None,
+    timeframe: str = "1d",
 ) -> list[MarketState]:
     """Build deterministic point-in-time market states from canonical bars.
 
@@ -838,6 +839,7 @@ def build_states_from_bars(
                 timestamp=timestamp,
                 instruments={snapshot.instrument_id: snapshot for snapshot in snapshots},
                 equity=equity,
+                timeframe=timeframe,
             )
         )
     return states
@@ -849,6 +851,7 @@ def default_state_builder(
     equity: float,
     *,
     instrument_master: InstrumentsConfig | None = None,
+    timeframe: str = "1d",
 ) -> MarketState:
     """Example injected-builder signature: state for one timestamp.
 
@@ -856,7 +859,9 @@ def default_state_builder(
     function exists so callers can rely on the documented callable contract
     without importing the data layer.
     """
-    states = build_states_from_bars(bars, instrument_master, initial_equity=equity)
+    states = build_states_from_bars(
+        bars, instrument_master, initial_equity=equity, timeframe=timeframe
+    )
     target = ensure_utc(timestamp)
     for state in states:
         if state.timestamp == target:
@@ -911,6 +916,7 @@ class EventBacktester:
         penalty_fee_per_contract: float = 15.0,
         use_bag_rolls: bool = False,
         annualization_factor: int = TRADING_DAYS_PER_YEAR,
+        timeframe: str = "1d",
     ) -> None:
         if not math.isfinite(initial_equity) or initial_equity <= 0.0:
             raise ValueError("initial_equity must be finite and strictly positive")
@@ -935,6 +941,7 @@ class EventBacktester:
         self._state_builder = state_builder
         self._use_bag_rolls = use_bag_rolls
         self._annualization_factor = annualization_factor
+        self._timeframe = _canonical_engine_timeframe(timeframe)
 
     # -- public runner ---------------------------------------------------------
 
@@ -956,9 +963,14 @@ class EventBacktester:
             self._initial_equity,
             start=start,
             end=end,
+            timeframe=self._timeframe,
         )
         if not state_list:
             raise ValueError("no market states available for the requested window")
+        # Intraday bars settle once per UTC calendar day; daily/coarser bars keep
+        # the historical per-bar settlement behaviour (1 bar == 1 session).
+        intraday_bars = _states_are_intraday(state_list)
+        last_settlement_day = None
         broker = self._broker or SimulatedBroker(
             self._instrument_master,
             self._cost_model,
@@ -1006,9 +1018,16 @@ class EventBacktester:
             roll_before_bar = roll_pnl_total
             equity_before_bar = previous_equity
             # 1) Daily mark-to-market settlement at the prices of the contracts
-            #    that were actually held (the roll has not happened yet).
+            #    that were actually held (the roll has not happened yet). For
+            #    intraday bars this is gated to the first bar of each UTC day.
+            settle_due = True
+            if intraday_bars:
+                current_day = utc_calendar_day(timestamp)
+                settle_due = last_settlement_day is None or current_day > last_settlement_day
+                if settle_due:
+                    last_settlement_day = current_day
             positions = broker.get_positions_sync()
-            if positions:
+            if positions and settle_due:
                 pre_marks = {
                     root: _contract_mark(
                         context,
@@ -1143,9 +1162,10 @@ class EventBacktester:
                     attribution.add_fill(fill)
                 fill_cursor = len(broker.fills)
             # 5) End-of-bar settlement at the mark: realises embedded execution
-            #    costs and any intraday move into cash.
+            #    costs and any intraday move into cash. Intraday bars must not
+            #    settle again within the same UTC day (one settlement per day).
             positions = broker.get_positions_sync()
-            if positions:
+            if positions and not intraday_bars:
                 settlement = broker.settle(close_marks)
                 settlement_pnl += settlement.settlement_pnl
             # 6) Post-trade margin call (e.g. after a large rebalance).
@@ -1158,7 +1178,7 @@ class EventBacktester:
                 trades.extend(_trade_from_fill(fill) for fill in new_fills)
                 fill_cursor = len(broker.fills)
                 positions = broker.get_positions_sync()
-                if positions:
+                if positions and not intraday_bars:
                     settlement = broker.settle(close_marks)
                     settlement_pnl += settlement.settlement_pnl
             equity = broker.net_liquidation
@@ -1257,6 +1277,7 @@ class EventBacktester:
                 "rebalance_schedule": json.dumps(self._schedule.to_dict(), sort_keys=True),
                 "use_bag_rolls": self._use_bag_rolls,
                 "annualization_factor": self._annualization_factor,
+                "timeframe": self._timeframe,
                 "mode": BacktestMode.EVENT.value,
             },
             warnings=warnings,
@@ -1383,6 +1404,7 @@ class BacktestEngine:
         penalty_fee_per_contract: float = 15.0,
         use_bag_rolls: bool = False,
         annualization_factor: int = TRADING_DAYS_PER_YEAR,
+        timeframe: str = "1d",
     ) -> None:
         if not isinstance(mode, BacktestMode):
             raise TypeError("mode must be a BacktestMode")
@@ -1402,6 +1424,7 @@ class BacktestEngine:
         self._state_builder = state_builder
         self._use_bag_rolls = use_bag_rolls
         self._annualization_factor = annualization_factor
+        self._timeframe = _canonical_engine_timeframe(timeframe)
         self._event = EventBacktester(
             strategy,
             translator,
@@ -1417,6 +1440,7 @@ class BacktestEngine:
             penalty_fee_per_contract=penalty_fee_per_contract,
             use_bag_rolls=use_bag_rolls,
             annualization_factor=annualization_factor,
+            timeframe=self._timeframe,
         )
 
     @property
@@ -1456,6 +1480,7 @@ class BacktestEngine:
             self._initial_equity,
             start=start,
             end=end,
+            timeframe=self._timeframe,
         )
         if not state_list:
             raise ValueError("no market states available for the requested window")
@@ -1679,6 +1704,8 @@ class BacktestEngine:
             metadata={
                 "cost_model": json.dumps(self._cost_model.to_dict(), sort_keys=True),
                 "rebalance_schedule": json.dumps(schedule.to_dict(), sort_keys=True),
+                "annualization_factor": self._annualization_factor,
+                "timeframe": self._timeframe,
                 "mode": BacktestMode.VECTORIZED.value,
             },
             warnings=warnings,
@@ -1975,6 +2002,7 @@ def _resolve_states(
     *,
     start: datetime | None,
     end: datetime | None,
+    timeframe: str = "1d",
 ) -> list[MarketState]:
     start_utc = ensure_utc(start) if start is not None else None
     end_utc = ensure_utc(end) if end is not None else None
@@ -1986,6 +2014,10 @@ def _resolve_states(
         timestamps = [state.timestamp for state in selected]
         if any(later <= earlier for earlier, later in pairwise(timestamps)):
             raise ValueError("states must be in strictly increasing timestamp order")
+        selected = [
+            state if state.timeframe == timeframe else replace(state, timeframe=timeframe)
+            for state in selected
+        ]
         return [
             state
             for state in selected
@@ -2006,13 +2038,41 @@ def _resolve_states(
                 continue
             built.append(state)
         return built
-    built = build_states_from_bars(frame, None, initial_equity=initial_equity)
+    built = build_states_from_bars(frame, None, initial_equity=initial_equity, timeframe=timeframe)
     return [
         state
         for state in built
         if (start_utc is None or state.timestamp >= start_utc)
         and (end_utc is None or state.timestamp <= end_utc)
     ]
+
+
+def _canonical_engine_timeframe(timeframe: str) -> str:
+    """Validate/canonicalise a bar timeframe via the data registry."""
+    from src.data.timeframes import get_timeframe
+
+    return get_timeframe(timeframe).name
+
+
+def _states_are_intraday(states: Sequence[MarketState]) -> bool:
+    """Whether the state sequence has a sub-daily median bar spacing.
+
+    Used to decide whether daily mark-to-market settlement must be gated to UTC
+    calendar-day boundaries (intraday bars) or may keep the legacy every-bar
+    settlement of daily backtests. Purely timestamp based (no data look-ahead).
+    """
+    timestamps = sorted({state.timestamp for state in states})
+    if len(timestamps) < 2:
+        return False
+    deltas = sorted(
+        (later - earlier).total_seconds()
+        for earlier, later in pairwise(timestamps)
+        if later > earlier
+    )
+    if not deltas:
+        return False
+    median = deltas[len(deltas) // 2]
+    return 0.0 < median < 86_400.0
 
 
 def _default_run_id(
@@ -2195,6 +2255,9 @@ def run_from_config(
         commission_bps=spec.commission_bps if spec is not None else 0.0,
         base_slippage_ticks=spec.slippage_ticks if spec is not None else 0.0,
     )
+    timeframe = spec.timeframe if spec is not None else "1d"
+    from src.data.timeframes import bars_per_year
+
     engine = BacktestEngine(
         resolved_pipeline,
         resolved_translator,
@@ -2204,6 +2267,8 @@ def run_from_config(
         initial_equity=equity,
         rebalance_schedule=schedule,
         state_builder=state_builder,
+        annualization_factor=bars_per_year(timeframe),
+        timeframe=timeframe,
     )
     start = (
         datetime.combine(spec.start, datetime.min.time(), tzinfo=UTC) if spec is not None else None
@@ -3147,6 +3212,10 @@ def run_walk_forward(
     resolved_mode = mode if mode is not None else BacktestMode.VECTORIZED
     master = instrument_master if instrument_master is not None else load_instruments()
     spec = config.backtest
+    wf_timeframe = spec.timeframe if spec is not None else "1d"
+    from src.data.timeframes import bars_per_year
+
+    wf_annualization = bars_per_year(wf_timeframe)
     resolved_equity = (
         initial_equity
         if initial_equity is not None
@@ -3176,7 +3245,12 @@ def run_walk_forward(
             raise ValueError("either bars or states must be supplied")
         timestamps = _state_timestamps(states)
     if states is not None:
-        state_by_timestamp = _states_by_timestamp(states)
+        state_by_timestamp = _states_by_timestamp(
+            [
+                state if state.timeframe == wf_timeframe else replace(state, timeframe=wf_timeframe)
+                for state in states
+            ]
+        )
     else:
         if window_bars is None:
             raise ValueError("either bars or states must be supplied")
@@ -3188,6 +3262,7 @@ def run_walk_forward(
             resolved_equity,
             start=None,
             end=None,
+            timeframe=wf_timeframe,
         )
         state_by_timestamp = _states_by_timestamp(all_states)
     splitter, folds = _build_walk_forward_folds(
@@ -3231,6 +3306,8 @@ def run_walk_forward(
             initial_equity=resolved_equity,
             rebalance_schedule=schedule,
             state_builder=None,
+            annualization_factor=wf_annualization,
+            timeframe=wf_timeframe,
         )
         fold_run_id = f"{run_id}-fold-{fold.fold_index}"
         if window_bars is not None:
@@ -3241,7 +3318,7 @@ def run_walk_forward(
             )
         else:
             fold_result = fold_engine.run(states=fold_states, run_id=fold_run_id)
-        fold_metric = compute_metrics_from_result(fold_result)
+        fold_metric = compute_metrics_from_result(fold_result, timeframe=wf_timeframe)
         fold_results.append((fold, fold_result))
         fold_metrics.append(fold_metric)
         fold_reports.append(
@@ -3280,9 +3357,10 @@ def run_walk_forward(
             "folds": len(folds),
             "purge_bars": purge_bars,
             "embargo_bars": embargo_bars,
+            "timeframe": wf_timeframe,
         },
     )
-    combined_metrics = compute_metrics_from_result(combined)
+    combined_metrics = compute_metrics_from_result(combined, timeframe=wf_timeframe)
     combined_curve = combined.equity_curve
     concatenated_curve = WalkForwardEquityCurve(
         timestamps=tuple(

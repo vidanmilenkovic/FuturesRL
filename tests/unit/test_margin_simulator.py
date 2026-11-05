@@ -7,11 +7,14 @@ from datetime import UTC, date, datetime
 import pytest
 from configs.instruments import InstrumentsConfig
 from src.backtest.margin_simulator import (
+    DailySettlementClock,
     ForcedLiquidationPlan,
     MarginCall,
     MarginRequirements,
     MarginSimulator,
     SettlementResult,
+    is_new_utc_day,
+    utc_calendar_day,
 )
 from src.core.types import AccountSnapshot, Position
 
@@ -249,3 +252,25 @@ def test_margin_simulator_validation() -> None:
     payload = MarginSimulator().to_dict()
     assert payload["maintenance_ratio"] == pytest.approx(0.90)
     assert payload["penalty_ticks"] == pytest.approx(2.0)
+
+
+def test_utc_day_settlement_helpers() -> None:
+    morning = datetime(2024, 1, 2, 9, 30, tzinfo=UTC)
+    midday = datetime(2024, 1, 2, 16, 0, tzinfo=UTC)
+    next_morning = datetime(2024, 1, 3, 9, 30, tzinfo=UTC)
+    assert utc_calendar_day(morning) == utc_calendar_day(midday)
+    assert is_new_utc_day(None, morning) is True
+    assert is_new_utc_day(morning, midday) is False
+    assert is_new_utc_day(midday, next_morning) is True
+    clock = DailySettlementClock()
+    assert clock.due(morning) is True
+    clock.mark(morning)
+    assert clock.last_settled_day == utc_calendar_day(morning)
+    assert clock.settlements == 1
+    assert clock.due(midday) is False
+    assert clock.due(next_morning) is True
+    clock.mark(next_morning)
+    assert clock.settlements == 2
+    clock.reset()
+    assert clock.last_settled_day is None
+    assert clock.settlements == 0
