@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Modal } from "@/components/ui/dialog";
 import {
@@ -11,7 +11,7 @@ import {
   TextInput,
 } from "@/components/ui/primitives";
 import { estimateDataCost, getDataInventory, ingestDataCache } from "@/lib/api";
-import { formatBytes } from "@/lib/data-cache";
+import { DATA_TIMEFRAME_OPTIONS, formatBytes } from "@/lib/data-cache";
 import { cn } from "@/lib/cn";
 import type {
   DataCacheRoot,
@@ -19,6 +19,7 @@ import type {
   DataIngestResult,
   DataInventoryResponse,
   DataSource,
+  DataTimeframe,
 } from "@/lib/types";
 import { useAsyncData } from "@/lib/use-async-data";
 
@@ -44,10 +45,18 @@ export function MarketDataCacheButton({
   className?: string;
   testId?: string;
 }) {
-  const inventory = useAsyncData(getDataInventory);
+  const [timeframe, setTimeframe] = useState<DataTimeframe>("1d");
+  const inventory = useAsyncData(
+    useCallback(() => getDataInventory(timeframe), [timeframe]),
+  );
   const [open, setOpen] = useState(false);
   const cached = inventory.data?.totals.cached_roots ?? 0;
   const total = inventory.data?.totals.total_roots ?? 45;
+
+  useEffect(() => {
+    inventory.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeframe]);
 
   return (
     <>
@@ -67,19 +76,55 @@ export function MarketDataCacheButton({
           {inventory.source === "live" ? `${cached}/${total}` : "n/a"}
         </span>
       </Button>
-      <MarketDataCacheModal open={open} onClose={() => setOpen(false)} inventory={inventory} />
+      <MarketDataCacheModal
+        open={open}
+        onClose={() => setOpen(false)}
+        inventory={inventory}
+        timeframe={timeframe}
+        onTimeframeChange={setTimeframe}
+      />
     </>
   );
+}
+
+interface DataErrorState {
+  status: number | null;
+  detail: unknown;
+  code: string | null;
+  message: string;
+}
+
+function errorFromResult(
+  result: { status?: number | null; detail?: unknown; detailCode?: string | null; error: string | null },
+  fallback: string,
+): DataErrorState {
+  const detail = result.detail;
+  const detailMessage =
+    typeof detail === "string"
+      ? detail
+      : detail && typeof detail === "object" && !Array.isArray(detail) && typeof (detail as Record<string, unknown>).message === "string"
+        ? String((detail as Record<string, unknown>).message)
+        : result.error ?? fallback;
+  return {
+    status: result.status ?? null,
+    detail,
+    code: result.detailCode ?? null,
+    message: detailMessage || fallback,
+  };
 }
 
 function MarketDataCacheModal({
   open,
   onClose,
   inventory,
+  timeframe,
+  onTimeframeChange,
 }: {
   open: boolean;
   onClose: () => void;
   inventory: InventoryState;
+  timeframe: DataTimeframe;
+  onTimeframeChange: (timeframe: DataTimeframe) => void;
 }) {
   const data = inventory.data;
   const roots = useMemo(() => data?.roots ?? [], [data]);
@@ -91,11 +136,11 @@ function MarketDataCacheModal({
   const [source, setSource] = useState<DataSource>("ibkr");
   const [overBudget, setOverBudget] = useState(false);
   const [cost, setCost] = useState<DataCostEstimate | null>(null);
-  const [costError, setCostError] = useState<string | null>(null);
+  const [costError, setCostError] = useState<DataErrorState | null>(null);
   const [costLoading, setCostLoading] = useState(false);
   const [ingesting, setIngesting] = useState(false);
   const [ingestResult, setIngestResult] = useState<DataIngestResult | null>(null);
-  const [ingestError, setIngestError] = useState<string | null>(null);
+  const [ingestError, setIngestError] = useState<DataErrorState | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -112,6 +157,14 @@ function MarketDataCacheModal({
     setEnd((current) => current || data.totals.end_date || new Date().toISOString().slice(0, 10));
   }, [data]);
 
+  useEffect(() => {
+    setCost(null);
+    setIngestResult(null);
+    setCostError(null);
+    setIngestError(null);
+    setOverBudget(false);
+  }, [timeframe]);
+
   const visibleRoots = sector === "all" ? roots : roots.filter((root) => root.sector === sector);
   const selected = roots.filter((root) => selectedRoots.has(root.root));
   const totalBytes = data?.totals.total_size_bytes ?? 0;
@@ -123,6 +176,9 @@ function MarketDataCacheModal({
     source === "ibkr" ? Boolean(data?.ibkr_available) : Boolean(data?.databento_configured);
   const inventoryAvailable = inventory.source === "live" && Boolean(data);
   const canRun = inventoryAvailable && selected.length > 0 && start.length > 0 && end.length > 0 && start <= end;
+  const budgetError = Boolean(
+    ingestError && (ingestError.status === 402 || ingestError.code === "databento_budget_exceeded"),
+  );
 
   const toggleRoot = (root: string) => {
     setSelectedRoots((current) => {
@@ -160,13 +216,12 @@ function MarketDataCacheModal({
       roots: [...selectedRoots],
       start,
       end,
+      timeframe,
       schema: data?.schema ?? "ohlcv-1d",
     });
     setCostLoading(false);
     if (result.source !== "live") {
-      setCostError(
-        describeDataError(result.error, result.data?.estimated_cost_usd, "Cost estimate failed."),
-      );
+      setCostError(errorFromResult(result, "Cost estimate failed."));
       return;
     }
     setCost(result.data);
@@ -182,13 +237,14 @@ function MarketDataCacheModal({
       roots: [...selectedRoots],
       start,
       end,
+      timeframe,
       schema: data?.schema ?? "ohlcv-1d",
       allow_over_budget: overBudget,
       confirm: true,
     });
     setIngesting(false);
     if (result.source !== "live" || !result.data.ok) {
-      setIngestError(describeDataError(result.error, null, result.data.message || "Backfill failed."));
+      setIngestError(errorFromResult(result, result.data.message || "Backfill failed."));
       return;
     }
     setIngestResult(result.data);
@@ -225,7 +281,11 @@ function MarketDataCacheModal({
             <Badge tone={data?.ibkr_available ? "gain" : "warn"}>
               IBKR {data?.ibkr_available ? "available" : "disconnected"}
             </Badge>
-            <span className="ml-auto font-mono text-[9.5px] text-zinc-600" data-testid="market-data-schema">{data?.schema ?? "ohlcv-1d"}</span>
+            <span className="ml-auto flex items-center gap-2 font-mono text-[9.5px] text-zinc-600">
+              <span data-testid="market-data-timeframe">TF {data?.timeframe ?? timeframe}</span>
+              <span data-testid="market-data-base-schema">base {data?.base_schema ?? data?.schema ?? "ohlcv-1d"}</span>
+              <span data-testid="market-data-schema">{data?.schema ?? "ohlcv-1d"}</span>
+            </span>
           </div>
           {data?.warnings && data.warnings.length > 0 ? (
             <p className="mt-1 text-[10px] text-amber-300">{data.warnings.join(" · ")}</p>
@@ -235,12 +295,12 @@ function MarketDataCacheModal({
         <div className="grid grid-cols-12 gap-2.5">
           <div className="col-span-12 space-y-2 lg:col-span-5">
             <div className="grid grid-cols-2 gap-2">
-              <Field label="Sector" htmlFor="data-sector">
+              <Field label="Timeframe" htmlFor="data-timeframe">
                 <Select
-                  id="data-sector"
-                  value={sector}
-                  onChange={setSector}
-                  options={[{ value: "all", label: `All sectors (${roots.length})` }, ...sectors.map((entry) => ({ value: entry, label: entry }))]}
+                  id="data-timeframe"
+                  value={timeframe}
+                  onChange={(value) => onTimeframeChange(value as DataTimeframe)}
+                  options={DATA_TIMEFRAME_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
                 />
               </Field>
               <Field label="Source" htmlFor="data-source">
@@ -257,6 +317,14 @@ function MarketDataCacheModal({
                     { value: "ibkr", label: "IBKR Historical (Free)" },
                     { value: "databento", label: "Databento Pay-As-You-Go" },
                   ]}
+                />
+              </Field>
+              <Field label="Sector" htmlFor="data-sector" className="col-span-2">
+                <Select
+                  id="data-sector"
+                  value={sector}
+                  onChange={setSector}
+                  options={[{ value: "all", label: `All sectors (${roots.length})` }, ...sectors.map((entry) => ({ value: entry, label: entry }))]}
                 />
               </Field>
               <Field label="Start" htmlFor="data-start">
@@ -296,7 +364,7 @@ function MarketDataCacheModal({
                   : "Databento is not configured (missing API key); backfill is disabled."}
               </p>
             ) : null}
-            {source === "databento" ? (
+            {source === "databento" && budgetError ? (
               <label className="flex items-start gap-2 rounded border border-warn/30 bg-warn-soft/20 px-2 py-1.5 text-[10px] leading-4 text-zinc-300">
                 <input
                   type="checkbox"
@@ -308,11 +376,7 @@ function MarketDataCacheModal({
                 I explicitly allow this Databento backfill to exceed the cost guard (operator confirmation).
               </label>
             ) : null}
-            {costError ? (
-              <div role="alert" data-testid="data-cost-error" className="rounded border border-loss/40 bg-loss-soft/40 px-2 py-1.5 text-[10.5px] text-rose-300">
-                {costError}
-              </div>
-            ) : null}
+            {costError ? <DataErrorPanel error={costError} testId="data-cost-error" /> : null}
             {cost ? (
               <div data-testid="data-cost-result" className="rounded border border-gain/30 bg-gain-soft/20 px-2.5 py-2 text-[11px] text-zinc-300">
                 <p className={cn("font-medium", cost.details?.metadata_available === false ? "text-amber-300" : "text-emerald-300")}>
@@ -324,22 +388,28 @@ function MarketDataCacheModal({
                 </p>
                 <p className="mt-0.5 text-[10px] text-zinc-500">
                   Billable {cost.billable_size_mb.toFixed(2)} MB ({cost.billable_size_bytes.toLocaleString("en-US")} bytes) ·
-                  source {cost.source}
+                  source {cost.source} · TF {cost.timeframe ?? timeframe}
+                  {cost.base_schema ? ` · base ${cost.base_schema}` : ""}
                 </p>
               </div>
             ) : null}
-            {ingestError ? (
-              <div role="alert" data-testid="data-ingest-error" className="rounded border border-loss/40 bg-loss-soft/40 px-2 py-1.5 text-[10.5px] text-rose-300">
-                {ingestError}
-              </div>
-            ) : null}
+            {ingestError ? <DataErrorPanel error={ingestError} testId="data-ingest-error" /> : null}
             {ingestResult ? (
               <div data-testid="data-ingest-result" className="rounded border border-gain/30 bg-gain-soft/20 px-2.5 py-2 text-[10.5px] text-zinc-300">
-                <p className="font-medium text-emerald-300">Backfill complete · {ingestResult.source}</p>
+                <p className="font-medium text-emerald-300">
+                  Backfill complete · {ingestResult.source} · TF {ingestResult.timeframe ?? timeframe}
+                  {ingestResult.resampled ? " · resampled" : ""}
+                </p>
                 <p className="mt-0.5">
                   {ingestResult.roots_ingested.length} roots · {ingestResult.bars_written.toLocaleString("en-US")} bars written
                   {ingestResult.duration_seconds !== null ? ` · ${ingestResult.duration_seconds.toFixed(2)}s` : ""}
+                  {ingestResult.base_schema ? ` · base ${ingestResult.base_schema}` : ""}
                 </p>
+                {ingestResult.resampled ? (
+                  <p className="mt-0.5 text-[9.5px] text-amber-300" data-testid="data-resampled">
+                    resampled from {ingestResult.base_schema ?? "finer base schema"}
+                  </p>
+                ) : null}
                 <p className="mt-0.5 font-mono text-[9.5px] text-zinc-500">{ingestResult.roots_ingested.join(", ") || "no roots"}</p>
                 {ingestResult.warnings.length > 0 ? (
                   <p className="mt-0.5 text-amber-300">{ingestResult.warnings.join(" · ")}</p>
@@ -395,19 +465,26 @@ function RootRow({ root, checked, onToggle }: { root: DataCacheRoot; checked: bo
   );
 }
 
-function describeDataError(error: string | null | undefined, cost: number | null | undefined, fallback: string): string {
-  const raw = error ?? "";
-  if (/\b402\b/.test(raw)) {
-    return `Cost guard rejected the Databento job (402)${cost !== null && cost !== undefined ? ` · estimate $${cost.toFixed(4)}` : ""}. Enable the over-budget confirmation and retry.`;
-  }
-  if (/\b409\b/.test(raw)) {
-    return `Backfill blocked (409): source unavailable OR Databento cost guard exceeded. For Databento, enable the over-budget confirmation and retry. ${fallback}`;
-  }
-  if (/\b400\b/.test(raw)) {
-    return `Missing Databento API key or invalid request (400): ${fallback}`;
-  }
-  if (/\b422\b/.test(raw)) {
-    return `Invalid roots / date window (422): ${fallback}`;
-  }
-  return raw ? `${fallback} (${raw})` : fallback;
+function DataErrorPanel({ error, testId }: { error: DataErrorState; testId: string }) {
+  return (
+    <div
+      role="alert"
+      data-testid={testId}
+      data-status={error.status ?? ""}
+      data-detail-code={error.code ?? ""}
+      className="space-y-1 rounded border border-loss/40 bg-loss-soft/40 px-2 py-1.5 text-[10.5px] text-rose-300"
+    >
+      <p className="font-mono text-[9.5px] text-rose-200/80">
+        HTTP {error.status ?? "error"}
+        {error.code ? ` · ${error.code}` : ""}
+      </p>
+      <p className="whitespace-pre-wrap break-words">{error.message}</p>
+      {error.detail && typeof error.detail === "object" ? (
+        <pre className="max-h-24 overflow-auto whitespace-pre-wrap break-words rounded bg-black/20 p-1 font-mono text-[9px] text-rose-200/90">
+          {JSON.stringify(error.detail, null, 2)}
+        </pre>
+      ) : null}
+    </div>
+  );
 }
+

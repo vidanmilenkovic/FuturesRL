@@ -59,6 +59,7 @@ import type {
   DataIngestResult,
   DataInventoryResponse,
   DataCacheRoot,
+  DataTimeframe,
   PaperStateResetResult,
   RiskLockResetResult,
   FlattenAllResponse,
@@ -326,9 +327,11 @@ export function runBacktest(config: BacktestRunConfig): Promise<ApiResult<Backte
 // Phase 11B — market data cache inventory / cost / ingest
 // ---------------------------------------------------------------------------
 
-function fallbackDataInventory(): DataInventoryResponse {
+function fallbackDataInventory(timeframe: DataTimeframe = "1d"): DataInventoryResponse {
   return {
     roots: [],
+    timeframe,
+    base_schema: null,
     totals: {
       cached_roots: 0,
       total_roots: 45,
@@ -370,7 +373,7 @@ function normalizeCacheRoot(raw: unknown): DataCacheRoot | null {
   };
 }
 
-function normalizeDataInventory(raw: unknown): DataInventoryResponse {
+function normalizeDataInventory(raw: unknown, timeframe: DataTimeframe = "1d"): DataInventoryResponse {
   const root = isRecord(raw) ? raw : {};
   const roots = asRebalanceArray(root.roots)
     .map(normalizeCacheRoot)
@@ -380,6 +383,8 @@ function normalizeDataInventory(raw: unknown): DataInventoryResponse {
   const cached = roots.filter((entry) => entry.cached_bars > 0);
   return {
     roots,
+    timeframe: asMessage(root.timeframe ?? timeframe) || timeframe,
+    base_schema: asMessage(root.base_schema ?? "") || null,
     totals: {
       cached_roots:
         typeof totalsRaw.cached_roots === "number" ? totalsRaw.cached_roots : cached.length,
@@ -404,16 +409,96 @@ function normalizeDataInventory(raw: unknown): DataInventoryResponse {
   };
 }
 
-export async function getDataInventory(): Promise<ApiResult<DataInventoryResponse>> {
-  return withFallback<unknown>("/api/data/inventory", fallbackDataInventory, undefined, 15_000).then(
-    (result) => ({
-      ...result,
-      data: result.source === "live" ? normalizeDataInventory(result.data) : fallbackDataInventory(),
-    }),
-  );
+function dataErrorDetail(body: unknown, text: string): { detail: unknown; message: string; code: string | null } {
+  let parsed: unknown = body;
+  if (parsed === undefined || parsed === null) {
+    try {
+      parsed = text.length > 0 ? JSON.parse(text) : null;
+    } catch {
+      parsed = text;
+    }
+  }
+  const detail = isRecord(parsed) && "detail" in parsed ? (parsed as Record<string, unknown>).detail : parsed;
+  if (typeof detail === "string") return { detail, message: detail, code: null };
+  if (isRecord(detail)) {
+    const message = asMessage(detail.message ?? detail.error ?? detail.detail ?? "") || JSON.stringify(detail);
+    const code = asMessage(detail.error ?? "") || null;
+    return { detail, message, code };
+  }
+  if (Array.isArray(detail)) return { detail, message: JSON.stringify(detail), code: null };
+  return { detail: detail ?? null, message: text || "Request failed.", code: null };
 }
 
-function normalizeDataCost(raw: unknown, source: DataCostRequest["source"]): DataCostEstimate {
+async function dataRequest<T>(
+  path: string,
+  init: RequestInit | undefined,
+  fallback: () => T,
+  timeoutMs: number,
+): Promise<ApiResult<T>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${apiBaseUrl()}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...init?.headers,
+      },
+      cache: "no-store",
+    });
+    const text = await response.text();
+    let parsed: unknown = null;
+    try {
+      parsed = text.length > 0 ? JSON.parse(text) : null;
+    } catch {
+      parsed = text;
+    }
+    if (!response.ok) {
+      const detail = dataErrorDetail(parsed, text);
+      return {
+        data: fallback(),
+        source: "demo",
+        error: `HTTP ${response.status}: ${detail.message}`,
+        status: response.status,
+        detail: detail.detail,
+        detailCode: detail.code,
+      };
+    }
+    return { data: parsed as T, source: "live", error: null, status: response.status, detail: null, detailCode: null };
+  } catch (error) {
+    return {
+      data: fallback(),
+      source: "demo",
+      error: error instanceof Error ? error.message : String(error),
+      status: null,
+      detail: null,
+      detailCode: null,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function getDataInventory(
+  timeframe: DataTimeframe = "1d",
+): Promise<ApiResult<DataInventoryResponse>> {
+  return dataRequest(
+    `/api/data/inventory?timeframe=${encodeURIComponent(timeframe)}`,
+    undefined,
+    () => fallbackDataInventory(timeframe),
+    15_000,
+  ).then((result) => ({
+    ...result,
+    data:
+      result.source === "live"
+        ? normalizeDataInventory(result.data, timeframe)
+        : fallbackDataInventory(timeframe),
+  }));
+}
+
+function normalizeDataCost(raw: unknown, source: DataCostRequest["source"], timeframe?: DataTimeframe): DataCostEstimate {
   const root = isRecord(raw) ? raw : {};
   const bytes =
     typeof root.billable_size_bytes === "number"
@@ -422,6 +507,8 @@ function normalizeDataCost(raw: unknown, source: DataCostRequest["source"]): Dat
         ? root.billable_size
         : 0;
   return {
+    timeframe: asMessage(root.timeframe ?? timeframe ?? "") || timeframe || null,
+    base_schema: asMessage(root.base_schema ?? "") || null,
     estimated_cost_usd:
       typeof root.estimated_cost_usd === "number" ? root.estimated_cost_usd : 0,
     billable_size_bytes: bytes,
@@ -438,29 +525,35 @@ function normalizeDataCost(raw: unknown, source: DataCostRequest["source"]): Dat
 }
 
 export function estimateDataCost(request: DataCostRequest): Promise<ApiResult<DataCostEstimate>> {
-  return withFallback<unknown>(
+  return dataRequest<unknown>(
     "/api/data/estimate-cost",
-    () => normalizeDataCost({ estimated_cost_usd: 0, source: "unavailable" }, request.source),
     {
       method: "POST",
       body: JSON.stringify({
         roots: request.roots,
         start: request.start,
         end: request.end,
-        schema: request.schema ?? "ohlcv-1d",
+        timeframe: request.timeframe ?? "1d",
         source: request.source,
       }),
     },
+    () => normalizeDataCost({ estimated_cost_usd: 0, source: "unavailable" }, request.source, request.timeframe),
     60_000,
   ).then((result) => ({
     ...result,
-    data: normalizeDataCost(result.data, request.source),
+    data:
+      result.source === "live"
+        ? normalizeDataCost(result.data, request.source, request.timeframe)
+        : normalizeDataCost({ estimated_cost_usd: 0, source: "unavailable" }, request.source, request.timeframe),
   }));
 }
 
 function fallbackDataIngest(request: DataIngestRequest): DataIngestResult {
   return {
     ok: false,
+    timeframe: request.timeframe ?? "1d",
+    base_schema: null,
+    resampled: null,
     source: request.source,
     roots_ingested: [],
     bars_written: 0,
@@ -475,9 +568,8 @@ function fallbackDataIngest(request: DataIngestRequest): DataIngestResult {
 }
 
 export function ingestDataCache(request: DataIngestRequest): Promise<ApiResult<DataIngestResult>> {
-  return withFallback<unknown>(
+  return dataRequest<unknown>(
     "/api/data/ingest",
-    () => fallbackDataIngest(request),
     {
       method: "POST",
       body: JSON.stringify({
@@ -485,24 +577,26 @@ export function ingestDataCache(request: DataIngestRequest): Promise<ApiResult<D
         roots: request.roots,
         start: request.start,
         end: request.end,
-        schema: request.schema ?? "ohlcv-1d",
+        timeframe: request.timeframe ?? "1d",
         allow_over_budget: request.allow_over_budget === true,
         confirm: request.confirm !== false,
       }),
     },
+    () => fallbackDataIngest(request),
     300_000,
   ).then((result) => {
-    if (result.source !== "live") {
-      return { ...result, data: fallbackDataIngest(request) };
-    }
+    if (result.source !== "live") return { ...result, data: fallbackDataIngest(request) };
     const raw = isRecord(result.data) ? result.data : {};
     const cost = isRecord(raw.cost_estimate)
-      ? normalizeDataCost(raw.cost_estimate, request.source)
+      ? normalizeDataCost(raw.cost_estimate, request.source, request.timeframe)
       : null;
     return {
       ...result,
       data: {
         ok: true,
+        timeframe: asMessage(raw.timeframe ?? request.timeframe ?? "1d") || "1d",
+        base_schema: asMessage(raw.base_schema ?? "") || null,
+        resampled: typeof raw.resampled === "boolean" ? raw.resampled : null,
         source: asMessage(raw.source ?? request.source) || request.source,
         roots_ingested: asRebalanceArray(raw.roots_ingested).map((root) => asMessage(root)).filter(Boolean),
         bars_written: typeof raw.bars_written === "number" ? raw.bars_written : 0,

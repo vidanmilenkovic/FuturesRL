@@ -23,7 +23,12 @@ import {
   runOptimization,
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
-import { DATA_MODE_OPTIONS, cachedBarsDetail, dataOriginBadge } from "@/lib/data-cache";
+import {
+  DATA_MODE_OPTIONS,
+  DATA_TIMEFRAME_OPTIONS,
+  cachedBarsDetail,
+  dataOriginBadge,
+} from "@/lib/data-cache";
 import { formatInteger, formatNumber, formatPct } from "@/lib/format";
 import {
   activeTunableParameters,
@@ -39,6 +44,7 @@ import {
 } from "@/lib/studio";
 import type {
   CachedBarsMeta,
+  DataTimeframe,
   MarketDataMode,
   OptimizationObjective,
   OptimizationRequest,
@@ -68,11 +74,15 @@ export function OptimizerPanel({
   strategies,
   onStrategiesChanged,
   onNotify,
+  timeframe,
+  onTimeframeChange,
 }: {
   catalog: StudioCatalogResponse;
   strategies: StrategyConfig[];
   onStrategiesChanged: () => void;
   onNotify: (message: string, tone: Tone) => void;
+  timeframe: DataTimeframe;
+  onTimeframeChange: (timeframe: DataTimeframe) => void;
 }) {
   const studies = useAsyncData(listOptimizations);
   const reloadStudies = studies.reload;
@@ -218,6 +228,7 @@ export function OptimizerPanel({
       search_space: buildSearchSpace(activeParams, bounds),
       seed: 7,
       data_mode: dataMode,
+      timeframe,
     };
     const result = await runOptimization(request);
     setRunning(false);
@@ -388,12 +399,20 @@ export function OptimizerPanel({
                 ]}
               />
             </Field>
-            <Field label="Data mode" htmlFor="opt-data-mode" className="col-span-2">
+            <Field label="Data mode" htmlFor="opt-data-mode">
               <Select
                 id="opt-data-mode"
                 value={dataMode}
                 onChange={(value) => setDataMode(value as MarketDataMode)}
                 options={DATA_MODE_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
+              />
+            </Field>
+            <Field label="Bar timeframe" htmlFor="opt-timeframe">
+              <Select
+                id="opt-timeframe"
+                value={timeframe}
+                onChange={(value) => onTimeframeChange(value as DataTimeframe)}
+                options={DATA_TIMEFRAME_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
               />
             </Field>
             <div className="col-span-2 rounded border border-hairline bg-canvas/50 px-2 py-1 text-[10px] leading-4 text-zinc-500">
@@ -1058,7 +1077,12 @@ export function OptimizerPanel({
 function StudyDataBadge({
   study,
 }: {
-  study: { data_origin?: string | null; data_mode?: string | null; cached_bars?: number | CachedBarsMeta | null };
+  study: {
+    data_origin?: string | null;
+    data_mode?: string | null;
+    timeframe?: string | null;
+    cached_bars?: number | CachedBarsMeta | null;
+  };
 }) {
   const meta = dataOriginBadge(study.data_origin);
   const detail = cachedBarsDetail(study.cached_bars);
@@ -1071,6 +1095,7 @@ function StudyDataBadge({
     >
       <Badge tone={meta.tone}>{meta.label}</Badge>
       {detail ? <span className="truncate font-mono text-[8.5px] text-zinc-600">{detail}</span> : null}
+      {study.timeframe ? <span className="font-mono text-[8.5px] text-zinc-600">TF {study.timeframe}</span> : null}
     </span>
   );
 }

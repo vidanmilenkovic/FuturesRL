@@ -31,7 +31,13 @@ import {
 } from "@/lib/api";
 import { diffStrategyConfigs, formatDiffValue } from "@/lib/artifacts";
 import { cn } from "@/lib/cn";
-import { DATA_MODE_OPTIONS, cachedBarsDetail, dataOriginBadge } from "@/lib/data-cache";
+import {
+  DATA_MODE_OPTIONS,
+  DATA_TIMEFRAME_OPTIONS,
+  DATA_TIMEFRAMES,
+  cachedBarsDetail,
+  dataOriginBadge,
+} from "@/lib/data-cache";
 import {
   formatDateTime,
   formatDuration,
@@ -45,6 +51,7 @@ import type {
   BacktestRunConfig,
   BacktestRunSummary,
   CachedBarsMeta,
+  DataTimeframe,
   MarketDataMode,
   StrategyConfig,
   TearsheetResponse,
@@ -133,6 +140,7 @@ export function BacktestsView() {
   const [rebalance, setRebalance] = useState("W-FRI");
   const [walkForward, setWalkForward] = useState(true);
   const [dataMode, setDataMode] = useState<MarketDataMode>("auto");
+  const [timeframe, setTimeframe] = useState<DataTimeframe>("1d");
   const [wfSplits, setWfSplits] = useState(5);
   const [purgeBars, setPurgeBars] = useState("");
   const [embargoBars, setEmbargoBars] = useState("");
@@ -152,6 +160,11 @@ export function BacktestsView() {
       const runsNow = backtests.data.runs;
       const requestedRun =
         typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("run") : null;
+      const requestedTimeframe =
+        typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("timeframe") : null;
+      if (requestedTimeframe && DATA_TIMEFRAMES.includes(requestedTimeframe as DataTimeframe)) {
+        setTimeframe(requestedTimeframe as DataTimeframe);
+      }
       setRuns(runsNow);
       setSelectedRunId((current) => {
         if (current && runsNow.some((run) => run.id === current)) return current;
@@ -230,6 +243,7 @@ export function BacktestsView() {
       walk_forward: walkForward,
       random_seed: 7,
       data_mode: dataMode,
+      timeframe,
       ...(walkForward ? { wf_splits: wfSplits } : {}),
       ...(purgeBars.trim() !== "" ? { purge_bars: Number(purgeBars) } : {}),
       ...(embargoBars.trim() !== "" ? { embargo_bars: Number(embargoBars) } : {}),
@@ -242,7 +256,7 @@ export function BacktestsView() {
     setRunnerDemo(result.source === "demo");
     setRunnerMessage(
       result.source === "live"
-        ? `Run ${run.id} completed · ${formatInteger(run.n_trades ?? 0)} trades · ${formatDuration(run.duration_seconds)} · ${dataOriginBadge(run.data_origin).label}`
+        ? `Run ${run.id} completed · ${formatInteger(run.n_trades ?? 0)} trades · ${formatDuration(run.duration_seconds)} · ${dataOriginBadge(run.data_origin).label} · TF ${run.timeframe ?? timeframe}`
 
         : `Backend unreachable — deterministic UI-fallback tear sheet ${run.id}.`,
     );
@@ -309,13 +323,22 @@ export function BacktestsView() {
               options={REBALANCE_OPTIONS}
             />
           </Field>
-          <Field label="Data mode" htmlFor="bt-data-mode" className="w-[250px]">
+          <Field label="Data mode" htmlFor="bt-data-mode" className="w-[240px]">
             <Select
               id="bt-data-mode"
               value={dataMode}
               onChange={(value) => setDataMode(value as MarketDataMode)}
               disabled={running}
               options={DATA_MODE_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
+            />
+          </Field>
+          <Field label="Timeframe" htmlFor="bt-timeframe" className="w-[112px]">
+            <Select
+              id="bt-timeframe"
+              value={timeframe}
+              onChange={(value) => setTimeframe(value as DataTimeframe)}
+              disabled={running}
+              options={DATA_TIMEFRAME_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
             />
           </Field>
           <div className="flex items-end gap-2">
@@ -457,7 +480,12 @@ export function BacktestsView() {
                       </Badge>
                     </td>
                     <td>
-                      <DataOriginBadge origin={run.data_origin} cachedBars={run.cached_bars} mode={run.data_mode} />
+                      <DataOriginBadge
+                        origin={run.data_origin}
+                        cachedBars={run.cached_bars}
+                        mode={run.data_mode}
+                        timeframe={run.timeframe}
+                      />
                     </td>
                     <td>
                       {(() => {
@@ -539,7 +567,12 @@ export function BacktestsView() {
         actions={
           <div className="flex items-center gap-3">
             {selectedRun ? (
-              <DataOriginBadge origin={selectedRun.data_origin} cachedBars={selectedRun.cached_bars} mode={selectedRun.data_mode} />
+              <DataOriginBadge
+                origin={selectedRun.data_origin}
+                cachedBars={selectedRun.cached_bars}
+                mode={selectedRun.data_mode}
+                timeframe={selectedRun.timeframe}
+              />
             ) : null}
             {selectedRun?.metrics ? (
               <div className="flex items-center gap-3 font-mono text-[11px] tabular-nums">
@@ -830,10 +863,12 @@ function DataOriginBadge({
   origin,
   cachedBars,
   mode,
+  timeframe,
 }: {
   origin: string | null | undefined;
   cachedBars: number | CachedBarsMeta | null | undefined;
   mode: string | null | undefined;
+  timeframe?: string | null;
 }) {
   const meta = dataOriginBadge(origin);
   const detail = cachedBarsDetail(cachedBars);
@@ -841,11 +876,13 @@ function DataOriginBadge({
     <span
       data-testid={meta.real ? "data-origin-real" : "data-origin-synthetic"}
       data-origin={meta.real ? "real_parquet" : "synthetic_fixture"}
-      title={[meta.title, detail, mode ? `mode ${mode}` : null].filter(Boolean).join(" · ")}
+      title={[meta.title, detail, mode ? `mode ${mode}` : null, timeframe ? `timeframe ${timeframe}` : null].filter(Boolean).join(" · ")}
       className="inline-flex flex-col gap-0.5"
     >
       <Badge tone={meta.tone}>{meta.label}</Badge>
-      {detail ? <span className="font-mono text-[8.5px] leading-3 text-zinc-600">{detail}</span> : null}
+      <span className="font-mono text-[8.5px] leading-3 text-zinc-600">
+        {timeframe ? `TF ${timeframe}` : ""}{detail ? ` · ${detail}` : ""}
+      </span>
     </span>
   );
 }

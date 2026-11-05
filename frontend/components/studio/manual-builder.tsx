@@ -23,6 +23,7 @@ import {
   saveStudioStrategy,
 } from "@/lib/api";
 import { isBuiltinStrategy } from "@/lib/artifacts";
+import { DATA_TIMEFRAME_OPTIONS } from "@/lib/data-cache";
 import { cn } from "@/lib/cn";
 import {
   SECTOR_TABS,
@@ -53,6 +54,7 @@ import type {
   DrlModel,
   InstrumentRoot,
   InstrumentSector,
+  DataTimeframe,
   StrategyConfig,
   StudioCatalogResponse,
   StudioDraft,
@@ -106,6 +108,8 @@ export function ManualBuilder({
   onDraftChange,
   onStrategiesChanged,
   onNotify,
+  timeframe,
+  onTimeframeChange,
 }: {
   draft: StudioDraft;
   catalog: StudioCatalogResponse;
@@ -113,6 +117,8 @@ export function ManualBuilder({
   onDraftChange: (draft: StudioDraft) => void;
   onStrategiesChanged: () => void;
   onNotify: (message: string, tone: Tone) => void;
+  timeframe: DataTimeframe;
+  onTimeframeChange: (timeframe: DataTimeframe) => void;
 }) {
   const router = useRouter();
   const instrumentsSource = useAsyncData(getInstruments);
@@ -218,7 +224,10 @@ export function ManualBuilder({
       setSaveToast({ strategyId: id });
       // Keep the toast/tear-sheet quick action visible briefly before handing
       // over to the Backtest Lab deep link.
-      setTimeout(() => router.push(`/backtests?strategy=${encodeURIComponent(id)}`), 1_200);
+      setTimeout(
+        () => router.push(`/backtests?strategy=${encodeURIComponent(id)}&timeframe=${encodeURIComponent(timeframe)}`),
+        1_200,
+      );
     }
   };
 
@@ -393,6 +402,14 @@ export function ManualBuilder({
             id="studio-id"
             value={draft.id}
             onChange={(value) => onDraftChange({ ...draft, id: value.toLowerCase().replace(/\s+/g, "_") })}
+          />
+        </Field>
+        <Field label="Backtest timeframe" htmlFor="studio-timeframe" className="w-[132px]">
+          <Select
+            id="studio-timeframe"
+            value={timeframe}
+            onChange={(value) => onTimeframeChange(value as DataTimeframe)}
+            options={DATA_TIMEFRAME_OPTIONS.map((option) => ({ value: option.value, label: option.value }))}
           />
         </Field>
         <div className="flex items-center gap-2 pb-0.5">

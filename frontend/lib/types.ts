@@ -579,6 +579,8 @@ export interface OptimizationRequest {
   seed?: number;
   /** Phase 11B: auto = real cached bars when sufficient, else synthetic. */
   data_mode?: MarketDataMode;
+  /** Phase 11C target bar timeframe. */
+  timeframe?: DataTimeframe;
 }
 
 export interface OptimizationTrial {
@@ -633,6 +635,8 @@ export interface OptimizationStudy {
   /** Phase 11B additive real/synthetic provenance. */
   data_origin?: DataOrigin | null;
   data_mode?: MarketDataMode | string | null;
+  /** Phase 11C target bar timeframe. */
+  timeframe?: DataTimeframe | string | null;
   cached_bars?: number | CachedBarsMeta | null;
 }
 
@@ -831,6 +835,8 @@ export interface BacktestRunConfig {
   embargo_bars?: number;
   /** Phase 11B: auto = real cached bars when sufficient, else synthetic. */
   data_mode?: MarketDataMode;
+  /** Phase 11C target bar timeframe. */
+  timeframe?: DataTimeframe;
 }
 
 export type MarketDataMode = "auto" | "cached_real" | "synthetic_offline";
@@ -842,6 +848,7 @@ export interface CachedBarsMeta {
   start_date?: string | null;
   end_date?: string | null;
   roots?: string[] | null;
+  timeframe?: string | null;
   [key: string]: unknown;
 }
 
@@ -870,6 +877,8 @@ export interface BacktestRunSummary {
   /** Phase 11B additive real/synthetic provenance. */
   data_origin?: DataOrigin | null;
   data_mode?: MarketDataMode | string | null;
+  /** Phase 11C target bar timeframe. */
+  timeframe?: DataTimeframe | string | null;
   cached_bars?: number | CachedBarsMeta | null;
 }
 
@@ -1022,6 +1031,10 @@ export interface ApiResult<T> {
   /** `live` = served by the FastAPI backend, `demo` = deterministic fixture. */
   source: "live" | "demo";
   error: string | null;
+  /** Phase 11C: raw HTTP status / FastAPI `detail` for exact error rendering. */
+  status?: number | null;
+  detail?: unknown;
+  detailCode?: string | null;
 }
 
 
@@ -1163,6 +1176,8 @@ export interface DataInventoryTotals {
 
 export interface DataInventoryResponse {
   roots: DataCacheRoot[];
+  timeframe?: DataTimeframe | string | null;
+  base_schema?: string | null;
   totals: DataInventoryTotals;
   databento_configured: boolean;
   ibkr_available: boolean;
@@ -1173,15 +1188,20 @@ export interface DataInventoryResponse {
 
 export type DataSource = "ibkr" | "databento";
 
+export type DataTimeframe = "1m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d" | "1w";
+
 export interface DataCostRequest {
   source: DataSource;
   roots: string[];
   start: string;
   end: string;
   schema?: string;
+  timeframe?: DataTimeframe;
 }
 
 export interface DataCostEstimate {
+  timeframe?: DataTimeframe | string | null;
+  base_schema?: string | null;
   estimated_cost_usd: number;
   billable_size_bytes: number;
   billable_size_mb: number;
@@ -1197,6 +1217,9 @@ export interface DataIngestRequest extends DataCostRequest {
 
 export interface DataIngestResult {
   ok: boolean;
+  timeframe?: DataTimeframe | string | null;
+  base_schema?: string | null;
+  resampled?: boolean | null;
   source: DataSource | string;
   roots_ingested: string[];
   bars_written: number;

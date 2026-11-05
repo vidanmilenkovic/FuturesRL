@@ -1,4 +1,17 @@
-import type { CachedBarsMeta, DataOrigin, MarketDataMode } from "./types";
+import type { CachedBarsMeta, DataOrigin, DataTimeframe, MarketDataMode } from "./types";
+
+export const DATA_TIMEFRAME_OPTIONS: { value: DataTimeframe; label: string }[] = [
+  { value: "1m", label: "1 minute" },
+  { value: "5m", label: "5 minutes" },
+  { value: "15m", label: "15 minutes" },
+  { value: "30m", label: "30 minutes" },
+  { value: "1h", label: "1 hour" },
+  { value: "4h", label: "4 hours" },
+  { value: "1d", label: "1 day" },
+  { value: "1w", label: "1 week" },
+];
+
+export const DATA_TIMEFRAMES: DataTimeframe[] = DATA_TIMEFRAME_OPTIONS.map((item) => item.value);
 
 export const DATA_MODE_OPTIONS: { value: MarketDataMode; label: string }[] = [
   { value: "auto", label: "Auto — real cached bars if available, else synthetic" },

@@ -1290,6 +1290,7 @@ export function normalizeOptimizationStudy(raw: unknown): OptimizationStudy | nu
     message: asString(source.message, "") || null,
     ...(typeof source.data_origin === "string" ? { data_origin: source.data_origin } : {}),
     ...(typeof source.data_mode === "string" ? { data_mode: source.data_mode } : {}),
+    ...(typeof source.timeframe === "string" ? { timeframe: source.timeframe } : {}),
     cached_bars: isRecord(source.cached_bars)
       ? (source.cached_bars as Record<string, unknown>)
       : typeof source.cached_bars === "number"

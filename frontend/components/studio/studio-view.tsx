@@ -4,8 +4,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Tabs } from "@/components/ui/primitives";
 import { getStudioCatalog, listStrategies } from "@/lib/api";
+import { DATA_TIMEFRAMES } from "@/lib/data-cache";
 import { draftFromPreset, draftFromStrategy } from "@/lib/studio";
-import type { StudioDraft } from "@/lib/types";
+import type { DataTimeframe, StudioDraft } from "@/lib/types";
 import { useAsyncData } from "@/lib/use-async-data";
 
 import { DrlPanel } from "./drl-panel";
@@ -25,6 +26,7 @@ export function StudioView() {
   const strategies = useAsyncData(listStrategies);
   const [mode, setMode] = useState<StudioMode>("builder");
   const [draft, setDraft] = useState<StudioDraft | null>(null);
+  const [timeframe, setTimeframe] = useState<DataTimeframe>("1d");
   const [notice, setNotice] = useState<{ text: string; tone: "accent" | "gain" | "warn" | "loss" | "neutral" } | null>(null);
 
   useEffect(() => {
@@ -33,6 +35,22 @@ export function StudioView() {
     const first = presets[0];
     if (first) setDraft(draftFromPreset(first));
   }, [catalog.data, draft]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const requested = new URLSearchParams(window.location.search).get("timeframe");
+    const stored = window.localStorage.getItem("futuresrlx:studio-timeframe");
+    const candidate = [requested, stored].find(
+      (value): value is DataTimeframe => value !== null && DATA_TIMEFRAMES.includes(value as DataTimeframe),
+    );
+    if (candidate) setTimeframe(candidate);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("futuresrlx:studio-timeframe", timeframe);
+    }
+  }, [timeframe]);
 
   useEffect(() => {
     if (!notice) return;
@@ -133,6 +151,8 @@ export function StudioView() {
           onDraftChange={setDraft}
           onStrategiesChanged={strategies.reload}
           onNotify={notify}
+          timeframe={timeframe}
+          onTimeframeChange={setTimeframe}
         />
       ) : mode === "optimizer" ? (
         <OptimizerPanel
@@ -140,6 +160,8 @@ export function StudioView() {
           strategies={strategiesList}
           onStrategiesChanged={strategies.reload}
           onNotify={notify}
+          timeframe={timeframe}
+          onTimeframeChange={setTimeframe}
         />
       ) : (
         <DrlPanel
