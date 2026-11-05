@@ -157,8 +157,17 @@ def _read_text(path: Path) -> str:
 
 
 def test_internal_agent_and_phase_documents_removed() -> None:
+    # AGENTS.md / Instructions.md may exist locally as developer references, but
+    # they must never be tracked or pushed.
     for relative in ("AGENTS" + ".md", "Instructions" + ".md", "docs/PHASE_COMPLETION.md"):
-        assert not (REPO_ROOT / relative).exists(), f"{relative} must not ship in the public repo"
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", relative],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert tracked.stdout.strip() == "", f"{relative} must not ship in the public repo"
     # No phase/QoL modules remain in the API package.
     assert not (REPO_ROOT / "src" / "api" / "schemas.py").exists(), "schemas.py must be a package"
     api_files = [path.name for path in (REPO_ROOT / "src" / "api").iterdir() if path.is_file()]
@@ -326,6 +335,15 @@ def test_all_eighteen_phase_tests_were_renamed() -> None:
         assert new_path.stat().st_size > 0
 
 
+def test_no_prompt_prefixed_test_files_anywhere() -> None:
+    offenders = [
+        path.relative_to(REPO_ROOT)
+        for path in (REPO_ROOT / "tests").rglob("test_*.py")
+        if path.name.startswith(("test_spec", "test_phase"))
+    ]
+    assert not offenders, f"prompt-prefixed test files remain: {sorted(map(str, offenders))}"
+
+
 def test_pytest_collection_has_no_phase_named_tests() -> None:
     completed = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "tests/integration"],
@@ -337,6 +355,7 @@ def test_pytest_collection_has_no_phase_named_tests() -> None:
     assert completed.returncode == 0, completed.stderr[-4000:]
     output = completed.stdout + completed.stderr
     assert "test_phase" not in output, "pytest still collects phase-named tests"
+    assert "test_spec" not in output, "pytest still collects spec-prefixed tests"
     for new_name in RENAMED_TESTS.values():
         assert new_name in output, f"renamed test not collected: {new_name}"
 
