@@ -61,6 +61,28 @@ class StrictModel(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Whether the configured LLM provider is a real API transport or the offline stub.
+type LLMProviderMode = Literal["live_api", "offline_stub"]
+
+#: Reported health of the LLM transport after the last probe/ping.
+type LLMHealthStatus = Literal["online", "offline_stub", "auth_error", "unreachable"]
+
+
+class LLMStatusResponse(APIModel):
+    """Health/status of the configured LLM provider (never invented)."""
+
+    provider: str
+    model: str
+    api_key_configured: bool
+    mode: LLMProviderMode
+    status: LLMHealthStatus
+    last_latency_ms: float | None = None
+    last_checked_at: datetime | None = None
+    #: Number of cached assessments the risk overlay currently holds (0 when none).
+    cache_entries: int = Field(default=0, ge=0)
+    error_detail: str | None = None
+
+
 class HealthResponse(APIModel):
     """Liveness/readiness payload consumed by the dashboard shell."""
 
@@ -82,6 +104,8 @@ class HealthResponse(APIModel):
     ibkr_enabled: bool = False
     ibkr_reconnecting: bool = False
     ibkr_last_error: str | None = None
+    #: Additive workstation-UX LLM health object (provider/mode/status/latency).
+    llm_status: LLMStatusResponse | None = None
 
 
 class TelemetryStatusResponse(APIModel):
@@ -248,6 +272,11 @@ class PipelineWaterfallResponse(APIModel):
     micro_routing: list[MicroRoutingEntry] = Field(default_factory=list)
     #: ``translator`` when the real discretization report was used, else ``fallback``.
     tracking_error_source: Literal["translator", "fallback"] = "fallback"
+    #: Additive 45-root workstation scope metadata (default keeps the strategy view).
+    scope: str = "strategy"
+    sector: str | None = None
+    selected_roots: list[str] = Field(default_factory=list)
+    data_origin: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +402,19 @@ class RiskStateResponse(APIModel):
     reset_available: bool = False
     #: Whether ``FUTURESRL_OPERATOR_RESET_TOKEN`` is configured (token required).
     operator_reset_token_required: bool = False
+    #: Additive workstation UX: 45-root Risk & LLM scope query provenance.
+    #: ``strategy`` keeps the legacy behaviour (latest strategy state roots).
+    scope: Literal["strategy", "cached", "all"] = "strategy"
+    #: Echo of the requested sector filter (normalised lower-case), if any.
+    sector: str | None = None
+    #: Roots covered by this response, sorted (all 45 instrument-master roots for
+    #: ``scope=all``; cached roots for ``scope=cached``; strategy roots otherwise).
+    selected_roots: list[str] = Field(default_factory=list)
+    #: Roots with no live/cached market snapshot, assessed from deterministic
+    #: neutral features (listed so clients never mislabel them as live LLM data).
+    derived_roots: list[str] = Field(default_factory=list)
+    #: Honest provenance: ``llm-cache`` | ``fixture`` | ``derived`` | ``mixed``.
+    assessment_source: str = "fixture"
 
 
 class FlattenReceipt(APIModel):
@@ -513,6 +555,11 @@ class TermStructureResponse(APIModel):
     as_of: datetime
     curves: list[TermCurve] = Field(default_factory=list)
     roll_calendar: list[RollCalendarEntry] = Field(default_factory=list)
+    #: Additive 45-root workstation scope metadata (default keeps the strategy view).
+    scope: str = "strategy"
+    sector: str | None = None
+    selected_roots: list[str] = Field(default_factory=list)
+    data_origin: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +1005,9 @@ __all__ = [
     "FlattenReceipt",
     "HealthResponse",
     "HeartbeatTelemetryPayload",
+    "LLMHealthStatus",
+    "LLMProviderMode",
+    "LLMStatusResponse",
     "MacroEvent",
     "MacroLockout",
     "MarginTelemetryPayload",

@@ -88,6 +88,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 from configs.instruments import InstrumentsConfig, InstrumentSpec, load_instruments
@@ -128,6 +129,47 @@ DEFAULT_SELECTED_PARAMETER_KEYS: tuple[str, ...] = (
     "allocator.volatility_target.target_annual_volatility",
     "risk.quant_risk.trailing_stop_pct",
 )
+
+#: One-line math/why explanations for each allocator family (Studio math tooltips).
+#: Additive metadata; the engine math lives in ``src/strategies/allocators/``.
+ALLOCATOR_FORMULAS: Mapping[str, str] = MappingProxyType(
+    {
+        "equal_weight": "w_i = L / N - every selected root gets the same signed notional weight; only gross "
+        "leverage L matters.",
+        "volatility_target": "w = inverse-vol weights * min(target_vol / sqrt(w^T Sigma w), L_max) - inverse "
+        "volatility sizes each root, then the book is scaled so ex-ante annual volatility hits the target.",
+        "risk_parity": "w_i * (Sigma w)_i = b_i * (w^T Sigma w) - each root contributes its budgeted share of "
+        "total risk; the fixed point is solved iteratively.",
+        "mean_variance": "w proportional to Sigma^-1 mu (max w^T mu - lambda/2 * w^T Sigma w under the "
+        "weight/gross caps) - expected-return scores are scaled by covariance risk and a risk-aversion penalty.",
+        "drl": "w = clip(policy(o_t), -w_max, w_max), scaled to L_max - the neural policy maps the observation "
+        "to target weights; risk caps and the deterministic risk projection still apply.",
+    }
+)
+
+#: Advanced/math-detail parameters (kept behind the Studio "Advanced Parameters" collapse).
+ADVANCED_PARAMETER_KEYS: frozenset[str] = frozenset(
+    {
+        "allocator.risk_parity.max_iterations",
+        "allocator.risk_parity.tolerance",
+        "allocator.risk_parity.ridge",
+        "allocator.risk_parity.shrinkage",
+        "allocator.risk_parity.min_volatility",
+        "allocator.volatility_target.ridge",
+        "allocator.volatility_target.shrinkage",
+        "allocator.volatility_target.min_volatility",
+        "allocator.mean_variance.ridge",
+        "allocator.mean_variance.shrinkage",
+        "allocator.mean_variance.min_volatility",
+        "allocator.drl.risk_penalty_lambda",
+        "timing.kama.trend_band",
+        "timing.kama.feature_band",
+        "timing.tsmom.min_scale",
+        "timing.tsmom.max_scale",
+        "translator.min_micro_notional_ratio",
+    }
+)
+
 
 #: Structural / data-hygiene parameters that must never enter an Optuna search
 #: space: universe composition and history filters, regime enable/logic switches,
@@ -428,6 +470,10 @@ class ParameterSpec:
     min_items: int | None = None
     max_items: int | None = None
     location: str = LOCATION_STAGE_PARAMS
+    #: Optional one-line math formula/explanation for the Studio UI (allocator math tooltips).
+    formula: str | None = None
+    #: Advanced/math-detail parameter: hidden behind the Studio's "Advanced Parameters" section.
+    advanced: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serialisable representation (the **stable** API contract)."""
@@ -452,6 +498,8 @@ class ParameterSpec:
             "min_items": self.min_items,
             "max_items": self.max_items,
             "location": self.location,
+            "formula": self.formula,
+            "advanced": self.advanced,
         }
 
 
@@ -605,6 +653,9 @@ class ParameterCatalog:
         missing_hygiene = sorted(NON_TUNABLE_PARAMETER_KEYS - known_keys)
         if missing_hygiene:
             raise ValueError(f"non-tunable hygiene keys are not catalogued: {missing_hygiene!r}")
+        missing_advanced = sorted(ADVANCED_PARAMETER_KEYS - known_keys)
+        if missing_advanced:
+            raise ValueError(f"advanced UI metadata references unknown keys: {missing_advanced!r}")
         for spec in self.parameters:
             if spec.optuna_default_selected and not spec.optuna_tunable:
                 raise ValueError(
@@ -709,6 +760,11 @@ class ParameterCatalog:
             "stage_choices": {
                 stage_id: list(names) for stage_id, names in self.stage_choices().items()
             },
+            # Additive UI metadata: one-line math per allocator family + the advanced
+            # parameter keys (the UI can render tooltips/collapse sections without
+            # hard-coding the mapping).
+            "formulas": dict(ALLOCATOR_FORMULAS),
+            "advanced_parameter_keys": sorted(ADVANCED_PARAMETER_KEYS),
         }
 
 
@@ -2907,14 +2963,33 @@ def _apply_optuna_selection(
     return tuple(adjusted)
 
 
+def _apply_ui_metadata(
+    parameters: tuple[ParameterSpec, ...],
+) -> tuple[ParameterSpec, ...]:
+    """Attach additive Studio metadata (math formula + advanced-parameter flag).
+
+    Centralised so the frontend can render allocator math tooltips and an
+    "Advanced Parameters" section from the catalog instead of hard-coding the
+    mapping. Purely additive: existing keys/flags are untouched.
+    """
+    adjusted: list[ParameterSpec] = []
+    for spec in parameters:
+        formula = ALLOCATOR_FORMULAS.get(spec.stage_name) if spec.stage == "allocator" else None
+        advanced = spec.key in ADVANCED_PARAMETER_KEYS
+        adjusted.append(replace(spec, formula=formula, advanced=advanced))
+    return tuple(adjusted)
+
+
 def _build_catalog(master: InstrumentsConfig) -> ParameterCatalog:
-    parameters: tuple[ParameterSpec, ...] = _apply_optuna_selection(
-        (
-            *_universe_specs(master),
-            *_allocator_specs(),
-            *_timing_specs(master),
-            *_risk_specs(),
-            *_translator_specs(),
+    parameters: tuple[ParameterSpec, ...] = _apply_ui_metadata(
+        _apply_optuna_selection(
+            (
+                *_universe_specs(master),
+                *_allocator_specs(),
+                *_timing_specs(master),
+                *_risk_specs(),
+                *_translator_specs(),
+            )
         )
     )
     stages = tuple(

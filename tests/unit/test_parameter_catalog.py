@@ -126,6 +126,8 @@ def test_catalog_json_is_serialisable_and_well_formed() -> None:
         "min_items",
         "max_items",
         "location",
+        "formula",
+        "advanced",
     }
     valid_types = {kind.value for kind in ParameterType}
     valid_encodings = {"scalar", "comma_ints", "comma_strings", "json_object"}
@@ -1147,3 +1149,48 @@ def test_default_selected_helper_never_returns_carry() -> None:
         assert carry_key not in default_selected_parameter_keys(preset.strategy)
     # Catalog-wide invariant: the curated five contain no carry parameter at all.
     assert all("carry" not in key for key in DEFAULT_SELECTED_PARAMETER_KEYS)
+
+
+# ---------------------------------------------------------------------------
+# Workstation UX: additive math formulas + advanced-parameter exposure
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_exposes_allocator_formulas_and_advanced_flags() -> None:
+    from src.strategies.parameter_catalog import (
+        ADVANCED_PARAMETER_KEYS,
+        ALLOCATOR_FORMULAS,
+    )
+
+    payload = catalog_dict()
+    formulas = payload["formulas"]
+    assert isinstance(formulas, dict)
+    assert set(formulas) == {
+        "equal_weight",
+        "risk_parity",
+        "volatility_target",
+        "mean_variance",
+        "drl",
+    }
+    assert set(formulas) == set(ALLOCATOR_FORMULAS)
+    for name, formula in formulas.items():
+        assert isinstance(name, str) and isinstance(formula, str) and len(formula) > 20
+
+    advanced_keys = set(payload["advanced_parameter_keys"])
+    assert advanced_keys == set(ADVANCED_PARAMETER_KEYS)
+    assert advanced_keys, "advanced parameters must be exposed for the Studio collapse"
+    for entry in payload["parameters"]:
+        assert isinstance(entry["advanced"], bool)
+        assert entry["formula"] is None or isinstance(entry["formula"], str)
+        if entry["key"] in advanced_keys:
+            assert entry["advanced"] is True, entry["key"]
+    # Every allocator parameter carries the family's one-line math explanation.
+    for entry in payload["parameters"]:
+        if entry["stage"] == "allocator":
+            assert entry["formula"], entry["key"]
+            assert entry["formula"] in ALLOCATOR_FORMULAS.values()
+    # Additive only: the established contract version/keys are unchanged.
+    assert payload["version"] == 1
+    assert {"version", "stages", "parameters", "presets", "universe", "stage_choices"} <= set(
+        payload
+    )

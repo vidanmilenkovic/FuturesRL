@@ -58,6 +58,7 @@ from src.api.live import (
     LiveStateService,
     micro_routing_from_payload,
 )
+from src.api.llm_status import LLMStatusService
 from src.api.news import NewsFeedService
 from src.api.protocols import (
     BacktestService,
@@ -74,6 +75,7 @@ from src.api.schemas import (
     FlattenAllResponse,
     FlattenReceipt,
     HealthResponse,
+    LLMStatusResponse,
     MicroRoutingEntry,
     PaperStateResetReceipts,
     PaperStateResetRequest,
@@ -103,6 +105,7 @@ from src.core.types import (
     AccountSnapshot,
     ContractTargetSet,
     InstrumentId,
+    InstrumentSnapshot,
     MarketState,
     OrderEvent,
     OrderReceipt,
@@ -110,6 +113,7 @@ from src.core.types import (
     OrderStatus,
     PipelineResult,
     Position,
+    RiskAssessment,
     WeightVector,
 )
 from src.data import schema as data_schema
@@ -1982,6 +1986,23 @@ class EngineMarketService:
         self._pipeline_cache[key] = response
         return response
 
+    def pipeline_for_state(self, state: MarketState) -> PipelineWaterfallResponse:
+        """Run the default strategy pipeline for an externally-scoped MarketState.
+
+        Used by ``src.api.root_scope`` to inspect arbitrary root sets (cached or
+        deterministic instrument-master pricing) with the same mapping as
+        :meth:`pipeline`; provenance is attached by the route/root-scope layer.
+        """
+        config = self._default_config()
+        if config is None:
+            raise RuntimeError(
+                "no declarative strategy config available under configs/strategies; "
+                "the pipeline inspector requires at least one YAML config"
+            )
+        pipeline, translator = self._pipeline_for(config, state)
+        result = pipeline.run(state)
+        return self._map_pipeline(config, state, result, translator)
+
     def _map_pipeline(
         self,
         config: StrategyConfig,
@@ -2666,7 +2687,10 @@ class EngineRiskService:
         self._clock = clock
         self._news = news
         self._state_store = state_store
+        self._master = settings.instruments
         self._thresholds = thresholds_from_settings(settings)
+        #: Size of the assessment cache produced by the last :meth:`state` call.
+        self._last_cache_entries: int = 0
 
     def thresholds(self) -> RiskThresholds:
         """Effective thresholds (settings + API overrides)."""
@@ -2839,24 +2863,176 @@ class EngineRiskService:
             ),
         )
 
-    def state(self) -> RiskStateResponse:
-        """Latest assessments, breaker state, macro lockout and news feed."""
+    def llm_cache_entries(self) -> int:
+        """Number of assessments held by the last computed LLM/risk assessment cache."""
+        return max(0, self._last_cache_entries)
+
+    def _parse_root_filter(self, roots: str | None) -> list[str] | None:
+        """Parse/validate a comma-separated ``roots`` query filter."""
+        if roots is None:
+            return None
+        tokens = [token.strip().upper() for token in roots.split(",") if token.strip()]
+        if not tokens:
+            return None
+        unknown = sorted({token for token in tokens if not self._master.has(token)})
+        if unknown:
+            raise ValueError(f"unknown futures root(s) in roots filter: {unknown}")
+        return list(dict.fromkeys(tokens))
+
+    def _cached_risk_roots(self) -> list[str]:
+        """Roots with cached Parquet bars (market-service backing first, repo fallback)."""
+        master = self._master
+        backing = getattr(self._market, "data_backing", None)
+        value = backing() if callable(backing) else backing
+        roots: list[str] = []
+        if isinstance(value, Mapping):
+            raw = value.get("cached_roots")
+            if isinstance(raw, list | tuple):
+                roots = [
+                    str(root).strip().upper()
+                    for root in raw
+                    if master.has(str(root).strip().upper())
+                ]
+        if roots:
+            return sorted(dict.fromkeys(roots))
+        try:
+            from src.data.storage import ParquetRepository
+        except Exception:  # pragma: no cover - data layer always importable today
+            return []
+        try:
+            inventory = ParquetRepository(self._settings).inventory("ohlcv-1d")
+        except Exception:
+            logger.warning("cached-root inventory unavailable for risk scope", exc_info=True)
+            return []
+        for entry in inventory:
+            root = str(getattr(entry, "root", "") or "").strip().upper()
+            cached_bars = int(getattr(entry, "cached_bars", 0) or 0)
+            if root and cached_bars > 0 and master.has(root):
+                roots.append(root)
+        return sorted(dict.fromkeys(roots))
+
+    def _select_risk_scope_roots(
+        self,
+        *,
+        scope: str,
+        sector: str | None,
+        roots: str | None,
+        state_roots: Sequence[str],
+    ) -> tuple[list[str], str | None]:
+        """Resolve the requested root scope/filters to a deterministic sorted root list."""
+        master = self._master
+        explicit = self._parse_root_filter(roots)
+        if explicit is not None:
+            selected = list(explicit)
+        elif scope == "all":
+            selected = list(master.roots())
+        elif scope == "cached":
+            selected = self._cached_risk_roots()
+        else:
+            selected = list(state_roots)
+        normalized_sector: str | None = None
+        if sector is not None and sector.strip():
+            normalized_sector = sector.strip().lower()
+            known_sectors = sorted({value.lower() for value in master.sectors()})
+            if normalized_sector not in known_sectors:
+                raise ValueError(f"unknown sector {sector!r}; expected one of {known_sectors}")
+            selected = [
+                root
+                for root in selected
+                if master.has(root) and master.get(root).sector.lower() == normalized_sector
+            ]
+        ordered = sorted(dict.fromkeys(root for root in selected if master.has(root)))
+        return ordered, normalized_sector
+
+    def _derived_assessment(
+        self, root: str, thresholds: RiskThresholds, now: datetime
+    ) -> RiskAssessment:
+        """Deterministic neutral assessment for a root without a live/cached snapshot.
+
+        It reuses the exact offline fixture scoring with documented neutral feature
+        defaults (momentum 0, vol 0.15, turbulence 1, carry 0), so 45-root scopes
+        are complete without inventing live LLM data; the root is reported in
+        ``derived_roots`` and never labelled as a live/cached assessment.
+        """
+        spec = self._master.get(root)
+        snapshot = InstrumentSnapshot(
+            instrument_id=root,
+            root_symbol=root,
+            price=1_000.0,
+            asset_class=spec.asset_class,
+            volume=0.0,
+            open_interest=0.0,
+        )
+        synthetic = MarketState(timestamp=now, instruments={root: snapshot})
+        base = fixtures.risk_assessment_core(synthetic, thresholds, now)[0]
+        return dataclass_replace(
+            base,
+            source="derived-neutral",
+            reasoning_summary=(
+                "Derived deterministic neutral assessment (no live/cached market "
+                "snapshot for this root). " + base.reasoning_summary
+            ),
+        )
+
+    @staticmethod
+    def _assessment_source(
+        *, derived: Sequence[str], selected: Sequence[str], cache_source: str
+    ) -> str:
+        if derived and len(derived) == len(selected):
+            return "derived"
+        if derived:
+            return "mixed"
+        return cache_source
+
+    def state(
+        self,
+        *,
+        scope: Literal["strategy", "cached", "all"] = "strategy",
+        sector: str | None = None,
+        roots: str | None = None,
+    ) -> RiskStateResponse:
+        """Latest assessments, breaker state, macro lockout and news feed.
+
+        ``scope=strategy`` (default) keeps the legacy behaviour of assessing the
+        latest strategy market-state roots. ``scope=cached`` covers roots with
+        cached Parquet bars and ``scope=all`` covers every instrument-master root
+        (45); roots without a live/cached snapshot are deterministically derived
+        and reported in ``derived_roots``.
+        """
+        if scope not in {"strategy", "cached", "all"}:
+            raise ValueError(f"unknown risk scope {scope!r}; expected strategy, cached or all")
         now = self._clock()
         thresholds = self._thresholds
         state = self._market.latest_state()
+        state_roots = tuple(sorted(state.instruments))
+        selected, normalized_sector = self._select_risk_scope_roots(
+            scope=scope, sector=sector, roots=roots, state_roots=state_roots
+        )
         # Prefer the real LLM Risk-First overlay's assessment cache (seeded from the
         # deterministic offline client); fall back to the raw fixture assessments
         # only when the risk layer is genuinely unavailable.
         overlay = build_llm_risk_overlay(
             self._settings, self._settings.instruments, self._clock, state
         )
+        provider = str(getattr(self._settings, "llm_provider_value", "offline")).lower()
+        cache_source = "llm-cache" if overlay is not None and provider != "offline" else "fixture"
         if overlay is not None:
             overlay.set_cached_assessments(fixtures.risk_assessment_core(state, thresholds, now))
-            core = tuple(
-                overlay.latest_assessments[root] for root in sorted(overlay.latest_assessments)
-            )
+            cached = dict(overlay.latest_assessments)
+            core_by_root = cached
+            self._last_cache_entries = len(cached)
         else:
-            core = fixtures.risk_assessment_core(state, thresholds, now)
+            core_all = fixtures.risk_assessment_core(state, thresholds, now)
+            core_by_root = {assessment.instrument_id: assessment for assessment in core_all}
+            self._last_cache_entries = len(core_all)
+        derived_roots: list[str] = []
+        core: list[RiskAssessment] = []
+        for root in selected:
+            assessment = core_by_root.get(root)
+            if assessment is None:
+                assessment = self._derived_assessment(root, thresholds, now)
+                derived_roots.append(root)
+            core.append(assessment)
         assessments = fixtures.risk_assessment_rows(core, thresholds, now)
         events = fixtures.macro_calendar(now)
         lockout = fixtures.macro_lockout(events, thresholds, now)
@@ -2903,6 +3079,13 @@ class EngineRiskService:
             lock_until=cast(datetime | None, lock["lock_until"]),
             reset_available=bool(lock["reset_available"]),
             operator_reset_token_required=bool(lock["operator_reset_token_required"]),
+            scope=scope,
+            sector=normalized_sector,
+            selected_roots=selected,
+            derived_roots=sorted(derived_roots),
+            assessment_source=self._assessment_source(
+                derived=derived_roots, selected=selected, cache_source=cache_source
+            ),
         )
 
 
@@ -2931,6 +3114,58 @@ class Container:
     warnings: list[str] = field(default_factory=list)
     #: Durable risk/kill-switch state shared with the live runner (file/DuckDB/Redis).
     risk_state_store: RiskStateStore | None = None
+    #: Additive workstation-UX LLM provider health service (lazily built when absent).
+    llm_status: LLMStatusService | None = None
+
+    def _risk_cache_entries(self) -> int:
+        getter = getattr(self.risk, "llm_cache_entries", None)
+        if not callable(getter):
+            return 0
+        try:
+            return max(0, int(getter()))
+        except Exception:  # pragma: no cover - defensive risk-cache adapter
+            logger.warning("risk llm_cache_entries() failed", exc_info=True)
+            return 0
+
+    def llm_status_service(self) -> LLMStatusService:
+        """Return (building lazily if needed) the LLM provider status service."""
+        service = self.llm_status
+        if service is None:
+            service = LLMStatusService(
+                settings=self.settings,
+                clock=self.clock,
+                cache_entries_provider=self._risk_cache_entries,
+            )
+            self.llm_status = service
+        return service
+
+    def llm_status_view(self) -> LLMStatusResponse:
+        """Current LLM provider status snapshot (no network I/O)."""
+        return self.llm_status_service().status()
+
+    async def llm_ping(self) -> LLMStatusResponse:
+        """Bounded, side-effect-free LLM provider ping."""
+        return await self.llm_status_service().ping()
+
+    def risk_state_scoped(
+        self,
+        *,
+        scope: Literal["strategy", "cached", "all"] = "strategy",
+        sector: str | None = None,
+        roots: str | None = None,
+    ) -> RiskStateResponse:
+        """Risk state with the optional 45-root scope/sector/roots filters."""
+        state_callable = cast(Any, self.risk).state
+        try:
+            return cast(
+                RiskStateResponse,
+                state_callable(scope=scope, sector=sector, roots=roots),
+            )
+        except TypeError:
+            # Legacy/injected risk services expose only ``state()``.
+            if scope == "strategy" and sector is None and roots is None:
+                return cast(RiskStateResponse, state_callable())
+            raise
 
     def health(self) -> HealthResponse:
         """Liveness payload with dynamically derived IBKR connectivity state.
@@ -2963,6 +3198,7 @@ class Container:
             runner_bridge_available=bridge_available,
             runner_bridge_stale=self.live.bridge_stale(),
             runner_mode=self.live.runner_mode(),
+            llm_status=self.llm_status_view(),
         )
 
     def telemetry_status(self) -> TelemetryStatusResponse:
@@ -3258,6 +3494,11 @@ def build_container(
     )
     from src.api.backtests_service import EngineBacktestService
 
+    llm_status = LLMStatusService(
+        settings=resolved_settings,
+        clock=resolved_clock,
+        cache_entries_provider=risk.llm_cache_entries,
+    )
     backtests = EngineBacktestService(
         settings=resolved_settings,
         market=market,
@@ -3300,4 +3541,5 @@ def build_container(
         offline_mode=offline_mode,
         warnings=warnings,
         risk_state_store=risk_state_store,
+        llm_status=llm_status,
     )

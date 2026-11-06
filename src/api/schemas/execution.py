@@ -9,7 +9,79 @@ from pydantic import Field
 
 from src.api.schemas.core import APIModel, StrictModel
 
+# ---------------------------------------------------------------------------
+# IBKR port discovery / guarded connection switch (workstation UX)
+# ---------------------------------------------------------------------------
+
+
+class IbkrPortInfo(APIModel):
+    """One probed IBKR TWS/IB Gateway TCP port."""
+
+    port: int = Field(ge=1, le=65535)
+    mode: Literal["paper", "live"]
+    gateway: Literal["tws", "ib_gateway"]
+    reachable: bool
+    latency_ms: float | None = None
+
+
+class IbkrActiveConnection(APIModel):
+    """Currently configured/active IBKR connection (settings/runtime)."""
+
+    port: int | None = None
+    client_id: int | None = None
+    environment: str = "backtest"
+    mode: Literal["paper", "live"] | None = None
+    gateway: Literal["tws", "ib_gateway"] | None = None
+
+
+class IbkrPortsResponse(APIModel):
+    """``GET /api/runner/ibkr-ports`` payload."""
+
+    host: str
+    ports: list[IbkrPortInfo] = Field(default_factory=list)
+    active: IbkrActiveConnection = Field(default_factory=IbkrActiveConnection)
+    warnings: list[str] = Field(default_factory=list)
+    probed_at: datetime
+
+
+class IbkrConnectionSwitchRequest(StrictModel):
+    """``POST /api/runner/ibkr-connection`` body."""
+
+    port: int = Field(ge=1, le=65535)
+    client_id: int | None = Field(default=None, ge=0, le=999)
+    #: Required exactly ``"LIVE"`` when requesting a live port (7496/4001).
+    confirmation: str | None = None
+
+
+class IbkrRequestedConnection(APIModel):
+    """Normalised connection requested by the switch endpoint."""
+
+    port: int
+    mode: Literal["paper", "live"]
+    gateway: Literal["tws", "ib_gateway"]
+    client_id: int
+
+
+class IbkrConnectionSwitchResponse(APIModel):
+    """Result of a guarded IBKR connection switch (never claims an unsafe switch)."""
+
+    status: Literal["applied", "restart_required", "refused"]
+    applied: bool = False
+    restart_required: bool = False
+    requested: IbkrRequestedConnection
+    active: IbkrActiveConnection
+    environment: str
+    warnings: list[str] = Field(default_factory=list)
+    message: str = ""
+
+
 __all__ = [
+    "IbkrActiveConnection",
+    "IbkrConnectionSwitchRequest",
+    "IbkrConnectionSwitchResponse",
+    "IbkrPortInfo",
+    "IbkrPortsResponse",
+    "IbkrRequestedConnection",
     "RebalanceExecuteRequest",
     "RebalanceExecuteResponse",
     "RebalanceFillRow",

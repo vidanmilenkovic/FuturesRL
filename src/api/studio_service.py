@@ -143,6 +143,11 @@ class ParameterSpec(_StudioModel):
     #: Concrete dotted path hint inside a serialised strategy (best-effort without
     #: a base strategy; ``resolve_optimizer_path`` computes the exact list index).
     path: str = ""
+    #: Additive workstation metadata (task-80): human-readable sizing/overlay formula
+    #: for formula-backed parameters (``None`` for plain scalar knobs).
+    formula: str | None = None
+    #: Advanced/expert parameter flag (collapsed behind "Advanced" in the Studio UI).
+    advanced: bool = False
 
     def as_dict(self) -> dict[str, object]:
         """JSON-serialisable representation."""
@@ -228,6 +233,10 @@ class StrategyCatalogResponse(_StudioModel):
     #: Additive Studio UX metadata: sector-grouped instrument universe explorer data.
     universe: UniverseCatalog = Field(default_factory=UniverseCatalog)
     parameters: list[ParameterSpec] = Field(default_factory=list)
+    #: Additive allocator math snippets keyed by allocator name.
+    formulas: dict[str, str] = Field(default_factory=dict)
+    #: Additive parameter keys the Studio should show under "advanced".
+    advanced_parameter_keys: list[str] = Field(default_factory=list)
     presets: list[StrategyPreset] = Field(default_factory=list)
     source: str = "fallback"
     preset_source: str = "fallback"
@@ -823,6 +832,8 @@ def _coerce_parameter(entry: object) -> ParameterSpec | None:
             and not isinstance(value, bool)
             else None
         ),
+        formula=cast("str | None", _pick(mapping, "formula")),
+        advanced=bool(_pick(mapping, "advanced") or False),
         location=str(_pick(mapping, "location", "binding") or "stage_params"),
         path=str(_pick(mapping, "path", "param_path") or f"{stage}.params.{param}"),
     )
@@ -1604,6 +1615,21 @@ class StrategyStudioService:
         universe = _universe_from_payload(payload) if payload is not None else UniverseCatalog()
         if not universe.roots:
             universe = _universe_from_master(master)
+        formulas: dict[str, str] = {}
+        advanced_parameter_keys: list[str] = []
+        if payload is not None:
+            raw_formulas = payload.get("formulas")
+            if isinstance(raw_formulas, Mapping):
+                formulas = {
+                    str(key): str(value)
+                    for key, value in raw_formulas.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                }
+            raw_advanced = payload.get("advanced_parameter_keys")
+            if isinstance(raw_advanced, Sequence) and not isinstance(raw_advanced, str | bytes):
+                advanced_parameter_keys = [
+                    str(key) for key in cast(Sequence[object], raw_advanced) if isinstance(key, str)
+                ]
         return StrategyCatalogResponse(
             version=1,
             stages=stages,
@@ -1611,6 +1637,8 @@ class StrategyStudioService:
             stage_choices=stage_choices,
             universe=universe,
             parameters=specs,
+            formulas=formulas,
+            advanced_parameter_keys=advanced_parameter_keys,
             presets=presets,
             source=source,
             preset_source=preset_source,

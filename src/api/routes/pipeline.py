@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
+from src.api import root_scope
 from src.api.deps import BridgePipelineDep, ContainerDep
 from src.api.schemas import PipelineWaterfallResponse
 
@@ -24,7 +25,11 @@ router = APIRouter(tags=["pipeline"])
     ),
 )
 def latest_pipeline(
-    container: ContainerDep, bridge: BridgePipelineDep
+    container: ContainerDep,
+    bridge: BridgePipelineDep,
+    scope: str = "strategy",
+    sector: str | None = None,
+    roots: str | None = None,
 ) -> PipelineWaterfallResponse:
     """Return the most recent pipeline trace (bridge-first).
 
@@ -32,6 +37,34 @@ def latest_pipeline(
     Weight matrix, identical fields to the engine waterfall) → the compact bridge
     scalar summary (Phase-9 snapshots without rows) → the engine waterfall.
     """
+    if scope.strip().lower() != "strategy" or sector or roots:
+        try:
+            selected, canonical_scope, canonical_sector = root_scope.resolve_scoped_roots(
+                settings=container.settings,
+                master=container.instrument_master,
+                market=container.market,
+                scope=scope,
+                sector=sector,
+                roots=roots,
+            )
+            scoped_market, data_origin = root_scope.build_scoped_market(
+                settings=container.settings,
+                master=container.instrument_master,
+                market=container.market,
+                selected=selected,
+            )
+            state = root_scope.scoped_state(scoped_market)
+            scoped = root_scope.scoped_pipeline(container.market, state).model_copy(
+                update={
+                    "scope": canonical_scope,
+                    "sector": canonical_sector,
+                    "selected_roots": selected,
+                    "data_origin": data_origin,
+                }
+            )
+        except root_scope.RootScopeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return scoped
     matrix = bridge.pipeline()
     if matrix is not None:
         return matrix

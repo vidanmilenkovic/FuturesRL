@@ -1,8 +1,8 @@
 """Frozen API schema surface (domain modules re-exported for compatibility).
 
 Every public model lives in a domain module: ``core`` (shared platform/backtest/
-strategy schemas), ``execution`` (rebalance preview/execute), ``data`` (Parquet
-cache/cost/ingest) and ``operations`` (artifact deletes + strategy identity).
+strategy schemas), ``execution`` (rebalance/IBKR execution + preview), ``data``
+(Parquet cache/cost/ingest) and ``operations`` (artifact deletes + strategy identity).
 The package re-exports every public symbol so ``from src.api.schemas import X``
 keeps working across the API.
 """
@@ -30,6 +30,9 @@ from src.api.schemas.core import (
     FlattenReceipt,
     HealthResponse,
     HeartbeatTelemetryPayload,
+    LLMHealthStatus,
+    LLMProviderMode,
+    LLMStatusResponse,
     MacroEvent,
     MacroLockout,
     MarginTelemetryPayload,
@@ -100,6 +103,12 @@ from src.api.schemas.data import (
     RootCacheSummary,
 )
 from src.api.schemas.execution import (
+    IbkrActiveConnection,
+    IbkrConnectionSwitchRequest,
+    IbkrConnectionSwitchResponse,
+    IbkrPortInfo,
+    IbkrPortsResponse,
+    IbkrRequestedConnection,
     RebalanceExecuteRequest,
     RebalanceExecuteResponse,
     RebalanceFillRow,
@@ -145,8 +154,17 @@ __all__ = [
     "FlattenReceipt",
     "HealthResponse",
     "HeartbeatTelemetryPayload",
+    "IbkrActiveConnection",
+    "IbkrConnectionSwitchRequest",
+    "IbkrConnectionSwitchResponse",
+    "IbkrPortInfo",
+    "IbkrPortsResponse",
+    "IbkrRequestedConnection",
     "IngestRequest",
     "IngestResponse",
+    "LLMHealthStatus",
+    "LLMProviderMode",
+    "LLMStatusResponse",
     "MacroEvent",
     "MacroLockout",
     "MarginTelemetryPayload",
