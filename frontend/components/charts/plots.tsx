@@ -315,6 +315,80 @@ export interface CurvePoint {
   price: number;
   days: number;
   isFront: boolean;
+  /** Optional backend-provided annualised roll yield for this leg (percent). */
+  rollYieldAnnualized?: number;
+}
+
+export type ForwardCurveMode = "normalized_basis" | "roll_yield" | "raw_price";
+
+/** Minimum Normalized Basis % axis half-span around zero (F1 = 0%). */
+export const NORMALIZED_BASIS_MIN_HALF_SPAN = 1.5;
+
+/** Minimum Raw Price axis half-span around F1 (±1.0%). */
+export const RAW_PRICE_MIN_HALF_SPAN_PCT = 1.0;
+
+function finitePrice(value: number): number {
+  return Number.isFinite(value) ? value : 0;
+}
+
+/** Per-leg annualised roll yield (%) derived from the F1/Fn price ratio. */
+export function annualizedRollYieldPct(frontPrice: number, price: number, days: number): number {
+  if (!Number.isFinite(frontPrice) || !Number.isFinite(price) || frontPrice <= 0 || price <= 0) {
+    return 0;
+  }
+  if (days <= 0) return 0;
+  const ratio = frontPrice / price;
+  const annualized = Math.pow(ratio, 365 / days) - 1;
+  return Number.isFinite(annualized) ? annualized * 100 : 0;
+}
+
+/** Charted values for a mode: all arrays are index-aligned with ``points``. */
+export function forwardCurveValues(mode: ForwardCurveMode, points: CurvePoint[]): number[] {
+  const front = finitePrice(points[0]?.price ?? 0);
+  return points.map((point, index) => {
+    const price = finitePrice(point.price);
+    if (mode === "normalized_basis") {
+      return index === 0 || front <= 0 ? 0 : ((price - front) / front) * 100;
+    }
+    if (mode === "roll_yield") {
+      if (index === 0) return 0;
+      if (typeof point.rollYieldAnnualized === "number" && Number.isFinite(point.rollYieldAnnualized)) {
+        return point.rollYieldAnnualized;
+      }
+      return annualizedRollYieldPct(front, price, point.days);
+    }
+    return price;
+  });
+}
+
+/** Y-axis domain with the task-81 minimum spans and data-expansion rules. */
+export function forwardCurveDomain(
+  mode: ForwardCurveMode,
+  values: number[],
+  frontPrice: number,
+): { min: number; max: number } {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (mode === "raw_price") {
+    const front = finitePrice(frontPrice);
+    const halfSpan = Math.max(Math.abs(front) * (RAW_PRICE_MIN_HALF_SPAN_PCT / 100), 0.01);
+    let min = Math.min(front - halfSpan, ...finite);
+    let max = Math.max(front + halfSpan, ...finite);
+    if (min === max) {
+      min -= halfSpan;
+      max += halfSpan;
+    }
+    const padding = (max - min) * 0.05;
+    return { min: min - padding, max: max + padding };
+  }
+  // Percent modes include the 0.00% reference and a minimum [-1.5%, +1.5%] span.
+  let min = Math.min(-NORMALIZED_BASIS_MIN_HALF_SPAN, 0, ...finite);
+  let max = Math.max(NORMALIZED_BASIS_MIN_HALF_SPAN, 0, ...finite);
+  if (min === max) {
+    min -= NORMALIZED_BASIS_MIN_HALF_SPAN;
+    max += NORMALIZED_BASIS_MIN_HALF_SPAN;
+  }
+  const padding = (max - min) * 0.06;
+  return { min: min - padding, max: max + padding };
 }
 
 export function ForwardCurveChart({
@@ -323,42 +397,67 @@ export function ForwardCurveChart({
   ariaLabel,
 }: {
   points: CurvePoint[];
-  mode: "price" | "normalized" | "basis";
+  mode: ForwardCurveMode;
   ariaLabel: string;
 }) {
   const width = 720;
   const height = 260;
-  const padding = { top: 18, right: 22, bottom: 30, left: 74 };
+  const padding = { top: 18, right: 22, bottom: 30, left: 78 };
   const innerW = width - padding.left - padding.right;
   const innerH = height - padding.top - padding.bottom;
-  const frontPrice = points[0]?.price ?? 1;
-  const values =
-    mode === "normalized"
-      ? points.map((point) => (point.price / frontPrice) * 100)
-      : mode === "basis"
-        ? points.map((point) => ((point.price - frontPrice) / frontPrice) * 10_000)
-        : points.map((point) => point.price);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min || Math.max(1, Math.abs(max) * 0.005);
-  const yMin = mode === "basis" ? Math.min(min, 0) - span * 0.2 : min - span * 0.2;
-  const yMax = mode === "basis" ? Math.max(max, 0) + span * 0.2 : max + span * 0.2;
-  const x = (index: number) => padding.left + (index / Math.max(points.length - 1, 1)) * innerW;
-  const y = (value: number) => padding.top + innerH - ((value - yMin) / (yMax - yMin)) * innerH;
+  const frontPrice = finitePrice(points[0]?.price ?? 0);
+  const values = forwardCurveValues(mode, points);
+  const { min: yMin, max: yMax } = forwardCurveDomain(mode, values, frontPrice);
+  const span = yMax - yMin || 1;
+  const x = (index: number) =>
+    points.length <= 1
+      ? padding.left + innerW / 2
+      : padding.left + (index / (points.length - 1)) * innerW;
+  const y = (value: number) => padding.top + innerH - ((value - yMin) / span) * innerH;
   const ticks = niceTicks(yMin, yMax, 4);
   const gradientId = useId().replace(/[:]/g, "");
-  const path = values.map((value, index) => `${index === 0 ? "M" : "L"} ${x(index)} ${y(value)}`).join(" ");
-  const area = `${path} L ${x(points.length - 1)} ${padding.top + innerH} L ${x(0)} ${padding.top + innerH} Z`;
+  const path = values
+    .map((value, index) => `${index === 0 ? "M" : "L"} ${x(index)} ${y(value)}`)
+    .join(" ");
+  const area =
+    values.length > 0
+      ? `${path} L ${x(values.length - 1)} ${padding.top + innerH} L ${x(0)} ${padding.top + innerH} Z`
+      : "";
+  const lastIndex = Math.max(points.length - 1, 0);
+  const lastPoint = points[lastIndex];
+  const lastSpreadAbs = lastPoint ? finitePrice(lastPoint.price) - frontPrice : 0;
+  const lastSpreadPct = frontPrice > 0 ? (lastSpreadAbs / frontPrice) * 100 : 0;
+  const spreadSummary =
+    points.length > 0
+      ? `F${lastIndex + 1}−F1 ${lastSpreadAbs >= 0 ? "+" : "−"}${Math.abs(lastSpreadAbs).toFixed(
+          2,
+        )} (${lastSpreadPct >= 0 ? "+" : "−"}${Math.abs(lastSpreadPct).toFixed(2)}%)`
+      : "no listed legs";
+  const isPercentMode = mode !== "raw_price";
+  const referenceLine = mode === "normalized_basis" || mode === "roll_yield";
 
   const formatTick = (value: number) =>
-    mode === "normalized"
-      ? value.toFixed(1)
-      : mode === "basis"
-        ? `${value.toFixed(1)}bp`
-        : value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    isPercentMode
+      ? `${value.toFixed(2)}%`
+      : value.toLocaleString("en-US", { maximumFractionDigits: 2 });
 
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="h-auto w-full" role="img" aria-label={ariaLabel}>
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className="h-auto w-full"
+      role="img"
+      aria-label={ariaLabel}
+      data-testid="forward-curve"
+      data-mode={mode}
+      data-y-min={yMin.toFixed(4)}
+      data-y-max={yMax.toFixed(4)}
+      data-y-span={(yMax - yMin).toFixed(4)}
+      data-front-price={frontPrice.toFixed(4)}
+      data-point-count={points.length}
+      data-last-spread-abs={lastSpreadAbs.toFixed(4)}
+      data-last-spread-pct={lastSpreadPct.toFixed(4)}
+    >
+      <title>{`${ariaLabel} · ${spreadSummary}`}</title>
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor="#3B82F6" stopOpacity={0.16} />
@@ -368,41 +467,55 @@ export function ForwardCurveChart({
 
       {ticks.map((tick) => (
         <g key={tick}>
-          <line x1={padding.left} x2={width - padding.right} y1={y(tick)} y2={y(tick)} stroke="#1E1E22" />
-          <text x={padding.left - 8} y={y(tick) + 3} textAnchor="end" fill="#71717A" fontSize={9} fontFamily="JetBrains Mono, monospace">
+          <line
+            x1={padding.left}
+            x2={width - padding.right}
+            y1={y(tick)}
+            y2={y(tick)}
+            stroke="#1E1E22"
+          />
+          <text
+            x={padding.left - 8}
+            y={y(tick) + 3}
+            textAnchor="end"
+            fill="#71717A"
+            fontSize={9}
+            fontFamily="JetBrains Mono, monospace"
+          >
             {formatTick(tick)}
           </text>
         </g>
       ))}
-      {mode === "basis" ? (
-        <line x1={padding.left} x2={width - padding.right} y1={y(0)} y2={y(0)} stroke="#3F3F46" />
+      {referenceLine ? (
+        <line
+          data-testid="curve-zero-reference"
+          x1={padding.left}
+          x2={width - padding.right}
+          y1={y(0)}
+          y2={y(0)}
+          stroke="#A1A1AA"
+          strokeWidth={1}
+          strokeDasharray="5 4"
+          opacity={0.85}
+        />
       ) : null}
 
-      {mode === "basis" ? (
-        values.map((value, index) => (
-          <rect
-            key={`basis-${points[index]?.label}`}
-            x={x(index) - 10}
-            y={Math.min(y(value), y(0))}
-            width={20}
-            height={Math.max(2, Math.abs(y(0) - y(value)))}
-            fill={value >= 0 ? "rgba(244,63,94,0.65)" : "rgba(16,185,129,0.65)"}
-            rx={2}
-          />
-        ))
-      ) : (
-        <>
-          <path d={area} fill={`url(#${gradientId})`} />
-          <path d={path} fill="none" stroke="#3B82F6" strokeWidth={1.75} />
-        </>
-      )}
+      <path d={area} fill={`url(#${gradientId})`} />
+      <path d={path} fill="none" stroke="#3B82F6" strokeWidth={1.75} />
 
       {points.map((point, index) => (
-        <g key={`${point.label}-${point.days}`}>
-          {mode !== "basis" ? (
+        <g key={`${point.label}-${index}`}>
+          <title>
+            {`${point.label}: ${finitePrice(point.price).toFixed(2)} · ${
+              isPercentMode
+                ? `${(values[index] ?? 0).toFixed(2)}%`
+                : finitePrice(point.price).toFixed(2)
+            } · ${spreadSummary}`}
+          </title>
+          {mode === "raw_price" ? (
             <circle
               cx={x(index)}
-              cy={y((values[index] ?? 0) ?? 0)}
+              cy={y(values[index] ?? 0)}
               r={point.isFront ? 3.5 : 2.5}
               fill={point.isFront ? "#3B82F6" : "#121215"}
               stroke="#3B82F6"
@@ -419,20 +532,31 @@ export function ForwardCurveChart({
           >
             {point.label}
           </text>
-          {mode !== "basis" ? (
+          {mode === "raw_price" ? (
             <text
               x={index === 0 ? x(0) + 4 : x(index)}
-              y={y((values[index] ?? 0)) - 9}
+              y={y(values[index] ?? 0) - 9}
               textAnchor={index === 0 ? "start" : "middle"}
               fill="#71717A"
               fontSize={8.5}
               fontFamily="JetBrains Mono, monospace"
             >
-              {mode === "normalized" ? (values[index] ?? 0).toFixed(2) : point.price.toFixed(2)}
+              {finitePrice(point.price).toFixed(2)}
             </text>
           ) : null}
         </g>
       ))}
+      {points.length === 0 ? (
+        <text
+          x={padding.left + innerW / 2}
+          y={padding.top + innerH / 2}
+          textAnchor="middle"
+          fill="#71717A"
+          fontSize={11}
+        >
+          No listed contracts in this curve.
+        </text>
+      ) : null}
     </svg>
   );
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { useState, type ReactNode } from "react";
+import { useCallback, useState, type ReactNode } from "react";
 
 import { getPipeline, listStrategies } from "@/lib/api";
 import { cn } from "@/lib/cn";
@@ -21,6 +21,7 @@ import { useTelemetry } from "../providers/telemetry-provider";
 import { Button, ModePill, NavTab, StatusDot, type Tone } from "../ui/primitives";
 import { FlattenDialog } from "./flatten-dialog";
 import { PowerIcon, ChevronDownIcon, ChevronUpIcon } from "./icons";
+import { LLMStatusPill } from "./llm-status-pill";
 import { OperatorDrawer } from "./operator-drawer";
 import { TelemetryDrawer } from "./telemetry-drawer";
 
@@ -75,6 +76,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [flattenOpen, setFlattenOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [operatorOpen, setOperatorOpen] = useState(false);
+  const closeTelemetry = useCallback(() => setDrawerOpen(false), []);
+  const toggleTelemetry = useCallback(() => setDrawerOpen((open) => !open), []);
+  const closeOperator = useCallback(() => setOperatorOpen(false), []);
+  const toggleOperator = useCallback(() => setOperatorOpen((open) => !open), []);
 
   const connection = connectionState(status);
   const modeTone = MODE_TONE[dataMode.key];
@@ -183,6 +188,8 @@ export function AppShell({ children }: { children: ReactNode }) {
             <ModePill label={dataMode.label} tone={modeTone} title={modeTooltip} />
           </span>
 
+          <LLMStatusPill />
+
           <Button
             variant="danger"
             size="xs"
@@ -242,7 +249,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </span>
           <button
             type="button"
-            onClick={() => setDrawerOpen((open) => !open)}
+            onClick={toggleTelemetry}
             aria-expanded={drawerOpen}
             className="focus-ring flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-zinc-400 transition-colors hover:bg-surface hover:text-zinc-200"
           >
@@ -252,7 +259,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <button
             type="button"
             data-testid="operator-button"
-            onClick={() => setOperatorOpen((open) => !open)}
+            onClick={toggleOperator}
             aria-expanded={operatorOpen}
             className="focus-ring flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-zinc-400 transition-colors hover:bg-surface hover:text-zinc-200"
           >
@@ -261,8 +268,8 @@ export function AppShell({ children }: { children: ReactNode }) {
         </span>
       </footer>
 
-      <TelemetryDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} />
-      <OperatorDrawer open={operatorOpen} onClose={() => setOperatorOpen(false)} />
+      <TelemetryDrawer open={drawerOpen} onClose={closeTelemetry} />
+      <OperatorDrawer open={operatorOpen} onClose={closeOperator} />
       <FlattenDialog
         open={flattenOpen}
         positions={positions}

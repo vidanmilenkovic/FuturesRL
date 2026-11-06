@@ -2,7 +2,12 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import { ForwardCurveChart, type CurvePoint } from "@/components/charts/plots";
+import {
+  ForwardCurveChart,
+  type CurvePoint,
+  type ForwardCurveMode,
+} from "@/components/charts/plots";
+import { RootScopeFilterBar, useRootScopeFilter } from "@/components/filters/root-scope-filter";
 import {
   Badge,
   EmptyState,
@@ -18,7 +23,6 @@ import { formatBps, formatDate, formatDateTime, formatPct } from "@/lib/format";
 import type { RollCalendarEntry, TermCurve, TermRegime, TermStructureResponse } from "@/lib/types";
 import { useAsyncData } from "@/lib/use-async-data";
 
-type CurveMode = "price" | "normalized" | "basis";
 type RollTab = "schedule" | "bag";
 
 const REGIME_TONE: Record<TermRegime, Tone> = {
@@ -41,12 +45,28 @@ function secondPrice(curve: TermCurve): number {
   return curve.contracts[1]?.price ?? 0;
 }
 
+function lastPrice(curve: TermCurve): number {
+  return curve.contracts[curve.contracts.length - 1]?.price ?? 0;
+}
+
+function lastLabel(curve: TermCurve): string {
+  return `F${Math.max(curve.contracts.length, 1)}`;
+}
+
+function curveSpread(curve: TermCurve): { absolute: number; pct: number } {
+  const front = frontPrice(curve);
+  const last = lastPrice(curve);
+  const absolute = last - front;
+  return { absolute, pct: front > 0 ? (absolute / front) * 100 : 0 };
+}
+
 /** View 4 — futures term structure & roll calendar. */
 export function TermStructureView() {
-  const terms = useAsyncData(getTermStructure);
+  const filter = useRootScopeFilter();
+  const terms = useAsyncData(() => getTermStructure(filter.query));
   const [data, setData] = useState<TermStructureResponse | null>(null);
   const [root, setRoot] = useState<string | null>(null);
-  const [mode, setMode] = useState<CurveMode>("price");
+  const [mode, setMode] = useState<ForwardCurveMode>("normalized_basis");
   const [rollTab, setRollTab] = useState<RollTab>("schedule");
 
   useEffect(() => {
@@ -70,6 +90,12 @@ export function TermStructureView() {
     () => (data?.roll_calendar ?? []).find((roll) => roll.root === selected?.root) ?? null,
     [data, selected],
   );
+
+  useEffect(() => {
+    if (!filter.hydrated) return;
+    terms.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter.key, filter.hydrated, terms.reload]);
 
   if (terms.loading && !data) {
     return (
@@ -98,13 +124,29 @@ export function TermStructureView() {
     price: contract.price,
     days: contract.days_to_expiry,
     isFront: contract.is_front,
+    rollYieldAnnualized: contract.roll_yield_annualized,
   }));
+  const spread = curveSpread(selected);
+  const spreadLabel = `${lastLabel(selected)}−F1`;
   const basis = secondPrice(selected) - frontPrice(selected);
   const basisPct = frontPrice(selected) > 0 ? basis / frontPrice(selected) : 0;
   const bagRolls = (data.roll_calendar ?? []).filter((roll) => roll.method.toLowerCase().includes("bag"));
 
   return (
     <div className="grid grid-cols-12 gap-3">
+      <RootScopeFilterBar
+        scope={filter.state.scope}
+        sector={filter.state.sector}
+        roots={filter.state.roots}
+        onScopeChange={filter.setScope}
+        onSectorChange={filter.setSector}
+        onToggleRoot={filter.toggleRoot}
+        onClearRoots={filter.clearRoots}
+        onRefresh={() => terms.reload()}
+        refreshing={terms.loading}
+        selectedCount={data.curves.length}
+        dataOrigin={data.data_origin ?? null}
+      />
       {/* ------------------------------------------------------ root selector */}
       <Panel className="col-span-12" flush>
         <div className="no-scrollbar flex items-stretch gap-1 overflow-x-auto px-2 py-2">
@@ -166,23 +208,52 @@ export function TermStructureView() {
         className="col-span-12 xl:col-span-8"
         title={`${selected.root} · forward curve`}
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <span
+              data-testid="curve-spread-header"
+              data-spread-abs={spread.absolute.toFixed(4)}
+              data-spread-pct={spread.pct.toFixed(4)}
+              data-spread-label={spreadLabel}
+              title={`${spreadLabel} absolute ${spread.absolute >= 0 ? "+" : "−"}${Math.abs(
+                spread.absolute,
+              ).toFixed(2)} · ${spread.pct >= 0 ? "+" : "−"}${Math.abs(spread.pct).toFixed(2)}%`}
+              className={cn(
+                "font-mono text-[10.5px] tabular-nums",
+                spread.absolute >= 0 ? "text-loss/90" : "text-gain/90",
+              )}
+            >
+              {spreadLabel} {spread.absolute >= 0 ? "+" : "−"}
+              {Math.abs(spread.absolute).toFixed(2)} ({spread.pct >= 0 ? "+" : "−"}
+              {Math.abs(spread.pct).toFixed(2)}%)
+            </span>
             <Badge tone={REGIME_TONE[selected.regime]}>{REGIME_LABEL[selected.regime]}</Badge>
             <Segmented
               ariaLabel="Curve mode"
               value={mode}
               onChange={setMode}
               options={[
-                { value: "price", label: "Price" },
-                { value: "normalized", label: "Normalized" },
-                { value: "basis", label: "Basis" },
+                {
+                  value: "normalized_basis",
+                  label: "Normalized Basis %",
+                  title: "Normalized Basis % vs. F1",
+                },
+                {
+                  value: "roll_yield",
+                  label: "Roll Yield %",
+                  title: "Annualized Roll Yield %",
+                },
+                {
+                  value: "raw_price",
+                  label: "Raw Price $",
+                  title: "Raw Contract Price ($)",
+                },
               ]}
             />
           </div>
         }
       >
         <ForwardCurveChart points={curvePoints} mode={mode} ariaLabel={`${selected.root} forward curve`} />
-        <div className="mt-2 grid grid-cols-2 gap-3 border-t border-hairline pt-2 sm:grid-cols-5">
+        <div className="mt-2 grid grid-cols-2 gap-3 border-t border-hairline pt-2 sm:grid-cols-3 xl:grid-cols-6">
           <CurveStat label="Front (F1)" value={frontPrice(selected).toFixed(2)} />
           <CurveStat
             label="F2 − F1 basis"
@@ -195,6 +266,12 @@ export function TermStructureView() {
             value={formatPct(selected.roll_yield_annualized)}
             tone={selected.roll_yield_annualized >= 0 ? "text-gain" : "text-loss"}
           />
+          <CurveStat
+            label={`${spreadLabel} spread`}
+            value={`${spread.absolute >= 0 ? "+" : "−"}${Math.abs(spread.absolute).toFixed(2)}`}
+            sub={`${spread.pct >= 0 ? "+" : "−"}${Math.abs(spread.pct).toFixed(2)}%`}
+            tone={spread.absolute >= 0 ? "text-loss" : "text-gain"}
+          />
           <CurveStat label="Term slope" value={formatPct(selected.slope, 3)} />
           <CurveStat
             label="Next roll"
@@ -204,11 +281,11 @@ export function TermStructureView() {
           />
         </div>
         <p className="mt-1 text-[10.5px] text-zinc-600">
-          {mode === "basis"
-            ? "F1-relative basis in basis points; positive bars indicate contango (deferred contracts above the front)."
-            : mode === "normalized"
-              ? "Each contract normalised to F1 = 100 for cross-root comparison."
-              : "Absolute settlement prices by listed expiry."}
+          {mode === "normalized_basis"
+            ? "Normalized basis % vs F1: (Fn − F1) / F1 × 100; F1 = 0.00% with a dashed zero reference and a minimum ±1.5% axis span (expands for steeper curves). Positive = contango, negative = backwardation."
+            : mode === "roll_yield"
+              ? "Annualized roll yield % per deferred leg (F1 = 0%); positive = backwardation carry, negative = contango drag."
+              : "Raw contract settlement prices ($); the axis keeps at least ±1.0% around F1 so flat curves still render with visible slope."}
         </p>
       </Panel>
 

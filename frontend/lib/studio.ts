@@ -600,6 +600,20 @@ export function validateDraft(draft: StudioDraft): StudioValidation {
     errors.push("Strategy ID must match ^[a-z][a-z0-9_]{0,63}$ (lowercase slug, no hyphens).");
   }
   if (draft.universe.name.trim().length === 0) errors.push("Universe selector is required.");
+  if (draft.universe.name === "composite") {
+    const components = universeStackNames(draft);
+    if (components.length < 2) {
+      errors.push("Composite universe stack needs at least two component selectors.");
+    }
+    const unsupported = components.filter((name) => !["liquidity", "regime"].includes(name));
+    if (unsupported.length > 0) {
+      errors.push(`Unsupported composite universe component(s): ${unsupported.join(", ")}.`);
+    }
+    const mode = draft.universe.params.mode;
+    if (mode !== undefined && mode !== "intersection" && mode !== "union") {
+      errors.push("Composite universe mode must be intersection or union.");
+    }
+  }
   if (draft.allocator.name.trim().length === 0) errors.push("Allocator is required.");
   if (rootsOf(draft).length < 2) errors.push("Select at least 2 universe roots.");
   if (draft.timing.length === 0) warnings.push("No timing overlay selected — raw allocator weights will trade as-is.");
@@ -1164,6 +1178,15 @@ export function normalizeStudioCatalog(
           }))
         : fallback.allocator_choices),
     universe: universeMetadata,
+    formulas: isRecord(candidate.formulas)
+      ? Object.fromEntries(
+          Object.entries(candidate.formulas).filter(([, value]) => typeof value === "string") as [string, string][],
+        )
+      : fallback.formulas,
+    advanced_parameter_keys:
+      asArray(candidate.advanced_parameter_keys).length > 0
+        ? asArray(candidate.advanced_parameter_keys).map(String)
+        : fallback.advanced_parameter_keys,
     presets: presets.length > 0 ? presets : fallback.presets,
     strategies:
       strategiesRaw.length > 0
@@ -1528,6 +1551,353 @@ export function formatParamPath(path: string): string {
     .replace(/\.params\./g, " · ")
     .replace(/\./g, " · ")
     .replace(/_/g, " ");
+}
+
+// ---------------------------------------------------------------------------
+// Workstation UX: allocator math, composite stacks, custom params/presets
+// ---------------------------------------------------------------------------
+
+/** Fallback one-line allocator math (catalog `formulas` wins when served). */
+export const ALLOCATOR_MATH: Record<string, string> = {
+  equal_weight:
+    "w_i = L / N — every selected root gets the same signed notional weight; only gross leverage L matters.",
+  volatility_target:
+    "w = inverse-vol weights × min(target_vol / sqrt(wᵀΣw), L_max) — inverse volatility sizes each root, then the book is scaled to the annual volatility target.",
+  risk_parity:
+    "w_i (Σw)_i = b_i wᵀΣw — each root contributes its budgeted share of total risk; the fixed point is solved iteratively.",
+  mean_variance:
+    "w ∝ Σ⁻¹μ under the weight/gross caps (max wᵀμ − λ/2·wᵀΣw) — expected-return scores are scaled by covariance risk and a risk-aversion penalty.",
+  drl:
+    "w = clip(policy(o_t), −w_max, w_max), scaled to L_max — the neural policy maps the observation to target weights; risk caps and the projection still apply.",
+};
+
+/** One-line math/why explanation for an allocator (catalog metadata preferred). */
+export function allocatorMath(
+  allocator: string,
+  formulas?: Record<string, string> | null,
+): string {
+  return formulas?.[allocator] ?? ALLOCATOR_MATH[allocator] ?? "";
+}
+
+/** Allocator families that expose a math tooltip in the Manual Builder. */
+export function allocatorMathOptions(
+  formulas?: Record<string, string> | null,
+): { value: string; label: string; formula: string }[] {
+  const source = formulas && Object.keys(formulas).length > 0 ? formulas : ALLOCATOR_MATH;
+  return Object.entries(source).map(([value, formula]) => ({
+    value,
+    label: value.replace(/_/g, " "),
+    formula,
+  }));
+}
+
+// -- composite stacks -------------------------------------------------------
+
+export type UniverseStackMode = "intersection" | "union";
+
+/** Unsupported names inside a composite universe stack (keep the YAML engine-valid). */
+export function universeStackChoices(): StudioParamOption[] {
+  return [
+    { value: "liquidity", label: "Liquidity + OI" },
+    { value: "regime", label: "Macro regime" },
+  ];
+}
+
+/** Selector names currently composing the universe (single name or composite components). */
+export function universeStackNames(draft: StudioDraft): string[] {
+  if (draft.universe.name !== "composite") return [draft.universe.name];
+  const raw = draft.universe.params.components;
+  const names = Array.isArray(raw) ? raw.map(String) : typeof raw === "string" ? raw.split(",") : [];
+  const cleaned = names.map((name) => name.trim().toLowerCase()).filter(Boolean);
+  return cleaned.length > 0 ? Array.from(new Set(cleaned)) : ["liquidity"];
+}
+
+/** Intersection/union mode of a composite universe stack. */
+export function universeStackMode(draft: StudioDraft): UniverseStackMode {
+  return draft.universe.params.mode === "union" ? "union" : "intersection";
+}
+
+/**
+ * Serialize a universe stack to a valid backend `StrategyConfig.universe` stage.
+ *
+ * One selector keeps independent parameters; two or more serialize to the
+ * backend composite selector (`components` + `mode`) because the declarative
+ * schema exposes a single universe stage. Component parameters are selected by
+ * the caller from the catalog defaults in composite mode (the engine's
+ * composite factory builds components with their defaults).
+ */
+export function applyUniverseStack(
+  draft: StudioDraft,
+  names: string[],
+  mode: UniverseStackMode,
+  defaultsBySelector: Record<string, Record<string, StudioParamValue>>,
+): StudioDraft {
+  const unique = Array.from(
+    new Set(names.map((name) => name.trim().toLowerCase()).filter((name) => name.length > 0)),
+  );
+  const roots = draft.universe.params.roots;
+  const topN = draft.universe.params.top_n;
+  if (unique.length === 0) return draft;
+  if (unique.length === 1) {
+    const name = unique[0] as string;
+    const params: Record<string, StudioParamValue> = {
+      ...(defaultsBySelector[name] ?? {}),
+    };
+    if (draft.universe.name === name) {
+      Object.assign(params, draft.universe.params);
+    }
+    if (roots !== undefined) params.roots = roots;
+    if (topN !== undefined) params.top_n = topN;
+    return { ...draft, universe: { name, params } };
+  }
+  const params: Record<string, StudioParamValue> = {
+    components: unique.join(","),
+    mode,
+  };
+  if (roots !== undefined) params.roots = roots;
+  if (topN !== undefined) params.top_n = topN;
+  return { ...draft, universe: { name: "composite", params } };
+}
+
+/** Enabled timing stack entries with their editable combination weight/priority. */
+export interface TimingStackEntry {
+  name: string;
+  weight: number;
+}
+
+export function timingStackEntries(
+  draft: StudioDraft,
+  weights?: Record<string, number> | null,
+): TimingStackEntry[] {
+  const fallback = draft.timing.length;
+  return draft.timing.map((stage, index) => ({
+    name: stage.name,
+    weight: weights?.[stage.name] ?? Math.max(1, fallback - index),
+  }));
+}
+
+/** Reorder `draft.timing` by combination weights (higher weight = applied earlier). */
+export function reorderTimingByWeights(
+  draft: StudioDraft,
+  weights: Record<string, number>,
+): StudioDraft {
+  const next = cloneDraft(draft);
+  next.timing.sort((a, b) => (weights[b.name] ?? 0) - (weights[a.name] ?? 0));
+  return next;
+}
+
+export const TIMING_STACK_COMPONENTS = ["tsmom", "kama", "carry_filter", "mean_reversion", "seasonality"] as const;
+
+// -- custom parameters ------------------------------------------------------
+
+const RESERVED_PARAM_KEYS = new Set(["name", "selector", "enabled", "components", "mode"]);
+
+/** Custom parameter keys are snake_case scalars accepted by the YAML stage model. */
+export function isValidCustomParamKey(key: string): boolean {
+  const cleaned = key.trim();
+  return /^[a-z][a-z0-9_]{0,63}$/.test(cleaned) && !RESERVED_PARAM_KEYS.has(cleaned);
+}
+
+/** Parse a raw string from the custom-parameter form into a stage scalar. */
+export function parseCustomParamValue(raw: string): { value?: StudioParamValue; error?: string } {
+  const text = raw.trim();
+  if (text.length === 0) return { error: "Enter a value (number, true/false, or text)." };
+  if (/^(true|false)$/i.test(text)) return { value: text.toLowerCase() === "true" };
+  if (/^-?(\d+(\.\d*)?|\.\d+)$/.test(text)) {
+    const numeric = Number(text);
+    if (Number.isFinite(numeric)) return { value: numeric };
+  }
+  return { value: text };
+}
+
+/** Add/replace a custom scalar parameter on a stage (or one of its overlays). */
+export function setCustomParam(
+  draft: StudioDraft,
+  stage: "universe" | "allocator" | "timing" | "risk",
+  key: string,
+  value: StudioParamValue,
+  overlayName?: string,
+): StudioDraft {
+  const next = cloneDraft(draft);
+  if (stage === "universe" || stage === "allocator") {
+    const target = stage === "universe" ? next.universe : next.allocator;
+    target.params[key] = value;
+    return next;
+  }
+  const stages = stage === "timing" ? next.timing : next.risk;
+  const target = stages.find((entry) => entry.name === overlayName);
+  if (!target) return next;
+  target.params[key] = value;
+  return next;
+}
+
+/** Remove a parameter (catalog or custom) from a stage/overlay. */
+export function removeCustomParam(
+  draft: StudioDraft,
+  stage: "universe" | "allocator" | "timing" | "risk",
+  key: string,
+  overlayName?: string,
+): StudioDraft {
+  const next = cloneDraft(draft);
+  if (stage === "universe" || stage === "allocator") {
+    const target = stage === "universe" ? next.universe : next.allocator;
+    delete target.params[key];
+    return next;
+  }
+  const stages = stage === "timing" ? next.timing : next.risk;
+  const target = stages.find((entry) => entry.name === overlayName);
+  if (target) delete target.params[key];
+  return next;
+}
+
+/** Advanced/math-detail parameters for a stage (from the additive catalog metadata). */
+export function advancedParametersFor(
+  parameters: StudioParameter[],
+  stage: StudioStageKey,
+  stageName?: string | null,
+): StudioParameter[] {
+  return parameters.filter(
+    (parameter) =>
+      parameter.stage === stage &&
+      (stageName == null || parameter.stage_name === stageName) &&
+      isAdvancedParameter(parameter),
+  );
+}
+
+// -- custom presets (localStorage only; honest fallback) --------------------
+
+export interface StudioStorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+export const CUSTOM_PRESET_STORAGE_KEY = "futuresrlx.studio.custom-presets.v1";
+
+export interface StudioCustomPreset {
+  id: string;
+  name: string;
+  description: string;
+  createdAt: string;
+  draft: StudioDraft;
+  timingWeights?: Record<string, number>;
+  universeMode?: UniverseStackMode;
+}
+
+/** Browser localStorage when available (returns null in SSR/private contexts). */
+export function customPresetStorage(): StudioStorageLike | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function normaliseCustomPreset(raw: unknown): StudioCustomPreset | null {
+  if (!isRecord(raw)) return null;
+  const id = asString(raw.id, "");
+  const name = asString(raw.name, "");
+  if (id.length === 0 || name.length === 0) return null;
+  const draft = isRecord(raw.draft) ? normaliseDraft(raw.draft, id) : null;
+  if (!draft) return null;
+  const rawWeights = isRecord(raw.timingWeights ?? raw.timing_weights)
+    ? (raw.timingWeights ?? raw.timing_weights)
+    : null;
+  const timingWeights = rawWeights
+    ? Object.fromEntries(
+        Object.entries(rawWeights).filter(([, value]) => typeof value === "number") as [string, number][],
+      )
+    : undefined;
+  return {
+    id,
+    name,
+    description: asString(raw.description, ""),
+    createdAt: asString(raw.created_at ?? raw.createdAt, new Date(0).toISOString()),
+    draft,
+    timingWeights,
+    universeMode: raw.universeMode === "union" ? "union" : raw.universeMode === "intersection" ? "intersection" : undefined,
+  };
+}
+
+/** Load locally saved custom presets (corrupt/absent storage = empty, never throws). */
+export function loadCustomPresets(storage: StudioStorageLike | null = customPresetStorage()): StudioCustomPreset[] {
+  if (!storage) return [];
+  try {
+    const raw = storage.getItem(CUSTOM_PRESET_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    const entries = Array.isArray(parsed) ? parsed : isRecord(parsed) && Array.isArray(parsed.presets) ? parsed.presets : [];
+    return entries.map(normaliseCustomPreset).filter((entry): entry is StudioCustomPreset => entry !== null);
+  } catch {
+    return [];
+  }
+}
+
+/** Persist a draft as a custom preset locally; returns the saved entry + honest error. */
+export function saveCustomPreset(
+  draft: StudioDraft,
+  name: string,
+  options: {
+    storage?: StudioStorageLike | null;
+    timingWeights?: Record<string, number>;
+    universeMode?: UniverseStackMode;
+  } = {},
+): { preset: StudioCustomPreset | null; error: string | null; presets: StudioCustomPreset[] } {
+  const storage = options.storage === undefined ? customPresetStorage() : options.storage;
+  const cleaned = name.trim();
+  if (!cleaned) {
+    return { preset: null, error: "Enter a preset name.", presets: loadCustomPresets(storage) };
+  }
+  if (!storage) {
+    return {
+      preset: null,
+      error: "Browser storage is unavailable — custom presets cannot be saved here (no server save was attempted).",
+      presets: [],
+    };
+  }
+  const existing = loadCustomPresets(storage);
+  const slug = `cp_${cleaned.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "preset"}_${Date.now().toString(36)}`;
+  const preset: StudioCustomPreset = {
+    id: slug,
+    name: cleaned,
+    description: draft.description,
+    createdAt: new Date().toISOString(),
+    draft: cloneDraft(draft),
+    ...(options.timingWeights ? { timingWeights: { ...options.timingWeights } } : {}),
+    ...(options.universeMode ? { universeMode: options.universeMode } : {}),
+  };
+  const presets = [...existing, preset];
+  try {
+    storage.setItem(CUSTOM_PRESET_STORAGE_KEY, JSON.stringify(presets));
+    return { preset, error: null, presets };
+  } catch {
+    return {
+      preset: null,
+      error: "Browser storage rejected the preset (quota/private mode); nothing was saved.",
+      presets: existing,
+    };
+  }
+}
+
+/** Remove a locally saved custom preset. */
+export function deleteCustomPreset(id: string, storage: StudioStorageLike | null = customPresetStorage()): StudioCustomPreset[] {
+  const existing = loadCustomPresets(storage);
+  const next = existing.filter((preset) => preset.id !== id);
+  if (storage) {
+    try {
+      storage.setItem(CUSTOM_PRESET_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      return existing;
+    }
+  }
+  return next;
+}
+
+export function customPresetFromSaved(preset: StudioCustomPreset, id?: string): StudioDraft {
+  const draft = cloneDraft(preset.draft);
+  if (id) draft.id = id;
+  return draft;
 }
 
 /** Build the Optuna search-space from enabled tunable bounds. */

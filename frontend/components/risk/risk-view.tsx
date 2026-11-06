@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 
 import { RiskMeter } from "@/components/charts/plots";
+import { RootScopeFilterBar, useRootScopeFilter } from "@/components/filters/root-scope-filter";
+import { useAccount } from "@/components/providers/account-provider";
 import { useTelemetry } from "@/components/providers/telemetry-provider";
 import {
   Badge,
@@ -57,7 +59,9 @@ const SEVERITY_TONE: Record<string, Tone> = {
 
 /** View 3 — LLM Risk-First monitor. */
 export function RiskView() {
-  const risk = useAsyncData(getRiskState);
+  const filter = useRootScopeFilter();
+  const { account, positions } = useAccount();
+  const risk = useAsyncData(() => getRiskState(filter.query));
   const { latest } = useTelemetry();
   const now = useNow(1000);
   const [state, setState] = useState<RiskStateResponse | null>(null);
@@ -67,6 +71,15 @@ export function RiskView() {
   }, [risk.data]);
 
   useEffect(() => {
+    if (!filter.hydrated) return;
+    risk.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter.key, filter.hydrated, risk.reload]);
+
+  useEffect(() => {
+    if (filter.state.scope !== "strategy" || filter.state.sector || filter.state.roots.length > 0) {
+      return;
+    }
     const frame = latest.risk_alert;
     if (!frame) return;
     const payload = frame.payload;
@@ -83,7 +96,7 @@ export function RiskView() {
           }
         : previous,
     );
-  }, [latest.risk_alert]);
+  }, [latest.risk_alert, filter.state.scope, filter.state.sector, filter.state.roots.length]);
 
   const nextTierOne = useMemo(
     () =>
@@ -126,8 +139,89 @@ export function RiskView() {
       ? compactCountdown(nextTierOne.event_time, now)
       : "—";
 
+  const equityCurve = account?.equity_curve ?? [];
+  const peakEquity = equityCurve.reduce((peak, point) => Math.max(peak, point.value), 0);
+  const lastEquity = equityCurve[equityCurve.length - 1]?.value ?? 0;
+  const trailingDrawdown = peakEquity > 0 ? Math.max(0, (peakEquity - lastEquity) / peakEquity) : null;
+  const grossLeverage = account?.gross_leverage ?? 0;
+  const grossCap = 3;
+  const singleCap = 0.35;
+  const largestWeight =
+    account && account.net_liquidation > 0
+      ? positions.reduce((largest, position) => Math.max(largest, Math.abs(position.notional) / account.net_liquidation), 0)
+      : 0;
+  const targetVol = state.thresholds.target_annual_volatility;
+  const portfolioVol = account?.portfolio_volatility;
+  const drawdownCap = 0.2;
+
   return (
-    <div className="grid min-h-full grid-cols-12 grid-rows-[auto_minmax(0,1fr)] gap-3">
+    <div className="grid min-h-full grid-cols-12 grid-rows-[auto_auto_auto_minmax(0,1fr)] gap-3">
+      <RootScopeFilterBar
+        scope={filter.state.scope}
+        sector={filter.state.sector}
+        roots={filter.state.roots}
+        onScopeChange={filter.setScope}
+        onSectorChange={filter.setSector}
+        onToggleRoot={filter.toggleRoot}
+        onClearRoots={filter.clearRoots}
+        onRefresh={() => risk.reload()}
+        refreshing={risk.loading}
+        selectedCount={state.assessments.length}
+        dataOrigin={state.data_origin ?? null}
+      />
+      <Panel className="col-span-12" title="Quant Risk Thresholds" actions={<span className="text-[10.5px] text-zinc-600">deterministic · current vs limit</span>}>
+        <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5" data-testid="risk-hero-meters">
+          <UtilizationMeter
+            testId="risk-meter-margin"
+            label="Initial margin"
+            current={account?.margin_utilization ?? 0}
+            limit={state.thresholds.max_margin_utilization}
+            format={(value) => formatPctPlain(value)}
+            plain="Portfolio IM must stay under the 60% hard cap; the translator scales orders down before breaching it."
+          />
+          <UtilizationMeter
+            testId="risk-meter-daily-loss"
+            label="Daily loss"
+            current={Math.max(0, -(account?.day_pnl_pct ?? 0))}
+            limit={state.thresholds.daily_max_loss_pct}
+            format={(value) => formatPctPlain(value)}
+            plain="Realised + unrealised drop from the day's starting NLV; the kill switch flattens at the limit."
+          />
+          <UtilizationMeter
+            testId="risk-meter-vol"
+            label="Volatility target"
+            current={portfolioVol ?? null}
+            limit={targetVol}
+            format={(value) => formatPctPlain(value)}
+            plain="Ex-ante book volatility vs the annualised target. The quant overlay scales gross weights to this budget."
+          />
+          <UtilizationMeter
+            testId="risk-meter-gross"
+            label="Gross / single-instrument caps"
+            current={grossLeverage}
+            limit={grossCap}
+            format={(value) => `${value.toFixed(2)}×`}
+            plain={`Gross leverage cap ${grossCap.toFixed(1)}×; largest single weight ${(largestWeight * 100).toFixed(1)}% vs ${(singleCap * 100).toFixed(0)}% cap.`}
+            extra={{ label: "Largest single", util: largestWeight / singleCap, text: `${(largestWeight * 100).toFixed(1)}% / ${(singleCap * 100).toFixed(0)}%` }}
+          />
+          <UtilizationMeter
+            testId="risk-meter-drawdown"
+            label="Trailing DD + turbulence"
+            current={trailingDrawdown}
+            limit={drawdownCap}
+            format={(value) => formatPctPlain(value)}
+            plain="Peak-to-current equity drawdown vs the 20% trailing guard. Turbulence is not reported by this API payload."
+            extra={{ label: "Turbulence", util: null, text: "n/a" }}
+          />
+        </div>
+      </Panel>
+
+      <div className="col-span-12 rounded-md border border-warn/30 bg-warn-soft/20 px-3 py-2 text-[11px] leading-5 text-amber-200" data-testid="llm-one-way-brake">
+        <span className="font-medium text-amber-100">LLM Risk-First overlay · one-way brake.</span>{" "}
+        The LLM overlay can only neutralise or scale exposure down — it never adds leverage or overrides the
+        deterministic quant risk caps below. Confidence/dispersion filtering neutralises low-confidence signals.
+      </div>
+
       {/* ------------------------------------------------------ status cards */}
       <KpiCard
         className="col-span-12 sm:col-span-4"
@@ -178,6 +272,14 @@ export function RiskView() {
           actions={
             <div className="flex items-center gap-2 text-[11px] text-zinc-600">
               <span>{state.assessments.length} roots</span>
+              {state.derived_roots && state.derived_roots.length > 0 ? (
+                <Badge tone="warn" title="Assessed deterministically from neutral features (no live/cached snapshot)">
+                  {state.derived_roots.length} derived
+                </Badge>
+              ) : null}
+              {state.assessment_source ? (
+                <span className="font-mono text-[9.5px] text-zinc-600">{state.assessment_source}</span>
+              ) : null}
               <span className="text-zinc-700">·</span>
               <span className="flex items-center gap-1">
                 <span className="h-1.5 w-1.5 rounded-full bg-gain" /> θ {state.thresholds.llm_safe_score.toFixed(1)}
@@ -258,6 +360,49 @@ function compactCountdown(iso: string, now: Date): string {
   return `${minutes}m`;
 }
 
+const UtilizationMeter = memo(function UtilizationMeter({
+  testId,
+  label,
+  current,
+  limit,
+  format,
+  plain,
+  extra,
+}: {
+  testId: string;
+  label: string;
+  current: number | null;
+  limit: number;
+  format: (value: number) => string;
+  plain: string;
+  extra?: { label: string; util: number | null; text: string };
+}) {
+  const util = current !== null && limit > 0 ? current / limit : null;
+  const tone = util === null ? "neutral" : util >= 0.9 ? "loss" : util >= 0.7 ? "warn" : "gain";
+  const color = tone === "loss" ? "bg-loss" : tone === "warn" ? "bg-warn" : "bg-gain";
+  return (
+    <div className="rounded-md border border-edge bg-canvas p-2.5" data-testid={testId} data-util={util === null ? "" : util.toFixed(4)}>
+      <div className="flex items-start justify-between gap-2">
+        <span className="text-[10.5px] font-medium uppercase tracking-[0.04em] text-zinc-500">{label}</span>
+        <Badge tone={tone}>{util === null ? "n/a" : `${(util * 100).toFixed(0)}%`}</Badge>
+      </div>
+      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+        <div className={cn("h-full rounded-full", color)} style={{ width: `${Math.min(100, (util ?? 0) * 100).toFixed(1)}%` }} />
+      </div>
+      <div className="mt-1.5 flex items-baseline justify-between font-mono text-[11px] tabular-nums">
+        <span className="text-zinc-200">{current === null ? "—" : format(current)}</span>
+        <span className="text-zinc-600">limit {format(limit)}</span>
+      </div>
+      <p className="mt-1 text-[10px] leading-4 text-zinc-600">{plain}</p>
+      {extra ? (
+        <p className="mt-0.5 font-mono text-[9.5px] text-zinc-600">
+          {extra.label}: {extra.text}
+        </p>
+      ) : null}
+    </div>
+  );
+});
+
 function RootAssessmentCard({
   assessment,
   thresholds,
@@ -269,7 +414,15 @@ function RootAssessmentCard({
   return (
     <div className="rounded-md border border-edge bg-canvas p-2.5">
       <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="font-mono text-[12.5px] font-semibold text-zinc-100">{assessment.instrument_id}</span>
+        <span className="flex items-center gap-1.5">
+          <span className="font-mono text-[12.5px] font-semibold text-zinc-100">{assessment.instrument_id}</span>
+          <span
+            className="rounded border border-edge px-1 text-[9px] text-zinc-500"
+            title="Regime context inferred by the LLM overlay for this root (e.g. risk-on, risk-off, neutral)."
+          >
+            Regime: {assessment.regime ?? "n/a"}
+          </span>
+        </span>
         <Badge tone={ACTION_TONE[assessment.action]}>{ACTION_LABEL[assessment.action]}</Badge>
       </div>
 
@@ -303,6 +456,12 @@ function RootAssessmentCard({
             {assessment.confidence.toFixed(2)}
             {confidenceBelow ? <span className="ml-1 text-[9.5px] text-warn">{"< τ"}</span> : null}
           </div>
+          <div
+            className="mt-0.5 font-mono text-[9px] text-zinc-600"
+            title="Dispersion across sampled LLM completions: high dispersion lowers confidence and can neutralise this signal."
+          >
+            disp {assessment.confidence_dispersion ?? assessment.dispersion ?? "n/a"}
+          </div>
           <div className="relative mt-1 h-1 w-full overflow-hidden rounded-full bg-zinc-800">
             <div
               className={`h-full rounded-full ${confidenceBelow ? "bg-warn/80" : "bg-gain/80"}`}
@@ -317,7 +476,10 @@ function RootAssessmentCard({
         </div>
         <div>
           <div className="text-[10.5px] text-zinc-500">Weight ×</div>
-          <div className="font-mono text-[12px] tabular-nums text-zinc-200">
+          <div
+            className="font-mono text-[12px] tabular-nums text-zinc-200"
+            title="Deterministic weight multiplier applied to this root: 1.000 = unchanged; below 1.000 = scaled down; 0 = neutralised/liquidated by the LLM brake."
+          >
             {assessment.weight_multiplier.toFixed(3)}
           </div>
         </div>

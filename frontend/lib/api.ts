@@ -60,7 +60,12 @@ import type {
   DataInventoryResponse,
   DataCacheRoot,
   DataTimeframe,
+  IbkrConnectionRequest,
+  IbkrConnectionResponse,
+  IbkrPortsResponse,
+  LLMStatusResponse,
   PaperStateResetResult,
+  RootScopeQuery,
   RiskLockResetResult,
   FlattenAllResponse,
   HealthResponse,
@@ -196,12 +201,180 @@ export function getAccount(): Promise<ApiResult<AccountSnapshotResponse>> {
 // Pipeline / risk / term structure
 // ---------------------------------------------------------------------------
 
-export function getPipeline(): Promise<ApiResult<PipelineWaterfallResponse>> {
-  return withFallback("/api/pipeline/latest", () => mockPipeline());
+function rootScopeQueryString(query?: RootScopeQuery): string {
+  if (!query) return "";
+  const params = new URLSearchParams();
+  if (query.scope && query.scope !== "strategy") params.set("scope", query.scope);
+  if (query.sector) params.set("sector", query.sector);
+  if (query.roots && query.roots.length > 0) params.set("roots", query.roots.join(","));
+  const serialized = params.toString();
+  return serialized.length > 0 ? `?${serialized}` : "";
 }
 
-export function getRiskState(): Promise<ApiResult<RiskStateResponse>> {
-  return withFallback("/api/risk/state", mockRiskState);
+export function getPipeline(query?: RootScopeQuery): Promise<ApiResult<PipelineWaterfallResponse>> {
+  return withFallback(`/api/pipeline/latest${rootScopeQueryString(query)}`, () => mockPipeline());
+}
+
+export function getRiskState(query?: RootScopeQuery): Promise<ApiResult<RiskStateResponse>> {
+  return withFallback(`/api/risk/state${rootScopeQueryString(query)}`, mockRiskState);
+}
+
+function fallbackLLMStatus(): LLMStatusResponse {
+  return {
+    provider: "offline",
+    model: "deterministic-stub",
+    api_key_configured: false,
+    mode: "offline_stub",
+    status: "offline_stub",
+    last_latency_ms: null,
+    last_checked_at: null,
+    cache_entries: 0,
+    error_detail: "LLM status API unavailable — showing honest offline stub state.",
+  };
+}
+
+export function getLLMStatus(): Promise<ApiResult<LLMStatusResponse>> {
+  return withFallback<unknown>("/api/risk/llm-status", fallbackLLMStatus).then((result) => ({
+    ...result,
+    data: result.source === "live" && isRecord(result.data)
+      ? normalizeLLMStatus(result.data)
+      : fallbackLLMStatus(),
+  }));
+}
+
+export function pingLLM(): Promise<ApiResult<LLMStatusResponse>> {
+  return withFallback<unknown>("/api/risk/llm-ping", fallbackLLMStatus, { method: "POST", body: JSON.stringify({}) }, 15_000).then(
+    (result) => ({
+      ...result,
+      data: result.source === "live" && isRecord(result.data)
+        ? normalizeLLMStatus(result.data)
+        : {
+            ...fallbackLLMStatus(),
+            status: "unreachable",
+            error_detail: result.error ?? "LLM ping requires the FastAPI backend.",
+          },
+    }),
+  );
+}
+
+function normalizeLLMStatus(raw: Record<string, unknown>): LLMStatusResponse {
+  return {
+    provider: String(raw.provider ?? "unknown"),
+    model: String(raw.model ?? "unknown"),
+    api_key_configured: raw.api_key_configured === true,
+    mode: String(raw.mode ?? "offline_stub"),
+    status: String(raw.status ?? "unreachable"),
+    last_latency_ms: typeof raw.last_latency_ms === "number" ? raw.last_latency_ms : null,
+    last_checked_at: typeof raw.last_checked_at === "string" ? raw.last_checked_at : null,
+    cache_entries: typeof raw.cache_entries === "number" ? raw.cache_entries : 0,
+    error_detail: typeof raw.error_detail === "string" ? raw.error_detail : null,
+  };
+}
+
+export function getIbkrPorts(): Promise<ApiResult<IbkrPortsResponse>> {
+  const fallback: IbkrPortsResponse = {
+    host: "127.0.0.1",
+    ports: [
+      { port: 7497, mode: "paper", gateway: "tws", reachable: false, latency_ms: null },
+      { port: 4002, mode: "paper", gateway: "ib_gateway", reachable: false, latency_ms: null },
+      { port: 7496, mode: "live", gateway: "tws", reachable: false, latency_ms: null },
+      { port: 4001, mode: "live", gateway: "ib_gateway", reachable: false, latency_ms: null },
+    ],
+    active: null,
+    warnings: ["IBKR port API unavailable — no probe results."],
+    probed_at: null,
+  };
+  return withFallback<unknown>("/api/runner/ibkr-ports", () => fallback, undefined, 15_000).then((result) => {
+    if (result.source !== "live" || !isRecord(result.data)) return { ...result, data: fallback };
+    const raw = result.data;
+    const ports = asRebalanceArray(raw.ports).map((entry) => {
+      const row = isRecord(entry) ? entry : {};
+      return {
+        port: typeof row.port === "number" ? row.port : 0,
+        mode: String(row.mode ?? "unknown"),
+        gateway: String(row.gateway ?? "unknown"),
+        reachable: row.reachable === true,
+        latency_ms: typeof row.latency_ms === "number" ? row.latency_ms : null,
+      };
+    });
+    return {
+      ...result,
+      data: {
+        host: String(raw.host ?? "127.0.0.1"),
+        ports,
+        active: isRecord(raw.active) ? normalizeIbkrActive(raw.active) : null,
+        warnings: asRebalanceArray(raw.warnings).map((warning) => String(warning)),
+        probed_at: typeof raw.probed_at === "string" ? raw.probed_at : null,
+      },
+    };
+  });
+}
+
+function normalizeIbkrActive(raw: Record<string, unknown>): IbkrPortsResponse["active"] {
+  return {
+    port: typeof raw.port === "number" ? raw.port : null,
+    client_id: typeof raw.client_id === "number" ? raw.client_id : null,
+    environment: typeof raw.environment === "string" ? raw.environment : null,
+    mode: typeof raw.mode === "string" ? raw.mode : null,
+    gateway: typeof raw.gateway === "string" ? raw.gateway : null,
+  };
+}
+
+export function switchIbkrConnection(
+  request: IbkrConnectionRequest,
+): Promise<ApiResult<IbkrConnectionResponse>> {
+  const fallback: IbkrConnectionResponse = {
+    status: "refused",
+    applied: false,
+    restart_required: false,
+    active: null,
+    warnings: [],
+    message: "IBKR connection switch requires the FastAPI runner API.",
+  };
+  return dataRequest<unknown>(
+    "/api/runner/ibkr-connection",
+    { method: "POST", body: JSON.stringify(request) },
+    () => fallback,
+    30_000,
+  ).then((result) => {
+    if (result.source !== "live" || !isRecord(result.data)) {
+      const detail = result.detail;
+      const message =
+        typeof detail === "string"
+          ? detail
+          : isRecord(detail) && typeof detail.message === "string"
+            ? detail.message
+            : result.error ?? fallback.message;
+      return {
+        ...result,
+        data: { ...fallback, message },
+        error: message,
+      };
+    }
+    const raw = result.data;
+    return {
+      ...result,
+      data: {
+        status: String(raw.status ?? "refused"),
+        applied: raw.applied === true,
+        restart_required: raw.restart_required === true,
+        requested: isRecord(raw.requested)
+          ? {
+              port: typeof raw.requested.port === "number" ? raw.requested.port : 0,
+              mode: String(raw.requested.mode ?? ""),
+              gateway: String(raw.requested.gateway ?? ""),
+              reachable: false,
+              latency_ms: null,
+              client_id: typeof raw.requested.client_id === "number" ? raw.requested.client_id : null,
+            }
+          : undefined,
+        active: isRecord(raw.active) ? normalizeIbkrActive(raw.active) : null,
+        environment: typeof raw.environment === "string" ? raw.environment : null,
+        warnings: asRebalanceArray(raw.warnings).map((warning) => String(warning)),
+        message: String(raw.message ?? ""),
+      },
+    };
+  });
 }
 
 export function updateRiskThresholds(
@@ -265,8 +438,8 @@ export function stepRunner(states = 1): Promise<ApiResult<RunnerStatus>> {
 // Term structure
 // ---------------------------------------------------------------------------
 
-export function getTermStructure(): Promise<ApiResult<TermStructureResponse>> {
-  return withFallback("/api/term-structure", mockTermStructure);
+export function getTermStructure(query?: RootScopeQuery): Promise<ApiResult<TermStructureResponse>> {
+  return withFallback(`/api/term-structure${rootScopeQueryString(query)}`, mockTermStructure);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 "use client";
 
+import { memo, useEffect } from "react";
+
 import { cn } from "@/lib/cn";
 import { formatClock } from "@/lib/format";
 import { summarizeTelemetry } from "@/lib/telemetry";
@@ -22,8 +24,22 @@ const KIND_TONE: Record<TelemetryKind, Tone> = {
  * frames exactly as received (kind + payload summary + sequence), which is the
  * honest source for working-order/fill information the REST API does not expose.
  */
-export function TelemetryDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+export const TelemetryDrawer = memo(function TelemetryDrawer({
+  open,
+  onClose,
+}: {
+  open: boolean;
+  onClose: () => void;
+}) {
   const { events, status, sequence } = useTelemetry();
+
+  useEffect(() => {
+    if (!open) return;
+    window.dispatchEvent(new Event("futuresrlx:pause-telemetry"));
+    return () => {
+      window.dispatchEvent(new Event("futuresrlx:resume-telemetry"));
+    };
+  }, [open]);
 
   return (
     <div
@@ -85,4 +101,4 @@ export function TelemetryDrawer({ open, onClose }: { open: boolean; onClose: () 
       </div>
     </div>
   );
-}
+});

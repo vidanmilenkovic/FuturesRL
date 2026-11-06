@@ -30,13 +30,16 @@ export function Modal({
   const titleId = useId();
   const descriptionId = useId();
   const dialogRef = useRef<HTMLDivElement | null>(null);
+  const requestCloseRef = useRef<() => void>(() => undefined);
 
   const requestClose = useCallback(() => {
     if (!busy) onClose();
   }, [busy, onClose]);
+  requestCloseRef.current = requestClose;
 
   useEffect(() => {
     if (!open) return;
+    window.dispatchEvent(new Event("futuresrlx:pause-telemetry"));
     const previous = document.activeElement as HTMLElement | null;
     const dialog = dialogRef.current;
     const focusable = dialog?.querySelectorAll<HTMLElement>(
@@ -47,7 +50,7 @@ export function Modal({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        requestClose();
+        requestCloseRef.current();
         return;
       }
       if (event.key !== "Tab" || !focusable || focusable.length === 0) return;
@@ -66,8 +69,11 @@ export function Modal({
     return () => {
       document.removeEventListener("keydown", onKeyDown);
       previous?.focus();
+      window.dispatchEvent(new Event("futuresrlx:resume-telemetry"));
     };
-  }, [open, requestClose]);
+    // The focus trap must not re-run on parent re-renders (typing/polling);
+    // requestClose is read through a ref so focus/dropdowns survive.
+  }, [open]);
 
   if (!open) return null;
 

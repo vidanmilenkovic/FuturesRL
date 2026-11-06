@@ -52,6 +52,27 @@ export interface HealthResponse {
   ibkr_enabled?: boolean;
   ibkr_reconnecting?: boolean;
   ibkr_last_error?: string | null;
+  /** Workstation UX additive LLM status. */
+  llm_status?: LLMStatusResponse | null;
+}
+
+export type LlmMode = "live_api" | "offline_stub";
+export type LlmStatus =
+  | "online"
+  | "offline_stub"
+  | "auth_error"
+  | "unreachable";
+
+export interface LLMStatusResponse {
+  provider: string;
+  model: string;
+  api_key_configured: boolean;
+  mode: LlmMode | string;
+  status: LlmStatus | string;
+  last_latency_ms: number | null;
+  last_checked_at: string | null;
+  cache_entries: number;
+  error_detail: string | null;
 }
 
 /** Data provenance shown by the ribbon badge. */
@@ -198,6 +219,29 @@ export interface PipelineWaterfallResponse {
   tracking_error_pct?: number | null;
   /** Phase 9 additive: standard → micro contract routing applied by the translator. */
   micro_routing?: MicroRoutingRow[];
+  /** Workstation UX additive 45-root scope provenance. */
+  scope?: RootScope | string | null;
+  sector?: string | null;
+  selected_roots?: string[];
+  data_origin?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Workstation UX — shared root scope selection
+// ---------------------------------------------------------------------------
+
+export type RootScope = "strategy" | "cached" | "all";
+
+export interface RootScopeQuery {
+  scope?: RootScope;
+  sector?: string | null;
+  roots?: string[];
+}
+
+export interface RootScopeState extends RootScopeQuery {
+  scope: RootScope;
+  sector: string;
+  roots: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +273,10 @@ export interface RiskAssessmentRow {
   source: string;
   action: RiskAction;
   weight_multiplier: number;
+  /** Workstation UX additive tooltip metadata (absent on older payloads). */
+  regime?: string | null;
+  confidence_dispersion?: number | null;
+  dispersion?: number | null;
 }
 
 export interface MacroEvent {
@@ -277,6 +325,13 @@ export interface RiskStateResponse {
   execution_locked_until?: string | null;
   reset_available?: boolean;
   operator_reset_token_required?: boolean;
+  /** Workstation UX additive 45-root scope / per-root tooltip metadata. */
+  scope?: RootScope | string | null;
+  sector?: string | null;
+  selected_roots?: string[];
+  derived_roots?: string[];
+  assessment_source?: string | null;
+  data_origin?: string | null;
 }
 
 export interface FlattenReceipt {
@@ -309,6 +364,8 @@ export interface TermContract {
   days_to_expiry: number;
   is_front: boolean;
   open_interest: number;
+  /** Optional backend-provided annualised roll yield for this leg (percent). */
+  roll_yield_annualized?: number;
 }
 
 export interface TermCurve {
@@ -335,6 +392,11 @@ export interface TermStructureResponse {
   as_of: string;
   curves: TermCurve[];
   roll_calendar: RollCalendarEntry[];
+  /** Workstation UX additive 45-root scope provenance. */
+  scope?: RootScope | string | null;
+  sector?: string | null;
+  selected_roots?: string[];
+  data_origin?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +479,10 @@ export interface StudioParameter {
   /** Catalog hints (Phase 10): log-scaled sliders and YAML encodings. */
   log_scale?: boolean;
   yaml_encoding?: string | null;
+  /** Additive Workstation UX metadata: one-line math/explanation (allocator tooltips). */
+  formula?: string | null;
+  /** Additive Workstation UX metadata: advanced/math-detail parameter for the collapse section. */
+  advanced?: boolean;
   min_items?: number | null;
   max_items?: number | null;
   /** Backend stage group (e.g. timing overlay name). */
@@ -515,6 +581,10 @@ export interface StudioCatalogResponse {
   stage_choices?: Record<string, string[]>;
   /** Additive sector-grouped universe metadata (task-31). */
   universe?: StudioUniverseMetadata | null;
+  /** Additive Workstation UX metadata: allocator family -> one-line math/why explanation. */
+  formulas?: Record<string, string>;
+  /** Additive Workstation UX metadata: keys of advanced/math-detail parameters. */
+  advanced_parameter_keys?: string[];
 }
 
 /** Editable draft the Manual Builder serializes to YAML + POST/PUT payload. */
@@ -944,6 +1014,47 @@ export interface RunnerStatus {
   runner_id: string;
   session_running: boolean;
   states_processed: number;
+}
+
+export interface IbkrPortInfo {
+  port: number;
+  mode: "paper" | "live" | string;
+  gateway: "tws" | "ib_gateway" | string;
+  reachable: boolean;
+  latency_ms: number | null;
+}
+
+export interface IbkrActiveConnection {
+  port: number | null;
+  client_id: number | null;
+  environment: string | null;
+  mode: string | null;
+  gateway: string | null;
+}
+
+export interface IbkrPortsResponse {
+  host: string;
+  ports: IbkrPortInfo[];
+  active: IbkrActiveConnection | null;
+  warnings: string[];
+  probed_at: string | null;
+}
+
+export interface IbkrConnectionRequest {
+  port: number;
+  client_id: number | null;
+  confirmation: string | null;
+}
+
+export interface IbkrConnectionResponse {
+  status: "applied" | "restart_required" | "refused" | string;
+  applied: boolean;
+  restart_required: boolean;
+  requested?: IbkrPortInfo & { client_id?: number | null };
+  active?: IbkrActiveConnection | null;
+  environment?: string | null;
+  warnings: string[];
+  message: string;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Modal } from "@/components/ui/dialog";
 import {
@@ -36,7 +36,7 @@ interface InventoryState {
  * and opens the inventory/cost/ingest modal used by the Operator drawer and
  * Backtest Lab.
  */
-export function MarketDataCacheButton({
+export const MarketDataCacheButton = memo(function MarketDataCacheButton({
   label = "Market Data Cache",
   className,
   testId = "market-data-cache-button",
@@ -85,7 +85,7 @@ export function MarketDataCacheButton({
       />
     </>
   );
-}
+});
 
 interface DataErrorState {
   status: number | null;
@@ -141,6 +141,18 @@ function MarketDataCacheModal({
   const [ingesting, setIngesting] = useState(false);
   const [ingestResult, setIngestResult] = useState<DataIngestResult | null>(null);
   const [ingestError, setIngestError] = useState<DataErrorState | null>(null);
+  const wasOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      setCost(null);
+      setCostError(null);
+      setIngestResult(null);
+      setIngestError(null);
+      setOverBudget(false);
+    }
+    wasOpenRef.current = open;
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;

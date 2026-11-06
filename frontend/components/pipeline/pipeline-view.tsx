@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, type CSSProperties } from "react";
+import { useEffect, useMemo, type CSSProperties } from "react";
 
 import { StageGroupedBars, type StageBar } from "@/components/charts/plots";
 import { RebalanceBar } from "@/components/rebalance/rebalance-bar";
+import { RootScopeFilterBar, useRootScopeFilter } from "@/components/filters/root-scope-filter";
 import {
   Badge,
   EmptyState,
@@ -128,8 +129,16 @@ function parseMargin(pipeline: PipelineWaterfallResponse): string {
 
 /** View 2 — FinRL-X pipeline & weights inspector. */
 export function PipelineView() {
-  const pipeline = useAsyncData(getPipeline);
-  const terms = useAsyncData(getTermStructure);
+  const filter = useRootScopeFilter();
+  const pipeline = useAsyncData(() => getPipeline(filter.query));
+  const terms = useAsyncData(() => getTermStructure(filter.query));
+
+  useEffect(() => {
+    if (!filter.hydrated) return;
+    pipeline.reload();
+    terms.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter.key, filter.hydrated, pipeline.reload, terms.reload]);
 
   const data = pipeline.data;
   const regimes = useMemo(() => {
@@ -197,13 +206,29 @@ export function PipelineView() {
   const selectedCount = data.instruments.filter((row) => row.selected).length;
 
   return (
-    <div className="grid min-h-full grid-rows-[auto_minmax(0,1fr)] grid-cols-12 gap-3">
+    <div className="grid min-h-full grid-rows-[auto_auto_minmax(0,1fr)] grid-cols-12 gap-3">
       <RebalanceBar
         className="col-span-12"
         onExecuted={() => {
           pipeline.reload();
           terms.reload();
         }}
+      />
+      <RootScopeFilterBar
+        scope={filter.state.scope}
+        sector={filter.state.sector}
+        roots={filter.state.roots}
+        onScopeChange={filter.setScope}
+        onSectorChange={filter.setSector}
+        onToggleRoot={filter.toggleRoot}
+        onClearRoots={filter.clearRoots}
+        onRefresh={() => {
+          pipeline.reload();
+          terms.reload();
+        }}
+        refreshing={pipeline.loading}
+        selectedCount={data.instruments.length}
+        dataOrigin={data.data_origin ?? null}
       />
       {/* ------------------------------------------------------- left column */}
       <div className="col-span-12 flex min-h-0 flex-col gap-3 xl:col-span-7">

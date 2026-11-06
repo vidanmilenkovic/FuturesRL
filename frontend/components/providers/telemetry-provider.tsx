@@ -40,6 +40,13 @@ const TelemetryContext = createContext<TelemetryContextValue | null>(null);
 
 const MAX_EVENTS = 60;
 
+function isEditableElement(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (target.matches("input, select, textarea") || target.isContentEditable)
+  );
+}
+
 export function TelemetryProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<ConnectionState>("connecting");
   const [backend, setBackend] = useState<"checking" | "online" | "offline">("checking");
@@ -49,13 +56,45 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
   const connectionRef = useRef<TelemetryConnection | null>(null);
   const [reconnectNonce, setReconnectNonce] = useState(0);
+  // Workstation UX: never replace drawer/modal/form state mid-interaction. Any
+  // open modal/drawer emits pause events; focused form controls pause globally.
+  const pauseCountRef = useRef(0);
+  const inputFocusedRef = useRef(false);
+  const updatesPaused = () => pauseCountRef.current > 0 || inputFocusedRef.current;
+
+  useEffect(() => {
+    const pause = () => {
+      pauseCountRef.current += 1;
+    };
+    const resume = () => {
+      pauseCountRef.current = Math.max(0, pauseCountRef.current - 1);
+    };
+    const focusIn = (event: FocusEvent) => {
+      if (isEditableElement(event.target)) inputFocusedRef.current = true;
+    };
+    const focusOut = () => {
+      window.setTimeout(() => {
+        inputFocusedRef.current = isEditableElement(document.activeElement);
+      }, 0);
+    };
+    window.addEventListener("futuresrlx:pause-telemetry", pause);
+    window.addEventListener("futuresrlx:resume-telemetry", resume);
+    document.addEventListener("focusin", focusIn);
+    document.addEventListener("focusout", focusOut);
+    return () => {
+      window.removeEventListener("futuresrlx:pause-telemetry", pause);
+      window.removeEventListener("futuresrlx:resume-telemetry", resume);
+      document.removeEventListener("focusin", focusIn);
+      document.removeEventListener("focusout", focusOut);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     const probe = () => {
       getHealth()
         .then((result) => {
-          if (cancelled) return;
+          if (cancelled || updatesPaused()) return;
           setBackend(result.source === "live" ? "online" : "offline");
           setHealth(result.data);
         })
@@ -76,11 +115,13 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     connectionRef.current = connectTelemetry({
       onMessage: (message) => {
+        if (updatesPaused()) return;
         setLatest((previous) => ({ ...previous, [message.kind]: message }));
         setEvents((previous) => [message, ...previous].slice(0, MAX_EVENTS));
         setLastUpdate(message.timestamp);
       },
       onStatus: (next) => {
+        if (updatesPaused()) return;
         setStatus(next);
         if (next === "offline") setBackend("offline");
       },

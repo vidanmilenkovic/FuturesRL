@@ -23,8 +23,8 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        canvas: "#09090B",
-        panel: "#121215",
+        canvas: "#09090B", /** #09090B */
+        panel: "#121215", /**#121215 */
         surface: "#18181C",
         hairline: "#1E1E22",
         edge: "#222226",

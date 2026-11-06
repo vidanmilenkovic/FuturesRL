@@ -1,12 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 
 import { cn } from "@/lib/cn";
 import { resetPaperState, resetRunnerBridge } from "@/lib/api";
 import type { PaperStateResetResult } from "@/lib/types";
 
 import { MarketDataCacheButton } from "@/components/data/market-data-cache";
+import { IbkrConnectionManager } from "./ibkr-connection-manager";
 
 import { useTelemetry } from "../providers/telemetry-provider";
 import { Modal } from "../ui/dialog";
@@ -18,7 +19,13 @@ type OperatorAction = "paper" | "runner";
  * Developer/operator settings drawer. Destructive resets are guarded by an
  * exact phrase + checkbox; paper-state clearing is unavailable in live.
  */
-export function OperatorDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+export const OperatorDrawer = memo(function OperatorDrawer({
+  open,
+  onClose,
+}: {
+  open: boolean;
+  onClose: () => void;
+}) {
   const { health } = useTelemetry();
   const [action, setAction] = useState<OperatorAction | null>(null);
   const [confirm, setConfirm] = useState("");
@@ -29,6 +36,28 @@ export function OperatorDrawer({ open, onClose }: { open: boolean; onClose: () =
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<string | null>(null);
+
+  const wasOpenRef = useRef(false);
+  useEffect(() => {
+    if (open) {
+      window.dispatchEvent(new Event("futuresrlx:pause-telemetry"));
+      if (!wasOpenRef.current) {
+        setAction(null);
+        setConfirm("");
+        setAck(false);
+        setClearRiskState(true);
+        setClearRunnerBridge(true);
+        setClearPaperCache(true);
+        setBusy(false);
+        setError(null);
+        setReceipt(null);
+      }
+    }
+    wasOpenRef.current = open;
+    return () => {
+      if (open) window.dispatchEvent(new Event("futuresrlx:resume-telemetry"));
+    };
+  }, [open]);
 
   const environment = health?.environment ?? "unknown";
   const live = environment === "live";
@@ -87,7 +116,7 @@ export function OperatorDrawer({ open, onClose }: { open: boolean; onClose: () =
           "absolute bottom-7 right-0 z-40 flex w-[360px] max-w-[92vw] flex-col rounded-tl-md border border-edge bg-panel shadow-popover transition-transform duration-150",
           open ? "translate-y-0" : "pointer-events-none translate-y-2 opacity-0",
         )}
-        style={{ maxHeight: open ? 360 : 0, overflow: "hidden" }}
+        style={{ maxHeight: open ? 540 : 0, overflow: "hidden" }}
         aria-hidden={!open}
         data-testid="operator-drawer"
       >
@@ -151,6 +180,7 @@ export function OperatorDrawer({ open, onClose }: { open: boolean; onClose: () =
               </Button>
             </div>
           </div>
+          <IbkrConnectionManager open={open} />
           <div className="rounded-md border border-edge bg-canvas/60 p-2">
             <div className="flex items-start justify-between gap-2">
               <div>
@@ -255,7 +285,7 @@ export function OperatorDrawer({ open, onClose }: { open: boolean; onClose: () =
       </Modal>
     </>
   );
-}
+});
 
 function formatPaperReceipt(result: PaperStateResetResult): string {
   const receipts = result.receipts;

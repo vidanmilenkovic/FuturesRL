@@ -27,29 +27,46 @@ import { DATA_TIMEFRAME_OPTIONS } from "@/lib/data-cache";
 import { cn } from "@/lib/cn";
 import {
   SECTOR_TABS,
+  advancedParametersFor,
   allocatorChoices,
+  allocatorMath,
+  applyUniverseStack,
   componentDefaults,
+  customPresetFromSaved,
   defaultUniverseRoots,
   draftFromPreset,
   draftFromStrategy,
   draftToYaml,
   buildEncodingMap,
+  deleteCustomPreset,
   getDraftValue,
   ID_PATTERN,
   isAdvancedParameter,
+  isValidCustomParamKey,
+  loadCustomPresets,
   numericBadge,
   orderUniverseRoots,
   overlayDefaults,
   parameterLabel,
+  parseCustomParamValue,
+  removeCustomParam,
+  reorderTimingByWeights,
   rootsOf,
+  saveCustomPreset,
   selectorChoices,
+  setCustomParam,
   setDraftValue,
   stageMeta,
   stageSummary,
   syncQuantCaps,
+  timingStackEntries,
   universeRoots,
+  universeStackChoices,
+  universeStackMode,
+  universeStackNames,
   validateDraft,
 } from "@/lib/studio";
+import type { StudioCustomPreset, UniverseStackMode } from "@/lib/studio";
 import type {
   DrlModel,
   InstrumentRoot,
@@ -134,6 +151,19 @@ export function ManualBuilder({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [saveToast, setSaveToast] = useState<{ strategyId: string } | null>(null);
+  // Workstation UX modular-builder state (T5)
+  const [universeStackOn, setUniverseStackOn] = useState(draft.universe.name === "composite");
+  const [timingStackOn, setTimingStackOn] = useState(draft.timing.length > 1);
+  const [timingWeights, setTimingWeights] = useState<Record<string, number>>(() =>
+    Object.fromEntries(timingStackEntries(draft).map((entry) => [entry.name, entry.weight])),
+  );
+  const [customPresets, setCustomPresets] = useState<StudioCustomPreset[]>([]);
+  const [presetName, setPresetName] = useState("");
+  const [customEditor, setCustomEditor] = useState<{ stage: "universe" | "allocator" | "timing" | "risk"; overlay?: string } | null>(null);
+  const [customKey, setCustomKey] = useState("");
+  const [customValue, setCustomValue] = useState("");
+  const [customError, setCustomError] = useState<string | null>(null);
+  const [advancedPick, setAdvancedPick] = useState("");
 
   const sectors = useMemo(
     () => instrumentsSource.data?.sectors ?? catalog.universe?.sectors ?? [],
@@ -179,6 +209,126 @@ export function ManualBuilder({
     return () => clearTimeout(timer);
   }, [saveToast]);
 
+  useEffect(() => {
+    setCustomPresets(loadCustomPresets());
+  }, []);
+
+  // Keep the stack toggles in sync when a preset/strategy is loaded into the draft.
+  useEffect(() => {
+    setUniverseStackOn(draft.universe.name === "composite");
+  }, [draft.universe.name]);
+  useEffect(() => {
+    if (draft.timing.length > 1) setTimingStackOn(true);
+  }, [draft.timing.length]);
+
+  const applyCustomPreset = (id: string) => {
+    const preset = customPresets.find((entry) => entry.id === id);
+    if (!preset) return;
+    const next = customPresetFromSaved(preset, draft.id);
+    onDraftChange(next);
+    setTimingWeights(preset.timingWeights ?? {});
+    setUniverseStackOn(preset.draft.universe.name === "composite");
+    setTimingStackOn(preset.draft.timing.length > 1);
+    setPresetId("");
+    setSaveNote({ text: `Loaded custom preset "${preset.name}" from browser storage.`, tone: "accent" });
+  };
+
+  const saveAsCustomPreset = () => {
+    const result = saveCustomPreset(draft, presetName, {
+      timingWeights,
+      universeMode: universeStackMode(draft),
+    });
+    setCustomPresets(result.presets);
+    if (result.error) {
+      setSaveNote({ text: result.error, tone: "warn" });
+      return;
+    }
+    setPresetName("");
+    setSaveNote({ text: `Saved custom preset "${result.preset?.name}" in this browser (localStorage).`, tone: "gain" });
+    onNotify(`Custom preset "${result.preset?.name}" saved locally`, "gain");
+  };
+
+  const changeUniverseStack = (names: string[], mode: UniverseStackMode) => {
+    const defaults: Record<string, Record<string, StudioParamValue>> = {};
+    for (const name of names) defaults[name] = componentDefaults(catalog.parameters, "universe", name);
+    applyDraft(applyUniverseStack(draft, names, mode, defaults));
+  };
+
+  const updateTimingWeight = (name: string, weight: number) => {
+    const next = { ...timingWeights, [name]: weight };
+    setTimingWeights(next);
+    applyDraft(reorderTimingByWeights(draft, next));
+  };
+
+  const openCustomEditor = (stage: "universe" | "allocator" | "timing" | "risk", overlay?: string) => {
+    setCustomEditor({ stage, overlay });
+    setCustomKey("");
+    setCustomValue("");
+    setCustomError(null);
+    setAdvancedPick("");
+  };
+
+  const customEditorTarget = useMemo(() => {
+    if (!customEditor) return null;
+    if (customEditor.stage === "timing" || customEditor.stage === "risk") {
+      const stages = customEditor.stage === "timing" ? draft.timing : draft.risk;
+      const overlay = customEditor.overlay ?? stages[0]?.name;
+      if (!overlay) return null;
+      return { ...customEditor, overlay };
+    }
+    return customEditor;
+  }, [customEditor, draft.risk, draft.timing]);
+
+  const customAdvancedOptions = useMemo(() => {
+    if (!customEditorTarget) return [];
+    const stageKey = customEditorTarget.stage;
+    return advancedParametersFor(
+      catalog.parameters,
+      stageKey,
+      customEditorTarget.overlay ?? null,
+    ).filter((parameter) => {
+      const key = parameter.path.split(".").pop() ?? parameter.label;
+      const params =
+        stageKey === "universe" || stageKey === "allocator"
+          ? stageKey === "universe"
+            ? draft.universe.params
+            : draft.allocator.params
+          : (stageKey === "timing" ? draft.timing : draft.risk).find(
+              (entry) => entry.name === customEditorTarget.overlay,
+            )?.params ?? {};
+      return params[key] === undefined;
+    });
+  }, [catalog.parameters, customEditorTarget, draft]);
+
+  const submitCustomParam = () => {
+    if (!customEditorTarget) {
+      setCustomError("Enable an overlay in this stage before adding parameters.");
+      return;
+    }
+    const stage = customEditorTarget.stage;
+    if (advancedPick) {
+      const parameter = catalog.parameters.find((entry) => entry.key === advancedPick);
+      if (parameter) {
+        applyDraft(setDraftValue(draft, parameter, parameter.default));
+        setCustomEditor(null);
+        return;
+      }
+    }
+    const key = customKey.trim();
+    if (!isValidCustomParamKey(key)) {
+      setCustomError("Key must be snake_case (letters/digits/underscore) and not a reserved stage field.");
+      return;
+    }
+    const parsed = parseCustomParamValue(customValue);
+    if (parsed.error || parsed.value === undefined) {
+      setCustomError(parsed.error ?? "Invalid value.");
+      return;
+    }
+    const overlay = stage === "timing" || stage === "risk" ? customEditorTarget.overlay : undefined;
+    applyDraft(setCustomParam(draft, stage, key, parsed.value, overlay));
+    setCustomEditor(null);
+  };
+
   const loadExisting = (id: string) => {
     setLoadId(id);
     const strategy = strategies.find((entry) => entry.id === id);
@@ -196,6 +346,14 @@ export function ManualBuilder({
       text: `${preset.name} — ${preset.hypothesis || preset.description}`,
       tone: "accent",
     });
+  };
+
+  const selectPreset = (id: string) => {
+    if (id.startsWith("cp_")) {
+      applyCustomPreset(id);
+      return;
+    }
+    applyPreset(id);
   };
 
   const save = async (mode: "save" | "run") => {
@@ -370,6 +528,45 @@ export function ManualBuilder({
 
   const stageIndex = STAGE_STEPS.findIndex((entry) => entry.key === activeStage);
   const activeMeta = stageMeta(activeStage);
+  const timingEntries = timingStackEntries(draft, timingWeights);
+  const selectedUniverseStack = universeStackNames(draft);
+  const compositeUniverse = selectedUniverseStack.length > 1;
+  const stacking = (name: string) => TIMING_OVERLAYS.find((entry) => entry.name === name);
+  const editorStageParams = (() => {
+    if (activeStage === "universe") return draft.universe.params;
+    if (activeStage === "allocator") return draft.allocator.params;
+    if (activeStage === "timing") {
+      return customEditorTarget?.overlay
+        ? (draft.timing.find((stage) => stage.name === customEditorTarget.overlay)?.params ?? {})
+        : (draft.timing[0]?.params ?? {});
+    }
+    if (activeStage === "risk") {
+      return customEditorTarget?.overlay
+        ? (draft.risk.find((stage) => stage.name === customEditorTarget.overlay)?.params ?? {})
+        : (draft.risk[0]?.params ?? {});
+    }
+    return {};
+  })();
+  const editorOverlayName =
+    activeStage === "timing"
+      ? customEditorTarget?.overlay ?? draft.timing[0]?.name
+      : activeStage === "risk"
+        ? customEditorTarget?.overlay ?? draft.risk[0]?.name
+        : undefined;
+  const catalogParamKeys = new Set(
+    catalog.parameters
+      .filter(
+        (parameter) =>
+          parameter.stage === activeStage &&
+          (parameter.stage_name == null || parameter.stage_name === editorOverlayName),
+      )
+      .map((parameter) => parameter.path.split(".").pop() ?? parameter.key ?? ""),
+  );
+  const extraParamEntries = Object.entries(editorStageParams).filter(
+    ([key]) =>
+      !catalogParamKeys.has(key) &&
+      !["roots", "components", "mode", "top_n", "name", "selector", "enabled"].includes(key),
+  );
 
   return (
     <div className="flex min-h-0 flex-col gap-3 xl:h-[calc(100vh-160px)]" data-testid="manual-builder">
@@ -386,17 +583,53 @@ export function ManualBuilder({
             ]}
           />
         </Field>
-        <Field label="New from hypothesis template" htmlFor="studio-template" className="w-[226px]">
+        <Field label="New from preset" htmlFor="studio-template" className="w-[226px]">
           <Select
             id="studio-template"
             value={presetId}
-            onChange={applyPreset}
+            onChange={selectPreset}
             options={[
-              { value: "", label: "— 5 built-in presets —" },
+              { value: "", label: "— presets —" },
               ...catalog.presets.map((preset) => ({ value: preset.id, label: preset.name })),
+              ...customPresets.map((preset) => ({ value: preset.id, label: `${preset.name} (local)` })),
             ]}
           />
         </Field>
+        <Field label="Custom preset name" htmlFor="studio-preset-name" className="w-[160px]">
+          <TextInput
+            id="studio-preset-name"
+            value={presetName}
+            onChange={setPresetName}
+            placeholder="e.g. my modular chain"
+          />
+        </Field>
+        <Button
+          variant="secondary"
+          size="xs"
+          className="pb-0.5"
+          onClick={saveAsCustomPreset}
+          disabled={presetName.trim().length === 0}
+          title="Save the current draft as a preset in this browser (localStorage; no server save is implied)"
+          testId="studio-save-custom-preset"
+        >
+          Save as Custom Preset
+        </Button>
+        {customPresets.length > 0 ? (
+          <Button
+            variant="ghost"
+            size="xs"
+            className="pb-0.5"
+            onClick={() => {
+              let remaining = customPresets;
+              for (const preset of customPresets) remaining = deleteCustomPreset(preset.id);
+              setCustomPresets(remaining);
+              setSaveNote({ text: "Local custom presets cleared.", tone: "neutral" });
+            }}
+            title="Delete all locally saved presets (localStorage only)"
+          >
+            Clear local presets ({customPresets.length})
+          </Button>
+        ) : null}
         <Field label="Strategy ID" htmlFor="studio-id" className="w-[190px]">
           <TextInput
             id="studio-id"
@@ -548,29 +781,116 @@ export function ManualBuilder({
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
               {activeStage === "universe" ? (
                 <div className="flex flex-col gap-3">
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    <Field label="Selector Type" htmlFor="studio-selector">
-                      <Select
-                        id="studio-selector"
-                        value={draft.universe.name}
-                        onChange={changeSelector}
-                        options={selectorChoices(catalog).map((choice) => ({
-                          value: String(choice.value),
-                          label: choice.label,
-                        }))}
-                      />
-                    </Field>
-                    <p className="self-end pb-1 text-[10.5px] leading-4 text-zinc-600">
-                      The selector filters eligible roots every bar; the master universe below defines which sectors and
-                      micro pairs the strategy may trade.
+                  <div className="rounded-md border border-edge bg-canvas px-2.5 py-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        aria-pressed={universeStackOn}
+                        data-testid="universe-stack-toggle"
+                        onClick={() => {
+                          const next = !universeStackOn;
+                          setUniverseStackOn(next);
+                          if (!next && compositeUniverse) {
+                            changeUniverseStack([selectedUniverseStack[0] as string], "intersection");
+                          }
+                        }}
+                        className={cn(
+                          "focus-ring inline-flex h-6 items-center gap-2 rounded border px-2 text-[11px] font-medium transition-colors",
+                          universeStackOn
+                            ? "border-accent/40 bg-accent text-white"
+                            : "border-edge bg-surface text-zinc-300 hover:border-zinc-600",
+                        )}
+                      >
+                        Modular Composite Stack
+                      </button>
+                      <span className="font-mono text-[10px] text-zinc-500">
+                        {selectedUniverseStack.join(" + ")} · {compositeUniverse ? universeStackMode(draft) : "single selector"}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[10px] leading-4 text-zinc-500">
+                      Stack two selectors into the backend composite selector (intersection/union). A single selector keeps
+                      independent parameters; in composite mode the engine builds each component from its catalog defaults.
                     </p>
                   </div>
-                  <ParameterBlock
-                    parameters={universeParams}
-                    draft={draft}
-                    onUpdate={updateParameter}
-                    emptyText="This selector has no extra parameters."
-                  />
+                  {universeStackOn ? (
+                    <div className="flex flex-col gap-3 rounded-md border border-edge bg-canvas px-2.5 py-2">
+                      <div className="flex flex-wrap gap-1.5">
+                        {universeStackChoices().map((choice) => {
+                          const name = String(choice.value);
+                          const active = selectedUniverseStack.includes(name);
+                          return (
+                            <button
+                              key={name}
+                              type="button"
+                              onClick={() => {
+                                const next = active
+                                  ? selectedUniverseStack.filter((entry) => entry !== name)
+                                  : [...selectedUniverseStack, name];
+                                if (next.length === 0) return;
+                                changeUniverseStack(next, universeStackMode(draft));
+                              }}
+                              className={cn(
+                                "focus-ring rounded-full border px-2.5 py-1 text-[10.5px]",
+                                active
+                                  ? "border-accent/40 bg-accent-soft text-blue-300"
+                                  : "border-edge bg-surface text-zinc-400 hover:border-zinc-600",
+                              )}
+                            >
+                              {choice.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {compositeUniverse ? (
+                        <Field label="Combination mode" htmlFor="studio-universe-mode">
+                          <Select
+                            id="studio-universe-mode"
+                            value={universeStackMode(draft)}
+                            onChange={(value) =>
+                              changeUniverseStack(selectedUniverseStack, value as UniverseStackMode)
+                            }
+                            options={[
+                              { value: "intersection", label: "Intersection (both selectors agree)" },
+                              { value: "union", label: "Union (either selector passes)" },
+                            ]}
+                          />
+                        </Field>
+                      ) : (
+                        <ParameterBlock
+                          parameters={stageParametersFor("universe", selectedUniverseStack[0] as string)}
+                          draft={draft}
+                          onUpdate={updateParameter}
+                          emptyText="This selector has no extra parameters."
+                        />
+                      )}
+                    </div>
+                  ) : (
+                    <>
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <Field label="Selector Type" htmlFor="studio-selector">
+                          <Select
+                            id="studio-selector"
+                            value={draft.universe.name}
+                            onChange={changeSelector}
+                            options={selectorChoices(catalog).map((choice) => ({
+                              value: String(choice.value),
+                              label: choice.label,
+                            }))}
+                          />
+                        </Field>
+                        <p className="self-end pb-1 text-[10.5px] leading-4 text-zinc-600">
+                          The selector filters eligible roots every bar; the master universe below defines which sectors and
+                          micro pairs the strategy may trade.
+                        </p>
+                      </div>
+                      <ParameterBlock
+                        parameters={universeParams}
+                        draft={draft}
+                        onUpdate={updateParameter}
+                        emptyText="This selector has no extra parameters."
+                      />
+                    </>
+                  )}
                   <UniverseRootPicker
                     sectors={sectors}
                     selected={selectedRoots}
@@ -596,6 +916,12 @@ export function ManualBuilder({
                       risk caps in Stage 4.
                     </p>
                   </div>
+                  <div className="rounded-md border border-accent/20 bg-accent-soft/20 px-2.5 py-2">
+                    <p className="text-[10.5px] leading-4 text-zinc-400">
+                      <span className="font-mono text-blue-300">Math:</span>{" "}
+                      {allocatorMath(draft.allocator.name, catalog.formulas)}
+                    </p>
+                  </div>
                   <ParameterBlock
                     parameters={allocatorParams}
                     draft={draft}
@@ -613,23 +939,123 @@ export function ManualBuilder({
                 </div>
               ) : activeStage === "timing" ? (
                 <div className="flex flex-col gap-2.5">
-                  {TIMING_OVERLAYS.map((overlay) => {
-                    const parameters = stageParametersFor("timing", overlay.name);
-                    const enabled = draft.timing.some((entry) => entry.name === overlay.name);
-                    return (
-                      <OverlayCard
-                        key={overlay.name}
-                        name={overlay.name}
-                        title={overlay.title}
-                        subtitle={overlay.subtitle}
-                        enabled={enabled}
-                        parameters={parameters}
-                        draft={draft}
-                        onUpdate={updateParameter}
-                        onToggle={() => toggleOverlay("timing", overlay.name, enabled, parameters)}
-                      />
-                    );
-                  })}
+                  <div className="rounded-md border border-edge bg-canvas px-2.5 py-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        aria-pressed={timingStackOn}
+                        data-testid="timing-stack-toggle"
+                        onClick={() => setTimingStackOn(!timingStackOn)}
+                        className={cn(
+                          "focus-ring inline-flex h-6 items-center gap-2 rounded border px-2 text-[11px] font-medium transition-colors",
+                          timingStackOn
+                            ? "border-accent/40 bg-accent text-white"
+                            : "border-edge bg-surface text-zinc-300 hover:border-zinc-600",
+                        )}
+                      >
+                        Modular Composite Stack
+                      </button>
+                      <span className="font-mono text-[10px] text-zinc-500">
+                        {draft.timing.length} signal{draft.timing.length === 1 ? "" : "s"} · sequential chain
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[10px] leading-4 text-zinc-500">
+                      Overlays are pure weight transforms applied in combination-weight order (higher weight = earlier).
+                      Each enabled signal keeps its own parameters; the serialized contract is the standard timing list.
+                    </p>
+                  </div>
+                  {timingStackOn ? (
+                    <div className="flex flex-col gap-2.5">
+                      {timingEntries.map((entry) => {
+                        const overlay = stacking(entry.name);
+                        const parameters = stageParametersFor("timing", entry.name);
+                        const enabled = draft.timing.some((stage) => stage.name === entry.name);
+                        if (!enabled) return null;
+                        return (
+                          <div
+                            key={entry.name}
+                            className="rounded-md border border-accent/25 bg-accent-soft/20 px-2.5 py-2"
+                            data-testid={`timing-stack-${entry.name}`}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <p className="truncate text-[11px] font-medium text-zinc-200">
+                                  {overlay?.title ?? entry.name}
+                                </p>
+                                <p className="truncate text-[10px] text-zinc-500">{overlay?.subtitle ?? ""}</p>
+                              </div>
+                              <div className="flex shrink-0 items-center gap-2">
+                                <Field label="Weight" htmlFor={`studio-weight-${entry.name}`} className="w-[74px]">
+                                  <TextInput
+                                    id={`studio-weight-${entry.name}`}
+                                    type="number"
+                                    step={0.5}
+                                    min={0.5}
+                                    value={entry.weight}
+                                    onChange={(value) => updateTimingWeight(entry.name, Number(value) || 1)}
+                                  />
+                                </Field>
+                                <Button
+                                  variant="ghost"
+                                  size="xs"
+                                  onClick={() => toggleOverlay("timing", entry.name, true, parameters)}
+                                  title="Remove this signal from the stack"
+                                >
+                                  Remove
+                                </Button>
+                              </div>
+                            </div>
+                            <div className="mt-2">
+                              <ParameterBlock
+                                parameters={parameters}
+                                draft={draft}
+                                onUpdate={updateParameter}
+                                emptyText="No parameters published for this overlay."
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                      <div className="flex flex-wrap gap-1.5">
+                        {TIMING_OVERLAYS.filter((overlay) => !draft.timing.some((stage) => stage.name === overlay.name)).map(
+                          (overlay) => {
+                            const parameters = stageParametersFor("timing", overlay.name);
+                            return (
+                              <Button
+                                key={overlay.name}
+                                variant="ghost"
+                                size="xs"
+                                onClick={() => {
+                                  setTimingWeights((current) => ({ ...current, [overlay.name]: 1 }));
+                                  toggleOverlay("timing", overlay.name, false, parameters);
+                                }}
+                              >
+                                + {overlay.title}
+                              </Button>
+                            );
+                          },
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    TIMING_OVERLAYS.map((overlay) => {
+                      const parameters = stageParametersFor("timing", overlay.name);
+                      const enabled = draft.timing.some((entry) => entry.name === overlay.name);
+                      return (
+                        <OverlayCard
+                          key={overlay.name}
+                          name={overlay.name}
+                          title={overlay.title}
+                          subtitle={overlay.subtitle}
+                          enabled={enabled}
+                          parameters={parameters}
+                          draft={draft}
+                          onUpdate={updateParameter}
+                          onToggle={() => toggleOverlay("timing", overlay.name, enabled, parameters)}
+                        />
+                      );
+                    })
+                  )}
                 </div>
               ) : activeStage === "risk" ? (
                 <div className="flex flex-col gap-2.5">
@@ -699,6 +1125,102 @@ export function ManualBuilder({
                   </div>
                 </div>
               )}
+              {activeStage !== "translator" ? (
+                <div className="mt-3 rounded-md border border-edge bg-canvas px-2.5 py-2" data-testid="custom-parameter-panel">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-[10.5px] text-zinc-400">
+                      Custom & advanced parameters · Stage {stageIndex + 1}
+                    </p>
+                    {customEditor ? (
+                      <Button variant="ghost" size="xs" onClick={() => setCustomEditor(null)}>
+                        Close
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        testId="studio-add-parameter"
+                        onClick={() =>
+                          openCustomEditor(
+                            activeStage as "universe" | "allocator" | "timing" | "risk",
+                            activeStage === "timing" ? draft.timing[0]?.name : activeStage === "risk" ? draft.risk[0]?.name : undefined,
+                          )
+                        }
+                      >
+                        + Add / Customize Parameter
+                      </Button>
+                    )}
+                  </div>
+                  {customEditor ? (
+                    <div className="mt-2 flex flex-col gap-2">
+                      {customEditorTarget && customAdvancedOptions.length > 0 ? (
+                        <Field label="Advanced catalog parameter" htmlFor="studio-advanced-pick">
+                          <Select
+                            id="studio-advanced-pick"
+                            value={advancedPick}
+                            onChange={setAdvancedPick}
+                            options={[
+                              { value: "", label: "— add an advanced parameter from the catalog —" },
+                              ...customAdvancedOptions.map((parameter) => ({
+                                value: parameter.key ?? parameter.path,
+                                label: `${parameterLabel(activeStage, parameter)} · ${parameter.path}`,
+                              })),
+                            ]}
+                          />
+                        </Field>
+                      ) : null}
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <Field label="Custom key (snake_case)" htmlFor="studio-custom-key">
+                          <TextInput id="studio-custom-key" value={customKey} onChange={setCustomKey} placeholder="my_parameter" />
+                        </Field>
+                        <Field label="Value (number / true / false / text)" htmlFor="studio-custom-value">
+                          <TextInput id="studio-custom-value" value={customValue} onChange={setCustomValue} placeholder="0.25" />
+                        </Field>
+                      </div>
+                      {customError ? <p className="text-[10.5px] text-rose-400">{customError}</p> : null}
+                      {extraParamEntries.length > 0 ? (
+                        <div className="flex flex-wrap gap-1.5">
+                          {extraParamEntries.map(([key, value]) => (
+                            <span
+                              key={key}
+                              className="inline-flex items-center gap-1 rounded border border-edge bg-surface px-2 py-0.5 font-mono text-[10px] text-zinc-400"
+                            >
+                              {key}={String(value)}
+                              <button
+                                type="button"
+                                aria-label={`Remove custom parameter ${key}`}
+                                className="text-zinc-500 hover:text-rose-300"
+                                onClick={() =>
+                                  applyDraft(
+                                    removeCustomParam(
+                                      draft,
+                                      activeStage as "universe" | "allocator" | "timing" | "risk",
+                                      key,
+                                      editorOverlayName,
+                                    ),
+                                  )
+                                }
+                              >
+                                ×
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                      <div className="flex gap-2">
+                        <Button variant="primary" size="xs" onClick={submitCustomParam} testId="studio-submit-custom-parameter">
+                          Add parameter
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-[10px] leading-4 text-zinc-500">
+                      Expose advanced catalog parameters or add your own scalar key/value pair to this stage. Keys are
+                      written into the declarative YAML stage params; values must be scalar (number, boolean or text).
+                    </p>
+                  )}
+                </div>
+              ) : null}
             </div>
           </section>
         </div>
