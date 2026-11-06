@@ -9,7 +9,27 @@ the public release history starts with the current line.
 
 ## [Unreleased]
 
-No unreleased changes.
+### Added
+
+- Global LLM provider status pill and `GET /api/risk/llm-status` / `POST /api/risk/llm-ping`,
+  with additive `/health.llm_status`, honest offline-stub/live/error states and latency.
+- Inspectable 45-root scope for Term Structure, Pipeline & Weights and Risk & LLM
+  (`scope=strategy|cached|all`, sector and explicit root filters) with cached-Parquet or
+  deterministic instrument-master provenance.
+- Non-destructive IBKR port discovery (`GET /api/runner/ibkr-ports`) for TWS/IB Gateway paper/live
+  ports and a guarded connection-switch API that never claims an unapplied switch.
+- Modular Strategy Studio composite stacks for timing/universe signals, allocator math tooltips,
+  advanced/custom stage parameters and local custom presets.
+- Term-structure forward-curve modes: normalized basis vs F1 (default), annualized roll yield and
+  raw price, with minimum domains, a zero reference line and F6-F1 spread headers.
+
+### Fixed
+
+- Operator drawer and Market Data Cache no longer lose input focus or close native select dropdowns
+  on telemetry/health polling ticks.
+- Deterministic quantitative risk thresholds are now the primary Risk & LLM workspace, with the LLM
+  overlay presented as an explicit one-way brake.
+- API catalog responses now forward allocator formulas and advanced-parameter metadata to the Studio.
 
 ## [1.9.0]
 
