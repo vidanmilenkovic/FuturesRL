@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { Tabs } from "@/components/ui/primitives";
+import { EmptyState, Panel, Tabs } from "@/components/ui/primitives";
 import { getStudioCatalog, listStrategies } from "@/lib/api";
 import { DATA_TIMEFRAMES } from "@/lib/data-cache";
 import { draftFromPreset, draftFromStrategy } from "@/lib/studio";
@@ -81,7 +81,7 @@ export function StudioView() {
     return { label: "Catalog fallback", tone: "warn" };
   }, [catalog.source]);
 
-  if (!catalog.data || !draft) {
+  if (!catalog.data) {
     return (
       <div className="grid min-h-full grid-cols-12 gap-3">
         <div className="panel col-span-12 flex h-11 items-center gap-2 px-3">
@@ -90,6 +90,16 @@ export function StudioView() {
         <div className="panel col-span-12 xl:col-span-8 h-72 animate-pulse" />
         <div className="panel col-span-12 xl:col-span-4 h-72 animate-pulse" />
       </div>
+    );
+  }
+  if (!draft) {
+    return (
+      <Panel title="Strategy Studio">
+        <EmptyState
+          title="Studio catalog unavailable"
+          description="The FastAPI Studio catalog returned no presets or is unreachable. No mock strategy data is substituted."
+        />
+      </Panel>
     );
   }
 

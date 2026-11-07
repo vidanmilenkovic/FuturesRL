@@ -29,9 +29,6 @@ import { InlineField, JsonPre, OrdinalLineChart } from "./controls";
 const ALGORITHMS: { value: DrlAlgorithm; label: string }[] = [
   { value: "PPO", label: "PPO" },
   { value: "CPPO", label: "CPPO (constrained)" },
-  { value: "SAC", label: "SAC" },
-  { value: "TD3", label: "TD3" },
-  { value: "A2C", label: "A2C" },
 ];
 
 const CHECKPOINT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;

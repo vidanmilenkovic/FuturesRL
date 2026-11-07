@@ -57,10 +57,10 @@ npm run start          # serve the production build on :3100
 ## Demo mode behaviour
 
 - Every REST helper in `lib/api.ts` returns `{ data, source, error }`. On a
-  network error or timeout it resolves `source: "demo"` with the seeded
-  factories in `lib/mock.ts` (identical numbers on every render).
-- `TelemetryProvider` opens `/ws/telemetry`; on failure it starts a deterministic
-  local telemetry simulator so PnL/margin/positions still animate.
+  network error or timeout it resolves `source: "demo"` with honest empty/error
+  payloads — no synthetic fixtures are substituted.
+- `TelemetryProvider` opens `/ws/telemetry`; on failure it reports offline and
+  does not start a local simulator.
 - The shell header shows a **DEMO DATA** badge and a warning strip whenever the
   backend is offline. The emergency flatten dialog is fully exercisable in demo
   mode (it clearly reports that the flatten was simulated).

@@ -9,30 +9,29 @@
  */
 
 import {
-  buildAccount,
-  buildPositions,
-  createTelemetrySimulator,
-  mockBacktestList,
-  mockHealth,
-  mockPipeline,
-  mockRiskState,
-  mockStrategies,
-  mockDrlBind,
-  mockDrlModels,
-  mockDrlTrain,
-  mockInstruments,
-  mockOptimizationApply,
-  mockOptimizationList,
-  mockOptimizationStudy,
-  mockRecentFills,
-  mockRunnerStatus,
-  mockSavedStrategy,
-  mockStudioCatalog,
-  mockTelemetryStatus,
-  mockTearsheet,
-  mockTermStructure,
-  mockWorkingOrders,
-} from "./mock";
+  emptyAccountSnapshot,
+  emptyPositions,
+  emptyBacktestList,
+  emptyHealth,
+  emptyPipeline,
+  emptyRiskState,
+  emptyStrategies,
+  emptyDrlBind,
+  emptyDrlModels,
+  emptyDrlTrain,
+  emptyInstruments,
+  emptyOptimizationApply,
+  emptyOptimizationList,
+  emptyOptimizationStudy,
+  emptyRecentFills,
+  emptyRunnerStatus,
+  emptySavedStrategy,
+  emptyStudioCatalog,
+  emptyTelemetryStatus,
+  emptyTearsheet,
+  emptyTermStructure,
+  emptyWorkingOrders,
+} from "./offline";
 import {
   draftToPayload,
   normalizeDrlModelsResponse,
@@ -59,6 +58,8 @@ import type {
   DataIngestResult,
   DataInventoryResponse,
   DataCacheRoot,
+  CalibratedCostsResponse,
+  CalibrateCostsResponse,
   DataTimeframe,
   IbkrConnectionRequest,
   IbkrConnectionResponse,
@@ -180,11 +181,11 @@ async function withFallback<T>(
 // ---------------------------------------------------------------------------
 
 export function getHealth(): Promise<ApiResult<HealthResponse>> {
-  return withFallback("/health", mockHealth, undefined, 1_500);
+  return withFallback("/health", emptyHealth, undefined, 1_500);
 }
 
 export function getTelemetryStatus(): Promise<ApiResult<TelemetryStatusResponse>> {
-  return withFallback("/api/telemetry/status", mockTelemetryStatus);
+  return withFallback("/api/telemetry/status", emptyTelemetryStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +195,7 @@ export function getTelemetryStatus(): Promise<ApiResult<TelemetryStatusResponse>
 export function getAccount(): Promise<ApiResult<AccountSnapshotResponse>> {
   // The first live snapshot can block while IBKR streams the ledger; allow more
   // than the default 2.5 s so the dashboard does not silently fall back to mock data.
-  return withFallback("/api/positions", () => buildAccount(), undefined, 15_000);
+  return withFallback("/api/positions", () => emptyAccountSnapshot(), undefined, 15_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,11 +213,11 @@ function rootScopeQueryString(query?: RootScopeQuery): string {
 }
 
 export function getPipeline(query?: RootScopeQuery): Promise<ApiResult<PipelineWaterfallResponse>> {
-  return withFallback(`/api/pipeline/latest${rootScopeQueryString(query)}`, () => mockPipeline());
+  return withFallback(`/api/pipeline/latest${rootScopeQueryString(query)}`, () => emptyPipeline());
 }
 
 export function getRiskState(query?: RootScopeQuery): Promise<ApiResult<RiskStateResponse>> {
-  return withFallback(`/api/risk/state${rootScopeQueryString(query)}`, mockRiskState);
+  return withFallback(`/api/risk/state${rootScopeQueryString(query)}`, emptyRiskState);
 }
 
 function fallbackLLMStatus(): LLMStatusResponse {
@@ -382,14 +383,14 @@ export function updateRiskThresholds(
 ): Promise<ApiResult<RiskThresholds>> {
   return withFallback(
     "/api/risk/thresholds",
-    () => ({ ...mockRiskState().thresholds, ...overrides }),
+    () => ({ ...emptyRiskState().thresholds, ...overrides }),
     { method: "PUT", body: JSON.stringify(overrides) },
   );
 }
 
 export function flattenAll(): Promise<ApiResult<FlattenAllResponse>> {
   return withFallback("/api/risk/flatten-all", () => {
-    const positions = buildPositions(buildAccount().net_liquidation);
+    const positions = emptyPositions(emptyAccountSnapshot().net_liquidation);
     return {
       status: "flattened" as const,
       timestamp: new Date().toISOString(),
@@ -415,21 +416,21 @@ export function flattenAll(): Promise<ApiResult<FlattenAllResponse>> {
 // ---------------------------------------------------------------------------
 
 export function getWorkingOrders(): Promise<ApiResult<WorkingOrdersResponse>> {
-  return withFallback("/api/orders/working", mockWorkingOrders);
+  return withFallback("/api/orders/working", emptyWorkingOrders);
 }
 
 export function getRecentFills(limit = 50): Promise<ApiResult<FillsResponse>> {
-  return withFallback(`/api/fills/recent?limit=${limit}`, mockRecentFills);
+  return withFallback(`/api/fills/recent?limit=${limit}`, emptyRecentFills);
 }
 
 export function getRunnerStatus(): Promise<ApiResult<RunnerStatus>> {
-  return withFallback("/api/runner/status", () => mockRunnerStatus());
+  return withFallback("/api/runner/status", () => emptyRunnerStatus());
 }
 
 export function stepRunner(states = 1): Promise<ApiResult<RunnerStatus>> {
   return withFallback(
     "/api/runner/step",
-    () => mockRunnerStatus(states),
+    () => emptyRunnerStatus(states),
     { method: "POST", body: JSON.stringify({ states }) },
   );
 }
@@ -439,7 +440,7 @@ export function stepRunner(states = 1): Promise<ApiResult<RunnerStatus>> {
 // ---------------------------------------------------------------------------
 
 export function getTermStructure(query?: RootScopeQuery): Promise<ApiResult<TermStructureResponse>> {
-  return withFallback(`/api/term-structure${rootScopeQueryString(query)}`, mockTermStructure);
+  return withFallback(`/api/term-structure${rootScopeQueryString(query)}`, emptyTermStructure);
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +448,7 @@ export function getTermStructure(query?: RootScopeQuery): Promise<ApiResult<Term
 // ---------------------------------------------------------------------------
 
 export function listStrategies(): Promise<ApiResult<StrategyConfig[]>> {
-  return withFallback("/api/strategies", mockStrategies);
+  return withFallback("/api/strategies", emptyStrategies);
 }
 
 export function updateStrategy(id: string, config: StrategyConfig): Promise<ApiResult<StrategyConfig>> {
@@ -462,18 +463,18 @@ export function updateStrategy(id: string, config: StrategyConfig): Promise<ApiR
 // ---------------------------------------------------------------------------
 
 export function listBacktests(): Promise<ApiResult<BacktestListResponse>> {
-  return withFallback("/api/backtests", mockBacktestList);
+  return withFallback("/api/backtests", emptyBacktestList);
 }
 
 export function getBacktest(id: string): Promise<ApiResult<BacktestRunSummary | null>> {
   return withFallback(`/api/backtests/${encodeURIComponent(id)}`, () => {
-    return mockBacktestList().runs.find((run) => run.id === id) ?? null;
+    return emptyBacktestList().runs.find((run) => run.id === id) ?? null;
   });
 }
 
 export function getTearsheet(id: string): Promise<ApiResult<TearsheetResponse | null>> {
   return withFallback(`/api/backtests/${encodeURIComponent(id)}/tearsheet`, () =>
-    mockTearsheet(id),
+    emptyTearsheet(id),
   );
 }
 
@@ -481,7 +482,7 @@ export function runBacktest(config: BacktestRunConfig): Promise<ApiResult<Backte
   return withFallback(
     "/api/backtests",
     () => {
-      const list = mockBacktestList();
+      const list = emptyBacktestList();
       const base = list.runs.find((run) => run.strategy_id === config.strategy_id) ?? list.runs[0]!;
       return {
         ...base,
@@ -494,6 +495,82 @@ export function runBacktest(config: BacktestRunConfig): Promise<ApiResult<Backte
     { method: "POST", body: JSON.stringify(config) },
     20_000,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Broker cost / margin calibration (task-85)
+// ---------------------------------------------------------------------------
+
+function emptyCalibratedCosts(): CalibratedCostsResponse {
+  return {
+    available: false,
+    path: null,
+    account_id: null,
+    calibrated_at: null,
+    age_seconds: null,
+    roots: {},
+    warnings: ["Calibrated cost API unavailable."],
+    source: "none",
+  };
+}
+
+export function getCalibratedCosts(): Promise<ApiResult<CalibratedCostsResponse>> {
+  return withFallback<unknown>("/api/runner/calibrated-costs", emptyCalibratedCosts).then((result) => {
+    if (result.source !== "live" || !isRecord(result.data)) {
+      return { ...result, data: emptyCalibratedCosts() };
+    }
+    const raw = result.data;
+    return {
+      ...result,
+      data: {
+        available: raw.available === true,
+        path: typeof raw.path === "string" ? raw.path : null,
+        account_id: typeof raw.account_id === "string" ? raw.account_id : null,
+        calibrated_at: typeof raw.calibrated_at === "string" ? raw.calibrated_at : null,
+        age_seconds: typeof raw.age_seconds === "number" ? raw.age_seconds : null,
+        roots: isRecord(raw.roots) ? (raw.roots as Record<string, never>) : {},
+        warnings: asRebalanceArray(raw.warnings).map((warning) => String(warning)),
+        source: String(raw.source ?? "none"),
+      },
+    };
+  });
+}
+
+export function calibrateCosts(roots?: string[]): Promise<ApiResult<CalibrateCostsResponse>> {
+  const fallback: CalibrateCostsResponse = {
+    status: "unavailable",
+    account_id: null,
+    calibrated_at: null,
+    roots: {},
+    warnings: [],
+    path: null,
+    source: "unavailable",
+    message: "IBKR cost calibration requires the runner API.",
+  };
+  return withFallback<unknown>(
+    "/api/runner/calibrate-costs",
+    () => fallback,
+    { method: "POST", body: JSON.stringify({ roots: roots ?? null }) },
+    120_000,
+  ).then((result) => {
+    if (result.source !== "live" || !isRecord(result.data)) {
+      return { ...result, data: { ...fallback, message: result.error ?? fallback.message } };
+    }
+    const raw = result.data;
+    return {
+      ...result,
+      data: {
+        status: String(raw.status ?? "unavailable"),
+        account_id: typeof raw.account_id === "string" ? raw.account_id : null,
+        calibrated_at: typeof raw.calibrated_at === "string" ? raw.calibrated_at : null,
+        roots: isRecord(raw.roots) ? (raw.roots as Record<string, never>) : {},
+        warnings: asRebalanceArray(raw.warnings).map((warning) => String(warning)),
+        path: typeof raw.path === "string" ? raw.path : null,
+        source: String(raw.source ?? "ibkr"),
+        message: typeof raw.message === "string" ? raw.message : null,
+      },
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,37 +1425,24 @@ export interface TelemetryConnection {
 /**
  * Subscribe to `/ws/telemetry`.
  *
- * On the first socket error/failure the hook starts the deterministic local
- * simulator so the Command Center and Risk views still animate in demo mode.
- * The caller gets `onStatus("live" | "demo")` transitions so the shell can show
- * the `UI FALLBACK` data-mode badge.
+ * On socket error/failure the connection reports `offline`; no synthetic local
+ * telemetry is generated. The caller gets honest live/offline status.
  */
 export function connectTelemetry(options: {
   onMessage: (message: TelemetryEnvelope) => void;
   onStatus: (status: ConnectionState) => void;
 }): TelemetryConnection {
-  const simulator = createTelemetrySimulator({
-    netLiquidation: 1_250_000,
-    initialMargin: 463_200,
-    marginUtilization: 0.371,
-  });
-
   let socket: WebSocket | null = null;
   let closed = false;
   let retries = 0;
-  let simulatorTimer: ReturnType<typeof setInterval> | null = null;
 
-  const startSimulator = () => {
-    if (simulatorTimer !== null || closed) return;
-    options.onStatus("demo");
-    simulatorTimer = setInterval(() => {
-      options.onMessage(simulator());
-    }, 1_400);
+  const markOffline = () => {
+    if (!closed) options.onStatus("offline");
   };
 
   const scheduleRetry = () => {
     if (closed) return;
-    startSimulator();
+    markOffline();
     if (retries >= 5) return;
     retries += 1;
     window.setTimeout(() => {
@@ -1407,10 +1471,6 @@ export function connectTelemetry(options: {
       }
       retries = 0;
       options.onStatus("live");
-      if (simulatorTimer !== null) {
-        clearInterval(simulatorTimer);
-        simulatorTimer = null;
-      }
     };
     socket.onmessage = (event: MessageEvent<string>) => {
       try {
@@ -1435,7 +1495,7 @@ export function connectTelemetry(options: {
   return {
     close: () => {
       closed = true;
-      if (simulatorTimer !== null) clearInterval(simulatorTimer);
+
       socket?.close();
       socket = null;
       options.onStatus("offline");
@@ -1449,7 +1509,7 @@ export function connectTelemetry(options: {
 // ---------------------------------------------------------------------------
 
 export function getInstruments(): Promise<ApiResult<InstrumentsResponse>> {
-  const fallback = mockInstruments();
+  const fallback = emptyInstruments();
   return withFallback<unknown>("/api/instruments", () => fallback).then((result) => ({
     ...result,
     data: normalizeInstrumentsResponse(result.data, fallback),
@@ -1461,7 +1521,7 @@ export function getInstruments(): Promise<ApiResult<InstrumentsResponse>> {
 // ---------------------------------------------------------------------------
 
 export function getStudioCatalog(): Promise<ApiResult<StudioCatalogResponse>> {
-  const fallback = mockStudioCatalog();
+  const fallback = emptyStudioCatalog();
   return withFallback<unknown>("/api/strategies/schema/catalog", () => fallback).then((result) => ({
     ...result,
     data: normalizeStudioCatalog(result.data, fallback),
@@ -1481,7 +1541,7 @@ export function saveStudioStrategy(
   const path = options.update ? `/api/strategies/${encodeURIComponent(draft.id)}` : "/api/strategies";
   return withFallback<unknown>(
     path,
-    () => ({ strategy: mockSavedStrategy(payload), persisted: false, message: "UI FALLBACK: strategy saved in memory only." }),
+    () => ({ strategy: emptySavedStrategy(payload), persisted: false, message: "UI FALLBACK: strategy saved in memory only." }),
     { method: options.update ? "PUT" : "POST", body: JSON.stringify(payload) },
     15_000,
   ).then((result) => {
@@ -1490,7 +1550,7 @@ export function saveStudioStrategy(
     if (!normalized) {
       return {
         data: {
-          strategy: mockSavedStrategy(payload),
+          strategy: emptySavedStrategy(payload),
           persisted: false,
           message: "API returned an unrecognized strategy payload; kept the local draft.",
         },
@@ -1515,7 +1575,7 @@ export function saveStudioStrategy(
 // ---------------------------------------------------------------------------
 
 export function listOptimizations(): Promise<ApiResult<OptimizationListResponse>> {
-  return withFallback<unknown>("/api/optimize", mockOptimizationList).then((result) => ({
+  return withFallback<unknown>("/api/optimize", emptyOptimizationList).then((result) => ({
     ...result,
     data:
       result.source === "live"
@@ -1528,7 +1588,7 @@ export function getOptimization(
   studyId: string,
 ): Promise<ApiResult<OptimizationStudy | null>> {
   return withFallback<unknown>(`/api/optimize/${encodeURIComponent(studyId)}`, () =>
-    mockOptimizationStudy(),
+    emptyOptimizationStudy(),
   ).then((result) => {
     // v1.5.2: the API quarantines legacy studies; a 404 means "archived", not
     // "render a fake fixture study".
@@ -1541,7 +1601,7 @@ export function getOptimization(
     }
     const normalized = normalizeOptimizationStudy(result.data);
     if (normalized) return { ...result, data: normalized };
-    const fallback = mockOptimizationStudy();
+    const fallback = emptyOptimizationStudy();
     return {
       data: { ...fallback, study_id: studyId },
       source: "demo" as const,
@@ -1555,14 +1615,14 @@ export function runOptimization(
 ): Promise<ApiResult<OptimizationStudy>> {
   return withFallback<unknown>(
     "/api/optimize",
-    () => mockOptimizationStudy(request),
+    () => emptyOptimizationStudy(request),
     { method: "POST", body: JSON.stringify(request) },
     120_000,
   ).then((result) => {
     if (result.source === "demo") return result as ApiResult<unknown> as ApiResult<OptimizationStudy>;
     const normalized = normalizeOptimizationStudy(result.data);
     if (normalized) return { ...result, data: normalized };
-    const fallback = mockOptimizationStudy(request);
+    const fallback = emptyOptimizationStudy(request);
     return { data: fallback, source: "demo" as const, error: "unrecognized optimization payload" };
   });
 }
@@ -1577,7 +1637,7 @@ export function applyOptimization(
   };
   return withFallback<unknown>(
     `/api/optimize/${encodeURIComponent(studyId)}/apply`,
-    () => mockOptimizationApply(studyId),
+    () => emptyOptimizationApply(studyId),
     { method: "POST", body: JSON.stringify(body) },
     300_000,
   ).then((result) => {
@@ -1613,7 +1673,7 @@ export function applyOptimization(
 // ---------------------------------------------------------------------------
 
 export function listDrlModels(): Promise<ApiResult<DrlModelsResponse>> {
-  return withFallback<unknown>("/api/drl/models", mockDrlModels).then((result) => ({
+  return withFallback<unknown>("/api/drl/models", emptyDrlModels).then((result) => ({
     ...result,
     data:
       result.source === "live"
@@ -1625,13 +1685,13 @@ export function listDrlModels(): Promise<ApiResult<DrlModelsResponse>> {
 export function trainDrlModel(request: DrlTrainRequest): Promise<ApiResult<DrlTrainResult>> {
   return withFallback<unknown>(
     "/api/drl/train",
-    () => mockDrlTrain(request),
+    () => emptyDrlTrain(request),
     { method: "POST", body: JSON.stringify(request) },
     180_000,
   ).then((result) => {
     const normalized = normalizeDrlTrainResult(result.data);
     if (normalized) return { ...result, data: normalized };
-    const fallback = mockDrlTrain(request);
+    const fallback = emptyDrlTrain(request);
     return { data: fallback, source: "demo" as const, error: "unrecognized DRL training payload" };
   });
 }
@@ -1683,7 +1743,7 @@ export function bindDrlModel(
   };
   return withFallback<unknown>(
     `/api/strategies/${encodeURIComponent(strategy.id)}`,
-    () => mockDrlBind(model, strategy.id),
+    () => emptyDrlBind(model, strategy.id),
     { method: "PUT", body: JSON.stringify(payload) },
   ).then((result) => {
     const universeSynced = result.source === "live" && metadataAvailable;

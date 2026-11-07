@@ -8,7 +8,7 @@ import { cn } from "@/lib/cn";
 import type { InstrumentRoot, RootScope, RootScopeQuery, RootScopeState } from "@/lib/types";
 import { useAsyncData } from "@/lib/use-async-data";
 
-const STORAGE_KEY = "futuresrlx:root-scope-filter";
+const STORAGE_KEY = "futuresrl:root-scope-filter";
 
 const SCOPE_OPTIONS: { value: RootScope; label: string; hint: string }[] = [
   { value: "strategy", label: "Active Strategy", hint: "Roots used by the active strategy (default)" },

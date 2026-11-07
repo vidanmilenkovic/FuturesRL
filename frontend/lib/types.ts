@@ -738,7 +738,7 @@ export interface OptimizationApplyResult {
 // DRL neural trainer (Phase 10)
 // ---------------------------------------------------------------------------
 
-export type DrlAlgorithm = "PPO" | "CPPO" | "SAC" | "TD3" | "A2C";
+export type DrlAlgorithm = "PPO" | "CPPO";
 
 export interface DrlTrainRequest {
   strategy_id: string;
@@ -823,6 +823,33 @@ export interface DrlBindResult {
   metadata_available?: boolean;
   warning?: string | null;
   strategy?: StrategyConfig | null;
+}
+
+export interface CostBreakdown {
+  broker_commissions?: number | null;
+  broker_commission?: number | null;
+  exchange_reg_fees?: number | null;
+  exchange_and_reg_fees?: number | null;
+  exchange_and_regulatory_fees?: number | null;
+  funding?: number | null;
+  roll_cost_total?: number | null;
+  roll_commissions?: number | null;
+  roll_exchange_and_regulatory_fees?: number | null;
+  roll_slippage?: number | null;
+  non_roll_commissions?: number | null;
+  non_roll_exchange_and_regulatory_fees?: number | null;
+  non_roll_slippage?: number | null;
+  forced_liquidation_cost?: number | null;
+  total_commissions?: number | null;
+  total_execution_costs?: number | null;
+  total_costs?: number | null;
+  slippage?: number | null;
+  slippage_cost?: number | null;
+  roll_costs?: number | null;
+  roll_cost?: number | null;
+  total_drag?: number | null;
+  total_cost?: number | null;
+  [key: string]: unknown;
 }
 
 export interface MetricsSet {
@@ -944,6 +971,9 @@ export interface BacktestRunSummary {
   /** QoL: strategy config snapshot captured when the run was created. */
   strategy_config?: Record<string, unknown> | null;
   strategy_yaml?: string | null;
+  /** Cost transparency (task-86 additive, optional). */
+  cost_breakdown?: CostBreakdown | null;
+  costs?: CostBreakdown | null;
   /** Phase 11B additive real/synthetic provenance. */
   data_origin?: DataOrigin | null;
   data_mode?: MarketDataMode | string | null;
@@ -1341,4 +1371,40 @@ export interface DataIngestResult {
   continuous_series: unknown[] | null;
   warnings: string[];
   message: string;
+}
+
+
+// ---------------------------------------------------------------------------
+// Broker cost calibration (task-85 / task-88)
+// ---------------------------------------------------------------------------
+
+export interface CalibratedRoot {
+  broker_commission_per_contract: number;
+  exchange_and_reg_fee_per_contract: number;
+  initial_margin: number | null;
+  maintenance_margin: number | null;
+  commission_source?: string | null;
+  margin_source?: string | null;
+}
+
+export interface CalibratedCostsResponse {
+  available: boolean;
+  path: string | null;
+  account_id: string | null;
+  calibrated_at: string | null;
+  age_seconds: number | null;
+  roots: Record<string, CalibratedRoot>;
+  warnings: string[];
+  source: "ibkr" | "none" | string;
+}
+
+export interface CalibrateCostsResponse {
+  status: "calibrated" | "partial" | "unavailable" | string;
+  account_id: string | null;
+  calibrated_at: string | null;
+  roots: Record<string, CalibratedRoot>;
+  warnings: string[];
+  path: string | null;
+  source: string;
+  message?: string | null;
 }

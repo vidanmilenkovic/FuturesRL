@@ -7,6 +7,7 @@ import { resetPaperState, resetRunnerBridge } from "@/lib/api";
 import type { PaperStateResetResult } from "@/lib/types";
 
 import { MarketDataCacheButton } from "@/components/data/market-data-cache";
+import { CostCalibrationPanel } from "./cost-calibration-panel";
 import { IbkrConnectionManager } from "./ibkr-connection-manager";
 
 import { useTelemetry } from "../providers/telemetry-provider";
@@ -40,7 +41,7 @@ export const OperatorDrawer = memo(function OperatorDrawer({
   const wasOpenRef = useRef(false);
   useEffect(() => {
     if (open) {
-      window.dispatchEvent(new Event("futuresrlx:pause-telemetry"));
+      window.dispatchEvent(new Event("futuresrl:pause-telemetry"));
       if (!wasOpenRef.current) {
         setAction(null);
         setConfirm("");
@@ -55,7 +56,7 @@ export const OperatorDrawer = memo(function OperatorDrawer({
     }
     wasOpenRef.current = open;
     return () => {
-      if (open) window.dispatchEvent(new Event("futuresrlx:resume-telemetry"));
+      if (open) window.dispatchEvent(new Event("futuresrl:resume-telemetry"));
     };
   }, [open]);
 
@@ -181,6 +182,7 @@ export const OperatorDrawer = memo(function OperatorDrawer({
             </div>
           </div>
           <IbkrConnectionManager open={open} />
+          <CostCalibrationPanel open={open} />
           <div className="rounded-md border border-edge bg-canvas/60 p-2">
             <div className="flex items-start justify-between gap-2">
               <div>

@@ -35,9 +35,9 @@ export const TelemetryDrawer = memo(function TelemetryDrawer({
 
   useEffect(() => {
     if (!open) return;
-    window.dispatchEvent(new Event("futuresrlx:pause-telemetry"));
+    window.dispatchEvent(new Event("futuresrl:pause-telemetry"));
     return () => {
-      window.dispatchEvent(new Event("futuresrlx:resume-telemetry"));
+      window.dispatchEvent(new Event("futuresrl:resume-telemetry"));
     };
   }, [open]);
 

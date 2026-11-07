@@ -205,7 +205,20 @@ export function AppShell({ children }: { children: ReactNode }) {
       </header>
 
       {/* ------------------------------------------------------------------ main */}
-      <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden bg-canvas p-3">{children}</main>
+      <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden bg-canvas p-3">
+        {backend === "offline" ? (
+          <div
+            role="alert"
+            data-testid="api-offline-banner"
+            className="mb-3 rounded-md border border-warn/30 bg-warn-soft/30 px-3 py-2 text-[11px] leading-5 text-amber-200"
+          >
+            <span className="font-medium text-amber-100">API unavailable.</span>{" "}
+            Showing honest empty/error states — no synthetic mock data is substituted. Start the FastAPI backend to
+            populate live payloads.
+          </div>
+        ) : null}
+        {children}
+      </main>
 
       {/* ------------------------------------------------------------ status bar */}
       <footer className="relative z-40 flex h-7 shrink-0 items-center gap-3 border-t border-hairline bg-panel px-3 text-[11px] text-zinc-500">

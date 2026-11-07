@@ -39,6 +39,7 @@ import {
   dataOriginBadge,
 } from "@/lib/data-cache";
 import {
+  formatCurrency,
   formatDateTime,
   formatDuration,
   formatInteger,
@@ -666,6 +667,7 @@ export function BacktestsView() {
             {exportMessage}
           </div>
         ) : null}
+        {selectedRun ? <CostBreakdown run={selectedRun} /> : null}
         {selectedRunId ? (
           <TearsheetOverlay
             key={`${compareIds.join("|")}|${selectedRunId}`}
@@ -856,6 +858,42 @@ function ParameterDiffAccordion({
         </div>
       </details>
     </Panel>
+  );
+}
+
+function CostBreakdown({ run }: { run: BacktestRunSummary }) {
+  const breakdown = run.cost_breakdown ?? run.costs ?? null;
+  if (!breakdown) {
+    return (
+      <div data-testid="cost-breakdown" className="mb-2 rounded border border-hairline bg-canvas/40 px-2 py-1.5 text-[10px] text-zinc-600">
+        Cost breakdown not available for fixture/legacy runs.
+      </div>
+    );
+  }
+  const rows = [
+    ["Broker commissions", breakdown.broker_commissions ?? breakdown.total_commissions],
+    ["Exchange & regulatory fees", breakdown.exchange_and_regulatory_fees ?? breakdown.exchange_reg_fees ?? breakdown.exchange_and_reg_fees],
+    ["Slippage", breakdown.slippage ?? breakdown.slippage_cost],
+    ["Funding", breakdown.funding],
+    ["Roll & BAG execution", breakdown.roll_cost_total ?? breakdown.roll_costs ?? breakdown.roll_cost],
+    ["Forced liquidation", breakdown.forced_liquidation_cost],
+    ["Total execution costs", breakdown.total_execution_costs],
+    ["Total costs", breakdown.total_costs ?? breakdown.total_drag ?? breakdown.total_cost],
+  ] as const;
+  return (
+    <div data-testid="cost-breakdown" className="mb-2 rounded border border-edge bg-canvas/50 px-2.5 py-2">
+      <div className="mb-1 text-[10px] font-medium uppercase tracking-[0.04em] text-zinc-500">Cost breakdown</div>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {rows.map(([label, value]) => (
+          <div key={label}>
+            <div className="text-[9px] text-zinc-600">{label}</div>
+            <div className="font-mono text-[11px] tabular-nums text-zinc-300">
+              {typeof value === "number" ? formatCurrency(Math.abs(value)) : "—"}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

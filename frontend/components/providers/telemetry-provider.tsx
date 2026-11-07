@@ -77,13 +77,13 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
         inputFocusedRef.current = isEditableElement(document.activeElement);
       }, 0);
     };
-    window.addEventListener("futuresrlx:pause-telemetry", pause);
-    window.addEventListener("futuresrlx:resume-telemetry", resume);
+    window.addEventListener("futuresrl:pause-telemetry", pause);
+    window.addEventListener("futuresrl:resume-telemetry", resume);
     document.addEventListener("focusin", focusIn);
     document.addEventListener("focusout", focusOut);
     return () => {
-      window.removeEventListener("futuresrlx:pause-telemetry", pause);
-      window.removeEventListener("futuresrlx:resume-telemetry", resume);
+      window.removeEventListener("futuresrl:pause-telemetry", pause);
+      window.removeEventListener("futuresrl:resume-telemetry", resume);
       document.removeEventListener("focusin", focusIn);
       document.removeEventListener("focusout", focusOut);
     };

@@ -97,7 +97,6 @@ const TIMING_OVERLAYS = [
   { name: "kama", title: "KAMA", subtitle: "Adaptive moving-average trend confirmation." },
   { name: "carry_filter", title: "Carry / term structure", subtitle: "Tilt towards backwardated roots; penalise expensive contango." },
   { name: "mean_reversion", title: "Mean reversion (RSI + Bollinger)", subtitle: "Fade oversold extremes only when turbulence says the move is noise." },
-  { name: "seasonality", title: "Seasonality", subtitle: "Commodity calendar tilts with a root-month bias and out-of-season scale." },
 ] as const;
 
 const RISK_OVERLAYS = [

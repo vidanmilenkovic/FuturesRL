@@ -1686,7 +1686,7 @@ export function reorderTimingByWeights(
   return next;
 }
 
-export const TIMING_STACK_COMPONENTS = ["tsmom", "kama", "carry_filter", "mean_reversion", "seasonality"] as const;
+export const TIMING_STACK_COMPONENTS = ["tsmom", "kama", "carry_filter", "mean_reversion"] as const;
 
 // -- custom parameters ------------------------------------------------------
 
@@ -1772,7 +1772,7 @@ export interface StudioStorageLike {
   removeItem(key: string): void;
 }
 
-export const CUSTOM_PRESET_STORAGE_KEY = "futuresrlx.studio.custom-presets.v1";
+export const CUSTOM_PRESET_STORAGE_KEY = "futuresrl.studio.custom-presets.v1";
 
 export interface StudioCustomPreset {
   id: string;
