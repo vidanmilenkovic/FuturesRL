@@ -60,7 +60,7 @@ function positionMap(rows: RebalancePosition[]): Map<string, number> {
 /**
  * Phase 11A Rebalance Book control bar: whatIf preview of the runner's target
  * book, PreTradeRiskGate diagnostics, then a guarded paper/offline execute.
- * Shared by Command Center and Pipeline & Weights.
+ * Shared by Overview and Weights.
  */
 export function RebalanceBar({
   className,

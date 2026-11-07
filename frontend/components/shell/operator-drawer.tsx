@@ -123,7 +123,7 @@ export const OperatorDrawer = memo(function OperatorDrawer({
       >
         <div className="flex h-9 shrink-0 items-center justify-between border-b border-hairline px-3">
           <div className="flex items-center gap-2">
-            <span className="text-[12px] font-medium text-zinc-200">Operator</span>
+            <span className="text-[12px] font-medium text-zinc-200">System</span>
             <Badge tone={live ? "loss" : "warn"}>{environment}</Badge>
           </div>
           <button

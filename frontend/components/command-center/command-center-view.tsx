@@ -341,7 +341,7 @@ export function CommandCenterView() {
 
   if (!account) {
     return (
-      <Panel title="Command Center">
+      <Panel title="Overview">
         <EmptyState
           title={dataMode.key === "reconnecting" ? "IBKR session reconnecting" : "Account snapshot unavailable"}
           description={
@@ -898,7 +898,7 @@ export function CommandCenterView() {
             I have reviewed the open book and understand this resumes automated execution.
           </label>
           {risk.data?.operator_reset_token_required ? (
-            <Field label="Operator reset token" htmlFor="risk-reset-token">
+            <Field label="System reset token" htmlFor="risk-reset-token">
               <TextInput
                 id="risk-reset-token"
                 type="password"

@@ -322,7 +322,7 @@ export function OptimizerPanel({
       `Applied ${study.study_id} → ${savedId}${backtestRunId ? ` · ${backtestRunId}` : ""}`,
       "gain",
     );
-    // Refresh both the strategy catalog (Studio Load-existing / Backtest Lab
+    // Refresh both the strategy catalog (Studio Load-existing / Backtests
     // navigation refreshes on mount) and the optimization study list.
     onStrategiesChanged();
     studies.reload();
@@ -685,14 +685,14 @@ export function OptimizerPanel({
                 data-testid="apply-link-backtests"
                 className="font-medium text-emerald-300 underline decoration-emerald-500/40 underline-offset-2 hover:text-emerald-200"
               >
-                View in Backtest Lab
+                View in Backtests
               </a>
               <a
                 href={`/studio?strategy=${encodeURIComponent(applyBanner.id)}`}
                 data-testid="apply-link-builder"
                 className="font-medium text-emerald-300 underline decoration-emerald-500/40 underline-offset-2 hover:text-emerald-200"
               >
-                Open in Manual Builder
+                Open in Configuration
               </a>
               {applyBanner.strategyPath ? (
                 <span className="truncate font-mono text-[10px] text-emerald-500/70" title={applyBanner.strategyPath}>
@@ -949,7 +949,7 @@ export function OptimizerPanel({
             </div>
           ) : null}
           <p className="text-[10.5px] leading-4 text-zinc-600">
-            The backend writes the strategy visible to the Studio and Backtest Lab, then auto-runs a verification
+            The backend writes the strategy visible to the Studio and Backtests, then auto-runs a verification
             walk-forward backtest. You will get deep links to both.
           </p>
         </div>
@@ -1065,7 +1065,7 @@ export function OptimizerPanel({
               href={`/backtests?strategy=${encodeURIComponent(applyToast.strategyId)}`}
               className="text-zinc-400 underline decoration-zinc-600 underline-offset-2 hover:text-zinc-200"
             >
-              Backtest Lab
+              Backtests
             </a>
           </div>
         </div>

@@ -33,8 +33,8 @@ interface InventoryState {
 
 /**
  * Phase 11B Market Data Cache entry point. Button exposes cached/total counts
- * and opens the inventory/cost/ingest modal used by the Operator drawer and
- * Backtest Lab.
+ * and opens the inventory/cost/ingest modal used by the System drawer and
+ * Backtests.
  */
 export const MarketDataCacheButton = memo(function MarketDataCacheButton({
   label = "Market Data Cache",

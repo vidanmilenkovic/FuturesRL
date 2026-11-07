@@ -16,9 +16,9 @@ import { OptimizerPanel } from "./optimizer-panel";
 type StudioMode = "builder" | "optimizer" | "drl";
 
 const MODES: { value: StudioMode; label: string }[] = [
-  { value: "builder", label: "Manual Builder" },
-  { value: "optimizer", label: "Optuna Auto-Optimizer" },
-  { value: "drl", label: "DRL Neural Trainer" },
+  { value: "builder", label: "Configuration" },
+  { value: "optimizer", label: "Optimization" },
+  { value: "drl", label: "RL Training" },
 ];
 
 export function StudioView() {
@@ -94,7 +94,7 @@ export function StudioView() {
   }
   if (!draft) {
     return (
-      <Panel title="Strategy Studio">
+      <Panel title="Strategies">
         <EmptyState
           title="Studio catalog unavailable"
           description="The FastAPI Studio catalog returned no presets or is unreachable. No mock strategy data is substituted."
@@ -104,14 +104,14 @@ export function StudioView() {
   }
 
   const strategiesList = strategies.data ?? [];
-  const activeView = mode === "builder" ? "Manual strategy builder" : mode === "optimizer" ? "Optuna auto-optimizer" : "DRL neural trainer";
+  const activeView = mode === "builder" ? "Strategy configuration" : mode === "optimizer" ? "Optimization" : "RL Training";
 
   return (
     <div className="flex min-h-full flex-col gap-3">
       <section className="panel col-span-12 flex flex-wrap items-center justify-between gap-3 px-3 py-1">
         <div className="flex min-w-0 items-center gap-4">
           <Tabs<StudioMode>
-            ariaLabel="Strategy Studio modes"
+            ariaLabel="Strategies modes"
             options={MODES}
             value={mode}
             onChange={setMode}

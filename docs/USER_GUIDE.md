@@ -30,7 +30,7 @@
 | Component | Entry point | Purpose |
 |---|---|---|
 | FastAPI telemetry backend | `python -m uvicorn src.api.main:app` | REST + `/ws/telemetry` for positions, pipeline, risk, term structure, backtests |
-| Next.js dashboard | `cd frontend && npm run dev` | 6-view quant workstation (Command Center, Pipeline & Weights, Risk & LLM, Term Structure, Backtest Lab, Strategy Studio) on port **3100** |
+| Next.js dashboard | `cd frontend && npm run dev` | 6-view quant workstation (Overview, Weights, Risk, Term Structure, Backtests, Strategies) on port **3100** |
 | Backtest CLI | `python -m src.backtest.engine` | Declarative strategy backtests + walk-forward validation + tear sheets |
 | Live runner | `python -m src.execution.runner` | Cold-start hydration → pipeline → OMS → IBKR paper/live (or `--offline` dry run) |
 | Quality gate | `./scripts/quality_gate.sh --cov` | ruff + format + strict mypy + pytest + coverage |
@@ -98,11 +98,11 @@ Open **http://localhost:3100**.
 
 | Route | View |
 |---|---|
-| `/` | Command Center — NLV, intraday PnL, margin utilisation, equity curve, positions, flatten-all |
-| `/pipeline` | Pipeline & Weights — `S_t → A_t → T_t → R_t → N_i,t` waterfall + per-root transformation matrix |
-| `/risk` | Risk & LLM Monitor — semantic risk, confidence, circuit breaker, macro lockouts, thresholds |
+| `/` | Overview — NLV, intraday PnL, margin utilisation, equity curve, positions, flatten-all |
+| `/pipeline` | Weights — `S_t → A_t → T_t → R_t → N_i,t` waterfall + per-root transformation matrix |
+| `/risk` | Risk — semantic risk, confidence, circuit breaker, macro lockouts, thresholds |
 | `/term-structure` | Term Structure & Roll Calendar — forward curves, basis, roll schedule |
-| `/backtests` | Backtest Lab — run/compare backtests, tear sheets, rolling Sharpe, Rachev tails |
+| `/backtests` | Backtests — run/compare backtests, tear sheets, rolling Sharpe, Rachev tails |
 
 **Data mode.** The dashboard reads `/health.offline_mode`:
 - `DEMO DATA` badge → backend not running (pure deterministic mock fixtures).
@@ -119,7 +119,7 @@ The ribbon shows a **three-state data-mode badge**:
 - `PAPER · IBKR` (blue) / `LIVE · IBKR` (emerald) — connected to an IBKR paper/live session
   (`ibkr_connected=true` plus the API `environment`).
 
-On the Command Center equity chart, daily timeframes (`1W/1M/3M/6M/1Y/ALL`) update the latest daily
+On the Overview equity chart, daily timeframes (`1W/1M/3M/6M/1Y/ALL`) update the latest daily
 bar in place when live `/ws/telemetry` ticks arrive; only the `1D` timeframe appends intraday points.
 
 Stop servers with `Ctrl-C` in each terminal.
@@ -372,7 +372,7 @@ Then restart `uvicorn`. `/health` should report `"ibkr_connected": true` and
 Alternatively, run a separate `TradingRunner` (which publishes the runner bridge) and the ribbon also
 reports `PAPER · IBKR` / `LIVE · IBKR` from a fresh bridge snapshot.
 
-![Command Center connected to the IBKR paper account](screenshots/command-center-ibkr-paper.png)
+![Overview connected to the IBKR paper account](screenshots/command-center-ibkr-paper.png)
 
 ### Non-USD IBKR account base currency
 
@@ -389,16 +389,16 @@ when only USD/currency-less rows are accepted) and `/api/positions` degrades to 
 actionable message. The API reads the ledger via `reqAccountUpdates` with an `accountSummary`
 fallback, so either streaming path is sufficient.
 
-### Strategy Studio (`/studio`), Optuna & DRL trainer
+### Strategies (`/studio`): Configuration, Optimization & RL Training
 
-![Strategy Studio — manual pipeline builder](screenshots/strategy-studio-builder.png)
+![Strategies — manual pipeline builder](screenshots/strategy-studio-builder.png)
 
-The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
+The dashboard's 6th tab, **Strategies**, has three sub-modes:
 
-![Strategy Studio — Manual Builder with stage switcher, sticky YAML and 45-root sector picker](screenshots/strategy-studio-universe.png)
+![Strategies — Configuration with stage switcher, sticky YAML and 45-root sector picker](screenshots/strategy-studio-universe.png)
 
-1. **Manual Strategy Builder** — pick a preset (trend following TSMOM+KAMA, commodity carry & term
-   structure, panic mean-reversion, seasonal commodity cycle, DRL + LLM risk) or an existing YAML.
+1. **Configuration** — pick a preset (trend following TSMOM+KAMA, commodity carry & term
+   structure, panic mean-reversion, DRL + LLM risk) or an existing YAML.
    A **five-step stage switcher** (`1 Universe → 2 Allocator → 3 Timing → 4 Risk/LLM → 5 Translator`)
    shows one stage card at a time, so the builder fits on a single screen; the **live YAML preview is
    sticky** on the right with its own scroll area and the margin-ceiling footer anchored at the bottom.
@@ -412,10 +412,10 @@ The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
    Weight`) are visually separated from Stage-4 hard caps (`Hard Portfolio Vol Ceiling`, `Hard
    Single-Root Cap`) with a **Sync with Allocator** control to avoid conflicting limits. **Save YAML**
    calls `POST /api/strategies` (new id) or `PUT /api/strategies/{id}`; **Save & Run** additionally
-   launches a Backtest Lab run on the new id. Built-ins are immutable in test/backtest environments
+   launches a Backtests run on the new id. Built-ins are immutable in test/backtest environments
    (edits persist as `artifacts/strategies/<id>.yaml` overlays); development/paper/live can update
    `configs/strategies/<id>.yaml`.
-2. **Optuna Auto-Optimizer** — choose the base strategy. Only parameters for the **active**
+2. **Optimization** — choose the base strategy. Only parameters for the **active**
    selector/allocator/timing/risk stages are listed; structural/data-hygiene parameters (universe
    liquidity/OI/history caps, LLM sample/cache/macro-lockout, translator plumbing) are read-only and
    excluded, and the curated five core signal/sizing parameters are pre-checked. Checking more than
@@ -434,12 +434,12 @@ The dashboard's 6th tab, **Strategy Studio**, has three sub-modes:
    pre-selected; the five curated defaults are TSMOM fast/slow, KAMA window, volatility-target target
    vol and quant-risk trailing stop.
    **Apply Best Parameters** opens a target-ID modal (default `<base>_opt`), shows a
-   “Saving & Running Backtest...” spinner, then an emerald banner with **View in Backtest Lab** and
-   **Open in Manual Builder** links. The tuned YAML is saved to `configs/strategies/<id>.yaml` in
+   “Saving & Running Backtest...” spinner, then an emerald banner with **View in Backtests** and
+   **Open in Configuration** links. The tuned YAML is saved to `configs/strategies/<id>.yaml` in
    development/paper/live, the strategy catalog reloads immediately, and a verification walk-forward
-   run is persisted and visible in Backtest Lab without restarting the API.
+   run is persisted and visible in Backtests without restarting the API.
 
-3. **DRL Neural Trainer** — choose PPO/CPPO/SAC/TD3/A2C, universe/strategy, timesteps, learning rate,
+3. **RL Training** — choose PPO/CPPO, universe/strategy, timesteps, learning rate,
    γ, LLM semantic-risk penalty λ and a checkpoint name; **Train Neural Agent** calls
    `POST /api/drl/train` (offline deterministic; synchronous, bounded to 20k timesteps). The registry
    lists `artifacts/models/*.zip` with parsed metadata, reward curve and a **Bind to Strategy** action
@@ -478,7 +478,7 @@ python -m src.backtest.optimizer \
 | `GET /api/optimize/{study_id}` | full trials, importances, best params/config |
 | `POST /api/optimize/{study_id}/apply` | save best params as `<id>_opt` (optional verification backtest) |
 
-**Timeframes.** The Market Data Cache, Backtest Lab and Strategy Studio select from eight
+**Timeframes.** The Market Data Cache, Backtests and Strategies select from eight
 canonical timeframes: **1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w**. Backfills fetch the matching base
 schema/IBKR bar size and the Parquet repository can auto-resample finer cached bars (1m→5m/15m/30m/1h,
 1h→4h, 1d→1w) on read. Backtests/Optuna accept a `timeframe` and annualize volatility, Sharpe,
@@ -496,7 +496,7 @@ download data when refused. Databento over-budget jobs require the explicit conf
 Center/Pipeline views use the real account NLV (~$1.00M) instead of the offline $4M fixture; cached
 Parquet bars back the latest state/term structure first, with explicit cached/fixture attribution.
 
-**Market Data Cache.** Open the Operator drawer or the Backtest Lab cache badge to see how many of
+**Market Data Cache.** Open the System drawer or the Backtests cache badge to see how many of
 the 45 roots have real cached Parquet bars and their date span/size. Choose roots/sectors and a date
 range, then `IBKR Historical (Free)` or `Databento Pay-As-You-Go`; **Check Cost** shows the estimated
 USD and billable MB. **Backfill Parquet Cache** writes `ohlcv-1d` bars into `data/parquet/` and
@@ -505,13 +505,13 @@ builds continuous F1/F2 series. Databento jobs are hard-guarded by
 unless you explicitly enable the over-budget confirmation. The UI disables unavailable sources and
 never reports a fake success.
 
-**Real vs synthetic research.** Backtest Lab and the Optuna Auto-Optimizer have a **Data mode**
+**Real vs synthetic research.** Backtests and the Optimization have a **Data mode**
 selector: `auto` (real cached Parquet when sufficient, otherwise synthetic), `cached_real` (requires
 sufficient cached bars, else an actionable error) and `synthetic_offline` (never reads the cache).
 Runs/studies are badged **REAL PARQUET DATA** or **SYNTHETIC FIXTURE**, with cached-bar counts and
 dates so provenance is always visible.
 
-**Paper rebalance from the dashboard.** Open **Command Center** or **Pipeline & Weights** and use
+**Paper rebalance from the dashboard.** Open **Overview** or **Weights** and use
 the **Rebalance Book** bar: pick a strategy, click **Preview Rebalance (whatIf)** to see current vs
 target contracts, delta orders, projected initial margin against the 60% cap, tracking error and
 per-order pre-trade gate status. **Execute Paper Rebalance** (checkbox confirmation) submits only
@@ -526,13 +526,13 @@ subscription; if TWS reports no paid tick bundle (10189/10090/354) it falls back
 polling and exposes diagnostics instead of crashing. Set the variable to `1` only when the account has
 live tick/L1/L2 permissions.
 
-**DRL checkpoint binding.** **Bind to Strategy** in the DRL Neural Trainer reads the checkpoint's
+**DRL checkpoint binding.** **Bind to Strategy** in the RL Training reads the checkpoint's
 `.meta.json` universe, updates the target strategy's `universe.params.roots` and `top_n`, and shows a
 “Universe synced (N roots)” notice. At runtime the allocator aligns observations to the checkpoint's
 trained root order (missing roots flat, extras ignored); checkpoints without metadata keep legacy
 behavior with a warning.
 
-**Artifact & strategy management.** From the Studio/Backtest Lab/Optuna tables you can delete
+**Artifact & strategy management.** From the Studio/Backtests/Optuna tables you can delete
 persisted studies, backtest runs and custom/tuned strategies (`DELETE /api/optimize/{id}`,
 `DELETE /api/backtests/{id}`, `DELETE /api/strategies/{id}`; committed built-ins are protected).
 The Studio header also offers **Clone**, **Rename**, **Download YAML** and (custom-only) **Delete**;
@@ -540,12 +540,12 @@ a durable custom-strategy registry keeps API-created/tuned strategies deletable 
 Studio-saved `universe.params.roots` allow-lists are honoured by the liquidity/regime/composite
 selectors.
 
-**Sharing backtests.** Backtest Lab's Export menu downloads **Trades CSV**
+**Sharing backtests.** Backtests's Export menu downloads **Trades CSV**
 (`GET /api/backtests/{id}/trades.csv`) or the **Full Tear Sheet JSON**
 (`GET /api/backtests/{id}/export.json`). Runs persist a strategy-config snapshot, so selecting two
 runs shows a **Parameter Diff** accordion with changed dotted paths and Run A/Run B values.
 
-**Risk-lock reset & operator controls.** When a kill switch is active the Command Center risk-budget
+**Risk-lock reset & operator controls.** When a kill switch is active the Overview risk-budget
 drawer shows **Reset Risk Lock / Resume Execution** (double confirmation, plus
 `FUTURESRL_OPERATOR_RESET_TOKEN` when set: `POST /api/risk/reset-lock`). The operator drawer can
 **Clear Paper State** (`POST /api/maintenance/reset-paper-state`, paper/backtest only) and reset the
@@ -561,7 +561,7 @@ F1/F2 term structures, so `feature_fallbacks` is empty and term/carry features a
 **Studio and pipeline fixes in this release:** `/api/pipeline/latest` now shows the full Weight matrix from a
 fresh runner bridge (same columns as the engine waterfall, including `weight_actual`, `driver`,
 `regime`, `tracking_error_pct`, `micro_routing`); offline DRL training has real synthetic carry; and
-the Backtest Lab `WF · N folds` badge binds the actual `n_folds`/`wf_splits`.
+the Backtests `WF · N folds` badge binds the actual `n_folds`/`wf_splits`.
 
 ### IBKR reconnects, stale books and the data-mode badge
 
@@ -582,7 +582,7 @@ If the broker reports the ledger in a different base currency than
 instead of failing; set `FUTURESRL_ACCOUNT_CURRENCY` and `FUTURESRL_FX_RATES` to match so USD
 notional/risk sizing stays correct.
 
-When connected to IBKR, the Command Center's risk-budget **Portfolio volatility** is computed
+When connected to IBKR, the Overview's risk-budget **Portfolio volatility** is computed
 ex-ante from the live book's weights and covariance (`0.0%` for a flat book) and never from the
 synthetic fixture curve; if covariance is unavailable it shows `—`. Real IBKR NLV observations are
 persisted to `data/ibkr_equity_history.json`: the equity chart shows a **Simulated Backfill ·
@@ -726,12 +726,12 @@ Walk-forward example:
   --output artifacts/wf_tsmom.json --html artifacts/wf_tsmom.html
 ```
 
-Output JSON includes run/fold metadata (`train_start/train_end/test_start/test_end`, fold metrics), per-fold metrics and aggregate mean/std statistics — useful for the Backtest Lab comparison.
+Output JSON includes run/fold metadata (`train_start/train_end/test_start/test_end`, fold metrics), per-fold metrics and aggregate mean/std statistics — useful for the Backtests comparison.
 
-### Persistence & the Backtest Lab
+### Persistence & the Backtests
 
 Custom backtest runs triggered via the API (including walk-forward runs) are persisted atomically
-to `artifacts/backtests/<id>.json` and reloaded when the API restarts, so the Backtest Lab history
+to `artifacts/backtests/<id>.json` and reloaded when the API restarts, so the Backtests history
 survives `uvicorn` restarts. The dashboard's Experiment runner sends `walk_forward`,
 `wf_splits` (2-20), `purge_bars` and `embargo_bars`; walk-forward runs are marked `kind="walk_forward"`
 with `n_folds`, real aggregate `n_trades`/`n_rebalances` and per-fold equity/underwater series in the
@@ -750,7 +750,7 @@ print(result.to_dict()["metrics"])
 
 ### Tear sheets & comparison
 
-`src.analytics.tearsheet.build_tearsheet(result)` → JSON + HTML; `compare_tearsheets({name: sheet})` → Backtest Lab comparison payload (normalised equity, underwater curve, rolling Sharpe, Rachev tails, roll-yield attribution).
+`src.analytics.tearsheet.build_tearsheet(result)` → JSON + HTML; `compare_tearsheets({name: sheet})` → Backtests comparison payload (normalised equity, underwater curve, rolling Sharpe, Rachev tails, roll-yield attribution).
 
 ---
 
@@ -827,7 +827,7 @@ back to the API's simulated/fixture engine. Start either an external runner:
 .venv/bin/python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
 ```
 
-or drive it from the dashboard/API with `POST /api/runner/step` (Backtest/Command Center Step
+or drive it from the dashboard/API with `POST /api/runner/step` (Backtest/Overview Step
 Runner control). A stale bridge is displayed honestly (`bridge_stale=true`, source falls back).
 
 ### DRL training & checkpoints
@@ -856,7 +856,7 @@ Checkpoint observation layout must match the configured universe/features (recor
 
 `src/data/news_ingestor.py` resolves headlines in this order: **RSS feeds** (when
 `FUTURESRL_NEWS_RSS_FEEDS` is set) → **IBKR news** (when an IBKR client is connected) →
-**deterministic fixtures** (offline). The API serves them in the Risk & LLM Monitor (`news_source`
+**deterministic fixtures** (offline). The API serves them in the Risk (`news_source`
 reports provenance).
 
 To switch the LLM Risk-First engine from fixtures to real inference, set in `.env`:
@@ -882,7 +882,7 @@ breaker; slow multi-sample calls are served from the async TTL cache and never b
 ### Monitoring
 
 - API `GET /api/positions`, `/api/pipeline/latest`, `/api/risk/state`
-- Dashboard Command Center (margin gauge, EMERGENCY FLATTEN ALL)
+- Dashboard Overview (margin gauge, EMERGENCY FLATTEN ALL)
 - WebSocket `ws://127.0.0.1:8000/ws/telemetry` (pnl/margin/positions/risk_alert/pipeline frames)
 - stderr logs + persisted risk state file
 

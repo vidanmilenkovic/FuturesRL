@@ -13,12 +13,12 @@ the public release history starts with the current line.
 
 - Global LLM provider status pill and `GET /api/risk/llm-status` / `POST /api/risk/llm-ping`,
   with additive `/health.llm_status`, honest offline-stub/live/error states and latency.
-- Inspectable 45-root scope for Term Structure, Pipeline & Weights and Risk & LLM
+- Inspectable 45-root scope for Term Structure, Weights and Risk
   (`scope=strategy|cached|all`, sector and explicit root filters) with cached-Parquet or
   deterministic instrument-master provenance.
 - Non-destructive IBKR port discovery (`GET /api/runner/ibkr-ports`) for TWS/IB Gateway paper/live
   ports and a guarded connection-switch API that never claims an unapplied switch.
-- Modular Strategy Studio composite stacks for timing/universe signals, allocator math tooltips,
+- Modular Strategies composite stacks for timing/universe signals, allocator math tooltips,
   advanced/custom stage parameters and local custom presets.
 - Term-structure forward-curve modes: normalized basis vs F1 (default), annualized roll yield and
   raw price, with minimum domains, a zero reference line and F6-F1 spread headers.
@@ -31,9 +31,9 @@ the public release history starts with the current line.
 
 ### Fixed
 
-- Operator drawer and Market Data Cache no longer lose input focus or close native select dropdowns
+- System drawer and Market Data Cache no longer lose input focus or close native select dropdowns
   on telemetry/health polling ticks.
-- Deterministic quantitative risk thresholds are now the primary Risk & LLM workspace, with the LLM
+- Deterministic quantitative risk thresholds are now the primary Risk workspace, with the LLM
   overlay presented as an explicit one-way brake.
 - API catalog responses now forward allocator formulas and advanced-parameter metadata to the Studio.
 
@@ -61,7 +61,7 @@ the public release history starts with the current line.
   an explicit operator override for intentional over-budget jobs.
 - IBKR historical bar ingestion for the cache, using qualified front-month contracts and a dedicated
   client id so it cannot collide with the execution session.
-- Timeframe selectors in the dashboard's Market Data Cache, Backtest Lab and Strategy Studio, plus a
+- Timeframe selectors in the dashboard's Market Data Cache, Backtests and Strategies, plus a
   live-account NLV binding for the pipeline and term-structure state.
 
 ### Changed
@@ -133,14 +133,14 @@ the public release history starts with the current line.
   used by the comparison parameter-diff view.
 - Guarded operator resets: Reset Risk Lock / Resume Execution, Clear Paper State and Reset Runner
   Bridge, all double-confirmed and restricted to safe environments.
-- Global 45-root Universe search in the Strategy Studio.
+- Global 45-root Universe search in the Strategies.
 
 ### Fixed
 
 - IBKR contracts are qualified before tick/realtime/market-depth subscriptions; unresolved roots
   produce an actionable root/exchange message instead of a hash/`conId` traceback.
 - Strategy selector supports Studio-saved explicit `roots` filters end-to-end.
-- Apply/Save & Run shows a direct tear-sheet deep link, and the Backtest Lab consumes it.
+- Apply/Save & Run shows a direct tear-sheet deep link, and the Backtests consumes it.
 
 ## [1.5.3]
 
@@ -158,7 +158,7 @@ the public release history starts with the current line.
 ### Fixed
 
 - Flat trials no longer win merely because their drawdown is small.
-- Applied strategies and verification runs are visible in the Strategy Studio and Backtest Lab
+- Applied strategies and verification runs are visible in the Strategies and Backtests
   without a restart.
 
 ## [1.5.2]
@@ -221,7 +221,7 @@ the public release history starts with the current line.
 
 ### Added
 
-- Strategy Studio with Manual Builder, walk-forward optimizer and DRL trainer workflows.
+- Strategies with Configuration, walk-forward optimizer and DRL trainer workflows.
 - Parameter catalog (121 parameters across universe/allocator/timing/risk/translator) with typed
   metadata, validation, encoding helpers and preset templates.
 - Purged/embargoed walk-forward optimizer with Optuna and a deterministic Latin-Hypercube fallback,
@@ -246,7 +246,7 @@ the public release history starts with the current line.
 
 - Live runner ↔ API bridge: atomic runner snapshots power positions, working orders, fills, runner
   status and a bridge-sourced pipeline waterfall.
-- Persisted Backtest Lab runs and walk-forward runs across API restarts.
+- Persisted Backtests runs and walk-forward runs across API restarts.
 - DRL training CLI with checkpoint metadata and lazy model loading through strategy configuration.
 - Pluggable news ingestion and LLM providers (OpenAI, Anthropic, DeepSeek, Gemini, vLLM/offline).
 - Five-view dashboard telemetry polish: equity timeframe merging, discretization tracking error,
@@ -264,8 +264,8 @@ the public release history starts with the current line.
 ### Added
 
 - Institutional dashboard redesign: full-viewport docked shell, dense KPI ribbon, trading-style
-  typography and rebuilt Command Center, Pipeline & Weights, Risk & LLM Monitor, Term Structure and
-  Backtest Lab views.
+  typography and rebuilt Overview, Weights, Risk Monitor, Term Structure and
+  Backtests views.
 - Multi-source cold-start hydration with Databento, IBKR historical and offline fallback sources.
 - Offline end-to-end runner and deterministic offline target broker for paper/dry-run workflows.
 - Walk-forward backtest CLI flags (`--walk-forward`, splits, purge, embargo) with per-fold and
@@ -307,8 +307,8 @@ the public release history starts with the current line.
 - FastAPI telemetry backend: positions, pipeline waterfall, risk state/thresholds/flatten-all, term
   structure and roll calendar, strategy catalog/editor, backtests/tearsheets and telemetry status,
   plus a WebSocket telemetry broadcaster.
-- Next.js dashboard with five views (Command Center, Pipeline Inspector, Risk & LLM Monitor, Term
-  Structure, Backtest Lab) and a typed API client with honest demo-data fallback.
+- Next.js dashboard with five views (Overview, Pipeline Inspector, Risk Monitor, Term
+  Structure, Backtests) and a typed API client with honest demo-data fallback.
 - Docker Compose stack with backend, frontend, TimescaleDB, Redis and headless IB Gateway services.
 
 ### Security

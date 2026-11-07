@@ -285,7 +285,7 @@ export function BacktestsView() {
       {/* --------------------------------------------------------- runner bar */}
       <Panel
         className="col-span-12"
-        title="Experiment runner"
+        title="Backtests"
         flush
         actions={<MarketDataCacheButton />}
       >

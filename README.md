@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/Frame.png" alt="FuturesRL Command Center connected to an IBKR paper account" width="250" />
+  <img src="docs/Frame.png" alt="FuturesRL Overview connected to an IBKR paper account" width="250" />
 </p>
 
 
@@ -36,7 +36,7 @@ pipeline, futures-native risk and contract translation, and one shared backtest/
 ### Key Highlights
 
 - **45+ CME futures across 7 sectors**, with automatic standard↔micro routing (`ES→MES`, `NQ→MNQ`, `CL→MCL`, `GC→MGC`).
-- **Weight-centric composability**: swap universe selectors, classical allocators, DRL policies (`PPO`/`CPPO`/`SAC`/`TD3`), and timing overlays without touching risk or execution code.
+- **Weight-centric composability**: swap universe selectors, classical allocators, DRL policies (`PPO`/`CPPO`), and timing overlays without touching risk or execution code.
 - **Futures-native realism**: zero-lookahead continuous rolls, F1–F6 term structure, margin/cost simulation, and purged walk-forward validation.
 - **Eight timeframes (`1m` to `1w`)**, cache-aware data management, and budgeted Databento/IBKR backfills.
 - **Backtest-to-live parity**: the same `ContractTranslator` feeds the event-driven backtester and the IBKR OMS, with LLM and quantitative risk overlays in both paths.
@@ -103,7 +103,7 @@ futuresrl/
 │   ├── analytics/               # Institutional metrics, tearsheets, attribution
 │   ├── execution/               # IBKR client/OMS, pre-trade gate, BAG rolls, reconciler, runner
 │   └── api/                     # FastAPI app, domain routes, schemas, telemetry, services
-├── frontend/                    # Next.js 15 workstation: Command Center, Pipeline, Risk, Studio
+├── frontend/                    # Next.js 15 workstation: Overview, Weights, Risk, Term Structure, Strategies, Backtests
 ├── tests/                       # unit/, integration/, parity/ — hermetic, deterministic suites
 ├── docker/                      # Backend/frontend images and headless IB Gateway compose
 ├── docs/                        # USER_GUIDE.md, ARCHITECTURE.md, screenshots/

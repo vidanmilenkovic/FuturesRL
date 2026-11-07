@@ -100,7 +100,7 @@ export interface TelemetryStatusResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Account / positions (Command Center)
+// Account / positions (Overview)
 // ---------------------------------------------------------------------------
 
 export interface PositionRow {
@@ -134,7 +134,7 @@ export interface AccountSnapshotResponse {
   day_pnl_pct: number;
   gross_leverage: number;
   net_exposure: number;
-  /** Point-in-time equity curve used by the Command Center chart. */
+  /** Point-in-time equity curve used by the Overview chart. */
   equity_curve: EquityPoint[];
   positions: PositionRow[];
   /** Additive: last-known-good book served while IBKR reconnects. */
@@ -427,7 +427,7 @@ export interface StrategyConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Strategy Studio (Phase 10)
+// Strategies (Phase 10)
 // ---------------------------------------------------------------------------
 
 export type StudioStageKey = "universe" | "allocator" | "timing" | "risk" | "translator";
@@ -587,7 +587,7 @@ export interface StudioCatalogResponse {
   advanced_parameter_keys?: string[];
 }
 
-/** Editable draft the Manual Builder serializes to YAML + POST/PUT payload. */
+/** Editable draft the Configuration serializes to YAML + POST/PUT payload. */
 export interface StudioDraft {
   id: string;
   description: string;
@@ -615,7 +615,7 @@ export interface StudioValidation {
 }
 
 // ---------------------------------------------------------------------------
-// Optuna auto-optimizer (Phase 10)
+// Optimization (Phase 10)
 // ---------------------------------------------------------------------------
 
 export type OptimizationObjective =
@@ -735,7 +735,7 @@ export interface OptimizationApplyResult {
 }
 
 // ---------------------------------------------------------------------------
-// DRL neural trainer (Phase 10)
+// RL Training (Phase 10)
 // ---------------------------------------------------------------------------
 
 export type DrlAlgorithm = "PPO" | "CPPO";

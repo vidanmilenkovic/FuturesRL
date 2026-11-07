@@ -1505,7 +1505,7 @@ export function connectTelemetry(options: {
 
 
 // ---------------------------------------------------------------------------
-// Instrument universe (Strategy Studio, task-32)
+// Instrument universe (Strategies, task-32)
 // ---------------------------------------------------------------------------
 
 export function getInstruments(): Promise<ApiResult<InstrumentsResponse>> {
@@ -1517,7 +1517,7 @@ export function getInstruments(): Promise<ApiResult<InstrumentsResponse>> {
 }
 
 // ---------------------------------------------------------------------------
-// Strategy Studio (Phase 10)
+// Strategies (Phase 10)
 // ---------------------------------------------------------------------------
 
 export function getStudioCatalog(): Promise<ApiResult<StudioCatalogResponse>> {
@@ -1529,7 +1529,7 @@ export function getStudioCatalog(): Promise<ApiResult<StudioCatalogResponse>> {
 }
 
 /**
- * Create (POST) or update (PUT) a strategy YAML. The Manual Builder uses this
+ * Create (POST) or update (PUT) a strategy YAML. The Configuration uses this
  * for "Save Strategy YAML"; the API persists to configs/strategies or
  * artifacts/strategies and re-validates the full FinRL-X pipeline contract.
  */
@@ -1571,7 +1571,7 @@ export function saveStudioStrategy(
 }
 
 // ---------------------------------------------------------------------------
-// Optuna auto-optimizer (Phase 10)
+// Optimization (Phase 10)
 // ---------------------------------------------------------------------------
 
 export function listOptimizations(): Promise<ApiResult<OptimizationListResponse>> {
@@ -1669,7 +1669,7 @@ export function applyOptimization(
 }
 
 // ---------------------------------------------------------------------------
-// DRL neural trainer (Phase 10)
+// RL Training (Phase 10)
 // ---------------------------------------------------------------------------
 
 export function listDrlModels(): Promise<ApiResult<DrlModelsResponse>> {

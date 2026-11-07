@@ -26,12 +26,12 @@ import { OperatorDrawer } from "./operator-drawer";
 import { TelemetryDrawer } from "./telemetry-drawer";
 
 const NAV_ITEMS: { href: string; label: string }[] = [
-  { href: "/", label: "Command Center" },
-  { href: "/pipeline", label: "Pipeline & Weights" },
-  { href: "/risk", label: "Risk & LLM" },
+  { href: "/", label: "Overview" },
+  { href: "/pipeline", label: "Weights" },
+  { href: "/risk", label: "Risk" },
   { href: "/term-structure", label: "Term Structure" },
-  { href: "/studio", label: "Strategy Studio" },
-  { href: "/backtests", label: "Backtest Lab" },
+  { href: "/studio", label: "Strategies" },
+  { href: "/backtests", label: "Backtests" },
 ];
 
 const MARGIN_CAP = 0.6;
@@ -276,7 +276,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             aria-expanded={operatorOpen}
             className="focus-ring flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-zinc-400 transition-colors hover:bg-surface hover:text-zinc-200"
           >
-            Operator
+            System
           </button>
         </span>
       </footer>

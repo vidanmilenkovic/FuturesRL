@@ -120,7 +120,7 @@ export function RiskView() {
 
   if (!state) {
     return (
-      <Panel title="Risk & LLM monitor">
+      <Panel title="Risk">
         <EmptyState
           title="Risk state unavailable"
           description="The Risk-First API did not return a state payload and the deterministic fixture fallback could not be built."

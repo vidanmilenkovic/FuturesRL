@@ -309,7 +309,7 @@ export function TimeSeriesChart({
 }
 
 // ---------------------------------------------------------------------------
-// Multi-series overlay (Backtest Lab: 2–3 runs on one chart)
+// Multi-series overlay (Backtests: 2–3 runs on one chart)
 // ---------------------------------------------------------------------------
 
 export interface OverlaySeries {

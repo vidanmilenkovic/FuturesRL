@@ -27,7 +27,7 @@ FuturesRL is research infrastructure for systematic futures strategies. The desi
 ```
                 ┌──────────────────────────────────────────────────────────┐
                 │                        Dashboard (Next.js)               │
-                │  Command Center · Pipeline · Risk · Term Structure · Lab │
+                │  Overview · Pipeline · Risk · Term Structure · Lab │
                 └──────────────────────────────┬───────────────────────────┘
                                                │ REST / WebSocket
                 ┌──────────────────────────────▼───────────────────────────┐
@@ -125,13 +125,13 @@ single responsibility:
   filter negative-trend roots without ever freezing the pipeline.
 - **Composite selector** — deterministic intersection or union of components with an explicit order.
 
-All selectors accept an optional explicit `roots` allow-list (the Strategy Studio's saved universe
+All selectors accept an optional explicit `roots` allow-list (the Strategies's saved universe
 filter), validated against the instrument master and intersected with the point-in-time state.
 
 ### 4.2 Portfolio allocation (`A_t`)
 
 `src/strategies/allocators/` provides equal weight, equal-risk-contribution risk parity,
-mean-variance, volatility-targeted inverse-volatility and a DRL allocator (PPO/CPPO/SAC/TD3/A2C via
+mean-variance, volatility-targeted inverse-volatility and a DRL allocator (PPO/CPPO via
 Stable-Baselines3, imported lazily). The DRL allocator loads checkpoints lazily, binds to the
 checkpoint's metadata universe and aligns observations/actions to the trained root order.
 
@@ -299,9 +299,8 @@ fixtures and marks the payloads accordingly. Services own the wiring:
 - `DataService` serves cache inventory, cost estimates and ingestion.
 
 Every response that could contain synthetic, cached or stale data carries provenance/metadata so the
-dashboard can label it. The frontend is a Next.js 15 dashboard with six views: Command Center,
-Pipeline & Weights, Risk & LLM Monitor, Term Structure & Roll Calendar, Backtest Lab and Strategy
-Studio. Live telemetry is delivered over `/ws/telemetry`.
+dashboard can label it. The frontend is a Next.js 15 dashboard with six views: Overview,
+Weights, Risk, Term Structure & Roll Calendar, Backtests and Strategies. Live telemetry is delivered over `/ws/telemetry`.
 
 ## 10. Configuration
 

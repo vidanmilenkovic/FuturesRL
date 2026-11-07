@@ -86,7 +86,7 @@ const STAGE_STEPS = [
   { key: "universe", label: "1. Universe S_t", title: "Universe selection", code: "S_t" },
   { key: "allocator", label: "2. Allocator A_t", title: "Portfolio allocator", code: "A_t" },
   { key: "timing", label: "3. Timing & Signals T_t", title: "Timing & signals", code: "T_t" },
-  { key: "risk", label: "4. Risk & LLM R_t", title: "Risk & LLM", code: "R_t" },
+  { key: "risk", label: "4. Risk R_t", title: "Risk", code: "R_t" },
   { key: "translator", label: "5. Translator N_i,t", title: "Contract translator", code: "N_i,t" },
 ] as const;
 
@@ -380,7 +380,7 @@ export function ManualBuilder({
       const id = result.data.strategy?.id ?? draft.id;
       setSaveToast({ strategyId: id });
       // Keep the toast/tear-sheet quick action visible briefly before handing
-      // over to the Backtest Lab deep link.
+      // over to the Backtests deep link.
       setTimeout(
         () => router.push(`/backtests?strategy=${encodeURIComponent(id)}&timeframe=${encodeURIComponent(timeframe)}`),
         1_200,
@@ -657,9 +657,9 @@ export function ManualBuilder({
             variant="secondary"
             onClick={() => void save("run")}
             disabled={!validation.valid || saving !== null}
-            title="Save, then open the Backtest Lab with this strategy selected"
+            title="Save, then open the Backtests with this strategy selected"
           >
-            {saving === "run" ? "Saving…" : "Save & Run in Backtest Lab"}
+            {saving === "run" ? "Saving…" : "Save & Run in Backtests"}
           </Button>
         </div>
         <div className="flex items-center gap-1 pb-0.5">
@@ -1389,7 +1389,7 @@ export function ManualBuilder({
         >
           <div className="flex items-start justify-between gap-2">
             <div>
-              <p className="text-[11.5px] font-medium text-blue-300">Strategy saved & opening Backtest Lab</p>
+              <p className="text-[11.5px] font-medium text-blue-300">Strategy saved & opening Backtests</p>
               <p className="mt-0.5 truncate font-mono text-[10px] text-zinc-500">{saveToast.strategyId}</p>
             </div>
             <button
@@ -1405,7 +1405,7 @@ export function ManualBuilder({
             href={`/backtests?strategy=${encodeURIComponent(saveToast.strategyId)}`}
             className="mt-1.5 inline-block text-[10.5px] font-medium text-blue-300 underline decoration-blue-500/40 underline-offset-2 hover:text-blue-200"
           >
-            Open Backtest Lab now
+            Open Backtests now
           </a>
         </div>
       ) : null}
@@ -1887,7 +1887,7 @@ function DrlCheckpointSelect({
       </div>
       {models.length === 0 ? (
         <p className="text-[10.5px] leading-4 text-zinc-600">
-          No trained checkpoints returned. Train one in the DRL Neural Trainer sub-tab, then pick it here to bind the
+          No trained checkpoints returned. Train one in the RL Training sub-tab, then pick it here to bind the
           allocator to its <span className="font-mono">model_path</span>.
         </p>
       ) : (

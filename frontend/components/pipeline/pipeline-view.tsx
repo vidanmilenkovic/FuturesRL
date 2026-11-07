@@ -191,7 +191,7 @@ export function PipelineView() {
 
   if (!data) {
     return (
-      <Panel title="Pipeline & weights">
+      <Panel title="Weights">
         <EmptyState
           title="Pipeline trace unavailable"
           description="The API did not return a FinRL-X rebalance trace and the deterministic fixture fallback could not be built."
