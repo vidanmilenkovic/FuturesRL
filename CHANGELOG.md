@@ -23,6 +23,12 @@ the public release history starts with the current line.
 - Term-structure forward-curve modes: normalized basis vs F1 (default), annualized roll yield and
   raw price, with minimum domains, a zero reference line and F6-F1 spread headers.
 
+### Changed
+
+- DRL support is focused on PPO and CPPO only; the experimental seasonality overlay was removed.
+- Docker Compose now runs only the FastAPI backend, Next.js workstation and optional IB Gateway profile;
+  TimescaleDB and Redis sidecars were removed in favour of local Parquet/Polars/DuckDB storage.
+
 ### Fixed
 
 - Operator drawer and Market Data Cache no longer lose input focus or close native select dropdowns

@@ -924,11 +924,16 @@ Every 30 s (`FUTURESRL_RISK__RECONCILIATION_INTERVAL_SECONDS`) the reconciler co
 ## 11. Docker deployment
 
 ```bash
-cp docker/.env.example docker/.env      # edit credentials/ports
+cp docker/.env.example docker/.env      # optional credentials
 docker compose -f docker/docker-compose.yml up --build
 ```
 
-Services: TimescaleDB, Redis, headless IB Gateway (paper), FastAPI backend (:8000), Next.js frontend (:3100). The backend runs offline/demo by default; set `FUTURESRL_API_ENABLE_IBKR=1` in `docker/.env` to attach a real IBKR session. Healthchecks gate startup order.
+Services: FastAPI backend (:8000), Next.js frontend (:3100) and an optional
+headless IB Gateway (paper) profile. Storage is local-first — partitioned
+Parquet, Polars and DuckDB live in the backend volume; **no external database or
+Redis service is required**. The backend runs offline/deterministic by default;
+set `FUTURESRL_API_ENABLE_IBKR=1` in `docker/.env` and start the `ibkr` profile
+to attach a real IBKR session. Healthchecks gate startup order.
 
 Without a Docker daemon (e.g. this workspace host) use the local runs in §4/§8/§9 instead; CI (`.github/workflows/ci.yml`) builds both images on push.
 

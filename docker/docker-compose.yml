@@ -1,17 +1,17 @@
 # ---------------------------------------------------------------------------
 # FuturesRL full stack
 #
-#   cp docker/.env.example docker/.env        # fill IBKR/DB secrets
+#   cp docker/.env.example docker/.env
 #   docker compose -f docker/docker-compose.yml up --build
 #
-#   frontend  → http://localhost:3100   (Next.js dashboard, demo mode if backend down)
-#   backend   → http://localhost:8000   (FastAPI + /ws/telemetry, docs at /docs)
-#   gateway   → 127.0.0.1:4003 (paper)  (headless IB Gateway, 5900 VNC)
-#   timescaledb / redis are internal only.
+#   frontend → http://localhost:3100   (Next.js workstation)
+#   backend  → http://localhost:8000   (FastAPI REST + WebSocket)
+#   gateway  → 127.0.0.1:4003 (paper API, VNC 5900) — opt-in profile "ibkr"
 #
-# The stack is designed to start even without IBKR credentials or a Databento
-# key: the backend then serves deterministic offline data and the dashboard
-# shows the DEMO DATA banner. Only the ib-gateway container reports unhealthy.
+# Storage is local-first: partitioned Parquet + Polars/DuckDB inside the
+# backend_data volume. There is no external database or cache service.
+# Without IBKR/Databento credentials the backend serves deterministic offline
+# fixtures, so the stack starts and remains usable out of the box.
 # ---------------------------------------------------------------------------
 
 x-logging: &default-logging
@@ -22,81 +22,19 @@ x-logging: &default-logging
 
 services:
   # -------------------------------------------------------------------------
-  # Time-series storage for bars, features and backtest artefacts.
-  # The DuckDB/Parquet cache lives in the backend volume; TimescaleDB is the
-  # shared multi-process store (research notebooks, scheduled jobs, BI tools).
-  # -------------------------------------------------------------------------
-  timescaledb:
-    image: timescale/timescaledb:2.17.2-pg16
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-futuresrl}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-futuresrl}
-      POSTGRES_DB: ${POSTGRES_DB:-futuresrl}
-      TIMESCALEDB_TELEMETRY: "off"
-    ports:
-      # Bound to loopback only: never expose the database to the network.
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - timescaledb_data:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -U ${POSTGRES_USER:-futuresrl} -d ${POSTGRES_DB:-futuresrl}",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-    networks:
-      - futuresrl
-    logging: *default-logging
-
-  # -------------------------------------------------------------------------
-  # Redis: telemetry fan-out, order-id dedupe, rate-limiter state.
-  # -------------------------------------------------------------------------
-  redis:
-    image: redis:7.4-alpine
-    restart: unless-stopped
-    command:
-      [
-        "redis-server",
-        "--appendonly",
-        "yes",
-        "--save",
-        "60",
-        "1000",
-        "--requirepass",
-        "${REDIS_PASSWORD:-change-me-redis}",
-      ]
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "redis-cli --no-auth-warning -a ${REDIS_PASSWORD:-change-me-redis} ping | grep -q PONG",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    networks:
-      - futuresrl
-    logging: *default-logging
-
-  # -------------------------------------------------------------------------
-  # Headless IB Gateway (paper). Requires TWS_USERID / TWS_PASSWORD.
+  # Optional headless IB Gateway (paper). Only starts with:
+  #   docker compose --profile ibkr up
+  # Requires TWS_USERID / TWS_PASSWORD in docker/.env.
   # Container ports: 4003 = paper gateway API, 5900 = noVNC.
   # -------------------------------------------------------------------------
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
+    profiles: ["ibkr"]
     restart: unless-stopped
     environment:
       TWS_USERID: ${TWS_USERID:-}
       TWS_PASSWORD: ${TWS_PASSWORD:-}
-      TRADING_MODE: paper
+      TRADING_MODE: ${IB_GATEWAY_TRADING_MODE:-paper}
       READ_ONLY_API: "no"
       BYPASS_WARNING: "yes"
       TWOFA_TIMEOUT_ACTION: restart
@@ -106,7 +44,7 @@ services:
       TIME_ZONE: America/New_York
       TRUSTED_IPS: ${IB_GATEWAY_TRUSTED_IPS:-}
     ports:
-      - "127.0.0.1:${IB_GATEWAY_PORT:-4003}:4003"
+      - "127.0.0.1:${IB_GATEWAY_PORT:-4003}:${IB_GATEWAY_INTERNAL_PORT:-4003}"
       - "127.0.0.1:${IB_GATEWAY_VNC_PORT:-5900}:5900"
     volumes:
       - ib_gateway_data:/home/ibgateway/Jts
@@ -115,8 +53,9 @@ services:
     logging: *default-logging
 
   # -------------------------------------------------------------------------
-  # FastAPI backend: REST + /ws/telemetry. Runs offline (deterministic data)
-  # when IBKR / Databento are unavailable.
+  # FastAPI backend: REST + /ws/telemetry. Local Parquet/DuckDB storage lives
+  # in backend_data; artifacts (tear sheets, studies, models) in
+  # backend_artifacts. Runs offline when IBKR/Databento are unavailable.
   # -------------------------------------------------------------------------
   backend:
     build:
@@ -131,36 +70,21 @@ services:
       FUTURESRL_API_PORT: "8000"
       FUTURESRL_API_CORS_ORIGINS: '["http://localhost:${FRONTEND_PORT:-3100}","http://127.0.0.1:${FRONTEND_PORT:-3100}"]'
       FUTURESRL_TELEMETRY_INTERVAL_SECONDS: "1.0"
-      # IBKR (paper gateway inside the compose network)
+      # IBKR (when the optional ib-gateway profile is running)
       FUTURESRL_IBKR_HOST: ${FUTURESRL_IBKR_HOST:-ib-gateway}
       FUTURESRL_IBKR_PORT: ${FUTURESRL_IBKR_PORT:-4003}
       FUTURESRL_IBKR_CLIENT_ID: ${FUTURESRL_IBKR_CLIENT_ID:-42}
       FUTURESRL_IBKR_PAPER: "true"
-      # 0 = deterministic offline simulated broker (default); set 1 to let the
-      # API attempt a real IBKR session (falls back to simulated if unavailable).
       FUTURESRL_API_ENABLE_IBKR: ${FUTURESRL_API_ENABLE_IBKR:-0}
-      # Optional data provider (blank → offline deterministic fixtures)
       FUTURESRL_DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
-      # Storage
+      # Local-first storage (Parquet + DuckDB)
       FUTURESRL_DATA_DIR: /app/data
-      FUTURESRL_DUCKDB_PATH: /app/data/futuresrl_x.duckdb
-      FUTURESRL_DB_HOST: timescaledb
-      FUTURESRL_DB_PORT: "5432"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-futuresrl}:${POSTGRES_PASSWORD:-change-me-futuresrl}@timescaledb:5432/${POSTGRES_DB:-futuresrl}
-      REDIS_URL: redis://:${REDIS_PASSWORD:-change-me-redis}@redis:6379/0
+      FUTURESRL_DUCKDB_PATH: /app/data/futuresrl.duckdb
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
       - backend_data:/app/data
       - backend_artifacts:/app/artifacts
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      ib-gateway:
-        # The API must start even if IBKR login is unavailable (offline mode).
-        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
       interval: 15s
@@ -172,7 +96,7 @@ services:
     logging: *default-logging
 
   # -------------------------------------------------------------------------
-  # Next.js dashboard. NEXT_PUBLIC_API_BASE_URL is build-time (browser origin).
+  # Next.js workstation. NEXT_PUBLIC_API_BASE_URL is build-time.
   # -------------------------------------------------------------------------
   frontend:
     build:
@@ -191,7 +115,6 @@ services:
       HOSTNAME: 0.0.0.0
     depends_on:
       backend:
-        # Dashboard still serves the DEMO DATA experience while the API boots.
         condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3100/ || exit 1"]
@@ -209,10 +132,6 @@ networks:
     driver: bridge
 
 volumes:
-  timescaledb_data:
-    name: futuresrl_timescaledb_data
-  redis_data:
-    name: futuresrl_redis_data
   ib_gateway_data:
     name: futuresrl_ib_gateway_data
   backend_data:

@@ -138,7 +138,7 @@ checkpoint's metadata universe and aligns observations/actions to the trained ro
 ### 4.3 Timing and term structure (`T_t`)
 
 `src/strategies/timing/` provides TSMOM, KAMA, a carry/term-structure filter, mean reversion with a
-turbulence veto, seasonality and a composite. Overlays are pure transforms of the weight vector:
+turbulence veto, mean-reversion and a composite. Overlays are pure transforms of the weight vector:
 they can scale or flatten existing legs but cannot introduce an instrument the allocator did not
 select.
 

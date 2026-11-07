@@ -53,30 +53,36 @@ Each transformation is contract-preserving — you can swap any module (e.g., ri
 | --- | --- | --- |
 | $\mathcal{S}$ | Universe selection | Filters liquid roots point-in-time by dollar volume, open interest and regime. |
 | $\mathcal{A}$ | Portfolio allocation | Produces signed target weights $w$ via risk parity, vol targeting, mean-variance or DRL. |
-| $\mathcal{T}$ | Timing & term structure | Scales weights with TSMOM, KAMA, carry/roll-yield, mean-reversion and seasonality signals. |
+| $\mathcal{T}$ | Timing & term structure | Scales weights with TSMOM, KAMA, carry/roll-yield and mean-reversion signals. |
 | $\mathcal{R}$ | Risk overlays | Applies LLM Risk-First circuit breakers and deterministic quantitative limits. |
 | $\mathcal{C}$ | Contract translation | Converts $w$ into discrete CME contracts with micro routing, FX normalization and margin checks. |
 
 *Configured for Interactive Brokers (`ib_async`) and Databento (`GLBX.MDP3`), with full offline mode out of the box.*
 ## Architecture
 
-WIP
+```text
+Data Layer  ──►  Strategy Layer  ──►  Execution & OMS Layer
+Parquet/DuckDB    S_t → A_t → T_t → R_t        C_t → IBKR / simulated broker
+8 timeframes      selectors, allocators,       pre-trade gate, whatIfOrder,
+rolls/features    overlays, DRL (PPO/CPPO)     OMS, reconciler, telemetry
+```
 
-
+| Layer | Responsibility | Key modules |
+| --- | --- | --- |
+| Data | Point-in-time Parquet cache, 8-timeframe resampling, continuous rolls and features | `src/data/` |
+| Strategy | Universe selection, allocation, timing overlays and PPO/CPPO DRL policies | `src/strategies/` |
+| Risk & Translation | LLM Risk-First brake, quant limits and deterministic contract translation | `src/risk/` |
+| Execution & OMS | Backtest/live parity, pre-trade margin gate, IBKR OMS and telemetry | `src/backtest/`, `src/execution/`, `src/api/` |
 
 ## Quick Start
-
-###  Clone & Launch
 
 ```bash
 git clone https://github.com/vidanmilenkovic/FuturesRL
 cd FuturesRL
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e ".[all]"
-./scripts/dev.sh        
+./scripts/dev.sh   # API :8000 · workstation :3100
 ```
-
-Starts the FastAPI backend on http://127.0.0.1:8000 and the Next.js workstation on http://localhost:3100
 
 
 
@@ -99,7 +105,7 @@ futuresrl/
 │   └── api/                     # FastAPI app, domain routes, schemas, telemetry, services
 ├── frontend/                    # Next.js 15 workstation: Command Center, Pipeline, Risk, Studio
 ├── tests/                       # unit/, integration/, parity/ — hermetic, deterministic suites
-├── docker/                      # Backend/frontend images, TimescaleDB/Redis/IB Gateway compose
+├── docker/                      # Backend/frontend images and headless IB Gateway compose
 ├── docs/                        # USER_GUIDE.md, ARCHITECTURE.md, screenshots/
 ├── scripts/                     # quality_gate.sh, dev.sh, WSL/Windows host helper
 ├── CHANGELOG.md                 # Keep a Changelog + Semantic Versioning

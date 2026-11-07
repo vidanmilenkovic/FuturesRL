@@ -1,106 +1,94 @@
 # FuturesRL · Docker deployment
 
-Containerised deployment of the full platform: FastAPI telemetry backend,
-Next.js dashboard, TimescaleDB, Redis and a headless IB Gateway (paper) for
-broker connectivity.
+Containerised deployment of the FuturesRL workstation: FastAPI backend,
+Next.js dashboard and an optional headless IB Gateway for broker connectivity.
+Storage is **local-first** (partitioned Parquet, Polars, DuckDB) inside the
+backend volume — there is no external database or cache service.
 
 ```
 ┌──────────────────┐   REST + WS    ┌──────────────────┐
 │ frontend :3100   │ ─────────────► │ backend :8000    │
 │ Next.js standalone│               │ FastAPI + /ws    │
-└──────────────────┘                └────┬──────┬──────┘
-                                          │      │
-                        ┌─────────────────┘      └──────────────┐
-                        ▼                                        ▼
-                ┌───────────────┐                        ┌───────────────┐
-                │ timescaledb   │                        │ redis :6379   │
-                │ (internal)    │                        │ (internal)    │
-                └───────────────┘                        └───────────────┘
-                        ▲
-                        │ 4003 (paper API)
-                ┌───────────────┐
-                │ ib-gateway    │  ghcr.io/gnzsnz/ib-gateway
-                │ 5900 noVNC    │
-                └───────────────┘
+└──────────────────┘                └────────┬─────────┘
+                                             │
+                                  ┌──────────▼──────────┐
+                                  │ backend_data volume │
+                                  │ Parquet + DuckDB    │
+                                  └─────────────────────┘
+                                             ▲
+                                             │ 4003 (paper API, optional)
+                                  ┌──────────┴──────────┐
+                                  │ ib-gateway (profile)│
+                                  │ 5900 noVNC          │
+                                  └─────────────────────┘
 ```
 
 ## Quick start
 
 ```bash
-cp docker/.env.example docker/.env      # edit secrets (IBKR paper credentials)
+cp docker/.env.example docker/.env      # optional: IBKR paper credentials
 docker compose -f docker/docker-compose.yml up --build
+
+# With the optional headless IB Gateway:
+docker compose -f docker/docker-compose.yml --profile ibkr up --build
 ```
 
-| Service      | URL / port                    | Notes                                                       |
-| ------------ | ----------------------------- | ----------------------------------------------------------- |
-| frontend     | <http://localhost:3100>       | Next.js dashboard; shows DEMO DATA if the API is down       |
-| backend      | <http://localhost:8000>       | REST `/api/*`, `/health`, `/ws/telemetry`, OpenAPI `/docs`  |
-| ib-gateway   | `127.0.0.1:4003` (paper API)  | VNC/noVNC on `127.0.0.1:5900` for the Gateway login screen   |
-| timescaledb  | `127.0.0.1:5432` (loopback)   | internal `timescaledb:5432` on `futuresrl_net`             |
-| redis        | internal `redis:6379`         | not published to the host                                   |
+| Service | URL / port | Notes |
+| --- | --- | --- |
+| frontend | <http://localhost:3100> | Next.js workstation; honest error banner if API is down |
+| backend | <http://localhost:8000> | REST `/api/*`, `/health`, `/ws/telemetry`, docs `/docs` |
+| ib-gateway | `127.0.0.1:4003` (paper API) | Optional profile; noVNC on `127.0.0.1:5900` |
+| storage | backend volume | Parquet cache + DuckDB; no external database/Redis |
 
 The backend starts in **offline mode** when IBKR/Databento are unavailable: it
-serves deterministic fixture data, so the stack remains demo-able end-to-end.
+serves deterministic fixture data, so the stack remains usable end-to-end.
 
 ## Files
 
-| File                          | Purpose                                                            |
-| ----------------------------- | ------------------------------------------------------------------ |
-| `Dockerfile.backend`          | Multi-stage `python:3.12-slim`; runtime deps extracted from `pyproject.toml`; non-root; uvicorn `src.api.main:app` |
-| `Dockerfile.frontend`         | Multi-stage `node:22-alpine`; `next build` → `output: "standalone"` runner |
-| `docker-compose.yml`          | 5 services, named volumes, healthchecks, bridge network            |
-| `entrypoint.backend.sh`       | Best-effort DB wait, data dir bootstrap, then `exec "$@"`          |
-| `.env.example`                | Documented environment template (copy to `.env`, git-ignored)      |
-| `.dockerignore`               | Canonical backend build-context ignore list (see note below)       |
+| File | Purpose |
+| --- | --- |
+| `Dockerfile.backend` | Multi-stage `python:3.12-slim`; non-root uvicorn `src.api.main:app` |
+| `Dockerfile.frontend` | Multi-stage `node:22-alpine`; Next.js standalone runner |
+| `docker-compose.yml` | Backend + frontend + optional IB Gateway profile; local volumes |
+| `entrypoint.backend.sh` | Creates local data/artifact directories, then execs uvicorn |
+| `.env.example` | Documented environment template (copy to `.env`, git-ignored) |
+| `.dockerignore` | Canonical backend build-context ignore list |
 
 > **Build context note.** The backend image needs the repository root as build
-> context (`pyproject.toml` + `src/` + `configs/`). Docker only reads a
-> `.dockerignore` from the context root; if the repository has no root
-> `.dockerignore`, pass this one explicitly:
+> context (`pyproject.toml` + `src/` + `configs/`). Pass the docker ignore file
+> explicitly when the repository root has no `.dockerignore`:
 > `docker buildx build --ignorefile docker/.dockerignore -f docker/Dockerfile.backend -t futuresrl/backend:1.0.0 .`
-> The frontend build uses the small `frontend/` context and therefore honours
-> `frontend/.dockerignore`.
 
 ## Environment variables
 
-Compose interpolates `docker/.env` (never committed). Full list with defaults
-lives in `.env.example`; the important ones:
-
-| Variable                       | Default                | Description                                                        |
-| ------------------------------ | ---------------------- | ------------------------------------------------------------------ |
-| `FUTURESRL_ENVIRONMENT`       | `paper`                | `development` / `paper` / `live` / `backtest`                      |
-| `POSTGRES_USER/PASSWORD/DB`    | `futuresrl`           | TimescaleDB credentials (change the password)                      |
-| `REDIS_PASSWORD`               | `change-me-redis`      | Redis AUTH password                                                |
-| `TWS_USERID` / `TWS_PASSWORD`  | *(empty)*              | IBKR **paper** credentials for the headless gateway                |
-| `IB_GATEWAY_PORT`              | `4003`                 | Published paper Gateway API port (loopback only)                    |
-| `FUTURESRL_IBKR_HOST`         | `ib-gateway`           | Hostname the backend uses to reach the Gateway                     |
-| `FUTURESRL_IBKR_PORT`         | `4003`                 | Paper Gateway API port inside the compose network                  |
-| `FUTURESRL_API_ENABLE_IBKR`   | `0`                    | `1` attempts a real IBKR session (offline simulated fallback stays) |
-| `DATABENTO_API_KEY`            | *(empty)*              | Optional; blank → offline deterministic fixtures                   |
-| `API_PORT`                     | `8000`                 | Published backend port                                             |
-| `FRONTEND_PORT`                | `3100`                 | Published dashboard port                                           |
-| `NEXT_PUBLIC_API_BASE_URL`     | `http://localhost:8000`| Browser-visible API origin, baked into the Next.js bundle at build |
-| `NEXT_PUBLIC_WS_URL`           | `ws://localhost:8000/ws/telemetry` | Browser-visible telemetry WebSocket URL                 |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `FUTURESRL_ENVIRONMENT` | `paper` | `development` / `paper` / `live` / `backtest` |
+| `TWS_USERID` / `TWS_PASSWORD` | empty | Optional IBKR paper credentials for the gateway profile |
+| `IB_GATEWAY_TRADING_MODE` | `paper` | `paper` or `live` (live uses internal/published port 4004) |
+| `IB_GATEWAY_PORT` / `IB_GATEWAY_INTERNAL_PORT` / `IB_GATEWAY_VNC_PORT` | `4003` / `4003` / `5900` | Optional Gateway API / noVNC ports |
+| `FUTURESRL_IBKR_HOST` / `_PORT` | `ib-gateway` / `4003` | Gateway endpoint inside the compose network |
+| `FUTURESRL_API_ENABLE_IBKR` | `0` | `1` attempts a real IBKR session; offline fallback remains |
+| `DATABENTO_API_KEY` | empty | Optional; blank keeps deterministic offline data |
+| `API_PORT` / `FRONTEND_PORT` | `8000` / `3100` | Published ports |
+| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:8000` | Browser-visible API origin (build-time) |
+| `NEXT_PUBLIC_WS_URL` | `ws://localhost:8000/ws/telemetry` | Browser-visible telemetry URL |
 
 ## Healthchecks
 
-| Service     | Check                                                    |
-| ----------- | -------------------------------------------------------- |
-| timescaledb | `pg_isready`                                              |
-| redis       | `redis-cli ping` (authenticated)                          |
-| backend     | `GET /health` via curl                                    |
-| frontend    | `GET /` via wget                                          |
+| Service | Check |
+| --- | --- |
+| backend | `GET /health` via curl |
+| frontend | `GET /` via wget |
+| ib-gateway | Optional profile; no healthcheck is required for offline mode |
 
 ## Operational notes
 
-- No secrets are committed: `.env` (if copied) is git-ignored; the compose file
-  only contains safe defaults and `${VAR}` interpolation.
-- Database and IB Gateway API ports bind to `127.0.0.1` only. The dashboard and
-  REST API are the intended public surface.
-- IB Gateway requires an interactive 2FA login on first start; `TWOFA_TIMEOUT_ACTION=restart`
-  and `RELOGIN_AFTER_TWOFA_TIMEOUT=yes` keep the session recoverable. Open
-  `http://127.0.0.1:5900` to complete the login when prompted.
-- `backend_data` (Parquet cache + DuckDB) and `backend_artifacts` (backtest tear
-  sheets) persist across restarts.
-- The API tolerates a missing IB Gateway: `depends_on: service_started` plus
-  lazy broker imports means telemetry continues from the offline engine.
+- No secrets are committed: `.env` is git-ignored; the compose file contains
+  only safe defaults and `${VAR}` interpolation.
+- The optional IB Gateway API and noVNC ports bind to `127.0.0.1` only.
+- IB Gateway may require an interactive 2FA login on first start; open
+  `http://127.0.0.1:5900` to complete it.
+- `backend_data` (Parquet + DuckDB) and `backend_artifacts` (tear sheets,
+  studies, models) persist across restarts.
+- No external database, Redis or message broker is required.
