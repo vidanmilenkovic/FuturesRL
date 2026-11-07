@@ -566,7 +566,6 @@ def test_default_search_space_is_active_only(config: StrategyConfig) -> None:
         "min_history_days",
         "top_n",
         "mean_reversion",
-        "seasonality",
         "llm_risk",
         "macro_lockout",
         "translator",

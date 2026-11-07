@@ -64,8 +64,8 @@ __all__ = [
 ]
 
 #: Supported Stable-Baselines3 algorithms (CPPO trains as risk-shaped PPO).
-DRL_ALGORITHMS: tuple[str, ...] = ("PPO", "CPPO", "SAC", "TD3", "A2C")
-type DRLAlgorithm = Literal["PPO", "CPPO", "SAC", "TD3", "A2C"]
+DRL_ALGORITHMS: tuple[str, ...] = ("PPO", "CPPO")
+type DRLAlgorithm = Literal["PPO", "CPPO"]
 
 #: Default training budget for an API-triggered smoke run.
 DEFAULT_TRAIN_TIMESTEPS: int = 128

@@ -87,6 +87,14 @@ class InstrumentSpec(BaseModel):
     ibkr_exchange: str
     micro_root: str | None = None
     standard_root: str | None = None
+    #: IBKR one-way broker commission per contract for this exact root
+    #: (standard ~0.85; micro equity/energy/metals/rates ~0.25; micro FX ~0.15).
+    broker_commission_per_contract: float = Field(default=0.85, ge=0.0)
+    #: Exchange + clearing + regulatory fees per contract per side for this exact
+    #: root (standard CME equity ~1.40; micro MES/MNQ ~0.37; CL ~1.52; MCL ~0.52).
+    exchange_and_reg_fee_per_contract: float = Field(default=1.70, ge=0.0)
+    #: Baseline slippage (ticks per side) for a liquid outright order.
+    default_slippage_ticks: float = Field(default=0.75, ge=0.0)
     margins: MarginSpec
     roll: RollSpec
 
@@ -102,6 +110,11 @@ class InstrumentSpec(BaseModel):
     def point_value(self) -> float:
         """Account-currency value of one full contract point."""
         return self.multiplier
+
+    @property
+    def transaction_fee_per_contract(self) -> float:
+        """Broker commission + exchange/regulatory fees per contract per side."""
+        return self.broker_commission_per_contract + self.exchange_and_reg_fee_per_contract
 
     @property
     def tick_value(self) -> float:

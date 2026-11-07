@@ -49,7 +49,6 @@ from src.strategies.parameter_catalog import (
     universe_sectors,
     validate_strategy_roots,
 )
-from src.strategies.timing import ALL_MONTHS, DEFAULT_ROOT_MONTH_BIASES
 
 from tests.fixtures.market import make_market_state
 
@@ -59,13 +58,10 @@ PRESET_IDS: tuple[str, ...] = (
     "trend_following_tsmom_kama",
     "commodity_carry_term_structure",
     "panic_mean_reversion",
-    "seasonal_commodity_cycle",
     "drl_neural_policy_llm_risk",
 )
 STRUCTURED_KEYS: tuple[str, ...] = (
     "universe.regime.risk_off_roots",
-    "timing.seasonality.active_months",
-    "timing.seasonality.root_month_biases",
     "translator.rounding_mode",
     "timing.mean_reversion.rsi_period",
 )
@@ -236,16 +232,11 @@ def test_new_overlay_parameters_are_catalogued() -> None:
         "turbulence_veto_threshold",
         "reversion_strength",
     }
-    seasonality = {spec.param for spec in catalog.for_stage_name("seasonality")}
-    assert seasonality == {"active_months", "root_month_biases", "out_of_season_scale"}
-    months = catalog.get("timing.seasonality.active_months")
-    assert months.type is ParameterType.MULTISELECT
-    assert set(months.choices) == set(ALL_MONTHS)
-    roots = catalog.get("timing.seasonality.root_month_biases")
-    # Root choices are derived from the live instrument master (no hardcoded list).
-    assert roots.choices == tuple(load_instruments().roots())
-    assert "CL" in roots.choices and "GC" in roots.choices
-    assert roots.yaml_encoding == "json_object"
+    assert catalog.for_stage_name("seasonality") == ()
+    composite = {
+        spec.param for spec in catalog.for_stage_name("composite") if spec.stage == "timing"
+    }
+    assert composite == {"components"}
 
 
 def test_optuna_tunable_subset_is_numeric_or_categorical() -> None:
@@ -319,7 +310,7 @@ def test_validate_parameter_value_types_ranges_and_choices() -> None:
     ) == (pytest.approx(0.1))
     assert validate_parameter_value("risk.quant_risk.volatility_targeting_enabled", False) is False
     assert validate_parameter_value("translator.rounding_mode", "FLOOR") == "floor"
-    assert validate_parameter_value("timing.seasonality.active_months", [1, "2", 12]) == (1, 2, 12)
+    assert validate_parameter_value("universe.regime.risk_off_roots", ["CL", "GC"]) == ("CL", "GC")
     invalid: tuple[tuple[str, object], ...] = (
         ("timing.tsmom.lookback_fast", True),
         ("timing.tsmom.lookback_fast", 1),
@@ -329,8 +320,6 @@ def test_validate_parameter_value_types_ranges_and_choices() -> None:
         ("timing.tsmom.lookback_fast", "fast"),
         ("risk.quant_risk.volatility_targeting_enabled", "yes"),
         ("translator.rounding_mode", "bankers"),
-        ("timing.seasonality.active_months", []),
-        ("timing.seasonality.active_months", [0]),
         ("universe.regime.risk_off_roots", ["ZZZ"]),
         ("allocator.volatility_target.target_annual_volatility", float("nan")),
     )
@@ -341,28 +330,15 @@ def test_validate_parameter_value_types_ranges_and_choices() -> None:
     with pytest.raises(ValueError, match="lookback_fast"):
         validate_parameter_value("timing.tsmom.lookback_fast", 10_000)
     # Duplicate multiselect entries are de-duplicated rather than rejected.
-    assert validate_parameter_value("timing.seasonality.active_months", [1, 1]) == (1,)
+    assert validate_parameter_value("universe.regime.risk_off_roots", ["CL", "CL"]) == ("CL",)
     with pytest.raises(KeyError, match="unknown parameter key"):
         validate_parameter_value("nope.nope.nope", 1)
 
 
 def test_encode_decode_yaml_round_trips() -> None:
-    assert decode_parameter_value("timing.seasonality.active_months", "1,2,3") == (1, 2, 3)
-    assert decode_parameter_value("timing.seasonality.active_months", [1, 2]) == (1, 2)
-    assert encode_parameter_value("timing.seasonality.active_months", [1, 2, 3]) == "1,2,3"
-    assert encode_parameter_value("universe.regime.risk_off_roots", ["CL", "GC"]) == "CL,GC"
     assert decode_parameter_value("universe.regime.risk_off_roots", "CL,GC") == ("CL", "GC")
-    encoded = encode_parameter_value("timing.seasonality.root_month_biases", ["CL"])
-    decoded = decode_parameter_value("timing.seasonality.root_month_biases", encoded)
-    assert isinstance(decoded, dict)
-    assert decoded["CL"][2] == pytest.approx(0.10)
-    custom = '{"GC": {"1": 0.2, "9": -0.05}}'
-    decoded_custom = decode_parameter_value("timing.seasonality.root_month_biases", custom)
-    assert decoded_custom == {"GC": {1: 0.2, 9: -0.05}}
-    assert decode_parameter_value("timing.seasonality.active_months", "-1") == (-1,)
+    assert encode_parameter_value("universe.regime.risk_off_roots", ["CL", "GC"]) == "CL,GC"
     assert encode_parameter_value("timing.tsmom.lookback_fast", 30) == 30
-    with pytest.raises(ValueError, match="is not one of"):
-        encode_parameter_value("timing.seasonality.root_month_biases", ["ZZZ"])
 
 
 def test_apply_parameter_overrides_is_deep_and_validated() -> None:
@@ -383,18 +359,6 @@ def test_apply_parameter_overrides_is_deep_and_validated() -> None:
     assert updated["translator"]["max_margin_utilization"] == 0.5
     # The overridden strategy is still a valid StrategyConfig.
     assert StrategyConfig.model_validate(updated).id == "tsmom_vol_target"
-    # Multiselect/object overrides are encoded into YAML-native scalars.
-    seasonal = apply_parameter_overrides(
-        parameter_catalog().presets[3].strategy,
-        {
-            "timing.seasonality.active_months": [1, 2, 11, 12],
-            "timing.seasonality.root_month_biases": ["CL", "GC"],
-        },
-    )
-    timing_params = seasonal["timing"][0]["params"]
-    assert timing_params["active_months"] == "1,2,11,12"
-    assert isinstance(timing_params["root_month_biases"], str)
-    assert json.loads(timing_params["root_month_biases"])["CL"]["2"] == pytest.approx(0.1)
     with pytest.raises(KeyError, match="unknown parameter key"):
         apply_parameter_overrides(strategy, {"timing.nope.nope": 1})
     with pytest.raises(ValueError, match="lookback_fast"):
@@ -436,7 +400,7 @@ def test_presets_are_complete_valid_strategies() -> None:
         assert config.universe.name and config.allocator.name
         assert preset.parameter_keys
     payload = catalog_dict()["presets"]
-    assert isinstance(payload, list) and len(payload) == 5
+    assert isinstance(payload, list) and len(payload) == 4
     for entry in payload:
         assert set(entry) == {
             "id",
@@ -449,10 +413,6 @@ def test_presets_are_complete_valid_strategies() -> None:
         }
         # The strategy payload is POST-ready: it validates straight into StrategyConfig.
         assert StrategyConfig.model_validate(entry["strategy"]).id == entry["strategy"]["id"]
-    seasonal = next(item for item in payload if item["id"] == "seasonal_commodity_cycle")
-    seasonality_params = seasonal["strategy"]["timing"][0]["params"]
-    assert seasonality_params["active_months"] == "1,2,3,4,5,9,10,11,12"
-    assert seasonality_params["root_month_biases"] == "CL,GC"
     drl_preset = next(item for item in payload if item["id"] == "drl_neural_policy_llm_risk")
     assert drl_preset["strategy"]["drl"]["algorithm"] == "PPO"
     assert drl_preset["strategy"]["allocator"]["name"] == "drl"
@@ -486,10 +446,10 @@ def test_catalog_preset_parameter_keys_are_bound_by_their_preset() -> None:
 
 
 def test_new_overlays_can_be_selected_from_a_yaml_config(tmp_path: Path) -> None:
-    """A strategy YAML can select the new overlays by name with scalar params."""
+    """A strategy YAML can select overlays by name with scalar params."""
     yaml_text = """
-id: mean_reversion_seasonal_test
-description: mean-reversion + seasonality wiring test
+id: mean_reversion_carry_test
+description: mean-reversion + carry wiring test
 tags: [test]
 universe:
   selector: liquidity
@@ -508,26 +468,25 @@ timing:
       overbought_threshold: 70.0
       turbulence_veto_threshold: 0.95
       reversion_strength: 0.5
-  - name: seasonality
+  - name: carry_filter
     params:
-      active_months: "1,2,3,9,10,11,12"
-      root_month_biases: "CL,GC"
-      out_of_season_scale: 0.5
+      min_carry_bps: -50.0
+      carry_weight: 1.0
 risk: []
 translator:
   rounding_mode: floor
   max_margin_utilization: 0.6
 """
-    path = tmp_path / "mean_reversion_seasonal.yaml"
+    path = tmp_path / "mean_reversion_carry.yaml"
     path.write_text(yaml_text, encoding="utf-8")
     config = load_strategy_config(path)
-    assert [stage.name for stage in config.timing] == ["mean_reversion", "seasonality"]
+    assert [stage.name for stage in config.timing] == ["mean_reversion", "carry_filter"]
     pipeline = build_pipeline(config, load_instruments())
     result = pipeline.run(make_market_state())
     assert result.universe
     assert result.timing_weights
     assert result.final_weights.gross <= result.timing_weights.gross + 1e-9
-    assert result.diagnostics["timing_overlays"] == ("mean_reversion", "seasonality")
+    assert result.diagnostics["timing_overlays"] == ("mean_reversion", "carry_filter")
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +606,6 @@ def test_catalog_root_and_sector_choices_track_instrument_master() -> None:
     catalog = parameter_catalog()
     assert catalog.get("universe.regime.risk_off_roots").choices == tuple(master.roots())
     assert catalog.get("universe.regime.risk_off_sectors").choices == tuple(master.sectors())
-    assert catalog.get("timing.seasonality.root_month_biases").choices == tuple(master.roots())
     # The catalog is bound to the master it was built from.
     assert catalog.instrument_master is not None
     assert tuple(catalog.instrument_master.roots()) == tuple(master.roots())
@@ -730,7 +688,6 @@ def test_parameter_catalog_is_cached_per_instrument_master_and_refreshes() -> No
     rebuilt = parameter_catalog(custom)
     assert rebuilt is not custom_catalog
     assert rebuilt.get("universe.regime.risk_off_roots").choices == ("ZC9",)
-    assert rebuilt.get("timing.seasonality.root_month_biases").choices == ("ZC9",)
     # refresh_parameter_catalog reloads the committed default master and re-primes the cache.
     refreshed = refresh_parameter_catalog()
     assert refreshed is parameter_catalog()
@@ -756,39 +713,29 @@ def test_universe_sector_mapping_falls_back_for_unmapped_sectors() -> None:
     assert sectors[-1].roots[0].root == "ZZ2"
 
 
-def test_seasonal_encoding_handles_expanded_instrument_master() -> None:
+def test_regime_roots_encoding_tracks_instrument_master() -> None:
     master = load_instruments()
-    extra_roots = [root for root in master.roots() if root not in DEFAULT_ROOT_MONTH_BIASES]
-    assert extra_roots, "expected the expanded master to add roots beyond the bespoke curves"
-    target = extra_roots[0]
-    encoded = encode_parameter_value("timing.seasonality.root_month_biases", [target])
-    payload = json.loads(encoded)
-    assert target in payload
-    assert isinstance(payload[target], dict)
-    decoded = decode_parameter_value("timing.seasonality.root_month_biases", encoded)
-    assert isinstance(decoded, dict) and target in decoded
-    # Custom instrument masters can supply their own root choices via the typed spec.
+    catalog = parameter_catalog()
+    roots_spec = catalog.get("universe.regime.risk_off_roots")
+    assert roots_spec.choices == tuple(master.roots())
+    assert encode_parameter_value("universe.regime.risk_off_roots", ["CL", "GC"]) == "CL,GC"
+    assert decode_parameter_value("universe.regime.risk_off_roots", "CL,GC") == ("CL", "GC")
     custom = _custom_master_with_extra_root()
-    custom_spec = parameter_catalog(custom).get("timing.seasonality.root_month_biases")
-    custom_encoded = encode_parameter_value(custom_spec, ["ZC9"], instrument_master=custom)
-    assert "ZC9" in json.loads(custom_encoded)
+    custom_spec = parameter_catalog(custom).get("universe.regime.risk_off_roots")
+    assert "ZC9" in custom_spec.choices
+    encoded = encode_parameter_value(custom_spec, ["ZC9"])
+    assert encoded == "ZC9"
     with pytest.raises(ValueError):
-        encode_parameter_value("timing.seasonality.root_month_biases", ["NOT_A_ROOT"])
+        encode_parameter_value("universe.regime.risk_off_roots", ["NOT_A_ROOT"])
 
 
 def test_presets_remain_valid_with_expanded_instrument_master() -> None:
     master = load_instruments()
     catalog = parameter_catalog()
-    catalog_roots = set(master.roots())
     for preset in catalog.presets:
         config = preset.to_config()
         assert config.id.startswith("preset_")
-        for stage in config.timing:
-            if stage.name != "seasonality":
-                continue
-            raw = str(stage.params.get("root_month_biases", ""))
-            if raw and not raw.startswith("{"):
-                assert {root.strip() for root in raw.split(",")} <= catalog_roots
+        assert all(stage.name in TIMING_REGISTRY for stage in config.timing)
         pipeline = build_pipeline(config, master)
         assert pipeline.selector.name == config.universe.name
 
@@ -930,7 +877,7 @@ def test_active_filtering_for_tsmom_config() -> None:
         "allocator.equal_weight.gross_leverage",
         "allocator.drl.total_timesteps",
         "timing.mean_reversion.rsi_period",
-        "timing.seasonality.out_of_season_scale",
+        "timing.composite.components",
         "translator.rebalance_buffer_contracts",
     )
     for key in inactive_or_structural:
@@ -1036,27 +983,21 @@ def test_presets_and_configs_reference_only_master_roots() -> None:
         for token in DELISTED_ROOT_TOKENS:
             assert f'"{token}"' not in serialized, f"{config.id} references {token}"
     assert DELISTED_ROOT_TOKENS.isdisjoint(referenced)
-    # The one preset that configures seasons uses canonical roots only.
-    seasonal = next(p for p in catalog.presets if p.id == "seasonal_commodity_cycle")
-    assert set(strategy_root_symbols(seasonal.strategy)) == {"CL", "GC"}
+    # No preset references delisted roots.
+    for preset in catalog.presets:
+        assert DELISTED_ROOT_TOKENS.isdisjoint(strategy_root_symbols(preset.strategy))
 
 
-def test_strategy_root_symbols_extracts_regime_and_seasonality_roots() -> None:
+def test_strategy_root_symbols_extracts_regime_roots() -> None:
     from configs.strategy import StageConfig
 
     strategy = _synthetic_strategy(
         universe=StageConfig(
             name="regime", params={"risk_off_roots": "CL,GC", "risk_off_sectors": "energy,metals"}
-        ),
-        timing=(
-            StageConfig(
-                name="seasonality",
-                params={"root_month_biases": '{"ZC": {"1": 0.2}, "ZS": {"9": -0.1}}'},
-            ),
-        ),
+        )
     )
     symbols = strategy_root_symbols(strategy)
-    assert symbols == ("CL", "GC", "ZC", "ZS")
+    assert symbols == ("CL", "GC")
     assert validate_strategy_roots(strategy) == symbols
     # Non-root lists are ignored.
     assert "energy" not in symbols and "metals" not in symbols

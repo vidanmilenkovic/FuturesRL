@@ -285,7 +285,6 @@ _FALLBACK_STAGE_CHOICES: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "kama",
             "carry_filter",
             "mean_reversion",
-            "seasonality",
             "composite",
         ),
         "risk": ("quant_risk", "llm_risk"),
@@ -459,17 +458,6 @@ def fallback_parameter_catalog() -> list[ParameterSpec]:
             optuna_tunable=True,
         ),
         _fallback_spec(
-            "timing.seasonality.active_months",
-            "timing",
-            "seasonality",
-            "active_months",
-            type_="multiselect",
-            choices=tuple(range(1, 13)),
-            default=None,
-            description="T_t: UTC calendar months in which the seasonal bias is active.",
-            yaml_encoding="comma_ints",
-        ),
-        _fallback_spec(
             "risk.volatility_target.vol_target",
             "risk",
             "volatility_target",
@@ -589,22 +577,6 @@ def fallback_presets() -> list[StrategyPreset]:
         "translator": _translator_block(),
         "backtest": _backtest_block(),
     }
-    seasonal = {
-        "id": "seasonal_commodity_cycle",
-        "description": "Seasonal commodity cycle tilts with an out-of-season de-risking scale.",
-        "tags": ["seasonality", "commodities", "calendar"],
-        "universe": {"name": "liquidity", "params": {"top_n": 8}},
-        "allocator": {"name": "volatility_target", "params": {"target_annual_volatility": 0.10}},
-        "timing": [
-            {
-                "name": "seasonality",
-                "params": {"active_months": "1,2,3,4,5,9,10,11,12", "out_of_season_scale": 0.5},
-            }
-        ],
-        "risk": [{"name": "quant_risk", "params": {"mode": "full"}}],
-        "translator": _translator_block(),
-        "backtest": _backtest_block(),
-    }
     drl = {
         "id": "drl_neural_policy_llm_risk",
         "description": "DRL policy allocator with the LLM Risk-First structural constraint engine.",
@@ -653,13 +625,6 @@ def fallback_presets() -> list[StrategyPreset]:
                     "timing.mean_reversion.rsi_period",
                     "timing.mean_reversion.oversold_threshold",
                 ),
-            ),
-            (
-                "seasonal_commodity_cycle",
-                "Seasonal Commodity Cycle",
-                "Commodity returns exhibit calendar seasonality; tilt into seasonal months only.",
-                seasonal,
-                ("timing.seasonality.active_months",),
             ),
             (
                 "drl_neural_policy_llm_risk",

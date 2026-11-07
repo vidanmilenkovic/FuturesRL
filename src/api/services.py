@@ -32,9 +32,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import logging
 import math
 import os
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -147,6 +149,37 @@ __all__ = [
 
 #: Env flag that opts into real IBKR wiring instead of the simulated broker.
 IBKR_ENABLE_ENV: str = "FUTURESRL_API_ENABLE_IBKR"
+
+#: Relative location of the persisted IBKR whatIf calibration overrides.
+CALIBRATED_COSTS_RELATIVE_PATH: Path = Path("cache") / "ibkr_calibrated_costs.json"
+
+
+class IBKRCalibrationUnavailableError(RuntimeError):
+    """Calibration requires a connected IBKR paper/live execution adapter."""
+
+
+def calibrated_costs_path(settings: Settings) -> Path:
+    """Persisted calibration path, matching the data-eng task-84 reader.
+
+    An explicit ``FUTURESRL_IBKR_CALIBRATED_COSTS_PATH`` wins (stable for operator
+    overrides); otherwise the canonical ``<settings.data_dir>/cache/...`` path is
+    used, which honours ``FUTURESRL_DATA_DIR`` through ``Settings``.
+    """
+    override = os.environ.get("FUTURESRL_IBKR_CALIBRATED_COSTS_PATH", "").strip()
+    if override:
+        return Path(override)
+    return Path(settings.data_dir) / CALIBRATED_COSTS_RELATIVE_PATH
+
+
+def load_calibrated_costs(settings: Settings) -> dict[str, object] | None:
+    """Read the persisted calibration document (``None`` when absent/corrupt)."""
+    path = calibrated_costs_path(settings)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
 
 #: How long the kill switch keeps execution locked after a flatten.
 KILL_SWITCH_LOCK_MINUTES: int = 30
@@ -1114,6 +1147,143 @@ class IBKRExecutionService:
             }
             for fill in fills
         ]
+
+    # -- cost/margin calibration (read-only IBKR whatIf) -----------------------
+
+    async def calibrate_costs(self, roots: Sequence[str] | None = None) -> dict[str, object]:
+        """Calibrate per-contract fees/margins via read-only IBKR ``whatIfOrder``.
+
+        One 1-lot MKT ``whatIfOrder`` per root; NO order is ever submitted. Results
+        persist atomically to ``data/cache/ibkr_calibrated_costs.json`` (the data-eng
+        task-84 loader contract) and are returned additively for the UI.
+        """
+
+        if not self.connected:
+            raise IBKRCalibrationUnavailableError(
+                "IBKR is not connected; cost calibration requires a connected paper/live "
+                "IBKR TWS or IB Gateway session"
+            )
+        master = self._market.instrument_master
+        requested = (
+            [str(root).strip().upper() for root in roots if str(root).strip()]
+            if roots is not None
+            else list(master.roots())
+        )
+        unknown = [root for root in requested if not master.has(root)]
+        if unknown:
+            raise ValueError(f"unknown futures root(s): {unknown!r}")
+        calibrated: dict[str, object] = {}
+        warnings: list[str] = []
+        for root in dict.fromkeys(requested):
+            try:
+                order = OrderEvent.market(
+                    order_id=f"calibration-{root}",
+                    timestamp=self._clock(),
+                    instrument_id=root,
+                    side=OrderSide.BUY,
+                    quantity=1,
+                )
+                impact = await self._manager.what_if_order(order)
+            except Exception as exc:
+                warnings.append(
+                    f"{root}: whatIfOrder failed ({type(exc).__name__}: {exc}); skipped"
+                )
+                continue
+            initial = self._calibrated_margin(
+                impact.initial_margin_change,
+                impact.initial_margin_before,
+                impact.initial_margin_after,
+            )
+            maintenance = self._calibrated_margin(
+                impact.maintenance_margin_change,
+                impact.maintenance_margin_before,
+                impact.maintenance_margin_after,
+            )
+            commission_total = impact.commission
+            if commission_total is None and initial is None and maintenance is None:
+                warnings.append(
+                    f"{root}: whatIfOrder reported neither commission nor margin; skipped"
+                )
+                continue
+            if commission_total is None:
+                warnings.append(f"{root}: whatIfOrder reported no commission; using 0.0")
+                commission_total = 0.0
+            broker, exchange, split_warning = self._split_commission(root, commission_total)
+            if split_warning:
+                warnings.append(f"{root}: {split_warning}")
+            calibrated[root] = {
+                "broker_commission_per_contract": round(float(broker), 6),
+                "exchange_and_reg_fee_per_contract": round(float(exchange), 6),
+                "initial_margin": round(float(initial or 0.0), 6),
+                "maintenance_margin": round(float(maintenance or 0.0), 6),
+                "commission_source": "ibkr_whatif",
+                "margin_source": "ibkr_whatif",
+            }
+        if not calibrated:
+            return {
+                "status": "unavailable",
+                "account_id": self._settings.ibkr_account,
+                "calibrated_at": self._clock(),
+                "roots": {},
+                "warnings": warnings,
+                "path": None,
+                "source": "ibkr",
+            }
+        status = "calibrated" if len(calibrated) == len(set(requested)) else "partial"
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "account_id": self._settings.ibkr_account,
+            "calibrated_at": self._clock().isoformat(),
+            "roots": calibrated,
+            "warnings": warnings,
+        }
+        path = calibrated_costs_path(self._settings)
+        self._write_calibration_atomically(path, payload)
+        return {
+            "status": status,
+            "account_id": self._settings.ibkr_account,
+            "calibrated_at": self._clock(),
+            "roots": calibrated,
+            "warnings": warnings,
+            "path": str(path),
+            "source": "ibkr",
+        }
+
+    @staticmethod
+    def _calibrated_margin(
+        change: float | None, before: float | None, after: float | None
+    ) -> float | None:
+        if change is not None:
+            return abs(float(change))
+        if before is not None and after is not None:
+            return abs(float(after) - float(before))
+        return None
+
+    def _split_commission(self, root: str, total: float) -> tuple[float, float, str | None]:
+        """Split IBKR's total commission into broker + exchange/reg components."""
+        spec = self._market.instrument_master.get(root)
+        broker = float(getattr(spec, "broker_commission_per_contract", 0.0) or 0.0)
+        exchange = float(getattr(spec, "exchange_and_reg_fee_per_contract", 0.0) or 0.0)
+        if broker > 0.0 and exchange > 0.0:
+            component_total = broker + exchange
+            return total * broker / component_total, total * exchange / component_total, None
+        return total, 0.0, "commission split not configured; total assigned to broker"
+
+    @staticmethod
+    def _write_calibration_atomically(path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=".ibkr_calibrated_costs.", suffix=".json.tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            Path(temp_name).replace(path)
+        except BaseException:
+            Path(temp_name).unlink(missing_ok=True)
+            raise
 
     # -- lifecycle / reconnect -------------------------------------------------
 

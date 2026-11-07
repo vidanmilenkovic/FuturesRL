@@ -48,6 +48,8 @@ from src.api.schemas import (
     BacktestRunConfig,
     BacktestRunSummary,
     CachedBarsSummary,
+    CostBreakdownResponse,
+    MarginRegimeResponse,
     MetricsSet,
     MonthlyReturn,
     SeriesPoint,
@@ -105,6 +107,39 @@ _METRIC_ALIASES: Mapping[str, tuple[str, ...]] = {
     ),
     "commission_to_gross_pnl": ("commission_to_gross_pnl", "commission_to_gross_pnl_ratio"),
 }
+
+
+def _cost_breakdown_response(result: BacktestResult) -> CostBreakdownResponse:
+    """Exact execution-cost breakdown for an engine result (task-86, additive)."""
+    breakdown = result.cost_breakdown
+    return CostBreakdownResponse(
+        broker_commissions=breakdown["broker_commissions"],
+        exchange_and_regulatory_fees=breakdown["exchange_and_regulatory_fees"],
+        slippage=breakdown["slippage"],
+        funding=breakdown["funding"],
+        roll_cost_total=breakdown["roll_cost_total"],
+        roll_commissions=breakdown["roll_commissions"],
+        roll_exchange_and_regulatory_fees=breakdown["roll_exchange_and_regulatory_fees"],
+        roll_slippage=breakdown["roll_slippage"],
+        non_roll_commissions=breakdown["non_roll_commissions"],
+        non_roll_exchange_and_regulatory_fees=breakdown["non_roll_exchange_and_regulatory_fees"],
+        non_roll_slippage=breakdown["non_roll_slippage"],
+        forced_liquidation_cost=breakdown["forced_liquidation_cost"],
+        total_commissions=breakdown["total_commissions"],
+        total_execution_costs=breakdown["total_execution_costs"],
+        total_costs=breakdown["total_costs"],
+    )
+
+
+def _margin_regime_response(result: BacktestResult) -> MarginRegimeResponse:
+    """Stress/calibrated-margin provenance for an engine result (task-86)."""
+    return MarginRegimeResponse(
+        stress_applied=result.margin_stress_applied,
+        stress_multiplier=result.margin_stress_multiplier,
+        stress_roots=list(result.margin_stress_roots),
+        calibrated=result.margin_calibrated,
+        calibrated_roots=list(result.margin_calibrated_roots),
+    )
 
 
 def _series_points(timestamps: Sequence[datetime], values: Sequence[float]) -> list[SeriesPoint]:
@@ -1000,6 +1035,8 @@ class EngineBacktestService:
             monthly_returns=_monthly_returns(timestamps, equity),
             metrics=_performance_metrics(performance),
             trades=_trade_rows(result.trades),
+            cost_breakdown=_cost_breakdown_response(result),
+            margin_regime=_margin_regime_response(result),
         )
 
     def _attribution(self, result: BacktestResult) -> list[AttributionRow]:

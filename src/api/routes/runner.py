@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import time
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Annotated, cast
 
@@ -15,6 +16,10 @@ from src.api.deps import ContainerDep, LiveDep
 from src.api.live import RunnerSessionUnavailableError
 from src.api.rebalance_service import RebalanceError, RebalanceService
 from src.api.schemas import (
+    CalibrateCostsRequest,
+    CalibrateCostsResponse,
+    CalibratedCostRoot,
+    CalibratedCostsStatusResponse,
     IbkrActiveConnection,
     IbkrConnectionSwitchRequest,
     IbkrConnectionSwitchResponse,
@@ -28,6 +33,11 @@ from src.api.schemas import (
     RunnerStatusResponse,
     RunnerStepRequest,
     RunnerStepResponse,
+)
+from src.api.services import (
+    IBKRCalibrationUnavailableError,
+    calibrated_costs_path,
+    load_calibrated_costs,
 )
 
 router = APIRouter(tags=["runner"])
@@ -385,8 +395,8 @@ async def runner_ibkr_connection(
         )
     warnings.append(
         "restart the API with the requested IBKR port/client id to apply the switch "
-        f"(FUTURESRLX_IBKR_PORT={requested.port}, "
-        f"FUTURESRLX_IBKR_CLIENT_ID={requested_client_id})"
+        f"(FUTURESRL_IBKR_PORT={requested.port}, "
+        f"FUTURESRL_IBKR_CLIENT_ID={requested_client_id})"
     )
     return IbkrConnectionSwitchResponse(
         status="restart_required",
@@ -400,4 +410,122 @@ async def runner_ibkr_connection(
             "no safe runtime reconnect is available for this adapter; the connection "
             "was NOT switched. Restart the API with the requested IBKR port/client id."
         ),
+    )
+
+
+# -- IBKR cost/margin calibration --------------------------------------------
+
+
+@router.post(
+    "/runner/calibrate-costs",
+    response_model=CalibrateCostsResponse,
+    summary="Calibrate per-contract fees/margins from read-only IBKR whatIfOrder",
+    description=(
+        "Requires a connected IBKR paper/live execution session. Sends one 1-lot MKT "
+        "``whatIfOrder`` per root (NO order submission), records the actual commission "
+        "and initial/maintenance margin impact and atomically persists "
+        "``data/cache/ibkr_calibrated_costs.json`` for the backtest cost model. Roots "
+        "without a usable whatIf response are skipped with warnings (status partial); "
+        "none usable -> status unavailable (nothing written). Simulated/offline adapters "
+        "cannot be calibrated (409, never fabricated)."
+    ),
+    responses={
+        409: {"description": "IBKR not connected / simulated adapter cannot be calibrated"},
+        422: {"description": "Unknown roots"},
+        500: {"description": "Calibration persistence failure"},
+    },
+)
+async def calibrate_costs(
+    payload: CalibrateCostsRequest, container: ContainerDep
+) -> CalibrateCostsResponse:
+    """Run the read-only IBKR whatIf calibration and persist the overrides."""
+    execution = container.execution
+    if not bool(getattr(execution, "ibkr_enabled", False)):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "IBKR cost calibration requires the real IBKR execution adapter; the "
+                "offline/simulated adapter cannot be calibrated"
+            ),
+        )
+    if not bool(getattr(execution, "connected", False)):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "IBKR is not connected; start TWS/IB Gateway (paper/live) and wait for "
+                "the session before calibrating costs"
+            ),
+        )
+    calibrator = getattr(execution, "calibrate_costs", None)
+    if not callable(calibrator):
+        raise HTTPException(
+            status_code=409,
+            detail="the active IBKR execution adapter does not support whatIf calibration",
+        )
+    try:
+        result = await calibrator(payload.roots)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IBKRCalibrationUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - persistence/transport failure
+        raise HTTPException(
+            status_code=500,
+            detail=f"IBKR cost calibration failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    return CalibrateCostsResponse.model_validate(result)
+
+
+@router.get(
+    "/runner/calibrated-costs",
+    response_model=CalibratedCostsStatusResponse,
+    summary="Persisted IBKR-calibrated fee/margin overrides",
+    description=(
+        "Returns the persisted ``data/cache/ibkr_calibrated_costs.json`` calibration "
+        "(roots, account, calibrated_at, age) for the UI. A missing/corrupt file is not "
+        "an error: ``available=false``/``source='none'``."
+    ),
+)
+def calibrated_costs(container: ContainerDep) -> CalibratedCostsStatusResponse:
+    """Return persisted calibration overrides + age/provenance."""
+    settings = container.settings
+    path = calibrated_costs_path(settings)
+    payload = load_calibrated_costs(settings)
+    if payload is None:
+        return CalibratedCostsStatusResponse(available=False, path=str(path), source="none")
+    raw_roots = payload.get("roots")
+    roots: dict[str, CalibratedCostRoot] = {}
+    warnings: list[str] = []
+    if isinstance(raw_roots, Mapping):
+        for root, entry in raw_roots.items():
+            try:
+                roots[str(root)] = CalibratedCostRoot.model_validate(entry)
+            except Exception as exc:
+                warnings.append(f"{root}: unusable persisted calibration entry ({exc})")
+    elif raw_roots is not None:
+        warnings.append("persisted calibration roots field is malformed")
+    calibrated_at: datetime | None = None
+    age_seconds: float | None = None
+    raw_time = payload.get("calibrated_at")
+    if isinstance(raw_time, str):
+        try:
+            calibrated_at = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            if calibrated_at.tzinfo is None:
+                calibrated_at = calibrated_at.replace(tzinfo=UTC)
+            age_seconds = max(0.0, (datetime.now(UTC) - calibrated_at).total_seconds())
+        except ValueError:
+            warnings.append("persisted calibration calibrated_at is unparseable")
+    raw_warnings = payload.get("warnings")
+    if isinstance(raw_warnings, Sequence) and not isinstance(raw_warnings, str | bytes):
+        warnings.extend(str(item) for item in raw_warnings if isinstance(item, str))
+    account = payload.get("account_id")
+    return CalibratedCostsStatusResponse(
+        available=bool(roots),
+        path=str(path),
+        account_id=str(account) if isinstance(account, str) and account else None,
+        calibrated_at=calibrated_at,
+        age_seconds=age_seconds,
+        roots=roots,
+        warnings=warnings,
+        source="ibkr" if roots else "none",
     )

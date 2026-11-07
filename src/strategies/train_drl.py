@@ -36,7 +36,8 @@ in the strategy YAML.
 
 Algorithms
 ----------
-``PPO``/``SAC``/``TD3``/``A2C`` map to their Stable-Baselines3 classes.
+``PPO`` maps to Stable-Baselines3's PPO class; ``CPPO`` is PPO trained against the
+semantic-risk-shaped reward (the constrained Lagrangian relaxation).
 ``CPPO`` (constrained PPO / CPRL) maps to PPO trained against the environment's
 semantic-risk-shaped reward (the existing :class:`DRLAllocator` semantics); the
 metadata records both the configured ``algorithm`` and the effective
@@ -403,7 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--algorithm",
         type=_algorithm,
         default=None,
-        help="override config.drl.algorithm (PPO/CPPO/SAC/TD3/A2C)",
+        help="override config.drl.algorithm (PPO/CPPO)",
     )
     parser.add_argument(
         "--periods",
@@ -997,7 +998,7 @@ def train_drl(
     strategy:
         Strategy YAML with a ``drl:`` section (algorithm/policy/seed defaults).
     algorithm:
-        Optional ``PPO``/``CPPO``/``SAC``/``TD3``/``A2C`` override (case-insensitive).
+        Optional ``PPO``/``CPPO`` override (case-insensitive).
     timesteps:
         Optional training-budget override (bounded to ``MAX_TIMESTEPS``).
     learning_rate, gamma, llm_reward_penalty_lambda:

@@ -226,7 +226,7 @@ def test_models_lists_and_parses_artifacts(
         models_dir,
         "older_model",
         trained_at=FIXED_TIMESTAMP - timedelta(days=3),
-        metadata={"algorithm": "SAC", "total_timesteps": 32, "universe": ["CL"]},
+        metadata={"algorithm": "CPPO", "total_timesteps": 32, "universe": ["CL"]},
     )
     mtime = FIXED_TIMESTAMP.timestamp() - 2 * 86_400
     os.utime(older, (mtime, mtime))
@@ -270,7 +270,7 @@ def test_models_lists_and_parses_artifacts(
     assert newer.meta_path is not None
 
     older_model = body.models[1]
-    assert older_model.algorithm == "SAC"
+    assert older_model.algorithm == "CPPO"
     assert older_model.total_timesteps == 32
     assert older_model.universe == ["CL"]
     assert older_model.reward_curve is None

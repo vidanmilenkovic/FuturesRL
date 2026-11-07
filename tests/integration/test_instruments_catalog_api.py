@@ -344,10 +344,7 @@ def test_catalog_universe_tracks_expanded_instrument_master(tmp_path: Path) -> N
     # catalog build), not the import-time 45-root snapshot.
     parameters = {parameter["key"]: parameter for parameter in catalog["parameters"]}
     synthetic_seen = False
-    for key in (
-        "universe.regime.risk_off_roots",
-        "timing.seasonality.root_month_biases",
-    ):
+    for key in ("universe.regime.risk_off_roots",):
         parameter = parameters.get(key)
         if parameter is None or not parameter["choices"]:
             continue

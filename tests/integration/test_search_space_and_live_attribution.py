@@ -219,7 +219,6 @@ def test_active_filtering_tsmom_vs_panic_mean_reversion() -> None:
     assert "risk.quant_risk.trailing_stop_pct" in tsmom_active
     # Inactive overlays/selectors are excluded.
     assert not any("mean_reversion" in key for key in tsmom_active)
-    assert not any("seasonality" in key for key in tsmom_active)
     assert not any("risk_parity" in key for key in tsmom_active)
     assert not any("mean_variance" in key for key in tsmom_active)
     # Non-tunable hygiene params are excluded from the active/tunable space.
@@ -273,7 +272,6 @@ def test_preset_and_config_root_symbols_are_canonical(master: InstrumentsConfig)
             f"preset {preset.id!r} still references delisted roots "
             f"{sorted(symbols & DELISTED_ROOT_TOKENS)!r}"
         )
-    assert referenced, "presets should reference at least one canonical root parameter"
 
     from configs.strategy import discover_strategy_configs
 
@@ -340,7 +338,6 @@ def test_default_search_space_tsmom_is_active_only() -> None:
         "max_margin_utilization",
         "risk_parity",
         "mean_reversion",
-        "seasonality",
     ):
         assert forbidden not in joined, (
             f"inactive/hygiene path leaked into default space: {forbidden}"

@@ -775,6 +775,36 @@ class TradeRow(APIModel):
     kind: str = ""
 
 
+class CostBreakdownResponse(APIModel):
+    """Exact execution-cost breakdown (additive; task-86)."""
+
+    broker_commissions: float = 0.0
+    exchange_and_regulatory_fees: float = 0.0
+    slippage: float = 0.0
+    funding: float = 0.0
+    roll_cost_total: float = 0.0
+    roll_commissions: float = 0.0
+    roll_exchange_and_regulatory_fees: float = 0.0
+    roll_slippage: float = 0.0
+    non_roll_commissions: float = 0.0
+    non_roll_exchange_and_regulatory_fees: float = 0.0
+    non_roll_slippage: float = 0.0
+    forced_liquidation_cost: float = 0.0
+    total_commissions: float = 0.0
+    total_execution_costs: float = 0.0
+    total_costs: float = 0.0
+
+
+class MarginRegimeResponse(APIModel):
+    """Stress-regime / calibrated-margin provenance for a run."""
+
+    stress_applied: bool = False
+    stress_multiplier: float = 1.0
+    stress_roots: list[str] = Field(default_factory=list)
+    calibrated: bool = False
+    calibrated_roots: list[str] = Field(default_factory=list)
+
+
 class TearsheetResponse(APIModel):
     """Tear sheet series + metrics for one run."""
 
@@ -790,6 +820,10 @@ class TearsheetResponse(APIModel):
     folds: list[WalkForwardFold] = Field(default_factory=list)
     #: Additive QoL trade tape (empty for legacy artifacts / fixture runs).
     trades: list[TradeRow] = Field(default_factory=list)
+    #: Exact execution-cost breakdown for engine runs (None for fixture/legacy).
+    cost_breakdown: CostBreakdownResponse | None = None
+    #: Stress-regime / calibrated-margin provenance (None for fixture/legacy).
+    margin_regime: MarginRegimeResponse | None = None
 
 
 # ---------------------------------------------------------------------------

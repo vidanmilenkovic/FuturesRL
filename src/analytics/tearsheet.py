@@ -400,6 +400,12 @@ def _render_html(
         ("Exchange / regulatory fees", f"{result.fees:,.2f}"),
         ("Slippage (spread + impact)", f"{result.slippage:,.2f}"),
         ("Funding", f"{result.funding:,.2f}"),
+        ("Roll / BAG execution costs", f"{result.roll_cost_total:,.2f}"),
+        ("  of which commissions", f"{result.roll_commissions:,.2f}"),
+        ("  of which exchange / reg fees", f"{result.roll_fees:,.2f}"),
+        ("  of which spread + slippage", f"{result.roll_slippage:,.2f}"),
+        ("Forced-liquidation costs", f"{result.forced_liquidation_cost:,.2f}"),
+        ("Total execution costs", f"{result.cost_breakdown['total_costs']:,.2f}"),
         ("Roll yield (annualised)", pct(metrics.roll_yield_annualized)),
     ]
     roll_rows = "".join(
@@ -551,7 +557,19 @@ def build_tearsheet(
             "fees": result.fees,
             "slippage": result.slippage,
             "funding": result.funding,
+            "roll_cost_total": result.roll_cost_total,
+            "roll_commissions": result.roll_commissions,
+            "roll_fees": result.roll_fees,
+            "roll_slippage": result.roll_slippage,
             "roll_yield_annualized": metrics.roll_yield_annualized,
+        },
+        "cost_breakdown": result.cost_breakdown,
+        "margin_regime": {
+            "stress_applied": result.margin_stress_applied,
+            "stress_multiplier": result.margin_stress_multiplier,
+            "stress_roots": list(result.margin_stress_roots),
+            "calibrated": result.margin_calibrated,
+            "calibrated_roots": list(result.margin_calibrated_roots),
         },
         "rachev": {
             "alpha": RACHEV_ALPHA,

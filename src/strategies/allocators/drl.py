@@ -1,4 +1,4 @@
-"""Deep-reinforcement-learning allocator (``A_t``) — PPO / CPPO / SAC / TD3 / A2C.
+"""Deep-reinforcement-learning allocator (``A_t``) — PPO / CPPO.
 
 :class:`DRLAllocator` is the bridge between the FinRL-X pipeline and a
 Stable-Baselines3 policy trained on
@@ -55,7 +55,7 @@ from src.strategies._risk import (
 )
 
 #: Algorithms supported by the allocator (``CPPO`` is PPO + reward shaping).
-SUPPORTED_ALGORITHMS: tuple[str, ...] = ("PPO", "CPPO", "SAC", "TD3", "A2C")
+SUPPORTED_ALGORITHMS: tuple[str, ...] = ("PPO", "CPPO")
 
 #: Action interpretation modes.
 ACTION_MODES: frozenset[str] = frozenset({"weights", "normalized"})

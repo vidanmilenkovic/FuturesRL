@@ -50,7 +50,7 @@ def list_drl_models(service: DrlServiceDep) -> DRLModelListResponse:
     response_model=DRLTrainResponse,
     summary="Train a DRL checkpoint (deterministic offline)",
     description=(
-        "Validates the algorithm (PPO/CPPO/SAC/TD3/A2C), the bounded timesteps and the "
+        "Validates the algorithm (PPO/CPPO), the bounded timesteps and the "
         "checkpoint name, then trains the strategy's ``drl:`` section from the "
         "deterministic offline data source (no Databento/IBKR/network), persists the "
         "checkpoint + metadata + reward curve and returns the training summary. "

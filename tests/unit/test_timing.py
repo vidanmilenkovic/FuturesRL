@@ -317,7 +317,6 @@ def test_build_timing_registry_and_yaml_params() -> None:
         "kama",
         "carry_filter",
         "mean_reversion",
-        "seasonality",
         "composite",
     }
     state = make_market_state()
@@ -351,8 +350,7 @@ def test_timing_overlays_never_emit_non_finite_weights() -> None:
         ("kama", {}),
         ("carry_filter", {}),
         ("mean_reversion", {}),
-        ("seasonality", {}),
-        ("composite", {"components": "tsmom,kama,carry_filter,mean_reversion,seasonality"}),
+        ("composite", {"components": "tsmom,kama,carry_filter,mean_reversion"}),
     ):
         adjusted = build_timing(name, params).adjust_timing(weights, state)
         assert all(np.isfinite(value) for value in adjusted.as_dict().values())

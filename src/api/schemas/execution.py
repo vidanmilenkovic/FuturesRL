@@ -75,7 +75,58 @@ class IbkrConnectionSwitchResponse(APIModel):
     message: str = ""
 
 
+# ---------------------------------------------------------------------------
+# IBKR whatIf cost/margin calibration (debloat/realism)
+# ---------------------------------------------------------------------------
+
+
+class CalibratedCostRoot(APIModel):
+    """Per-root IBKR whatIf-calibrated fees/margins (USD per contract)."""
+
+    broker_commission_per_contract: float = Field(ge=0.0)
+    exchange_and_reg_fee_per_contract: float = Field(ge=0.0)
+    initial_margin: float = Field(default=0.0, ge=0.0)
+    maintenance_margin: float = Field(default=0.0, ge=0.0)
+    commission_source: str = "ibkr_whatif"
+    margin_source: str = "ibkr_whatif"
+
+
+class CalibrateCostsRequest(StrictModel):
+    """``POST /api/runner/calibrate-costs`` body."""
+
+    roots: list[str] | None = None
+
+
+class CalibrateCostsResponse(APIModel):
+    """Result of an IBKR whatIf cost/margin calibration run."""
+
+    status: Literal["calibrated", "partial", "unavailable"]
+    account_id: str | None = None
+    calibrated_at: datetime
+    roots: dict[str, CalibratedCostRoot] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    path: str | None = None
+    source: Literal["ibkr"] = "ibkr"
+
+
+class CalibratedCostsStatusResponse(APIModel):
+    """``GET /api/runner/calibrated-costs`` persisted-override status."""
+
+    available: bool = False
+    path: str | None = None
+    account_id: str | None = None
+    calibrated_at: datetime | None = None
+    age_seconds: float | None = None
+    roots: dict[str, CalibratedCostRoot] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    source: Literal["ibkr", "none"] = "none"
+
+
 __all__ = [
+    "CalibrateCostsRequest",
+    "CalibrateCostsResponse",
+    "CalibratedCostRoot",
+    "CalibratedCostsStatusResponse",
     "IbkrActiveConnection",
     "IbkrConnectionSwitchRequest",
     "IbkrConnectionSwitchResponse",

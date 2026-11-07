@@ -416,6 +416,20 @@ def test_backtest_run_uses_real_engine_and_returns_tearsheet(client: TestClient)
     assert sheet["roll_yield_attribution"]
     assert sheet["monthly_returns"]
     assert math.isfinite(sheet["metrics"]["rachev_ratio"])
+    # task-86 additive cost-breakdown/margin-regime transparency for engine runs.
+    breakdown = sheet["cost_breakdown"]
+    assert breakdown is not None
+    assert breakdown["total_costs"] == pytest.approx(
+        breakdown["total_commissions"] + breakdown["slippage"] + breakdown["funding"]
+    )
+    assert breakdown["total_execution_costs"] == pytest.approx(
+        breakdown["total_commissions"] + breakdown["slippage"]
+    )
+    assert breakdown["roll_cost_total"] >= 0.0
+    margin_regime = sheet["margin_regime"]
+    assert margin_regime is not None
+    assert isinstance(margin_regime["stress_applied"], bool)
+    assert margin_regime["stress_multiplier"] >= 1.0
 
     assert client.get("/api/backtests/bt-unknown").status_code == 404
     assert client.get("/api/backtests/bt-unknown/tearsheet").status_code == 404

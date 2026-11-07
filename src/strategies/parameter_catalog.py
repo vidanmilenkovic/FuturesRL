@@ -27,7 +27,7 @@ resolved dynamically from the stage name).
 Dynamic instrument master / Studio dropdowns
 -------------------------------------------
 The catalog is **not** a static snapshot of the instrument master: root choices
-(``universe.regime.risk_off_roots``, ``timing.seasonality.root_month_biases``) and
+(``universe.regime.risk_off_roots``) and
 sector choices are rebuilt from :func:`configs.instruments.load_instruments`, and
 :func:`parameter_catalog` caches one catalog per *instrument-master fingerprint*
 (roots + sectors + per-root contract specs). Adding futures roots/sectors to
@@ -52,7 +52,7 @@ details) are never tunable. :func:`active_parameter_keys`,
 :func:`parameters_for_strategy` and :func:`default_selected_parameter_keys`
 filter to the *active* stage choices/overlays of a concrete strategy (inactive
 selectors/overlays are excluded), and :func:`validate_strategy_roots` /
-:func:`strategy_root_symbols` guard root lists (regime/seasonality/universe)
+:func:`strategy_root_symbols` guard root lists (regime/universe)
 against roots that are not in the instrument master.
 
 Helper API (also the contract reported to the API/optimizer owners)
@@ -93,8 +93,6 @@ from typing import Any
 
 from configs.instruments import InstrumentsConfig, InstrumentSpec, load_instruments
 from configs.strategy import StrategyConfig
-
-from src.strategies.timing.seasonality import ALL_MONTHS, DEFAULT_ROOT_MONTH_BIASES
 
 #: Catalogue schema version (bumped on incompatible JSON changes).
 CATALOG_VERSION: int = 1
@@ -294,7 +292,7 @@ STAGE_OPTION_LABELS: Mapping[str, Mapping[str, tuple[str, str]]] = {
             "Mean variance",
             "Regularised inverse-covariance mean-variance allocation.",
         ),
-        "drl": ("DRL policy", "Trained PPO/CPPO/SAC/TD3/A2C policy allocator."),
+        "drl": ("DRL policy", "Trained PPO/CPPO policy allocator."),
     },
     "timing": {
         "tsmom": ("TSMOM", "Volatility-scaled time-series momentum."),
@@ -304,7 +302,6 @@ STAGE_OPTION_LABELS: Mapping[str, Mapping[str, tuple[str, str]]] = {
             "Mean reversion",
             "Fade RSI/Bollinger extremes unless turbulence vetoes.",
         ),
-        "seasonality": ("Seasonality", "UTC-month seasonal commodity cycle tilt."),
         "composite": ("Composite", "Apply several timing overlays in order."),
     },
     "risk": {
@@ -323,19 +320,7 @@ STAGE_OPTION_LABELS: Mapping[str, Mapping[str, tuple[str, str]]] = {
 _STAGE_CHOICE_ORDER: Mapping[str, tuple[str, ...]] = {
     "universe": ("liquidity", "regime", "composite"),
     "allocator": ("volatility_target", "risk_parity", "equal_weight", "mean_variance", "drl"),
-    "timing": ("tsmom", "kama", "carry_filter", "mean_reversion", "seasonality", "composite"),
-}
-
-#: Fallback monthly tilt curves per asset class for roots without a bespoke curve.
-_GENERIC_SEASONAL_CURVES: Mapping[str, Mapping[int, float]] = {
-    "equity_index": {1: 0.05, 9: -0.10, 10: 0.05, 11: 0.10, 12: 0.10},
-    "rates": {3: -0.05, 6: -0.05, 9: -0.05, 12: -0.05},
-    "energy": {2: 0.10, 3: 0.15, 4: 0.20, 5: 0.25, 6: 0.20, 7: 0.10, 9: -0.05, 10: -0.10},
-    "metals": {1: 0.10, 8: 0.05, 9: 0.10, 10: 0.10, 11: 0.05, 12: 0.10},
-    "fx": {},
-    "agriculture": {3: 0.10, 4: 0.10, 5: 0.05, 6: -0.05, 7: -0.10, 8: -0.10, 9: -0.15, 10: -0.10},
-    "crypto": {},
-    "unknown": {},
+    "timing": ("tsmom", "kama", "carry_filter", "mean_reversion", "composite"),
 }
 
 
@@ -1503,7 +1488,7 @@ def _drl_allocator_specs() -> tuple[ParameterSpec, ...]:
             "trains as PPO against the semantic-risk-shaped reward.",
             ParameterType.SELECT,
             "PPO",
-            choices=("PPO", "CPPO", "SAC", "TD3", "A2C"),
+            choices=("PPO", "CPPO"),
             tunable=False,
         ),
         _p(
@@ -1687,15 +1672,13 @@ def _drl_allocator_specs() -> tuple[ParameterSpec, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _timing_specs(master: InstrumentsConfig) -> tuple[ParameterSpec, ...]:
+def _timing_specs() -> tuple[ParameterSpec, ...]:
     timing_names: tuple[CatalogScalar, ...] = (
         "tsmom",
         "kama",
         "carry_filter",
         "mean_reversion",
-        "seasonality",
     )
-    roots: tuple[CatalogScalar, ...] = tuple(master.roots())
     return (
         _p(
             "timing",
@@ -2023,48 +2006,6 @@ def _timing_specs(master: InstrumentsConfig) -> tuple[ParameterSpec, ...]:
         ),
         _p(
             "timing",
-            "seasonality",
-            "active_months",
-            "Active months",
-            "UTC calendar months in which the seasonal bias is applied.",
-            ParameterType.MULTISELECT,
-            tuple(month for month in ALL_MONTHS if month in (1, 2, 3, 11, 12)),
-            choices=tuple(ALL_MONTHS),
-            tunable=False,
-            yaml_encoding=ENCODING_COMMA_INTS,
-            min_items=1,
-            max_items=12,
-            unit="month",
-        ),
-        _p(
-            "timing",
-            "seasonality",
-            "root_month_biases",
-            "Seasonal root curves",
-            "Roots that receive a seasonal month bias. Selected roots use the built-in "
-            "conservative commodity curves; an advanced JSON object string supplies custom "
-            "month-by-month magnitudes.",
-            ParameterType.MULTISELECT,
-            (),
-            choices=roots,
-            tunable=False,
-            yaml_encoding=ENCODING_JSON_OBJECT,
-        ),
-        _p(
-            "timing",
-            "seasonality",
-            "out_of_season_scale",
-            "Out-of-season scale",
-            "Multiplier on legs in months outside the active window (1.0 keeps them unchanged, "
-            "0.0 flattens them).",
-            ParameterType.FLOAT,
-            1.0,
-            min=0.0,
-            max=2.0,
-            step=0.05,
-        ),
-        _p(
-            "timing",
             "composite",
             "components",
             "Composite timing components",
@@ -2075,7 +2016,7 @@ def _timing_specs(master: InstrumentsConfig) -> tuple[ParameterSpec, ...]:
             tunable=False,
             yaml_encoding=ENCODING_COMMA_STRINGS,
             min_items=1,
-            max_items=5,
+            max_items=4,
         ),
     )
 
@@ -2647,52 +2588,6 @@ def _preset_specs() -> tuple[PresetTemplate, ...]:
             },
         ),
         PresetTemplate(
-            id="seasonal_commodity_cycle",
-            name="Seasonal Commodity Cycle",
-            description=(
-                "Volatility-targeted book tilted by conservative commodity seasonality curves, "
-                "de-risked outside the configured active months."
-            ),
-            hypothesis=(
-                "Commodity demand and inventory cycles create repeatable calendar tilts. A "
-                "month-aware overlay can lean into seasonal strength and reduce exposure "
-                "out-of-season without changing the underlying allocation."
-            ),
-            tags=("seasonality", "commodity", "calendar", "vol-target"),
-            parameter_keys=(
-                "timing.seasonality.active_months",
-                "timing.seasonality.root_month_biases",
-                "timing.seasonality.out_of_season_scale",
-                "allocator.volatility_target.target_annual_volatility",
-            ),
-            strategy={
-                "id": "preset_seasonal_commodity_cycle",
-                "description": "Seasonal Commodity Cycle preset",
-                "tags": ["seasonality", "commodity", "calendar", "vol-target"],
-                "universe": _liquidity_stage(top_n=10),
-                "allocator": {
-                    "name": "volatility_target",
-                    "params": {
-                        "target_annual_volatility": 0.12,
-                        "covariance_lookback_days": 60,
-                        "max_gross_leverage": 3.0,
-                    },
-                },
-                "timing": [
-                    {
-                        "name": "seasonality",
-                        "params": {
-                            "active_months": "1,2,3,4,5,9,10,11,12",
-                            "root_month_biases": "CL,GC",
-                            "out_of_season_scale": 0.5,
-                        },
-                    }
-                ],
-                "risk": _risk_stages(),
-                "translator": dict(_TRANSLATOR_DEFAULTS),
-            },
-        ),
-        PresetTemplate(
             id="drl_neural_policy_llm_risk",
             name="DRL Neural Policy + LLM Risk",
             description=(
@@ -2986,7 +2881,7 @@ def _build_catalog(master: InstrumentsConfig) -> ParameterCatalog:
             (
                 *_universe_specs(master),
                 *_allocator_specs(),
-                *_timing_specs(master),
+                *_timing_specs(),
                 *_risk_specs(),
                 *_translator_specs(),
             )
@@ -3029,7 +2924,7 @@ _STAGE_METADATA: tuple[tuple[str, str, str], ...] = (
         "timing",
         "Timing & signals (T_t)",
         "Directional and calendar overlays that scale the allocator's weights: TSMOM, KAMA, "
-        "carry, mean-reversion and seasonality.",
+        "carry and mean-reversion.",
     ),
     (
         "risk",
@@ -3349,7 +3244,6 @@ def default_selected_parameter_keys(
 ROOT_LIST_PARAMETER_KEYS: tuple[str, ...] = (
     "roots",
     "risk_off_roots",
-    "root_month_biases",
 )
 
 
@@ -3384,9 +3278,9 @@ def strategy_root_symbols(
 ) -> tuple[str, ...]:
     """Every root symbol referenced by a strategy dict's root lists.
 
-    Covers ``universe.params.{roots,risk_off_roots,root_month_biases}`` and the
-    same keys inside ``timing``/``risk`` stage params (e.g. the seasonality
-    overlay's ``root_month_biases``). Symbols are upper-cased, de-duplicated and
+    Covers ``universe.params.{roots,risk_off_roots}`` and the
+    same keys inside ``timing``/``risk`` stage params (e.g. a regime
+    overlay's ``risk_off_roots``). Symbols are upper-cased, de-duplicated and
     returned in first-reference order.
     """
     mapping = _strategy_mapping(strategy)
@@ -3600,22 +3494,6 @@ def decode_parameter_value(key_or_spec: str | ParameterSpec, raw: object) -> obj
     return raw
 
 
-def _seasonal_curve_for(
-    root: str, *, instrument_master: InstrumentsConfig | None = None
-) -> Mapping[int, float]:
-    """Monthly tilt curve for ``root``: bespoke curve, else its asset-class default."""
-    bespoke = DEFAULT_ROOT_MONTH_BIASES.get(root)
-    if bespoke is not None:
-        return bespoke
-    master = instrument_master if instrument_master is not None else load_instruments()
-    spec = master.instruments.get(root)
-    if spec is None:
-        raise ValueError(
-            f"unknown futures root {root!r} for seasonal biases; known roots: {list(master.roots())!r}"
-        )
-    return _GENERIC_SEASONAL_CURVES.get(spec.asset_class.value, {})
-
-
 def encode_parameter_value(
     key_or_spec: str | ParameterSpec,
     value: object,
@@ -3623,6 +3501,9 @@ def encode_parameter_value(
     instrument_master: InstrumentsConfig | None = None,
 ) -> CatalogScalar:
     """Validate a UI-native value and encode it for ``StageConfig.params``/YAML."""
+    del (
+        instrument_master
+    )  # retained for backward-compatible call sites; no seasonal encoding remains
     spec = _catalog_lookup(key_or_spec)
     normalised = validate_parameter_value(spec, value)
     if spec.yaml_encoding == ENCODING_SCALAR:
@@ -3633,7 +3514,7 @@ def encode_parameter_value(
     if spec.yaml_encoding == ENCODING_COMMA_STRINGS:
         assert isinstance(normalised, tuple)
         return ",".join(str(item) for item in normalised)
-    # JSON object encoding (e.g. seasonal root_month_biases).
+    # JSON object encoding (root -> {month: value}) for any remaining object params.
     if isinstance(normalised, Mapping):
         curves: dict[str, dict[str, float]] = {
             str(root): {str(int(month)): float(bias) for month, bias in curve.items()}
@@ -3641,11 +3522,7 @@ def encode_parameter_value(
         }
         return json.dumps(curves, sort_keys=True)
     assert isinstance(normalised, tuple)
-    selected: dict[str, dict[str, float]] = {}
-    for root in normalised:
-        curve = _seasonal_curve_for(str(root), instrument_master=instrument_master)
-        selected[str(root)] = {str(int(month)): float(bias) for month, bias in curve.items()}
-    return json.dumps(selected, sort_keys=True)
+    return ",".join(str(item) for item in normalised)
 
 
 def apply_parameter_overrides(

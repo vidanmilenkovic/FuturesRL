@@ -341,7 +341,7 @@ def test_train_drl_callable_plumbs_algorithm_and_hyperparameters(
 ) -> None:
     summary = trainer.train_drl(
         strategy=STRATEGY_PATH,
-        algorithm="a2c",
+        algorithm="cppo",
         timesteps=8,
         learning_rate=0.0007,
         gamma=0.9,
@@ -355,7 +355,7 @@ def test_train_drl_callable_plumbs_algorithm_and_hyperparameters(
     )
 
     captured = _CAPTURED_ALLOCATOR_KWARGS
-    assert captured["algorithm"] == "A2C"
+    assert captured["algorithm"] == "CPPO"
     assert captured["policy"] == "MlpPolicy"
     assert captured["total_timesteps"] == 8
     assert captured["learning_rate"] == pytest.approx(0.0007)
@@ -366,16 +366,16 @@ def test_train_drl_callable_plumbs_algorithm_and_hyperparameters(
     assert captured["feature_names"] == MINI_FEATURES
 
     assert summary["status"] == "ok"
-    assert summary["algorithm"] == "A2C"
-    assert summary["sb3_algorithm"] == "A2C"
+    assert summary["algorithm"] == "CPPO"
+    assert summary["sb3_algorithm"] == "PPO"
     assert summary["total_timesteps"] == 8
     assert summary["learning_rate"] == pytest.approx(0.0007)
     assert summary["gamma"] == pytest.approx(0.9)
     assert summary["llm_reward_penalty_lambda"] == pytest.approx(0.25)
     assert summary["checkpoint_name"] == "unit_plumb"
     assert summary["hyperparameters"] == {
-        "algorithm": "A2C",
-        "sb3_algorithm": "A2C",
+        "algorithm": "CPPO",
+        "sb3_algorithm": "PPO",
         "policy": "MlpPolicy",
         "total_timesteps": 8,
         "learning_rate": 0.0007,
@@ -460,11 +460,13 @@ def test_train_drl_checkpoint_naming_precedence(
 
     defaulted = trainer.train_drl(
         strategy=STRATEGY_PATH,
-        algorithm="sac",
+        algorithm="cppo",
         timesteps=4,
         output_dir=tmp_path / "defaulted",
     )
-    assert Path(str(defaulted["model_path"])) == tmp_path / "defaulted" / "drl_ppo_llm_risk_sac.zip"
+    assert (
+        Path(str(defaulted["model_path"])) == tmp_path / "defaulted" / "drl_ppo_llm_risk_cppo.zip"
+    )
 
 
 @pytest.mark.parametrize(

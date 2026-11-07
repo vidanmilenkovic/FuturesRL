@@ -1,7 +1,7 @@
 """Frozen API schema surface (domain modules re-exported for compatibility).
 
 Every public model lives in a domain module: ``core`` (shared platform/backtest/
-strategy schemas), ``execution`` (rebalance/IBKR execution + preview), ``data``
+strategy schemas), ``execution`` (rebalance/IBKR execution/calibration), ``data``
 (Parquet cache/cost/ingest) and ``operations`` (artifact deletes + strategy identity).
 The package re-exports every public symbol so ``from src.api.schemas import X``
 keeps working across the API.
@@ -21,6 +21,7 @@ from src.api.schemas.core import (
     BacktestRunSummary,
     BacktestStatus,
     CachedBarsSummary,
+    CostBreakdownResponse,
     DataSource,
     Environment,
     EquityCurveSource,
@@ -35,6 +36,7 @@ from src.api.schemas.core import (
     LLMStatusResponse,
     MacroEvent,
     MacroLockout,
+    MarginRegimeResponse,
     MarginTelemetryPayload,
     MetricsSet,
     MicroRoutingEntry,
@@ -103,6 +105,10 @@ from src.api.schemas.data import (
     RootCacheSummary,
 )
 from src.api.schemas.execution import (
+    CalibrateCostsRequest,
+    CalibrateCostsResponse,
+    CalibratedCostRoot,
+    CalibratedCostsStatusResponse,
     IbkrActiveConnection,
     IbkrConnectionSwitchRequest,
     IbkrConnectionSwitchResponse,
@@ -139,7 +145,12 @@ __all__ = [
     "CacheSource",
     "CacheTotals",
     "CachedBarsSummary",
+    "CalibrateCostsRequest",
+    "CalibrateCostsResponse",
+    "CalibratedCostRoot",
+    "CalibratedCostsStatusResponse",
     "ContinuousSeriesSummary",
+    "CostBreakdownResponse",
     "CostEstimateResponse",
     "DataInventoryResponse",
     "DataMode",
@@ -167,6 +178,7 @@ __all__ = [
     "LLMStatusResponse",
     "MacroEvent",
     "MacroLockout",
+    "MarginRegimeResponse",
     "MarginTelemetryPayload",
     "MetricsSet",
     "MicroRoutingEntry",

@@ -35,6 +35,9 @@ instruments:
     tick_size: 0.25
     databento_symbol: ES.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.4
+    default_slippage_ticks: 0.5
     micro_root: MES
     margins:
       initial: 15000.0
@@ -55,6 +58,9 @@ instruments:
     tick_size: 0.25
     databento_symbol: MES.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.37
+    default_slippage_ticks: 1.0
     standard_root: ES
     margins:
       initial: 1500.0
@@ -75,6 +81,9 @@ instruments:
     tick_size: 0.25
     databento_symbol: NQ.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.4
+    default_slippage_ticks: 0.5
     micro_root: MNQ
     margins:
       initial: 20000.0
@@ -95,6 +104,9 @@ instruments:
     tick_size: 0.25
     databento_symbol: MNQ.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.37
+    default_slippage_ticks: 1.0
     standard_root: NQ
     margins:
       initial: 2000.0
@@ -115,6 +127,9 @@ instruments:
     tick_size: 1.0
     databento_symbol: YM.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.4
+    default_slippage_ticks: 0.5
     micro_root: MYM
     margins:
       initial: 15000.0
@@ -135,6 +150,9 @@ instruments:
     tick_size: 0.10
     databento_symbol: RTY.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.45
+    default_slippage_ticks: 0.75
     micro_root: M2K
     margins:
       initial: 8000.0
@@ -155,6 +173,9 @@ instruments:
     tick_size: 0.01
     databento_symbol: CL.FUT
     ibkr_exchange: NYMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.52
+    default_slippage_ticks: 0.5
     micro_root: MCL
     margins:
       initial: 6500.0
@@ -175,6 +196,9 @@ instruments:
     tick_size: 0.01
     databento_symbol: MCL.FUT
     ibkr_exchange: NYMEX
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.52
+    default_slippage_ticks: 1.0
     standard_root: CL
     margins:
       initial: 650.0
@@ -195,6 +219,9 @@ instruments:
     tick_size: 0.10
     databento_symbol: GC.FUT
     ibkr_exchange: COMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.5
+    default_slippage_ticks: 0.5
     micro_root: MGC
     margins:
       initial: 10000.0
@@ -215,6 +242,9 @@ instruments:
     tick_size: 0.10
     databento_symbol: MGC.FUT
     ibkr_exchange: COMEX
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.5
+    default_slippage_ticks: 1.0
     standard_root: GC
     margins:
       initial: 1000.0
@@ -236,6 +266,9 @@ instruments:
     price_precision: 6
     databento_symbol: ZN.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.2
+    default_slippage_ticks: 0.5
     margins:
       initial: 2200.0
       maintenance: 2000.0
@@ -256,6 +289,9 @@ instruments:
     price_precision: 6
     databento_symbol: ZT.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.2
+    default_slippage_ticks: 0.5
     margins:
       initial: 1500.0
       maintenance: 1360.0
@@ -276,6 +312,9 @@ instruments:
     price_precision: 5
     databento_symbol: 6E.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.05
+    default_slippage_ticks: 0.75
     margins:
       initial: 2500.0
       maintenance: 2300.0
@@ -296,6 +335,9 @@ instruments:
     price_precision: 0
     databento_symbol: NKD.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.05
+    default_slippage_ticks: 1.0
     margins:
       initial: 9000.0
       maintenance: 8200.0
@@ -315,6 +357,9 @@ instruments:
     tick_size: 1.0
     databento_symbol: MYM.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.37
+    default_slippage_ticks: 1.0
     standard_root: YM
     margins:
       initial: 1500.0
@@ -335,6 +380,9 @@ instruments:
     tick_size: 0.1
     databento_symbol: M2K.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.37
+    default_slippage_ticks: 1.0
     standard_root: RTY
     margins:
       initial: 800.0
@@ -356,6 +404,9 @@ instruments:
     price_precision: 6
     databento_symbol: ZF.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.2
+    default_slippage_ticks: 0.5
     margins:
       initial: 1800.0
       maintenance: 1640.0
@@ -376,6 +427,9 @@ instruments:
     price_precision: 6
     databento_symbol: TN.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.2
+    default_slippage_ticks: 0.75
     margins:
       initial: 2800.0
       maintenance: 2550.0
@@ -396,6 +450,9 @@ instruments:
     price_precision: 6
     databento_symbol: ZB.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.2
+    default_slippage_ticks: 0.5
     margins:
       initial: 4200.0
       maintenance: 3800.0
@@ -416,6 +473,9 @@ instruments:
     price_precision: 6
     databento_symbol: UB.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.2
+    default_slippage_ticks: 0.75
     margins:
       initial: 4800.0
       maintenance: 4400.0
@@ -436,6 +496,9 @@ instruments:
     price_precision: 4
     databento_symbol: SR3.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.1
+    default_slippage_ticks: 0.5
     margins:
       initial: 1200.0
       maintenance: 1100.0
@@ -456,6 +519,9 @@ instruments:
     price_precision: 3
     databento_symbol: NG.FUT
     ibkr_exchange: NYMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.52
+    default_slippage_ticks: 0.75
     micro_root: MNG
     margins:
       initial: 3200.0
@@ -477,6 +543,9 @@ instruments:
     price_precision: 3
     databento_symbol: MNG.FUT
     ibkr_exchange: NYMEX
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.52
+    default_slippage_ticks: 1.0
     standard_root: NG
     margins:
       initial: 800.0
@@ -498,6 +567,9 @@ instruments:
     price_precision: 4
     databento_symbol: RB.FUT
     ibkr_exchange: NYMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.52
+    default_slippage_ticks: 0.75
     margins:
       initial: 4200.0
       maintenance: 3800.0
@@ -518,6 +590,9 @@ instruments:
     price_precision: 4
     databento_symbol: HO.FUT
     ibkr_exchange: NYMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.52
+    default_slippage_ticks: 0.75
     margins:
       initial: 4200.0
       maintenance: 3800.0
@@ -538,6 +613,9 @@ instruments:
     price_precision: 3
     databento_symbol: SI.FUT
     ibkr_exchange: COMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.55
+    default_slippage_ticks: 0.75
     micro_root: SIL
     margins:
       initial: 11000.0
@@ -559,6 +637,9 @@ instruments:
     price_precision: 3
     databento_symbol: SIL.FUT
     ibkr_exchange: COMEX
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.55
+    default_slippage_ticks: 1.0
     standard_root: SI
     margins:
       initial: 2200.0
@@ -580,6 +661,9 @@ instruments:
     price_precision: 4
     databento_symbol: HG.FUT
     ibkr_exchange: COMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.5
+    default_slippage_ticks: 0.75
     micro_root: MHG
     margins:
       initial: 6500.0
@@ -601,6 +685,9 @@ instruments:
     price_precision: 4
     databento_symbol: MHG.FUT
     ibkr_exchange: COMEX
+    broker_commission_per_contract: 0.25
+    exchange_and_reg_fee_per_contract: 0.5
+    default_slippage_ticks: 1.0
     standard_root: HG
     margins:
       initial: 650.0
@@ -621,6 +708,9 @@ instruments:
     tick_size: 0.1
     databento_symbol: PL.FUT
     ibkr_exchange: NYMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.52
+    default_slippage_ticks: 1.0
     margins:
       initial: 4200.0
       maintenance: 3800.0
@@ -640,6 +730,9 @@ instruments:
     tick_size: 0.5
     databento_symbol: PA.FUT
     ibkr_exchange: NYMEX
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.52
+    default_slippage_ticks: 1.0
     margins:
       initial: 4800.0
       maintenance: 4400.0
@@ -660,6 +753,9 @@ instruments:
     price_precision: 7
     databento_symbol: 6J.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.05
+    default_slippage_ticks: 0.75
     margins:
       initial: 3000.0
       maintenance: 2750.0
@@ -680,6 +776,9 @@ instruments:
     price_precision: 4
     databento_symbol: 6B.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.05
+    default_slippage_ticks: 0.75
     margins:
       initial: 2800.0
       maintenance: 2550.0
@@ -700,6 +799,9 @@ instruments:
     price_precision: 4
     databento_symbol: 6A.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.05
+    default_slippage_ticks: 0.75
     margins:
       initial: 2000.0
       maintenance: 1850.0
@@ -720,6 +822,9 @@ instruments:
     price_precision: 5
     databento_symbol: 6C.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.05
+    default_slippage_ticks: 0.75
     margins:
       initial: 1500.0
       maintenance: 1360.0
@@ -740,6 +845,9 @@ instruments:
     price_precision: 4
     databento_symbol: 6S.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.05
+    default_slippage_ticks: 0.75
     margins:
       initial: 4200.0
       maintenance: 3800.0
@@ -759,6 +867,9 @@ instruments:
     tick_size: 0.25
     databento_symbol: ZC.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.45
+    default_slippage_ticks: 0.75
     margins:
       initial: 2200.0
       maintenance: 2000.0
@@ -778,6 +889,9 @@ instruments:
     tick_size: 0.25
     databento_symbol: ZS.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.45
+    default_slippage_ticks: 0.75
     margins:
       initial: 3200.0
       maintenance: 2900.0
@@ -797,6 +911,9 @@ instruments:
     tick_size: 0.25
     databento_symbol: ZW.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.45
+    default_slippage_ticks: 0.75
     margins:
       initial: 2600.0
       maintenance: 2350.0
@@ -816,6 +933,9 @@ instruments:
     tick_size: 0.1
     databento_symbol: ZM.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.45
+    default_slippage_ticks: 0.75
     margins:
       initial: 2800.0
       maintenance: 2550.0
@@ -835,6 +955,9 @@ instruments:
     tick_size: 0.01
     databento_symbol: ZL.FUT
     ibkr_exchange: CBOT
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.45
+    default_slippage_ticks: 0.75
     margins:
       initial: 2200.0
       maintenance: 2000.0
@@ -855,6 +978,9 @@ instruments:
     price_precision: 3
     databento_symbol: LE.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.6
+    default_slippage_ticks: 1.0
     margins:
       initial: 2200.0
       maintenance: 2000.0
@@ -875,6 +1001,9 @@ instruments:
     price_precision: 3
     databento_symbol: HE.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 1.6
+    default_slippage_ticks: 1.0
     margins:
       initial: 2000.0
       maintenance: 1800.0
@@ -894,6 +1023,9 @@ instruments:
     tick_size: 5.0
     databento_symbol: MBT.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 2.5
+    default_slippage_ticks: 1.0
     margins:
       initial: 2500.0
       maintenance: 2250.0
@@ -913,6 +1045,9 @@ instruments:
     tick_size: 0.5
     databento_symbol: MET.FUT
     ibkr_exchange: CME
+    broker_commission_per_contract: 0.85
+    exchange_and_reg_fee_per_contract: 2.5
+    default_slippage_ticks: 1.0
     margins:
       initial: 1400.0
       maintenance: 1260.0

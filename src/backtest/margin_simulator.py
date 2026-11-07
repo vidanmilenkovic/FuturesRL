@@ -24,9 +24,12 @@ types so the simulated account is wire-compatible with IBKR telemetry.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
+from types import MappingProxyType
 
 from configs.instruments import InstrumentsConfig
 
@@ -83,9 +86,101 @@ class DailySettlementClock:
         self.settlements = 0
 
 
-# ---------------------------------------------------------------------------
-# Typed result containers
-# ---------------------------------------------------------------------------
+#: Relative persisted IBKR calibration document (task-84/85 contract).
+CALIBRATED_COSTS_RELATIVE_PATH: Path = Path("cache") / "ibkr_calibrated_costs.json"
+
+#: Default stress-regime margin multiplier (task-86).
+DEFAULT_STRESS_MARGIN_MULTIPLIER: float = 1.35
+
+#: Default annualised volatility threshold above which stress margins apply.
+DEFAULT_STRESS_VOL_THRESHOLD: float = 0.30
+
+
+@dataclass(frozen=True, slots=True)
+class CalibratedMargin:
+    """IBKR whatIf-calibrated initial/maintenance margin for one root (USD)."""
+
+    initial_margin: float
+    maintenance_margin: float
+    calibrated_at: str | None = None
+    margin_source: str = "ibkr_whatif"
+
+    def __post_init__(self) -> None:
+        for name in ("initial_margin", "maintenance_margin"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and strictly positive")
+            object.__setattr__(self, name, value)
+
+
+def default_calibrated_costs_path() -> Path:
+    """Resolve the persisted calibration path (shared data-eng task-84 contract).
+
+    Delegates to :func:`src.backtest.cost_model.default_calibrated_costs_path`
+    (env override ``FUTURESRL_IBKR_CALIBRATED_COSTS_PATH`` then
+    ``settings.data_dir/cache/ibkr_calibrated_costs.json``) with a pure-path
+    fallback so margin code can never fail on settings/import issues.
+    """
+    try:
+        from src.backtest.cost_model import (
+            default_calibrated_costs_path as cost_model_default_path,
+        )
+
+        return cost_model_default_path()
+    except Exception:  # pragma: no cover - settings/import fallback
+        override = os.environ.get("FUTURESRL_IBKR_CALIBRATED_COSTS_PATH") or os.environ.get(
+            "FUTURESRL_CALIBRATED_COSTS_PATH"
+        )
+        if override:
+            return Path(override).expanduser()
+        return Path(__file__).resolve().parents[2] / "data" / CALIBRATED_COSTS_RELATIVE_PATH
+
+
+def load_calibrated_margins(
+    path: Path | str | None = None,
+    *,
+    max_age_days: float | None = None,
+) -> dict[str, CalibratedMargin]:
+    """Load calibrated initial/maintenance margins from the shared IBKR JSON.
+
+    Reuses data-eng task-84's validated loader (``schema_version``/staleness/
+    provenance contract) and converts per-root overrides to :class:`CalibratedMargin`.
+    Absent, unreadable, corrupt, stale or empty documents fail cleanly to ``{}`` so
+    the simulator/translator fall back to YAML/position margins; roots without
+    usable positive initial+maintenance margins are skipped individually.
+    """
+    try:
+        from src.backtest.cost_model import (
+            CalibrationError,
+            load_calibrated_costs,
+        )
+        from src.backtest.cost_model import (
+            default_calibrated_costs_path as cost_model_default_path,
+        )
+
+        resolved = Path(path) if path is not None else cost_model_default_path()
+        parsed = load_calibrated_costs(
+            resolved,
+            max_age_days=max_age_days,
+        )
+    except (CalibrationError, ImportError, OSError, ValueError):
+        return {}
+    result: dict[str, CalibratedMargin] = {}
+    calibrated_at = parsed.calibrated_at.isoformat()
+    for raw_root, override in parsed.roots.items():
+        initial = override.initial_margin
+        maintenance = override.maintenance_margin
+        if initial is None or maintenance is None:
+            continue
+        if initial <= 0.0 or maintenance <= 0.0:
+            continue
+        result[str(raw_root).strip().upper()] = CalibratedMargin(
+            initial_margin=float(initial),
+            maintenance_margin=float(maintenance),
+            calibrated_at=calibrated_at,
+            margin_source=override.margin_source,
+        )
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,12 +189,30 @@ class MarginRequirements:
 
     initial_margin: float = 0.0
     maintenance_margin: float = 0.0
+    #: Whether the stress-regime multiplier was applied to any root.
+    stress_applied: bool = False
+    #: Effective stress multiplier (``1.0`` when no root is stressed).
+    stress_multiplier: float = 1.0
+    #: Roots whose margin was stress-multiplied (sorted).
+    stress_roots: tuple[InstrumentId, ...] = ()
+    #: Whether any root used an IBKR-calibrated margin override.
+    calibrated: bool = False
+    #: Roots using calibrated margins (sorted).
+    calibrated_roots: tuple[InstrumentId, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("initial_margin", "maintenance_margin"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        multiplier = float(self.stress_multiplier)
+        if not math.isfinite(multiplier) or multiplier < 1.0:
+            raise ValueError("stress_multiplier must be finite and >= 1.0")
+        object.__setattr__(self, "stress_multiplier", multiplier)
+        object.__setattr__(self, "stress_roots", tuple(sorted(self.stress_roots)))
+        object.__setattr__(self, "calibrated_roots", tuple(sorted(self.calibrated_roots)))
+        object.__setattr__(self, "stress_applied", bool(self.stress_applied))
+        object.__setattr__(self, "calibrated", bool(self.calibrated))
 
     @property
     def utilisation(self) -> float:
@@ -107,6 +220,19 @@ class MarginRequirements:
         if self.initial_margin <= 0.0:
             return 0.0
         return self.maintenance_margin / self.initial_margin
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serialisable representation (stress/calibration provenance)."""
+        return {
+            "initial_margin": self.initial_margin,
+            "maintenance_margin": self.maintenance_margin,
+            "utilisation": self.utilisation,
+            "stress_applied": self.stress_applied,
+            "stress_multiplier": self.stress_multiplier,
+            "stress_roots": list(self.stress_roots),
+            "calibrated": self.calibrated,
+            "calibrated_roots": list(self.calibrated_roots),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +400,10 @@ class MarginSimulator:
         penalty_ticks: float = 2.0,
         penalty_fee_per_contract: float = 15.0,
         margin_call_buffer: float = 0.0,
+        stress_margin_multiplier: float = DEFAULT_STRESS_MARGIN_MULTIPLIER,
+        stress_vol_threshold: float = DEFAULT_STRESS_VOL_THRESHOLD,
+        calibrated_margins: Mapping[str, CalibratedMargin] | None = None,
+        calibrated_costs_path: Path | str | None = None,
     ) -> None:
         if not math.isfinite(maintenance_ratio) or not 0.0 <= maintenance_ratio <= 1.0:
             raise ValueError("maintenance_ratio must be finite and within [0, 1]")
@@ -284,11 +414,119 @@ class MarginSimulator:
         ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        if not math.isfinite(stress_margin_multiplier) or stress_margin_multiplier < 1.0:
+            raise ValueError("stress_margin_multiplier must be finite and >= 1.0")
+        if not math.isfinite(stress_vol_threshold) or stress_vol_threshold <= 0.0:
+            raise ValueError("stress_vol_threshold must be finite and strictly positive")
         self._instrument_master = instrument_master
         self.maintenance_ratio = float(maintenance_ratio)
         self.penalty_ticks = float(penalty_ticks)
         self.penalty_fee_per_contract = float(penalty_fee_per_contract)
         self.margin_call_buffer = float(margin_call_buffer)
+        self.stress_margin_multiplier = float(stress_margin_multiplier)
+        self.stress_vol_threshold = float(stress_vol_threshold)
+        self.calibrated_costs_path = (
+            Path(calibrated_costs_path) if calibrated_costs_path is not None else None
+        )
+        if calibrated_margins is None:
+            calibrated_margins = load_calibrated_margins(self.calibrated_costs_path)
+        self.calibrated_margins: Mapping[str, CalibratedMargin] = MappingProxyType(
+            {str(root).strip().upper(): margin for root, margin in calibrated_margins.items()}
+        )
+        self._volatilities: Mapping[InstrumentId, float] = MappingProxyType({})
+        self._last_requirements: MarginRequirements = MarginRequirements()
+        self._last_stress_roots: tuple[str, ...] = ()
+        self._last_calibrated_roots: tuple[str, ...] = ()
+
+    # -- stress/calibration context ------------------------------------------
+
+    def set_volatilities(self, volatilities: Mapping[InstrumentId, float]) -> None:
+        """Point-in-time annualised per-root volatilities used by stress margins.
+
+        The event/vectorised backtester sets this once per bar from the
+        ``MarketState`` (point-in-time, no look-ahead). Roots missing/with
+        non-finite volatility are treated as normal regime.
+        """
+        cleaned: dict[InstrumentId, float] = {}
+        for root, value in volatilities.items():
+            number = float(value)
+            if math.isfinite(number) and number >= 0.0:
+                cleaned[str(root).strip().upper()] = number
+        self._volatilities = MappingProxyType(cleaned)
+
+    @property
+    def calibrated_margin_count(self) -> int:
+        """Number of roots with an applied IBKR-calibrated margin override."""
+        return len(self.calibrated_margins)
+
+    def reload_calibrated_margins(self) -> int:
+        """Reload the calibration file (e.g. after task-85 whatIf calibration).
+
+        Returns the number of roots with usable margin overrides; absent/corrupt/
+        stale files cleanly fall back to an empty mapping (YAML margins).
+        """
+        self.calibrated_margins = MappingProxyType(
+            load_calibrated_margins(self.calibrated_costs_path)
+        )
+        return len(self.calibrated_margins)
+
+    @property
+    def last_requirements(self) -> MarginRequirements:
+        """Most recent margin requirements (stress/calibration provenance)."""
+        return self._last_requirements
+
+    def _apply_margin_regime(
+        self,
+        instrument_id: InstrumentId,
+        initial: float,
+        maintenance: float,
+    ) -> tuple[float, float, bool, bool]:
+        """Apply calibrated override first, then the stress multiplier.
+
+        Returns ``(initial, maintenance, calibrated, stress)``; calibrated JSON
+        values are authoritative for the root and the stress multiplier is applied
+        on top of them when the root's point-in-time annualised volatility exceeds
+        ``stress_vol_threshold``. Normal-regime, uncalibrated roots are unchanged.
+        """
+        calibrated = False
+        override = self.calibrated_margins.get(instrument_id)
+        if override is not None:
+            initial = override.initial_margin
+            maintenance = override.maintenance_margin
+            calibrated = True
+        stressed = False
+        volatility = self._volatilities.get(instrument_id)
+        if (
+            volatility is not None
+            and volatility >= self.stress_vol_threshold
+            and self.stress_margin_multiplier > 1.0
+        ):
+            initial *= self.stress_margin_multiplier
+            maintenance *= self.stress_margin_multiplier
+            stressed = True
+        return initial, maintenance, calibrated, stressed
+
+    def effective_margin(
+        self, instrument_id: InstrumentId, quantity: int = 1
+    ) -> tuple[float, float]:
+        """Effective ``(initial, maintenance)`` margin for one root/quantity.
+
+        Uses the calibrated override when available, the instrument-master margin
+        otherwise, then applies the stress multiplier from the current volatility
+        context. Used by the vectorised margin estimate.
+        """
+        initial = 0.0
+        maintenance = 0.0
+        master = self._instrument_master
+        if master is not None and master.has(instrument_id):
+            spec = master.get(instrument_id)
+            initial = float(spec.margins.initial)
+            maintenance = float(spec.margins.maintenance)
+        initial, maintenance, _calibrated, _stressed = self._apply_margin_regime(
+            instrument_id, initial, maintenance
+        )
+        quantity_abs = abs(int(quantity))
+        return initial * quantity_abs, maintenance * quantity_abs
 
     # -- helpers --------------------------------------------------------------
 
@@ -322,6 +560,9 @@ class MarginSimulator:
             maintenance = initial * self.maintenance_ratio
         if maintenance > initial and initial > 0.0:
             maintenance = initial
+        initial, maintenance, _calibrated, _stressed = self._apply_margin_regime(
+            position.instrument_id, initial, maintenance
+        )
         return initial, maintenance
 
     # -- margin arithmetic ----------------------------------------------------
@@ -331,12 +572,52 @@ class MarginSimulator:
         self._validate_positions(positions)
         initial = 0.0
         maintenance = 0.0
+        stress_roots: list[str] = []
+        calibrated_roots: list[str] = []
         for position in positions.values():
+            if position.quantity == 0:
+                continue
+            raw_initial = float(position.initial_margin)
+            raw_maintenance = float(position.maintenance_margin)
+            master = self._instrument_master
+            if (
+                (raw_initial <= 0.0 or raw_maintenance <= 0.0)
+                and master is not None
+                and master.has(position.instrument_id)
+            ):
+                spec = master.get(position.instrument_id)
+                if raw_initial <= 0.0:
+                    raw_initial = float(spec.margins.initial)
+                if raw_maintenance <= 0.0:
+                    raw_maintenance = float(spec.margins.maintenance)
+            if (
+                position.instrument_id in self.calibrated_margins
+                or position.instrument_id in self._volatilities
+            ):
+                _initial, _maintenance, calibrated, stressed = self._apply_margin_regime(
+                    position.instrument_id, raw_initial, raw_maintenance
+                )
+                if calibrated:
+                    calibrated_roots.append(position.instrument_id)
+                if stressed:
+                    stress_roots.append(position.instrument_id)
             per_contract_initial, per_contract_maintenance = self._margin_per_contract(position)
             quantity = abs(position.quantity)
             initial += per_contract_initial * quantity
             maintenance += per_contract_maintenance * quantity
-        return MarginRequirements(initial_margin=initial, maintenance_margin=maintenance)
+        requirements = MarginRequirements(
+            initial_margin=initial,
+            maintenance_margin=maintenance,
+            stress_applied=bool(stress_roots),
+            stress_multiplier=self.stress_margin_multiplier if stress_roots else 1.0,
+            stress_roots=tuple(stress_roots),
+            calibrated=bool(calibrated_roots),
+            calibrated_roots=tuple(calibrated_roots),
+        )
+        self._last_requirements = requirements
+        self._last_stress_roots = tuple(sorted(set(stress_roots)))
+        self._last_calibrated_roots = tuple(sorted(set(calibrated_roots)))
+        return requirements
 
     def unrealized_pnl(self, positions: Mapping[InstrumentId, Position]) -> float:
         """Sum of position-level unrealised PnL at current market prices."""
@@ -539,4 +820,11 @@ class MarginSimulator:
             "penalty_ticks": self.penalty_ticks,
             "penalty_fee_per_contract": self.penalty_fee_per_contract,
             "margin_call_buffer": self.margin_call_buffer,
+            "stress_margin_multiplier": self.stress_margin_multiplier,
+            "stress_vol_threshold": self.stress_vol_threshold,
+            "calibrated_margin_roots": self.calibrated_margin_count,
+            "calibrated_costs_path": (
+                str(self.calibrated_costs_path) if self.calibrated_costs_path is not None else None
+            ),
+            "last_requirements": self._last_requirements.to_dict(),
         }

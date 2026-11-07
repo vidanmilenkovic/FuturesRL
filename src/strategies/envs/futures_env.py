@@ -1,7 +1,7 @@
 """Gymnasium futures trading environment for DRL allocation (Module 2).
 
 ``FuturesTradingEnv`` is the training ground for :class:`DRLAllocator` (PPO,
-CPPO/CPRL, SAC, TD3, A2C) and is fully usable with plain ``gymnasium`` — the
+CPPO/CPRL, PPO) and is fully usable with plain ``gymnasium`` — the
 Stable-Baselines3 stack is *not* imported here, so the environment can be unit
 tested (and driven by any Gymnasium-compatible trainer) without torch.
 

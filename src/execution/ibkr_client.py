@@ -181,6 +181,10 @@ class MarginImpact:
     maintenance_margin_change: float | None = None
     initial_margin_after: float | None = None
     maintenance_margin_after: float | None = None
+    #: Actual IBKR-reported total commission for the hypothetical order (one-way).
+    commission: float | None = None
+    #: IBKR commission currency (``None`` when unreported).
+    commission_currency: str | None = None
     warning: str = ""
 
     @property
@@ -1277,6 +1281,7 @@ def margin_impact_from_order_state(state: object) -> MarginImpact:
         return _optional_float(getattr(state, name, None))
 
     warning = getattr(state, "warningText", "")
+    currency = getattr(state, "commissionCurrency", None)
     return MarginImpact(
         initial_margin_before=read("initMarginBefore"),
         maintenance_margin_before=read("maintMarginBefore"),
@@ -1284,6 +1289,8 @@ def margin_impact_from_order_state(state: object) -> MarginImpact:
         maintenance_margin_change=read("maintMarginChange"),
         initial_margin_after=read("initMarginAfter"),
         maintenance_margin_after=read("maintMarginAfter"),
+        commission=read("commission"),
+        commission_currency=currency if isinstance(currency, str) and currency else None,
         warning=warning if isinstance(warning, str) else "",
     )
 

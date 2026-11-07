@@ -39,7 +39,6 @@ EXPECTED_PRESET_IDS = {
     "trend_following_tsmom_kama",
     "commodity_carry_term_structure",
     "panic_mean_reversion",
-    "seasonal_commodity_cycle",
     "drl_neural_policy_llm_risk",
 }
 

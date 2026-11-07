@@ -103,7 +103,7 @@ class BacktestSpec(BaseModel):
 
 
 class DRLSpec(BaseModel):
-    """Optional DRL allocator configuration (PPO / CPPO / SAC / TD3 / A2C)."""
+    """Optional DRL allocator configuration (PPO / CPPO)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -120,7 +120,7 @@ class DRLSpec(BaseModel):
 
     @model_validator(mode="after")
     def _known_algorithm(self) -> DRLSpec:
-        allowed = {"PPO", "CPPO", "SAC", "TD3", "A2C"}
+        allowed = {"PPO", "CPPO"}
         if self.algorithm.upper() not in allowed:
             raise ValueError(f"algorithm must be one of {sorted(allowed)}")
         return self

@@ -28,15 +28,32 @@ is random or depends on wall-clock time, which keeps backtests reproducible.
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 
 from configs.instruments import InstrumentsConfig
+from configs.settings import Settings, get_settings
 
 from src.core.types import AssetClass
+
+logger = logging.getLogger(__name__)
+
+#: Relative location of the IBKR whatIf calibration cache (under ``data_dir``).
+DEFAULT_CALIBRATED_COSTS_RELATIVE_PATH: Path = Path("cache") / "ibkr_calibrated_costs.json"
+
+#: Environment override for the calibration file path (wins over the default).
+CALIBRATED_COSTS_ENV_VAR = "FUTURESRL_IBKR_CALIBRATED_COSTS_PATH"
+
+#: Default maximum calibration age before the file is treated as stale.
+DEFAULT_CALIBRATION_MAX_AGE_DAYS: float = 30.0
 
 # ---------------------------------------------------------------------------
 # Fee schedules
@@ -153,6 +170,232 @@ DEFAULT_FEE_SCHEDULE: FeeSchedule = FeeSchedule()
 def default_fee_schedule(asset_class: AssetClass) -> FeeSchedule:
     """Return the default fee schedule for one instrument class."""
     return ASSET_CLASS_FEE_SCHEDULES.get(asset_class, DEFAULT_FEE_SCHEDULE)
+
+
+class CalibrationError(RuntimeError):
+    """Raised when an IBKR calibration file is missing, corrupt, stale or unusable."""
+
+
+class CalibrationProvenance(StrEnum):
+    """Where a cost/margin value came from for provenance badges."""
+
+    YAML_DEFAULT = "yaml_default"
+    IBKR_CALIBRATED = "ibkr_calibrated"
+
+
+@dataclass(frozen=True, slots=True)
+class CalibratedCostOverride:
+    """Per-root commission/fee (and optional margin) overrides from IBKR whatIf.
+
+    Amounts are account-currency (USD) per one contract per side; margins are
+    USD per one contract. ``commission_source``/``margin_source`` record the
+    upstream calibration provenance (normally ``"ibkr_whatif"``).
+    """
+
+    root: str
+    broker_commission_per_contract: float
+    exchange_and_reg_fee_per_contract: float
+    initial_margin: float | None = None
+    maintenance_margin: float | None = None
+    commission_source: str = "ibkr_whatif"
+    margin_source: str = "ibkr_whatif"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, str) or not self.root.strip():
+            raise ValueError("root must be a non-empty string")
+        for name in ("broker_commission_per_contract", "exchange_and_reg_fee_per_contract"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        for name in ("initial_margin", "maintenance_margin"):
+            value = getattr(self, name)
+            if value is not None:
+                numeric = float(value)
+                if not math.isfinite(numeric) or numeric < 0.0:
+                    raise ValueError(f"{name} must be finite and non-negative")
+
+    @property
+    def transaction_fee_per_contract(self) -> float:
+        """Broker commission + exchange/regulatory fees per contract per side."""
+        return self.broker_commission_per_contract + self.exchange_and_reg_fee_per_contract
+
+
+@dataclass(frozen=True, slots=True)
+class CalibratedCosts:
+    """Parsed ``ibkr_calibrated_costs.json`` payload (read contract for task-85)."""
+
+    account_id: str
+    calibrated_at: datetime
+    roots: Mapping[str, CalibratedCostOverride]
+    warnings: tuple[str, ...] = ()
+    schema_version: int = 1
+    path: str | None = None
+
+
+def default_calibrated_costs_path(settings: Settings | None = None) -> Path:
+    """Canonical calibration file path, honouring env and ``settings.data_dir``.
+
+    Resolution order: ``FUTURESRL_IBKR_CALIBRATED_COSTS_PATH`` env override, then
+    ``<settings.data_dir>/cache/ibkr_calibrated_costs.json`` (so
+    ``FUTURESRL_DATA_DIR`` is respected). This is the path the writer
+    (execution-eng task-85) and :class:`CostModel` must agree on.
+    """
+    override = os.environ.get(CALIBRATED_COSTS_ENV_VAR)
+    if override:
+        return Path(override).expanduser()
+    resolved = settings if settings is not None else get_settings()
+    return Path(resolved.data_dir) / DEFAULT_CALIBRATED_COSTS_RELATIVE_PATH
+
+
+def _coerce_finite_non_negative(value: object, *, field: str) -> float:
+    """Coerce a JSON number to a finite non-negative float (actionable error)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CalibrationError(f"{field} must be a number, got {type(value).__name__}")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0.0:
+        raise CalibrationError(f"{field} must be finite and non-negative, got {value!r}")
+    return numeric
+
+
+def _parse_calibration_timestamp(value: object) -> datetime:
+    """Parse an ISO-8601 calibration timestamp (``Z`` accepted, naive -> UTC)."""
+    if not isinstance(value, str) or not value.strip():
+        raise CalibrationError("calibrated_at must be a non-empty ISO-8601 string")
+    raw = value.strip()
+    if raw.endswith(("Z", "z")):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise CalibrationError(f"calibrated_at is not ISO-8601: {value!r}") from exc
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _parse_calibration_roots(
+    raw_roots: object, warnings: list[str]
+) -> dict[str, CalibratedCostOverride]:
+    """Parse the per-root overrides, skipping invalid roots with warnings."""
+    if not isinstance(raw_roots, Mapping):
+        raise CalibrationError("roots must be a JSON object")
+    parsed: dict[str, CalibratedCostOverride] = {}
+    for raw_root, raw_values in raw_roots.items():
+        root = str(raw_root).strip().upper()
+        if not root:
+            warnings.append("skipped calibration entry with an empty root")
+            continue
+        if not isinstance(raw_values, Mapping):
+            warnings.append(f"{root}: skipped non-object calibration entry")
+            continue
+        try:
+            broker = _coerce_finite_non_negative(
+                raw_values.get("broker_commission_per_contract"),
+                field=f"{root}.broker_commission_per_contract",
+            )
+            exchange = _coerce_finite_non_negative(
+                raw_values.get("exchange_and_reg_fee_per_contract"),
+                field=f"{root}.exchange_and_reg_fee_per_contract",
+            )
+        except CalibrationError as exc:
+            warnings.append(f"{root}: skipped — {exc}")
+            continue
+        initial: float | None = None
+        maintenance: float | None = None
+        for name in ("initial_margin", "maintenance_margin"):
+            if raw_values.get(name) is None:
+                continue
+            try:
+                value = _coerce_finite_non_negative(raw_values[name], field=f"{root}.{name}")
+            except CalibrationError as exc:
+                warnings.append(f"{root}: ignored {name} — {exc}")
+                continue
+            if name == "initial_margin":
+                initial = value
+            else:
+                maintenance = value
+        parsed[root] = CalibratedCostOverride(
+            root=root,
+            broker_commission_per_contract=broker,
+            exchange_and_reg_fee_per_contract=exchange,
+            initial_margin=initial,
+            maintenance_margin=maintenance,
+            commission_source=str(raw_values.get("commission_source") or "ibkr_whatif"),
+            margin_source=str(raw_values.get("margin_source") or "ibkr_whatif"),
+        )
+    return parsed
+
+
+def load_calibrated_costs(
+    path: Path | str,
+    *,
+    max_age_days: float | None = DEFAULT_CALIBRATION_MAX_AGE_DAYS,
+    now: datetime | None = None,
+) -> CalibratedCosts:
+    """Load and validate an IBKR calibration file (raises :class:`CalibrationError`).
+
+    The read contract (written by execution-eng task-85)::
+
+        {"schema_version": 1, "account_id": "DU...", "calibrated_at": "<ISO-8601 UTC>",
+         "roots": {"ES": {"broker_commission_per_contract": 0.42,
+                          "exchange_and_reg_fee_per_contract": 1.40,
+                          "initial_margin": 15234.5, "maintenance_margin": 13870.2,
+                          "commission_source": "ibkr_whatif",
+                          "margin_source": "ibkr_whatif"}},
+         "warnings": ["..."]}
+
+    Required: ``calibrated_at`` and ``roots``. A file older than ``max_age_days``
+    (default 30) is rejected as stale; malformed/unsupported/missing fields raise
+    so the caller can fall back to the YAML defaults. Invalid individual roots are
+    skipped with a warning instead of poisoning the whole file.
+    """
+    if max_age_days is not None and (not math.isfinite(max_age_days) or max_age_days < 0.0):
+        raise ValueError("max_age_days must be finite and non-negative")
+    file_path = Path(path)
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CalibrationError(f"cannot read calibration file {file_path}: {exc}") from exc
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise CalibrationError(f"calibration file {file_path} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise CalibrationError(f"calibration file {file_path} must contain a JSON object")
+    raw_schema = payload.get("schema_version", 1)
+    if isinstance(raw_schema, bool) or not isinstance(raw_schema, int) or raw_schema < 1:
+        raise CalibrationError("schema_version must be a positive integer")
+    if raw_schema > 1:
+        raise CalibrationError(f"unsupported calibration schema_version {raw_schema}")
+    calibrated_at = _parse_calibration_timestamp(payload.get("calibrated_at"))
+    reference = now if now is not None else datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    age = reference - calibrated_at
+    if max_age_days is not None and age > timedelta(days=max_age_days):
+        raise CalibrationError(
+            f"calibration file {file_path} is stale: calibrated_at="
+            f"{calibrated_at.isoformat()} is {age.total_seconds() / 86_400:.1f} days old "
+            f"(max {max_age_days:.1f} days)"
+        )
+    warnings: list[str] = []
+    raw_file_warnings = payload.get("warnings", [])
+    if isinstance(raw_file_warnings, list):
+        warnings.extend(str(item) for item in raw_file_warnings)
+    elif raw_file_warnings:
+        warnings.append("ignored non-list warnings field")
+    roots = _parse_calibration_roots(payload.get("roots"), warnings)
+    if not roots:
+        raise CalibrationError(f"calibration file {file_path} has no usable root overrides")
+    account_value = payload.get("account_id")
+    return CalibratedCosts(
+        account_id="" if account_value is None else str(account_value),
+        calibrated_at=calibrated_at,
+        roots=MappingProxyType(roots),
+        warnings=tuple(warnings),
+        schema_version=raw_schema,
+        path=str(file_path),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +589,15 @@ class RollCostBreakdown:
     close_leg: CostBreakdown
     open_leg: CostBreakdown
     bag_discount: float = 0.0
+    roll_slippage_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
         if self.close_leg.root != self.root or self.open_leg.root != self.root:
             raise ValueError("roll leg root mismatch")
         if self.bag_discount < 0.0 or not math.isfinite(self.bag_discount):
             raise ValueError("bag_discount must be finite and non-negative")
+        if not math.isfinite(self.roll_slippage_multiplier) or self.roll_slippage_multiplier < 0.0:
+            raise ValueError("roll_slippage_multiplier must be finite and non-negative")
 
     @property
     def spread_cost(self) -> float:
@@ -400,6 +646,7 @@ class RollCostBreakdown:
             "commission": self.commission,
             "fees": self.fees,
             "bag_discount": self.bag_discount,
+            "roll_slippage_multiplier": self.roll_slippage_multiplier,
             "total": self.total,
             "close_leg": self.close_leg.to_dict(),
             "open_leg": self.open_leg.to_dict(),
@@ -433,6 +680,9 @@ class CostModel:
         bag_spread_factor: float = 0.5,
         penalty_fee_per_contract: float = 15.0,
         monthly_volume: int = 0,
+        roll_slippage_multiplier: float = 1.5,
+        calibrated_costs_path: Path | str | None = None,
+        calibration_max_age_days: float | None = DEFAULT_CALIBRATION_MAX_AGE_DAYS,
     ) -> None:
         if not isinstance(slippage_model, SlippageModel):
             raise TypeError("slippage_model must be a SlippageModel")
@@ -444,6 +694,7 @@ class CostModel:
             ("commission_bps", commission_bps),
             ("bag_commission_discount", bag_commission_discount),
             ("penalty_fee_per_contract", penalty_fee_per_contract),
+            ("roll_slippage_multiplier", roll_slippage_multiplier),
         ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
@@ -453,6 +704,10 @@ class CostModel:
             raise TypeError("monthly_volume must be an int")
         if monthly_volume < 0:
             raise ValueError("monthly_volume must be non-negative")
+        if calibration_max_age_days is not None and (
+            not math.isfinite(calibration_max_age_days) or calibration_max_age_days < 0.0
+        ):
+            raise ValueError("calibration_max_age_days must be finite and non-negative")
         self._instrument_master = instrument_master
         self._fee_schedules: dict[str, FeeSchedule] = dict(fee_schedules or {})
         self.slippage_model = slippage_model
@@ -465,6 +720,116 @@ class CostModel:
         self.bag_spread_factor = float(bag_spread_factor)
         self.penalty_fee_per_contract = float(penalty_fee_per_contract)
         self.monthly_volume = monthly_volume
+        self.roll_slippage_multiplier = float(roll_slippage_multiplier)
+        self.calibration_max_age_days = calibration_max_age_days
+        self._fee_schedule_cache: dict[str, FeeSchedule] = {}
+        self._explicit_calibration_path: Path | None = (
+            Path(calibrated_costs_path) if calibrated_costs_path is not None else None
+        )
+        self._calibration: CalibratedCosts | None = None
+        self._calibration_error: str | None = None
+        self._calibration_path: Path | None = None
+        self.reload_calibration()
+
+    # -- calibrated costs (IBKR whatIf) ---------------------------------------
+
+    @property
+    def calibration(self) -> CalibratedCosts | None:
+        """Loaded IBKR calibration payload (``None`` when absent/stale/corrupt)."""
+        return self._calibration
+
+    @property
+    def calibration_path(self) -> Path | None:
+        """Path the calibration loader used (``None`` before first resolve)."""
+        return self._calibration_path
+
+    @property
+    def calibration_error(self) -> str | None:
+        """Why a present calibration file was rejected, if it was."""
+        return self._calibration_error
+
+    def reload_calibration(self) -> CalibratedCosts | None:
+        """(Re)load the IBKR calibrated-cost file; fall back cleanly to YAML."""
+        self._fee_schedule_cache.clear()
+        self._calibration = None
+        self._calibration_error = None
+        path = self._explicit_calibration_path or default_calibrated_costs_path()
+        self._calibration_path = path
+        if not path.is_file():
+            return None
+        try:
+            self._calibration = load_calibrated_costs(
+                path, max_age_days=self.calibration_max_age_days
+            )
+        except CalibrationError as exc:
+            self._calibration_error = str(exc)
+            logger.warning("IBKR calibrated costs ignored (%s); falling back to YAML defaults", exc)
+            return None
+        logger.info(
+            "IBKR calibrated costs loaded from %s (account=%r, calibrated_at=%s, roots=%d)",
+            path,
+            self._calibration.account_id,
+            self._calibration.calibrated_at.isoformat(),
+            len(self._calibration.roots),
+        )
+        return self._calibration
+
+    def _calibrated_override(self, root: str) -> CalibratedCostOverride | None:
+        if self._calibration is None:
+            return None
+        return self._calibration.roots.get(root.strip().upper())
+
+    def calibrated_margins(self, root: str) -> tuple[float, float] | None:
+        """Calibrated ``(initial_margin, maintenance_margin)`` per 1 lot, if any."""
+        override = self._calibrated_override(root)
+        if override is None:
+            return None
+        if override.initial_margin is None or override.maintenance_margin is None:
+            return None
+        return (override.initial_margin, override.maintenance_margin)
+
+    def fee_provenance(self, root: str) -> CalibrationProvenance:
+        """Provenance badge for ``root`` fees: YAML default or IBKR calibrated.
+
+        Explicit programmatic ``fee_schedules=`` overrides win over the calibrated
+        file (see :meth:`fee_schedule`) and are reported as ``yaml_default``.
+        """
+        key = root.strip().upper()
+        if key in self._fee_schedules:
+            return CalibrationProvenance.YAML_DEFAULT
+        exchange = self._exchange(key)
+        if exchange is not None and exchange.upper() in self._fee_schedules:
+            return CalibrationProvenance.YAML_DEFAULT
+        if self._asset_class(key).value in self._fee_schedules:
+            return CalibrationProvenance.YAML_DEFAULT
+        if self._calibrated_override(key) is not None:
+            return CalibrationProvenance.IBKR_CALIBRATED
+        return CalibrationProvenance.YAML_DEFAULT
+
+    def margin_provenance(self, root: str) -> CalibrationProvenance:
+        """Provenance badge for ``root`` margins: YAML default or IBKR calibrated."""
+        if self.calibrated_margins(root) is not None:
+            return CalibrationProvenance.IBKR_CALIBRATED
+        return CalibrationProvenance.YAML_DEFAULT
+
+    def calibration_metadata(self) -> dict[str, object]:
+        """JSON-friendly calibration state for run metadata/API/UI."""
+        payload = self._calibration
+        return {
+            "source": (
+                CalibrationProvenance.IBKR_CALIBRATED.value
+                if payload is not None
+                else CalibrationProvenance.YAML_DEFAULT.value
+            ),
+            "path": str(self._calibration_path) if self._calibration_path is not None else None,
+            "account_id": payload.account_id if payload is not None else None,
+            "calibrated_at": (payload.calibrated_at.isoformat() if payload is not None else None),
+            "schema_version": payload.schema_version if payload is not None else None,
+            "applied_roots": sorted(payload.roots) if payload is not None else [],
+            "warnings": list(payload.warnings) if payload is not None else [],
+            "error": self._calibration_error,
+            "max_age_days": self.calibration_max_age_days,
+        }
 
     # -- instrument metadata helpers -----------------------------------------
 
@@ -484,13 +849,27 @@ class CostModel:
         return self._instrument_master.get(root).exchange
 
     def fee_schedule(self, root: str) -> FeeSchedule:
-        """Resolve the fee schedule for ``root``.
+        """Resolve the fully-wired fee schedule for ``root`` (cached per root).
 
-        Resolution order: explicit root override, explicit exchange override,
-        explicit asset-class override, the venue default from the instrument
-        master, then the instrument-class default.
+        Resolution order: explicit programmatic root/exchange/asset-class
+        overrides, then an IBKR-calibrated override (task-84 loader), then the
+        instrument master's per-root ``broker_commission_per_contract`` +
+        ``exchange_and_reg_fee_per_contract``, then the venue/asset-class default.
+
+        Micro routing is exact: the caller passes the actual traded root, so an
+        ES->MES routed micro leg resolves the MES commission/fee schedule (not
+        the ES standard schedule).
         """
         key = root.strip().upper()
+        cached = self._fee_schedule_cache.get(key)
+        if cached is not None:
+            return cached
+        schedule = self._build_fee_schedule(key)
+        self._fee_schedule_cache[key] = schedule
+        return schedule
+
+    def _build_fee_schedule(self, key: str) -> FeeSchedule:
+        """Build the uncached fee schedule for ``key`` (see :meth:`fee_schedule`)."""
         if key in self._fee_schedules:
             return self._fee_schedules[key]
         exchange = self._exchange(key)
@@ -499,11 +878,43 @@ class CostModel:
         asset_class = self._asset_class(key)
         if asset_class.value in self._fee_schedules:
             return self._fee_schedules[asset_class.value]
+        base: FeeSchedule
         if exchange is not None:
             venue = EXCHANGE_FEE_SCHEDULES.get(exchange.upper())
-            if venue is not None:
-                return venue
-        return default_fee_schedule(asset_class)
+            base = venue if venue is not None else default_fee_schedule(asset_class)
+        else:
+            base = default_fee_schedule(asset_class)
+        calibrated = self._calibrated_override(key)
+        if calibrated is not None:
+            return FeeSchedule(
+                commission_tiers=((0, calibrated.broker_commission_per_contract),),
+                exchange_fee=calibrated.exchange_and_reg_fee_per_contract,
+                clearing_fee=0.0,
+                nfa_fee=0.0,
+            )
+        spec = None
+        if self._instrument_master is not None and self._instrument_master.has(key):
+            spec = self._instrument_master.get(key)
+        if spec is None:
+            return base
+        tiers = base.commission_tiers
+        if abs(spec.broker_commission_per_contract - base.commission_tiers[0][1]) > 1e-12:
+            # Micro (or otherwise different) broker commission: flat per-contract.
+            tiers = ((0, spec.broker_commission_per_contract),)
+        return FeeSchedule(
+            commission_tiers=tiers,
+            exchange_fee=spec.exchange_and_reg_fee_per_contract,
+            clearing_fee=0.0,
+            nfa_fee=0.0,
+        )
+
+    def default_slippage_ticks(self, root: str) -> float:
+        """Instrument-master baseline slippage ticks per side for ``root``."""
+        if self._instrument_master is not None and self._instrument_master.has(
+            root.strip().upper()
+        ):
+            return self._instrument_master.get(root.strip().upper()).default_slippage_ticks
+        return 0.0
 
     def commission_per_contract(self, root: str, monthly_volume: int | None = None) -> float:
         """Tiered IBKR commission per contract for ``root``."""
@@ -587,8 +998,12 @@ class CostModel:
         limit_order: bool = False,
         extra_slippage_ticks: float = 0.0,
         extra_fee_per_contract: float = 0.0,
+        is_roll: bool = False,
     ) -> CostBreakdown:
         """Full transaction cost for one order side.
+
+        ``is_roll=True`` applies ``roll_slippage_multiplier`` to the execution
+        slippage only (used for roll/BAG legs; normal entries are unaffected).
 
         ``quantity`` is an absolute contract count (direction is applied by the
         caller through the fill price). A zero quantity returns a zero
@@ -625,6 +1040,8 @@ class CostModel:
                 quantity, bar_volume, extra_slippage_ticks=extra_slippage_ticks
             )
         )
+        if is_roll:
+            slippage_ticks *= self.roll_slippage_multiplier
         tick_value = tick_size * multiplier
         return CostBreakdown(
             root=root.strip().upper(),
@@ -707,6 +1124,7 @@ class CostModel:
             monthly_volume=volume,
             quoted_spread_ticks=quoted_spread_ticks,
             is_bag=use_bag,
+            is_roll=True,
         )
         open_leg = self.transaction_cost(
             root,
@@ -718,6 +1136,7 @@ class CostModel:
             monthly_volume=volume,
             quoted_spread_ticks=quoted_spread_ticks,
             is_bag=use_bag,
+            is_roll=True,
         )
         bag_discount = 0.0
         if use_bag:
@@ -731,6 +1150,7 @@ class CostModel:
                 monthly_volume=volume,
                 quoted_spread_ticks=quoted_spread_ticks,
                 is_bag=False,
+                is_roll=True,
             )
             independent_open = self.transaction_cost(
                 root,
@@ -742,6 +1162,7 @@ class CostModel:
                 monthly_volume=volume,
                 quoted_spread_ticks=quoted_spread_ticks,
                 is_bag=False,
+                is_roll=True,
             )
             bag_discount = max(
                 0.0,
@@ -757,6 +1178,7 @@ class CostModel:
             close_leg=close_leg,
             open_leg=open_leg,
             bag_discount=bag_discount,
+            roll_slippage_multiplier=self.roll_slippage_multiplier,
         )
 
     def forced_liquidation_cost(
@@ -807,6 +1229,8 @@ class CostModel:
             "bag_spread_factor": self.bag_spread_factor,
             "penalty_fee_per_contract": self.penalty_fee_per_contract,
             "monthly_volume": self.monthly_volume,
+            "roll_slippage_multiplier": self.roll_slippage_multiplier,
+            "calibration": self.calibration_metadata(),
         }
 
     @staticmethod

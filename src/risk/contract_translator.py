@@ -80,11 +80,18 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from configs.instruments import InstrumentsConfig, InstrumentSpec, load_instruments
 
+from src.backtest.margin_simulator import (
+    DEFAULT_STRESS_MARGIN_MULTIPLIER,
+    DEFAULT_STRESS_VOL_THRESHOLD,
+    CalibratedMargin,
+    load_calibrated_margins,
+)
 from src.core.types import (
     ContractTarget,
     ContractTargetSet,
@@ -250,6 +257,15 @@ class ContractTranslator:
     min_micro_notional_ratio: float = 0.0
     account_currency: str | None = None
     fx_rates: Mapping[str, float] = field(default_factory=dict)
+    #: IBKR-calibrated initial/maintenance margin overrides by root (task-86).
+    calibrated_margins: Mapping[str, CalibratedMargin] = field(default_factory=dict)
+    #: Optional explicit calibration JSON path (defaults to settings/data cache).
+    calibrated_costs_path: Path | str | None = None
+    #: Auto-load calibrated margins from the shared JSON when available.
+    load_calibrated_costs: bool = True
+    #: Stress-regime margin multiplier/config (task-86).
+    stress_margin_multiplier: float = DEFAULT_STRESS_MARGIN_MULTIPLIER
+    stress_vol_threshold: float = DEFAULT_STRESS_VOL_THRESHOLD
 
     def __post_init__(self) -> None:
         if not isinstance(self.rounding_mode, RoundingMode):
@@ -265,6 +281,26 @@ class ContractTranslator:
         ratio = float(self.min_micro_notional_ratio)
         if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
             raise ValueError("min_micro_notional_ratio must be within [0, 1]")
+        multiplier = float(self.stress_margin_multiplier)
+        if not math.isfinite(multiplier) or multiplier < 1.0:
+            raise ValueError("stress_margin_multiplier must be finite and >= 1.0")
+        threshold = float(self.stress_vol_threshold)
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError("stress_vol_threshold must be finite and strictly positive")
+        object.__setattr__(self, "stress_margin_multiplier", multiplier)
+        object.__setattr__(self, "stress_vol_threshold", threshold)
+        calibrated = self.calibrated_margins
+        if not isinstance(calibrated, Mapping):
+            raise TypeError("calibrated_margins must be a mapping of root -> CalibratedMargin")
+        if not calibrated and self.load_calibrated_costs:
+            calibrated = load_calibrated_margins(self.calibrated_costs_path)
+        object.__setattr__(
+            self,
+            "calibrated_margins",
+            MappingProxyType(
+                {str(root).strip().upper(): margin for root, margin in calibrated.items()}
+            ),
+        )
         if self.account_currency is not None:
             object.__setattr__(
                 self,
@@ -357,8 +393,11 @@ class ContractTranslator:
         # leg is built or any target can be emitted.
         self._validate_contract_currencies(active, specs, master, rates)
         legs = self._build_legs(active, specs, master, state, equity_usd, rates)
-        quantities = self._resolve_quantities(legs, equity_usd)
-        return self._materialise(legs, quantities)
+        margin_by_root = {
+            leg.instrument_id: self._effective_margin_pair(leg, state) for leg in legs
+        }
+        quantities = self._resolve_quantities(legs, equity_usd, margin_by_root)
+        return self._materialise(legs, quantities, margin_by_root)
 
     def margin_utilization(
         self,
@@ -948,9 +987,43 @@ class ContractTranslator:
         threshold = 0.5 + 0.5 * min(self.rebalance_buffer_contracts, 1.0)
         return sign * (base + 1 if fraction >= threshold else base)
 
+    # -- margin regime (calibrated + stress) -----------------------------------
+
+    def _effective_margin_pair(self, leg: _Leg, state: MarketState) -> tuple[float, float]:
+        """Effective ``(initial, maintenance)`` margin for a leg at ``state``.
+
+        Calibrated IBKR overrides take precedence over YAML margins; the stress
+        multiplier is applied on top when the state's point-in-time annualised
+        volatility for the root exceeds ``stress_vol_threshold``.
+        """
+        initial = float(leg.spec.margins.initial)
+        maintenance = float(leg.spec.margins.maintenance)
+        override = self.calibrated_margins.get(leg.instrument_id)
+        if override is not None:
+            initial = override.initial_margin
+            maintenance = override.maintenance_margin
+        volatility = state.annualized_vol(leg.instrument_id)
+        if (
+            math.isfinite(volatility)
+            and volatility >= self.stress_vol_threshold
+            and self.stress_margin_multiplier > 1.0
+        ):
+            initial *= self.stress_margin_multiplier
+            maintenance *= self.stress_margin_multiplier
+        if initial < 0.0 or maintenance < 0.0:
+            raise ValueError(f"negative margin for {leg.instrument_id!r}")
+        if maintenance > initial and initial > 0.0:
+            maintenance = initial
+        return initial, maintenance
+
     # -- margin feasibility ----------------------------------------------------
 
-    def _resolve_quantities(self, legs: list[_Leg], equity_usd: float) -> dict[InstrumentId, int]:
+    def _resolve_quantities(
+        self,
+        legs: list[_Leg],
+        equity_usd: float,
+        effective_margins: Mapping[InstrumentId, tuple[float, float]],
+    ) -> dict[InstrumentId, int]:
         """Round legs and enforce the hard initial-margin utilisation ceiling.
 
         The budget is ``eta_max * equity_usd`` because initial margins are
@@ -962,14 +1035,14 @@ class ContractTranslator:
         if not legs:
             return quantities
         budget = self.max_margin_utilization * equity_usd
-        margin_by_root = {leg.instrument_id: leg.initial_margin for leg in legs}
-        projected = self._projected_initial_margin(quantities, margin_by_root)
+        initial_margins = {root: pair[0] for root, pair in effective_margins.items()}
+        projected = self._projected_initial_margin(quantities, initial_margins)
         if projected <= budget:
             return quantities
 
         raw = {leg.instrument_id: leg.raw_quantity for leg in legs}
         for _ in range(_MARGIN_SCALING_ITERATIONS):
-            projected = self._projected_initial_margin(quantities, margin_by_root)
+            projected = self._projected_initial_margin(quantities, initial_margins)
             if projected <= budget:
                 return quantities
             factor = budget / projected if projected > 0.0 else 0.0
@@ -977,7 +1050,7 @@ class ContractTranslator:
                 raw[root] *= factor
             quantities = {root: self._round_quantity(value) for root, value in raw.items()}
 
-        return self._drop_until_feasible(quantities, margin_by_root, budget)
+        return self._drop_until_feasible(quantities, initial_margins, budget)
 
     @staticmethod
     def _projected_initial_margin(
@@ -1018,7 +1091,10 @@ class ContractTranslator:
     # -- output ----------------------------------------------------------------
 
     def _materialise(
-        self, legs: list[_Leg], quantities: dict[InstrumentId, int]
+        self,
+        legs: list[_Leg],
+        quantities: dict[InstrumentId, int],
+        margin_by_root: Mapping[InstrumentId, tuple[float, float]],
     ) -> ContractTargetSet:
         targets: list[ContractTarget] = []
         for leg in legs:
@@ -1032,8 +1108,8 @@ class ContractTranslator:
                     price=leg.price,
                     multiplier=leg.spec.multiplier,
                     expiration=leg.expiration,
-                    initial_margin=leg.spec.margins.initial,
-                    maintenance_margin=leg.spec.margins.maintenance,
+                    initial_margin=margin_by_root[leg.instrument_id][0],
+                    maintenance_margin=margin_by_root[leg.instrument_id][1],
                     contract_symbol=self._contract_symbol(leg.instrument_id, leg.expiration),
                     asset_class=leg.spec.asset_class,
                 )

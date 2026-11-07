@@ -64,14 +64,11 @@ from src.strategies.selectors import (
     build_selector,
 )
 from src.strategies.timing import (
-    ALL_MONTHS,
-    DEFAULT_ROOT_MONTH_BIASES,
     TIMING_REGISTRY,
     CarryFilter,
     CompositeTiming,
     KAMATiming,
     MeanReversionTiming,
-    SeasonalityTiming,
     TSMOMTiming,
     bollinger_bands,
     build_timing,
@@ -81,9 +78,7 @@ from src.strategies.timing import (
 
 __all__ = [
     "ALLOCATOR_REGISTRY",
-    "ALL_MONTHS",
     "CATALOG",
-    "DEFAULT_ROOT_MONTH_BIASES",
     "SELECTOR_REGISTRY",
     "TIMING_REGISTRY",
     "CarryFilter",
@@ -105,7 +100,6 @@ __all__ = [
     "RegimeSelector",
     "RegimeSnapshot",
     "RiskParityAllocator",
-    "SeasonalityTiming",
     "TSMOMTiming",
     "VolatilityTargetAllocator",
     "apply_parameter_overrides",

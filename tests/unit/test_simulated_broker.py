@@ -81,7 +81,7 @@ def test_market_buy_fill_and_accounting(broker: SimulatedBroker) -> None:
     assert receipt.filled_quantity == 2
     assert receipt.average_price is not None
     assert receipt.average_price > 4800.0  # paid the half-spread
-    assert receipt.commission == pytest.approx(2 * (0.85 + 1.70))
+    assert receipt.commission == pytest.approx(2 * (0.85 + 1.40))
     position = broker.get_positions_sync()["ES"]
     assert position.quantity == 2
     assert position.average_price == pytest.approx(receipt.average_price)

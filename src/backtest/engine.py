@@ -57,7 +57,7 @@ from configs.strategy import StrategyConfig, load_strategy_config
 from numpy.typing import NDArray
 
 from src.backtest.cost_model import CostModel
-from src.backtest.margin_simulator import MarginSimulator, utc_calendar_day
+from src.backtest.margin_simulator import MarginRequirements, MarginSimulator, utc_calendar_day
 from src.backtest.simulated_broker import (
     BarQuote,
     FillRecord,
@@ -457,6 +457,19 @@ class BacktestResult:
     margin_utilization_avg: float = 0.0
     margin_utilization_peak: float = 0.0
     settlement_pnl: float = 0.0
+    #: Cost-breakdown transparency (task-86): roll/BAG execution cost components
+    #: are subsets of ``commissions``/``fees``/``slippage`` (never double-counted).
+    roll_cost_total: float = 0.0
+    roll_commissions: float = 0.0
+    roll_fees: float = 0.0
+    roll_slippage: float = 0.0
+    forced_liquidation_cost: float = 0.0
+    #: Stress-regime/calibrated margin provenance (task-86).
+    margin_stress_applied: bool = False
+    margin_stress_multiplier: float = 1.0
+    margin_stress_roots: tuple[str, ...] = ()
+    margin_calibrated: bool = False
+    margin_calibrated_roots: tuple[str, ...] = ()
     metadata: Mapping[str, ScalarValue] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
 
@@ -477,11 +490,23 @@ class BacktestResult:
             "margin_utilization_avg",
             "margin_utilization_peak",
             "settlement_pnl",
+            "roll_cost_total",
+            "roll_commissions",
+            "roll_fees",
+            "roll_slippage",
+            "forced_liquidation_cost",
+            "margin_stress_multiplier",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
             object.__setattr__(self, name, value)
+        object.__setattr__(self, "margin_stress_roots", tuple(sorted(self.margin_stress_roots)))
+        object.__setattr__(
+            self, "margin_calibrated_roots", tuple(sorted(self.margin_calibrated_roots))
+        )
+        object.__setattr__(self, "margin_stress_applied", bool(self.margin_stress_applied))
+        object.__setattr__(self, "margin_calibrated", bool(self.margin_calibrated))
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     # -- headline statistics ---------------------------------------------------
@@ -507,6 +532,37 @@ class BacktestResult:
     def total_costs(self) -> float:
         """Every execution cost component."""
         return self.total_commissions + self.slippage + self.funding
+
+    @property
+    def cost_breakdown(self) -> dict[str, float]:
+        """Exact execution-cost breakdown for result/tearsheet/API consumers.
+
+        ``*_total`` fields are the headline components summed by
+        :attr:`total_costs`; the ``roll_*`` entries are subsets of those headline
+        components attributable to roll_close/roll_open executions (never added
+        again), and ``non_roll_*`` are the complement. ``forced_liquidation_cost``
+        is a subset of commissions/fees/slippage from liquidation fills.
+        """
+        non_roll_commissions = max(0.0, self.commissions - self.roll_commissions)
+        non_roll_fees = max(0.0, self.fees - self.roll_fees)
+        non_roll_slippage = max(0.0, self.slippage - self.roll_slippage)
+        return {
+            "broker_commissions": self.commissions,
+            "exchange_and_regulatory_fees": self.fees,
+            "slippage": self.slippage,
+            "funding": self.funding,
+            "roll_cost_total": self.roll_cost_total,
+            "roll_commissions": self.roll_commissions,
+            "roll_exchange_and_regulatory_fees": self.roll_fees,
+            "roll_slippage": self.roll_slippage,
+            "non_roll_commissions": non_roll_commissions,
+            "non_roll_exchange_and_regulatory_fees": non_roll_fees,
+            "non_roll_slippage": non_roll_slippage,
+            "forced_liquidation_cost": self.forced_liquidation_cost,
+            "total_commissions": self.total_commissions,
+            "total_execution_costs": self.total_commissions + self.slippage,
+            "total_costs": self.total_costs,
+        }
 
     @property
     def n_bars(self) -> int:
@@ -574,6 +630,17 @@ class BacktestResult:
             "margin_utilization_avg": self.margin_utilization_avg,
             "margin_utilization_peak": self.margin_utilization_peak,
             "settlement_pnl": self.settlement_pnl,
+            "roll_cost_total": self.roll_cost_total,
+            "roll_commissions": self.roll_commissions,
+            "roll_fees": self.roll_fees,
+            "roll_slippage": self.roll_slippage,
+            "forced_liquidation_cost": self.forced_liquidation_cost,
+            "cost_breakdown": self.cost_breakdown,
+            "margin_stress_applied": self.margin_stress_applied,
+            "margin_stress_multiplier": self.margin_stress_multiplier,
+            "margin_stress_roots": list(self.margin_stress_roots),
+            "margin_calibrated": self.margin_calibrated,
+            "margin_calibrated_roots": list(self.margin_calibrated_roots),
             "n_bars": self.n_bars,
             "n_trades": self.n_trades,
             "n_rolls": len(self.roll_events),
@@ -1001,6 +1068,7 @@ class EventBacktester:
         depleted = False
         for index, state in enumerate(state_list):
             timestamp = state.timestamp
+            self._margin_simulator.set_volatilities(_state_volatilities(state))
             quotes = _extend_quotes(
                 _quotes_for_state(state, context),
                 state,
@@ -1270,6 +1338,7 @@ class EventBacktester:
             liquidations=liquidation_events,
             attribution=attribution,
             settlement_pnl=settlement_pnl,
+            margin_requirements=self._margin_simulator.last_requirements,
             metadata={
                 "broker": broker.name,
                 "cost_model": json.dumps(self._cost_model.to_dict(), sort_keys=True),
@@ -1278,6 +1347,9 @@ class EventBacktester:
                 "use_bag_rolls": self._use_bag_rolls,
                 "annualization_factor": self._annualization_factor,
                 "timeframe": self._timeframe,
+                "margin_regime": json.dumps(
+                    self._margin_simulator.last_requirements.to_dict(), sort_keys=True
+                ),
                 "mode": BacktestMode.EVENT.value,
             },
             warnings=warnings,
@@ -1509,6 +1581,7 @@ class BacktestEngine:
         order_counter = 0
         for index, state in enumerate(state_list):
             timestamp = state.timestamp
+            self._margin_simulator.set_volatilities(_state_volatilities(state))
             marks = _marks_for_state(state)
             multipliers = _multipliers_for_roots(tuple(sorted(marks)), self._instrument_master)
             # Mark the existing book to market on the continuous front prices.
@@ -1641,7 +1714,13 @@ class BacktestEngine:
             attribution.turnover += turnover_bar
             attribution.roll_pnl = roll_pnl_total
             peak_equity = max(peak_equity, equity) if equity > 0.0 else peak_equity
-            margin_used = _vectorized_margin(contracts, marks, multipliers, self._instrument_master)
+            margin_used = _vectorized_margin(
+                contracts,
+                marks,
+                multipliers,
+                self._instrument_master,
+                self._margin_simulator,
+            )
             gross = sum(abs(weight) * equity for weight in weights.weights.values())
             net = sum(weight * equity for weight in weights.weights.values())
             equity_rows.append(
@@ -1701,11 +1780,15 @@ class BacktestEngine:
             liquidations=[],
             attribution=attribution,
             settlement_pnl=0.0,
+            margin_requirements=self._margin_simulator.last_requirements,
             metadata={
                 "cost_model": json.dumps(self._cost_model.to_dict(), sort_keys=True),
                 "rebalance_schedule": json.dumps(schedule.to_dict(), sort_keys=True),
                 "annualization_factor": self._annualization_factor,
                 "timeframe": self._timeframe,
+                "margin_regime": json.dumps(
+                    self._margin_simulator.last_requirements.to_dict(), sort_keys=True
+                ),
                 "mode": BacktestMode.VECTORIZED.value,
             },
             warnings=warnings,
@@ -1982,11 +2065,19 @@ def _vectorized_margin(
     marks: Mapping[str, float],
     multipliers: Mapping[str, float],
     instrument_master: InstrumentsConfig | None,
+    margin_simulator: MarginSimulator | None = None,
 ) -> float:
     margin = 0.0
     for root, quantity in contracts.items():
         if root not in marks or root not in multipliers:
             continue
+        if margin_simulator is not None and (
+            margin_simulator.calibrated_margins or instrument_master is not None
+        ):
+            initial, _maintenance = margin_simulator.effective_margin(root, 1)
+            if initial > 0.0:
+                margin += abs(quantity) * initial
+                continue
         if instrument_master is not None and instrument_master.has(root):
             margin += abs(quantity) * float(instrument_master.get(root).margins.initial)
         else:
@@ -2047,6 +2138,11 @@ def _resolve_states(
     ]
 
 
+def _state_volatilities(state: MarketState) -> dict[str, float]:
+    """Point-in-time annualised per-root volatilities from a MarketState."""
+    return {root: state.annualized_vol(root) for root in state.ids}
+
+
 def _canonical_engine_timeframe(timeframe: str) -> str:
     """Validate/canonicalise a bar timeframe via the data registry."""
     from src.data.timeframes import get_timeframe
@@ -2101,6 +2197,7 @@ def _build_result(
     settlement_pnl: float,
     metadata: Mapping[str, ScalarValue],
     warnings: list[str],
+    margin_requirements: MarginRequirements | None = None,
 ) -> BacktestResult:
     equity_curve = _curve_frame(equity_rows)
     if equity_curve.height == 0:
@@ -2129,6 +2226,31 @@ def _build_result(
         "n_states": len(state_list),
     }
     metadata_full.update(metadata)
+    roll_commissions = 0.0
+    roll_fees = 0.0
+    roll_slippage = 0.0
+    for fill in fills:
+        if fill.kind.value in {"roll_close", "roll_open"}:
+            roll_commissions += fill.cost.commission
+            roll_fees += fill.cost.fees
+            roll_slippage += fill.cost.spread_cost + fill.cost.slippage_cost
+    roll_cost_total = (
+        roll_commissions + roll_fees + roll_slippage
+        if fills
+        else sum(float(event.total_cost) for event in roll_events)
+    )
+    forced_liquidation_cost = sum(float(event.penalty_cost) for event in liquidations)
+    stress_roots: tuple[str, ...] = ()
+    calibrated_roots: tuple[str, ...] = ()
+    stress_applied = False
+    stress_multiplier = 1.0
+    calibrated = False
+    if margin_requirements is not None:
+        stress_roots = margin_requirements.stress_roots
+        calibrated_roots = margin_requirements.calibrated_roots
+        stress_applied = margin_requirements.stress_applied
+        stress_multiplier = margin_requirements.stress_multiplier
+        calibrated = margin_requirements.calibrated
     return BacktestResult(
         run_id=run_id,
         strategy_id=strategy.name,
@@ -2154,6 +2276,16 @@ def _build_result(
         margin_utilization_avg=utilization_avg,
         margin_utilization_peak=utilization_peak,
         settlement_pnl=settlement_pnl,
+        roll_cost_total=roll_cost_total,
+        roll_commissions=roll_commissions,
+        roll_fees=roll_fees,
+        roll_slippage=roll_slippage,
+        forced_liquidation_cost=forced_liquidation_cost,
+        margin_stress_applied=stress_applied,
+        margin_stress_multiplier=stress_multiplier,
+        margin_stress_roots=stress_roots,
+        margin_calibrated=calibrated,
+        margin_calibrated_roots=calibrated_roots,
         metadata=metadata_full,
         warnings=tuple(warnings),
     )
