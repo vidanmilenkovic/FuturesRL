@@ -484,6 +484,8 @@ python -m src.backtest.optimizer \
 | `GET /api/optimize/{study_id}` | full trials, importances, best params/config |
 | `POST /api/optimize/{study_id}/apply` | save best params as `<id>_opt` (optional verification backtest) |
 
+**Long backtests.** Multi-year intraday walk-forward runs can take several minutes and continue server-side if the browser request times out. The Backtests view now refreshes the run history automatically and does not create a fake fallback run on timeout; wait for the run to appear (or use a daily timeframe / shorter window) instead of clicking **Run backtest** repeatedly. A completed 2021–2025 30-minute walk-forward took ~521 seconds in a local test.
+
 **Timeframes.** The Market Data Cache, Backtests and Strategies select from eight
 canonical timeframes: **1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w**. Backfills fetch the matching base
 schema/IBKR bar size and the Parquet repository can auto-resample finer cached bars (1m→5m/15m/30m/1h,

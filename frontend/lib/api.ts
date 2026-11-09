@@ -516,7 +516,7 @@ export function runBacktest(config: BacktestRunConfig): Promise<ApiResult<Backte
       };
     },
     { method: "POST", body: JSON.stringify(config) },
-    20_000,
+    1_800_000, // 30 min: walk-forward over multi-year cached intraday data is slow
   );
 }
 

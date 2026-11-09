@@ -35,6 +35,10 @@ the public release history starts with the current line.
 
 ### Fixed
 
+- Backtest Lab no longer labels a client-side timeout as “backend unreachable” or inserts a
+  deterministic fallback run. Long walk-forward requests get a 30-minute client window, run history
+  polls automatically while a run is pending/after a timeout, and the UI tells the operator not to
+  retry a still-running server job.
 - Long Databento backfills no longer look failed when the browser request times out: the
   Market Data Cache modal polls the server-side chunk progress and explains that the server may
   still be downloading, preventing accidental duplicate-charge retries. Ingest timeout increased

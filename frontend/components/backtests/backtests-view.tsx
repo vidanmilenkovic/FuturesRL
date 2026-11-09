@@ -146,6 +146,7 @@ export function BacktestsView() {
   const [purgeBars, setPurgeBars] = useState("");
   const [embargoBars, setEmbargoBars] = useState("");
   const [running, setRunning] = useState(false);
+  const [pollAfterTimeout, setPollAfterTimeout] = useState(false);
   const [runnerMessage, setRunnerMessage] = useState<string | null>(null);
   const [runnerDemo, setRunnerDemo] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<BacktestRunSummary | null>(null);
@@ -234,6 +235,7 @@ export function BacktestsView() {
   const submitRun = async () => {
     if (!strategyId) return;
     setRunning(true);
+    setPollAfterTimeout(false);
     setRunnerMessage(null);
     const config: BacktestRunConfig = {
       strategy_id: strategyId,
@@ -250,19 +252,41 @@ export function BacktestsView() {
       ...(embargoBars.trim() !== "" ? { embargo_bars: Number(embargoBars) } : {}),
     };
     const result = await runBacktest(config);
+    const timedOut = Boolean(result.error && /abort|timeout/i.test(result.error));
+    if (result.source !== "live") {
+      // Never insert the deterministic UI-fallback run: the server may still be
+      // processing this backtest. Retrying before the run settles can queue a
+      // duplicate and make the UI mislabel a timeout as "backend unreachable".
+      setRunnerDemo(true);
+      setPollAfterTimeout(timedOut);
+      setRunnerMessage(
+        timedOut
+          ? "Backtest request timed out. The server may still be running it; run history refreshes automatically. Do not retry until it appears."
+          : "Backend unreachable — no local fallback backtest was created.",
+      );
+      setRunning(false);
+      return;
+    }
     const run = result.data;
     setRuns((current) => [run, ...current]);
     setSelectedRunId(run.id);
     setCompareIds((current) => [run.id, ...current.filter((id) => id !== run.id)].slice(0, 3));
-    setRunnerDemo(result.source === "demo");
+    setRunnerDemo(false);
+    setPollAfterTimeout(false);
     setRunnerMessage(
-      result.source === "live"
-        ? `Run ${run.id} completed · ${formatInteger(run.n_trades ?? 0)} trades · ${formatDuration(run.duration_seconds)} · ${dataOriginBadge(run.data_origin).label} · TF ${run.timeframe ?? timeframe}`
-
-        : `Backend unreachable — deterministic UI-fallback tear sheet ${run.id}.`,
+      `Run ${run.id} completed · ${formatInteger(run.n_trades ?? 0)} trades · ${formatDuration(run.duration_seconds)} · ${dataOriginBadge(run.data_origin).label} · TF ${run.timeframe ?? timeframe}`,
     );
     setRunning(false);
   };
+
+  useEffect(() => {
+    if (!running && !pollAfterTimeout) return;
+    // Keep run history fresh while a long walk-forward request is in flight and
+    // after a client-side timeout, when the server may still be computing.
+    const timer = setInterval(() => backtests.reload(), 10_000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, pollAfterTimeout]);
 
   const columns = compareRuns.length > 0 ? compareRuns : selectedRun ? [selectedRun] : [];
   const strategiesOptions: StrategyConfig[] = strategies.data ?? [];
