@@ -296,7 +296,8 @@ data/parquet/<dataset>/<schema>/<root>/part.parquet
 4. Supported schemas: `ohlcv-1m`, `ohlcv-1h`, `ohlcv-1d`, `tbbo`, `mbp-1`, `mbp-10`, `definition`. If the SDK or key is missing the loader raises an actionable error (never silently fabricates vendor data).
 5. Large requests are automatically split into **180-day chunks** when the estimate exceeds 100 MB or the window exceeds one year. Each completed chunk is persisted immediately, so a later timeout (HTTP 522) does not discard earlier data.
 6. A Databento parent request also returns calendar spreads and options; the loader keeps only outright futures (symbols without `-`/spaces) before mapping contract identities.
-7. If a downloaded response cannot be normalised, the raw frame is preserved under `data/databento_raw/` and the error names the file. This includes Databento SDK timestamp-index differences; the current loader restores `ts_event`/`ts_recv` from the pandas index automatically.
+7. A long backfill can outlive the browser's HTTP request. If the UI reports a client timeout while the cache count is still moving, the server is still chunk-downloading — **do not click Backfill again**. The Market Data Cache modal now polls inventory every 10 seconds; the count/size refresh automatically when chunks land. Re-open the modal or wait for the count to settle.
+8. If a downloaded response cannot be normalised, the raw frame is preserved under `data/databento_raw/` and the error names the file. This includes Databento SDK timestamp-index differences; the current loader restores `ts_event`/`ts_recv` from the pandas index automatically.
 
 **Costs are vendor-side.** The in-app estimate is not a charge. Databento bills usage on its dashboard, and an interrupted stream can still be billable. For a large historical backfill, prefer smaller windows and check the Databento Billing page before retrying.
 

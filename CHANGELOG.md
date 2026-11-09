@@ -35,6 +35,10 @@ the public release history starts with the current line.
 
 ### Fixed
 
+- Long Databento backfills no longer look failed when the browser request times out: the
+  Market Data Cache modal polls the server-side chunk progress and explains that the server may
+  still be downloading, preventing accidental duplicate-charge retries. Ingest timeout increased
+  to 30 minutes.
 - Databento 0.89 `DBNStore.to_df()` returns `ts_event`/`ts_recv` as the pandas index; the
   loader now restores it before Polars conversion, so downloaded frames are no longer discarded
   with a false “no timestamp column” error.

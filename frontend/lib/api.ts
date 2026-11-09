@@ -856,7 +856,7 @@ export function ingestDataCache(request: DataIngestRequest): Promise<ApiResult<D
       }),
     },
     () => fallbackDataIngest(request),
-    300_000,
+    1_800_000, // 30 min: a multi-year 1m backfill is chunked server-side
   ).then((result) => {
     if (result.source !== "live") return { ...result, data: fallbackDataIngest(request) };
     const raw = isRecord(result.data) ? result.data : {};

@@ -161,6 +161,16 @@ function MarketDataCacheModal({
   }, [open]);
 
   useEffect(() => {
+    if (!open) return;
+    // A multi-year backfill is chunked and can outlive the browser request.
+    // Poll inventory so the cache badge reflects chunks that land after a
+    // client-side timeout, without the operator retrying and double-charging.
+    const timer = setInterval(() => inventory.reload(), 10_000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
     if (!data) return;
     setSelectedRoots((current) =>
       current.size > 0 ? current : new Set(data.roots.map((root) => root.root)),
@@ -256,7 +266,21 @@ function MarketDataCacheModal({
     });
     setIngesting(false);
     if (result.source !== "live" || !result.data.ok) {
-      setIngestError(errorFromResult(result, result.data.message || "Backfill failed."));
+      const timedOut = Boolean(result.error && /abort|timeout/i.test(result.error));
+      const error = errorFromResult(result, result.data.message || "Backfill failed.");
+      setIngestError(
+        timedOut
+          ? {
+              ...error,
+              status: null,
+              code: "client_timeout",
+              message:
+                "The browser request timed out, but the server may still be downloading " +
+                "chunks. The cache count refreshes automatically; do not retry until it " +
+                "stops changing and check the cache count first.",
+            }
+          : error,
+      );
       return;
     }
     setIngestResult(result.data);
