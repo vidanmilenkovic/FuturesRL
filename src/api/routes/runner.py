@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import FileResponse
 
 from src.api.deps import ContainerDep, LiveDep
 from src.api.live import RunnerSessionUnavailableError
@@ -33,12 +34,14 @@ from src.api.schemas import (
     RunnerStatusResponse,
     RunnerStepRequest,
     RunnerStepResponse,
+    TradeJournalResponse,
 )
 from src.api.services import (
     IBKRCalibrationUnavailableError,
     calibrated_costs_path,
     load_calibrated_costs,
 )
+from src.execution.trade_journal import TradeJournal
 
 router = APIRouter(tags=["runner"])
 
@@ -529,3 +532,54 @@ def calibrated_costs(container: ContainerDep) -> CalibratedCostsStatusResponse:
         warnings=warnings,
         source="ibkr" if roots else "none",
     )
+
+
+# ---------------------------------------------------------------------------
+# Local paper/live trade journal (benchmark CSV files)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/runner/trade-journal",
+    response_model=TradeJournalResponse,
+    summary="Local paper/live trade journal and equity curve",
+    description=(
+        "Reads the append-only local CSV files written by the live/paper runner "
+        "(`artifacts/live_trades/trades.csv` and `equity.csv` by default). Returns "
+        "the latest trades, the full equity curve and a benchmark summary; missing "
+        "files are an honest empty journal, not a fabricated series."
+    ),
+)
+def trade_journal(container: ContainerDep, limit: int = 500) -> TradeJournalResponse:
+    """Return the local journal snapshot."""
+    settings = container.settings
+    journal = TradeJournal.from_settings(settings)
+    payload = journal.snapshot(limit=max(1, min(limit, 5000)))
+    payload["enabled"] = settings.environment in ("paper", "live")
+    return TradeJournalResponse.model_validate(payload)
+
+
+@router.get(
+    "/runner/trade-journal/trades.csv",
+    summary="Download the local trade journal CSV",
+    response_class=FileResponse,
+)
+def trade_journal_trades_csv(container: ContainerDep) -> FileResponse:
+    """Download ``trades.csv`` (404 until the runner has logged a trade)."""
+    path = TradeJournal.from_settings(container.settings).trades_path
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no trade journal rows have been written yet")
+    return FileResponse(path, media_type="text/csv", filename="trades.csv")
+
+
+@router.get(
+    "/runner/trade-journal/equity.csv",
+    summary="Download the local account equity CSV",
+    response_class=FileResponse,
+)
+def trade_journal_equity_csv(container: ContainerDep) -> FileResponse:
+    """Download ``equity.csv`` (404 until the runner has logged an account snapshot)."""
+    path = TradeJournal.from_settings(container.settings).equity_path
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no equity journal rows have been written yet")
+    return FileResponse(path, media_type="text/csv", filename="equity.csv")

@@ -113,6 +113,7 @@ from src.execution.runner_bridge import (
     RunnerBridgeStore,
     snapshot_from_runner,
 )
+from src.execution.trade_journal import TradeJournal
 from src.risk.state_store import PersistedRiskState, RiskStateStore
 
 if TYPE_CHECKING:
@@ -354,6 +355,7 @@ class TradingRunner:
         prime_pipeline: bool = False,
         bridge_store: RunnerBridgeStore | None = None,
         runner_id: str | None = None,
+        trade_journal: TradeJournal | None = None,
     ) -> None:
         if not isinstance(settings, Settings):
             raise TypeError(f"settings must be a Settings, got {type(settings)!r}")
@@ -385,6 +387,9 @@ class TradingRunner:
         self._started_at: datetime | None = None
         self._ended_at: datetime | None = None
         self._bridge_store = bridge_store
+        self._trade_journal = trade_journal
+        if self._trade_journal is not None:
+            self._trade_journal.ensure_files()
         self._runner_id = runner_id or f"runner-{uuid.uuid4().hex[:12]}"
         self._last_bridge_snapshot: RunnerBridgeSnapshot | None = None
         self._last_pipeline_result: PipelineResult | None = None
@@ -439,6 +444,11 @@ class TradingRunner:
     def runner_id(self) -> str:
         """Stable identifier published on the bridge."""
         return self._runner_id
+
+    @property
+    def trade_journal(self) -> TradeJournal | None:
+        """Local paper/live trade journal (``None`` disables CSV logging)."""
+        return self._trade_journal
 
     @property
     def mode(self) -> BridgeMode:
@@ -1063,6 +1073,8 @@ class TradingRunner:
             if targets is None:
                 self._ensure_daily_anchor(state)
                 await self._refresh_bridge_caches()
+                summary = await self._account_summary()
+                self._record_trade_journal([], summary, state.timestamp)
                 await self._publish_telemetry(
                     "orders", {"timestamp": state.timestamp.isoformat(), "submitted": 0}
                 )
@@ -1071,6 +1083,8 @@ class TradingRunner:
             if lock_reason is not None:
                 self._halted = True
                 await self._refresh_bridge_caches()
+                summary = await self._account_summary()
+                self._record_trade_journal([], summary, state.timestamp)
                 await self._publish_telemetry(
                     "kill_switch", {"locked": True, "reason": lock_reason}
                 )
@@ -1092,6 +1106,7 @@ class TradingRunner:
             self._orders_submitted += len(accepted)
             self._orders_rejected += rejected
             summary = await self._account_summary()
+            self._record_trade_journal(receipts, summary, state.timestamp)
             if self._bridge_store is not None:
                 # The bridge must describe the post-trade book, not the pre-trade one.
                 with contextlib.suppress(Exception):
@@ -1149,6 +1164,23 @@ class TradingRunner:
             "orders_from_targets(...)+submit_orders(...); cannot route the approved targets"
         )
 
+    def _record_trade_journal(
+        self,
+        receipts: Sequence[OrderReceipt],
+        summary: Mapping[str, ScalarValue],
+        timestamp: datetime,
+    ) -> None:
+        """Append receipts/account snapshot to the local CSV journal (best effort)."""
+        journal = self._trade_journal
+        if journal is None:
+            return
+        try:
+            for receipt in receipts:
+                journal.record_trade(receipt, account=summary, timestamp=timestamp)
+            journal.record_account(summary, timestamp=timestamp)
+        except Exception:
+            logger.exception("trade journal write failed; trading continues")
+
     async def _account_summary(self) -> dict[str, ScalarValue]:
         """Publish-able account/PNL/margin scalars from the broker (best effort)."""
         getter = getattr(self._broker, "get_account", None)
@@ -1162,7 +1194,10 @@ class TradingRunner:
         summary: dict[str, ScalarValue] = {
             "net_liquidation": account.net_liquidation,
             "cash_balance": account.cash_balance,
+            "buying_power": account.buying_power,
             "initial_margin_used": account.initial_margin_used,
+            "maintenance_margin_used": account.maintenance_margin_used,
+            "excess_liquidity": account.excess_liquidity,
             "margin_utilization": account.margin_utilization,
         }
         self._last_account = {
@@ -2462,6 +2497,9 @@ def _run_live(  # pragma: no cover - production wiring
         prime_pipeline=True,
         bridge_store=bridge_store,
         dry_run=bool(getattr(args, "dry_run", False)),
+        trade_journal=None
+        if bool(getattr(args, "dry_run", False))
+        else TradeJournal.from_settings(settings),
     )
     if rebalance_once:
         return asyncio.run(

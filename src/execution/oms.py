@@ -1196,4 +1196,9 @@ class OrderManagementSystem:
             commission=record.commission,
             message=record.message,
             timestamp=self._clock(),
+            instrument_id=record.event.instrument_id,
+            side=record.event.side.value,
+            requested_quantity=record.event.quantity,
+            contract_symbol=record.event.contract_symbol,
+            expiration=record.event.expiration,
         )

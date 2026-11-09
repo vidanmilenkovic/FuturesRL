@@ -32,6 +32,7 @@ const NAV_ITEMS: { href: string; label: string }[] = [
   { href: "/term-structure", label: "Term Structure" },
   { href: "/studio", label: "Strategies" },
   { href: "/backtests", label: "Backtests" },
+  { href: "/journal", label: "Journal" },
 ];
 
 const MARGIN_CAP = 0.6;

@@ -11,6 +11,10 @@ the public release history starts with the current line.
 
 ### Added
 
+- Local trade journal for paper/live benchmark runs: `artifacts/live_trades/trades.csv` records
+  every order/fill, commission and account snapshot, while `equity.csv` records NLV, cash, margin,
+  daily PnL and cumulative PnL. The new **Journal** workspace charts the benchmark, and
+  `GET /api/runner/trade-journal` (+ CSV downloads) exposes the same local files.
 - Global LLM provider status pill and `GET /api/risk/llm-status` / `POST /api/risk/llm-ping`,
   with additive `/health.llm_status`, honest offline-stub/live/error states and latency.
 - Inspectable 45-root scope for Term Structure, Weights and Risk

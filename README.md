@@ -40,6 +40,7 @@ pipeline, futures-native risk and contract translation, and one shared backtest/
 - **Futures-native realism**: zero-lookahead continuous rolls, F1–F6 term structure, margin/cost simulation, and purged walk-forward validation.
 - **Eight timeframes (`1m` to `1w`)**, cache-aware data management, and budgeted Databento/IBKR backfills.
 - **Backtest-to-live parity**: the same `ContractTranslator` feeds the event-driven backtester and the IBKR OMS, with LLM and quantitative risk overlays in both paths.
+- **Local trade journal**: paper/live runs append every fill and account snapshot to `artifacts/live_trades/trades.csv` and `equity.csv`, charted in the **Journal** workspace for a month-long benchmark run.
 
 ---
 
@@ -103,7 +104,7 @@ futuresrl/
 │   ├── analytics/               # Institutional metrics, tearsheets, attribution
 │   ├── execution/               # IBKR client/OMS, pre-trade gate, BAG rolls, reconciler, runner
 │   └── api/                     # FastAPI app, domain routes, schemas, telemetry, services
-├── frontend/                    # Next.js 15 workstation: Overview, Weights, Risk, Term Structure, Strategies, Backtests
+├── frontend/                    # Next.js 15 workstation: Overview, Weights, Risk, Term Structure, Strategies, Backtests, Journal
 ├── tests/                       # unit/, integration/, parity/ — hermetic, deterministic suites
 ├── docker/                      # Backend/frontend images and headless IB Gateway compose
 ├── docs/                        # USER_GUIDE.md, ARCHITECTURE.md, screenshots/

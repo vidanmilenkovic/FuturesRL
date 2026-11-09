@@ -41,7 +41,7 @@ echo "Press Ctrl+C to stop both."
 
 .venv/bin/python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000 --reload &
 api_pid=$!
-(cd frontend && npm run dev) &
+(cd frontend && npm run dev:clean) &
 web_pid=$!
 
 wait "$api_pid" "$web_pid"

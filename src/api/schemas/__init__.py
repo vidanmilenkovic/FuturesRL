@@ -124,6 +124,7 @@ from src.api.schemas.execution import (
     RebalancePreviewRequest,
     RebalancePreviewResponse,
     RebalanceTargetRow,
+    TradeJournalResponse,
 )
 from src.api.schemas.operations import (
     ArtifactDeleteResponse,
@@ -239,6 +240,7 @@ __all__ = [
     "TermCurve",
     "TermRegime",
     "TermStructureResponse",
+    "TradeJournalResponse",
     "TradeRow",
     "WalkForwardFold",
     "WorkingOrderRow",

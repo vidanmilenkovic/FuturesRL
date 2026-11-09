@@ -830,6 +830,36 @@ back to the API's simulated/fixture engine. Start either an external runner:
 or drive it from the dashboard/API with `POST /api/runner/step` (Backtest/Overview Step
 Runner control). A stale bridge is displayed honestly (`bridge_stale=true`, source falls back).
 
+### Local trade journal & benchmark run
+
+Every paper/live `TradingRunner` process appends two local CSV files (no database, no network):
+
+| File | Contents |
+|---|---|
+| `artifacts/live_trades/trades.csv` | one row per order acknowledgement: UTC timestamp, mode, account, order id, root, side, requested/filled qty, average price, commission, status/message, contract/expiry and the account snapshot at that moment |
+| `artifacts/live_trades/equity.csv` | one row per processed rebalance state: NLV, cash, buying power, initial/maintenance margin, excess liquidity, margin utilisation, daily PnL and cumulative PnL |
+
+The **Journal** tab (`/journal`) charts the equity benchmark, shows totals/return/max drawdown and
+lists recent fills. The same data is available read-only through
+`GET /api/runner/trade-journal` and as downloads at
+`GET /api/runner/trade-journal/trades.csv` / `equity.csv`.
+
+Start a month-long paper benchmark with a stable state store and the bridge enabled:
+
+```bash
+export FUTURESRL_ENVIRONMENT=paper
+export FUTURESRL_IBKR_PORT=7497
+export FUTURESRL_RISK_STATE_STORE_URI=duckdb:
+.venv/bin/python -m src.execution.runner \
+  --strategy configs/strategies/tsmom_vol_target.yaml \
+  --roots ES,NQ,CL,GC,ZN --backfill-source auto
+# leave it running; every order and account snapshot is appended to artifacts/live_trades/
+```
+
+Set `FUTURESRL_TRADE_JOURNAL_DIR` to write the CSVs elsewhere. The journal is only enabled for
+`paper`/`live` environments and is disabled for `--dry-run`/offline runs. A missing journal is
+rendered as an honest empty state, never synthetic trades.
+
 ### DRL training & checkpoints
 
 ```bash
@@ -998,3 +1028,21 @@ Logs: `data/` holds cache; `artifacts/` holds tear sheets; API logs to stdout; r
 - LLM outputs are schema-validated, confidence-filtered and only applied through bounded deterministic projections. Treat news/macro text as untrusted data.
 - Reconcile and monitor; never disable the pre-trade gate or reconciler on a live account without a documented operator override.
 - Futures margin is leveraged — losses can exceed capital. This software is provided for research/engineering use; validate thoroughly before any live deployment.
+
+
+## 13. Troubleshooting
+
+### `Cannot find module './NN.js'` or a Next.js runtime error at localhost
+
+This is a stale/corrupted `frontend/.next` cache, usually caused by running a production
+`npm run build` while `next dev` was still running. Stop both processes, then start clean:
+
+```bash
+pkill -f "next dev" || true
+pkill -f "next-server" || true
+cd frontend && rm -rf .next && npm run dev
+# or from the repo root: ./scripts/dev.sh  (now runs `npm run dev:clean`)
+```
+
+Do not run `npm run build` against a live `npm run dev` server; use `npm run start:clean` for a
+production build, or `npm run dev:clean` for development.

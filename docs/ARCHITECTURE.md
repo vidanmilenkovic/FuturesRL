@@ -299,8 +299,8 @@ fixtures and marks the payloads accordingly. Services own the wiring:
 - `DataService` serves cache inventory, cost estimates and ingestion.
 
 Every response that could contain synthetic, cached or stale data carries provenance/metadata so the
-dashboard can label it. The frontend is a Next.js 15 dashboard with six views: Overview,
-Weights, Risk, Term Structure & Roll Calendar, Backtests and Strategies. Live telemetry is delivered over `/ws/telemetry`.
+dashboard can label it. The frontend is a Next.js 15 dashboard with seven views: Overview,
+Weights, Risk, Term Structure & Roll Calendar, Backtests, Strategies and Journal. Live telemetry is delivered over `/ws/telemetry`.
 
 ## 10. Configuration
 

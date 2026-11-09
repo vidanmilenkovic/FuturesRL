@@ -1117,6 +1117,13 @@ class OrderReceipt:
     commission: float = 0.0
     message: str = ""
     timestamp: datetime | None = None
+    #: Optional order-intent metadata used by the local trade journal. Additive so
+    #: every existing broker/fake receipt remains valid.
+    instrument_id: InstrumentId | None = None
+    side: str | None = None
+    requested_quantity: int | None = None
+    contract_symbol: str | None = None
+    expiration: date | None = None
 
     def __post_init__(self) -> None:
         if self.timestamp is not None:

@@ -50,7 +50,7 @@ NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 npm run dev
 ```bash
 npx tsc --noEmit       # strict type check
 npm run lint           # ESLint (zero warnings)
-npm run build          # production build (static prerender of all 5 routes)
+npm run build          # production build (static prerender of all 7 routes)
 npm run start          # serve the production build on :3100
 ```
 

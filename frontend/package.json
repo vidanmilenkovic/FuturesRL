@@ -8,7 +8,9 @@
     "build": "next build",
     "start": "next start -p 3100",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev:clean": "rm -rf .next && next dev -p 3100",
+    "start:clean": "rm -rf .next && next build && next start -p 3100"
   },
   "dependencies": {
     "lightweight-charts": "5.2.1",

@@ -254,3 +254,20 @@ class RebalanceExecuteResponse(APIModel):
     bridge_updated: bool = False
     message: str = ""
     generated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Local paper/live trade journal
+# ---------------------------------------------------------------------------
+
+
+class TradeJournalResponse(APIModel):
+    """``GET /api/runner/trade-journal`` payload (local CSV benchmark journal)."""
+
+    enabled: bool
+    directory: str
+    trades_path: str
+    equity_path: str
+    trades: list[dict[str, object]] = Field(default_factory=list)
+    equity: list[dict[str, object]] = Field(default_factory=list)
+    summary: dict[str, object] = Field(default_factory=dict)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -46,6 +47,7 @@ from src.execution.runner_bridge import (
     RunnerBridgeSnapshot,
     RunnerBridgeStore,
 )
+from src.execution.trade_journal import TradeJournal
 from src.risk.state_store import InMemoryRiskStateStore, PersistedRiskState
 
 from tests.fixtures.market import (
@@ -296,6 +298,7 @@ def make_runner(
     bridge_store: RunnerBridgeStore | None = None,
     runner_id: str | None = None,
     events: list[str] | None = None,
+    trade_journal: TradeJournal | None = None,
 ) -> tuple[TradingRunner, dict[str, Any]]:
     ordered_events: list[str] = events if events is not None else []
     market_states = states if states is not None else single_state_states()
@@ -324,6 +327,7 @@ def make_runner(
         prime_pipeline=prime_pipeline,
         bridge_store=bridge_store,
         runner_id=runner_id,
+        trade_journal=trade_journal,
     )
     return runner, components
 
@@ -331,6 +335,16 @@ def make_runner(
 # ---------------------------------------------------------------------------
 # Hydration ordering (upgrade 1: hydrate BEFORE the first IBKR bar)
 # ---------------------------------------------------------------------------
+
+
+async def test_runner_writes_local_trade_journal(settings: Settings, tmp_path: Path) -> None:
+    journal = TradeJournal(tmp_path / "live_trades", mode="paper", account_id="DU-TEST")
+    runner, _ = make_runner(settings, states=single_state_states(1), trade_journal=journal)
+    await runner.run(roots=("ES",))
+    snapshot = journal.snapshot()
+    assert snapshot["summary"]["equity_points"] == 1
+    assert snapshot["summary"]["trade_rows"] >= 1
+    assert snapshot["trades"][0]["instrument_id"] in (None, "ES")
 
 
 async def test_warm_start_runs_before_the_first_streamed_state(settings: Settings) -> None:

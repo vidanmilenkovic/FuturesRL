@@ -77,6 +77,7 @@ import type {
   StrategyConfig,
   StrategyMutationResult,
   TearsheetResponse,
+  TradeJournalResponse,
   DrlBindResult,
   DrlModel,
   DrlModelsResponse,
@@ -425,6 +426,28 @@ export function getRecentFills(limit = 50): Promise<ApiResult<FillsResponse>> {
 
 export function getRunnerStatus(): Promise<ApiResult<RunnerStatus>> {
   return withFallback("/api/runner/status", () => emptyRunnerStatus());
+}
+
+export function getTradeJournal(limit = 500): Promise<ApiResult<TradeJournalResponse>> {
+  return withFallback(`/api/runner/trade-journal?limit=${limit}`, () => ({
+    enabled: false,
+    directory: "",
+    trades_path: "",
+    equity_path: "",
+    trades: [],
+    equity: [],
+    summary: {
+      starting_equity: null,
+      latest_equity: null,
+      total_pnl: null,
+      total_return: null,
+      max_drawdown: null,
+      trade_rows: 0,
+      filled_trades: 0,
+      equity_points: 0,
+      last_trade_at: null,
+    },
+  }));
 }
 
 export function stepRunner(states = 1): Promise<ApiResult<RunnerStatus>> {

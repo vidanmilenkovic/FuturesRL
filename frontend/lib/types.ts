@@ -1408,3 +1408,68 @@ export interface CalibrateCostsResponse {
   source: string;
   message?: string | null;
 }
+
+// ---------------------------------------------------------------------------
+// Local paper/live trade journal
+// ---------------------------------------------------------------------------
+
+export interface TradeJournalTrade {
+  timestamp_utc: string | null;
+  mode: string | null;
+  account_id: string | null;
+  order_id: string | null;
+  instrument_id: string | null;
+  side: string | null;
+  requested_quantity: number | null;
+  filled_quantity: number | null;
+  average_price: number | null;
+  commission: number | null;
+  status: string | null;
+  message: string | null;
+  contract_symbol: string | null;
+  expiration: string | null;
+  net_liquidation: number | null;
+  cash_balance: number | null;
+  buying_power: number | null;
+  initial_margin_used: number | null;
+  maintenance_margin_used: number | null;
+  excess_liquidity: number | null;
+  margin_utilization: number | null;
+}
+
+export interface TradeJournalEquity {
+  timestamp_utc: string | null;
+  mode: string | null;
+  account_id: string | null;
+  net_liquidation: number | null;
+  cash_balance: number | null;
+  buying_power: number | null;
+  initial_margin_used: number | null;
+  maintenance_margin_used: number | null;
+  excess_liquidity: number | null;
+  margin_utilization: number | null;
+  daily_pnl: number | null;
+  cumulative_pnl: number | null;
+}
+
+export interface TradeJournalSummary {
+  starting_equity: number | null;
+  latest_equity: number | null;
+  total_pnl: number | null;
+  total_return: number | null;
+  max_drawdown: number | null;
+  trade_rows: number | null;
+  filled_trades: number | null;
+  equity_points: number | null;
+  last_trade_at: string | null;
+}
+
+export interface TradeJournalResponse {
+  enabled: boolean;
+  directory: string;
+  trades_path: string;
+  equity_path: string;
+  trades: TradeJournalTrade[];
+  equity: TradeJournalEquity[];
+  summary: TradeJournalSummary;
+}
