@@ -313,6 +313,19 @@ def _validate_window(start: datetime, end: datetime) -> tuple[datetime, datetime
     return (start_utc, end_utc)
 
 
+def _chunk_windows(
+    start: datetime, end: datetime, *, days: int = 180
+) -> list[tuple[datetime, datetime]]:
+    """Split ``[start, end)`` into half-open windows of at most ``days``."""
+    windows: list[tuple[datetime, datetime]] = []
+    cursor = start
+    while cursor < end:
+        chunk_end = min(cursor + timedelta(days=days), end)
+        windows.append((cursor, chunk_end))
+        cursor = chunk_end
+    return windows
+
+
 def _as_polars(store: Any) -> pl.DataFrame:
     """Convert a Databento ``DBNStore`` (or any table-like object) to Polars."""
     if isinstance(store, pl.DataFrame):
@@ -322,7 +335,18 @@ def _as_polars(store: Any) -> pl.DataFrame:
         data = to_df()
         if isinstance(data, pl.DataFrame):
             return data
-        return pl.from_pandas(data)
+        # Databento >=0.89 sets ts_event/ts_recv as the pandas index. Polars'
+        # from_pandas drops the index unless it is reset, which previously made
+        # every real downloaded frame look like it had no timestamp column.
+        reset_index = getattr(data, "reset_index", None)
+        if callable(reset_index):
+            data = reset_index()
+        frame = pl.from_pandas(data)
+        if "index" in frame.columns and not any(
+            column in frame.columns for column in ("ts_event", "ts_recv", s.TIMESTAMP_COLUMN)
+        ):
+            frame = frame.rename({"index": "ts_event"})
+        return frame
     to_arrow = getattr(store, "to_arrow", None)
     if callable(to_arrow):
         return cast(pl.DataFrame, pl.from_arrow(to_arrow()))
@@ -707,36 +731,132 @@ class DatabentoLoader:
                 start_utc.isoformat(),
                 end_utc.isoformat(),
             )
+        # Large historical requests can exceed Databento/Cloudflare streaming
+        # timeouts (HTTP 522). Split them into bounded windows and persist each
+        # chunk as it completes, so a later failure never discards earlier data.
+        if self._should_chunk(start_utc, end_utc, schema, estimate):
+            logger.info(
+                "Databento request split into bounded chunks: roots=%r schema=%r "
+                "window=[%s, %s] estimated=%.2f MB",
+                list(normalised_roots),
+                schema,
+                start_utc.isoformat(),
+                end_utc.isoformat(),
+                estimate.billable_size_megabytes,
+            )
+            frames: list[pl.DataFrame] = []
+            for chunk_start, chunk_end in _chunk_windows(start_utc, end_utc):
+                try:
+                    frame = self._fetch_and_persist(
+                        client_object,
+                        normalised_roots,
+                        chunk_start,
+                        chunk_end,
+                        schema=schema,
+                        dataset=resolved_dataset,
+                        symbols=requested_symbols,
+                        stype_in=stype_in,
+                        mode=mode,
+                        allow_empty=True,
+                    )
+                except DatabentoIngestError as exc:
+                    raise DatabentoIngestError(f"{exc}; completed chunks remain cached") from exc
+                if not frame.is_empty():
+                    frames.append(frame)
+            if not frames:
+                raise DatabentoIngestError(
+                    f"Databento returned no {schema!r} rows for {normalised_roots!r} in "
+                    f"[{start_utc.isoformat()}, {end_utc.isoformat()}); check the request "
+                    "window/entitlements."
+                )
+            return pl.concat(frames, how="diagonal")
+        return self._fetch_and_persist(
+            client_object,
+            normalised_roots,
+            start_utc,
+            end_utc,
+            schema=schema,
+            dataset=resolved_dataset,
+            symbols=requested_symbols,
+            stype_in=stype_in,
+            mode=mode,
+        )
+
+    @staticmethod
+    def _should_chunk(start: datetime, end: datetime, schema: str, estimate: CostEstimate) -> bool:
+        """Whether to split a large bar request into timeout-safe windows."""
+        if not s.is_bar_schema(schema):
+            return False
+        duration_days = (end - start).total_seconds() / 86_400.0
+        return estimate.billable_size_bytes > 100_000_000 or duration_days > 366.0
+
+    def _fetch_and_persist(
+        self,
+        client_object: Any,
+        roots: Sequence[InstrumentId],
+        start: datetime,
+        end: datetime,
+        *,
+        schema: str,
+        dataset: str,
+        symbols: Sequence[str],
+        stype_in: str,
+        mode: WriteMode,
+        allow_empty: bool = False,
+    ) -> pl.DataFrame:
+        """Download one Databento window, normalise it and append to the cache."""
         try:
             store = client_object.timeseries.get_range(
-                dataset=resolved_dataset,
+                dataset=dataset,
                 schema=schema,
-                symbols=requested_symbols,
-                start=start_utc,
-                end=end_utc,
+                symbols=list(symbols),
+                start=start,
+                end=end,
                 stype_in=stype_in,
             )
         except Exception as exc:
             raise DatabentoIngestError(
-                f"Databento get_range failed (dataset={resolved_dataset!r}, schema={schema!r}, "
-                f"roots={normalised_roots!r}, window=[{start_utc.isoformat()}, "
-                f"{end_utc.isoformat()})): {exc}"
+                f"Databento get_range failed (dataset={dataset!r}, schema={schema!r}, "
+                f"roots={tuple(roots)!r}, window=[{start.isoformat()}, "
+                f"{end.isoformat()}]): {exc}"
             ) from exc
         raw = _as_polars(store)
         if raw.is_empty():
+            if allow_empty:
+                return raw
             raise DatabentoIngestError(
-                f"Databento returned no {schema!r} rows for {normalised_roots!r} in "
-                f"[{start_utc.isoformat()}, {end_utc.isoformat()}); check the request "
+                f"Databento returned no {schema!r} rows for {tuple(roots)!r} in "
+                f"[{start.isoformat()}, {end.isoformat()}); check the request "
                 "window/entitlements or widen the date range."
             )
-        frame = self._normalise(raw, schema=schema, roots=normalised_roots, reference=end_utc)
+        try:
+            frame = self._normalise(raw, schema=schema, roots=roots, reference=end)
+        except Exception as exc:
+            # Never discard data the operator has already paid to download.
+            raw_path = (
+                self._settings.data_dir
+                / "databento_raw"
+                / f"{schema}_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}_"
+                f"{'_'.join(str(root) for root in roots)}.parquet"
+            )
+            try:
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw.write_parquet(raw_path)
+                logger.error("normalisation failed; raw Databento response saved to %s", raw_path)
+                saved = f"; raw response preserved at {raw_path}"
+            except Exception as save_exc:
+                logger.error("could not preserve raw Databento response: %s", save_exc)
+                saved = ""
+            raise DatabentoIngestError(
+                f"Databento response could not be normalised: {exc}{saved}"
+            ) from exc
         if schema == s.DATABENTO_DEFINITION_SCHEMA:
-            self._repository.store_definitions(frame, dataset=resolved_dataset, mode=mode)
+            self._repository.store_definitions(frame, dataset=dataset, mode=mode)
         elif s.is_bar_schema(schema):
-            self._repository.write_bars(frame, dataset=resolved_dataset, schema=schema, mode=mode)
+            self._repository.write_bars(frame, dataset=dataset, schema=schema, mode=mode)
         else:
-            self._repository.write_frame(frame, schema=schema, dataset=resolved_dataset, mode=mode)
-        self._record_ingested_source(frame, schema, resolved_dataset)
+            self._repository.write_frame(frame, schema=schema, dataset=dataset, mode=mode)
+        self._record_ingested_source(frame, schema, dataset)
         return frame
 
     def _record_ingested_source(self, frame: pl.DataFrame, schema: str, dataset: str) -> None:
@@ -874,6 +994,23 @@ class DatabentoLoader:
             source = timestamp_column or _pick_timestamp_column(raw)
             frame = frame.with_columns(pl.col(source).alias(s.TIMESTAMP_COLUMN))
         symbol_column = self._symbol_column(frame)
+        # A Databento parent request (e.g. ``ES.FUT``) also returns calendar
+        # spreads (``ESZ6-ESH7``) and options. They are not outright futures and
+        # cannot be mapped to a single expiry, so keep only outright symbols.
+        symbols_expr = pl.col(symbol_column).cast(pl.Utf8)
+        before = frame.height
+        frame = frame.filter(~symbols_expr.str.contains(r"[- ]"))
+        if frame.height != before:
+            logger.info(
+                "Databento parent request: dropped %d spread/option rows, kept %d outright rows",
+                before - frame.height,
+                frame.height,
+            )
+        if frame.is_empty():
+            raise DatabentoIngestError(
+                f"Databento returned only spread/option rows for roots={tuple(roots)!r}; "
+                "no outright futures remained after filtering."
+            )
         resolved = self._resolve_identities(
             frame, symbol_column=symbol_column, roots=roots, reference=reference
         )

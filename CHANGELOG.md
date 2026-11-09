@@ -35,6 +35,12 @@ the public release history starts with the current line.
 
 ### Fixed
 
+- Databento 0.89 `DBNStore.to_df()` returns `ts_event`/`ts_recv` as the pandas index; the
+  loader now restores it before Polars conversion, so downloaded frames are no longer discarded
+  with a false “no timestamp column” error.
+- Databento parent requests now filter calendar spreads/options to outright futures, and large
+  requests are split into persisted 180-day chunks to avoid HTTP 522 stream timeouts. If
+  normalisation still fails, the raw paid response is preserved under `data/databento_raw/`.
 - IBKR cost calibration resolves contracts correctly: qualification no longer sends a futures
   multiplier, FX roots use IBKR currency symbols (`6E`→`EUR`, etc.), expired front months roll
   forward, and SR3 uses its quarterly cycle. Missing IBKR commissions retain the YAML fee split

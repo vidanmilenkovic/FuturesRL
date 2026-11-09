@@ -294,6 +294,11 @@ data/parquet/<dataset>/<schema>/<root>/part.parquet
    Or simply let the runner backfill: set `FUTURESRL_HYDRATION_SOURCE=databento` (or leave `auto` with a key configured) and start it — the cold-start hydrator fetches the lookback window it needs and persists it.
 
 4. Supported schemas: `ohlcv-1m`, `ohlcv-1h`, `ohlcv-1d`, `tbbo`, `mbp-1`, `mbp-10`, `definition`. If the SDK or key is missing the loader raises an actionable error (never silently fabricates vendor data).
+5. Large requests are automatically split into **180-day chunks** when the estimate exceeds 100 MB or the window exceeds one year. Each completed chunk is persisted immediately, so a later timeout (HTTP 522) does not discard earlier data.
+6. A Databento parent request also returns calendar spreads and options; the loader keeps only outright futures (symbols without `-`/spaces) before mapping contract identities.
+7. If a downloaded response cannot be normalised, the raw frame is preserved under `data/databento_raw/` and the error names the file. This includes Databento SDK timestamp-index differences; the current loader restores `ts_event`/`ts_recv` from the pandas index automatically.
+
+**Costs are vendor-side.** The in-app estimate is not a charge. Databento bills usage on its dashboard, and an interrupted stream can still be billable. For a large historical backfill, prefer smaller windows and check the Databento Billing page before retrying.
 
 ### IBKR historical / live market data
 

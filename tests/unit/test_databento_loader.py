@@ -761,3 +761,63 @@ def test_ingest_provenance_failure_does_not_fail_ingest(
     monkeypatch.setattr(loader.repository, "record_source", boom)
     frame = loader.ingest(["ES"], START, END, client=metadata_client(FakeMetadata(cost=0.5)))
     assert frame.height == 3  # persisted data still returned; provenance is best effort
+
+
+def test_dbnstore_dataframe_index_is_restored_as_timestamp() -> None:
+    """Databento 0.89 returns ts_event as the pandas index, not a column."""
+    import pandas as pd
+    from src.data.databento_loader import _as_polars
+
+    indexed = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [10],
+            "symbol": ["ES"],
+        },
+        index=pd.Index([pd.Timestamp(START)], name="ts_event"),
+    )
+
+    class IndexedStore:
+        def to_df(self) -> Any:
+            return indexed
+
+    frame = _as_polars(IndexedStore())
+    assert "ts_event" in frame.columns
+    assert frame["ts_event"].to_list() == [START]
+
+
+def test_large_ingest_is_split_into_persisted_windows(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    metadata = FakeMetadata(cost=0.5, billable_size=200_000_000)
+    client = metadata_client(metadata)
+    end = START + timedelta(days=400)
+    frame = loader.ingest(["ES"], START, end, client=client)
+    assert frame.height > 0
+    assert len(client.timeseries.calls) == 3
+    assert [call["start"].date() for call in client.timeseries.calls] == [
+        START.date(),
+        (START + timedelta(days=180)).date(),
+        (START + timedelta(days=360)).date(),
+    ]
+
+
+def test_parent_futures_request_drops_spread_and_option_rows(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    raw = pl.DataFrame(
+        {
+            "ts_event": [START, START],
+            "raw_symbol": ["ESZ6", "ESZ6-ESH7"],
+            "open": [5_000.0, 5_000.0],
+            "high": [5_001.0, 5_001.0],
+            "low": [4_999.0, 4_999.0],
+            "close": [5_000.5, 5_000.5],
+            "volume": [10, 10],
+        }
+    )
+    frame = loader._normalise_bars(raw, roots=("ES",), reference=START)
+    assert frame.height == 1
+    assert frame["instrument_id"].to_list() == ["ESZ6"]
+    assert frame["root_symbol"].to_list() == ["ES"]
