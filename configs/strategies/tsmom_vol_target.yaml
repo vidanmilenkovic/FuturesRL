@@ -1,64 +1,72 @@
+# ---------------------------------------------------------------------------
+# FuturesRL declarative strategy pipeline
+#
+# Classical volatility-targeted time-series momentum across the full futures
+# universe, with a carry/term-structure filter and the two-tier risk overlay.
+# ---------------------------------------------------------------------------
 id: tsmom_vol_target
-description: Volatility-targeted TSMOM across equity index, rates, energy, metals
-  and FX futures, KAMA trend confirmation, carry filter and quant + LLM risk overlays.
-tags:
-- classical
-- tsmom
-- vol-target
-- carry
+description: >-
+  Volatility-targeted TSMOM across equity index, rates, energy, metals and FX
+  futures, KAMA trend confirmation, carry filter and quant + LLM risk overlays.
+tags: [classical, tsmom, vol-target, carry]
+
 universe:
-  name: liquidity
+  selector: liquidity
   params:
     min_avg_dollar_volume: 50000000
     min_open_interest: 5000
     top_n: 10
     min_history_days: 252
-    roots: ES,NQ
+
 allocator:
   name: volatility_target
   params:
     target_annual_volatility: 0.12
     covariance_lookback_days: 60
-    max_gross_leverage: 3
+    max_gross_leverage: 3.0
+
 timing:
-- name: tsmom
-  params:
-    lookback_fast: 21
-    lookback_slow: 126
-    vol_lookback: 20
-- name: kama
-  params:
-    window: 10
-    fast_period: 2
-    slow_period: 30
-- name: carry_filter
-  params:
-    min_carry_bps: 0
-    carry_weight: 1
+  - name: tsmom
+    params:
+      lookback_fast: 21
+      lookback_slow: 126
+      vol_lookback: 20
+  - name: kama
+    params:
+      window: 10
+      fast_period: 2
+      slow_period: 30
+  - name: carry_filter
+    params:
+      min_carry_bps: 0.0
+      carry_weight: 1.0
+
 risk:
-- name: quant_risk
-  params:
-    vol_target: 0.12
-    ewma_halflife_days: 20
-    max_single_instrument_weight: 0.35
-    max_sector_weight: 0.4
-    drawdown_limit_pct: 0.2
-    daily_max_loss_pct: 0.03
-- name: llm_risk
-  params:
-    confidence_threshold: 0.7
-    safe_score: 1.5
-    critical_score: 4.5
-    risk_penalty_lambda: 0.5
+  - name: quant_risk
+    params:
+      vol_target: 0.12
+      ewma_halflife_days: 20
+      max_single_instrument_weight: 0.35
+      max_sector_weight: 0.40
+      drawdown_limit_pct: 0.20
+      daily_max_loss_pct: 0.03
+  - name: llm_risk
+    params:
+      confidence_threshold: 0.70
+      safe_score: 1.5
+      critical_score: 4.5
+      risk_penalty_lambda: 0.5
+
 translator:
   rounding_mode: nearest
-  rebalance_buffer_contracts: 2.0
-  max_margin_utilization: 0.6
+  rebalance_buffer_contracts: 2
+  max_margin_utilization: 0.60
   enable_micro_routing: true
   min_micro_notional_ratio: 0.0
+
 backtest:
-  start: '2018-01-01'
-  end: '2024-12-31'
+  start: 2018-01-01
+  end: 2024-12-31
   initial_equity: 1000000.0
   base_currency: USD
   rebalance_frequency: W-FRI
@@ -70,6 +78,3 @@ backtest:
     test_days: 63
     purge_days: 5
     embargo_days: 5
-    step_days: null
-  timeframe: 1d
-drl: null
