@@ -43,6 +43,7 @@ an expiry.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -425,9 +426,27 @@ class DatabentoLoader:
         return self._api_key
 
     def _client(self) -> Any:
-        """Build a ``databento.Historical`` client (lazy import, credentials checked)."""
+        """Build a ``databento.Historical`` client (lazy import, credentials checked).
+
+        Databento 0.89+ renamed the constructor keyword from ``api_key`` to ``key``;
+        older releases only accept ``api_key``. Support both so pinning either SDK
+        version does not break the cost estimator or ingestion.
+        """
         sdk = self._import_sdk()
-        return sdk.Historical(api_key=self._require_api_key())
+        api_key = self._require_api_key()
+        historical = sdk.Historical
+        try:
+            parameters = inspect.signature(historical).parameters
+            key_supported = "key" in parameters
+            api_key_supported = "api_key" in parameters
+        except (TypeError, ValueError):
+            key_supported = False
+            api_key_supported = False
+        if key_supported:
+            return historical(key=api_key)
+        if api_key_supported:
+            return historical(api_key=api_key)
+        return historical(api_key)  # positional fallback for older/minimal clients
 
     # -- cost estimation / budget guard ---------------------------------------
 
@@ -484,7 +503,14 @@ class DatabentoLoader:
         metadata_available = callable(get_cost) or callable(get_billable_size)
         if callable(get_cost):
             try:
-                raw_cost = get_cost(unit="usd", **request_kwargs)
+                try:
+                    # Databento <=0.6x accepted an explicit USD unit; newer SDKs
+                    # (0.89+) return USD floats and dropped the keyword.
+                    raw_cost = get_cost(unit="usd", **request_kwargs)
+                except TypeError as exc:
+                    if "unit" not in str(exc):
+                        raise
+                    raw_cost = get_cost(**request_kwargs)
             except Exception as exc:
                 raise DatabentoCostEstimateError(
                     "Databento metadata.get_cost failed while estimating the job cost "

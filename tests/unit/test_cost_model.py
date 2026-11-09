@@ -760,6 +760,7 @@ def test_default_calibrated_costs_path_respects_settings_and_env(
     monkeypatch: pytest.MonkeyPatch,
     instrument_master: InstrumentsConfig,
 ) -> None:
+    monkeypatch.delenv(CALIBRATED_COSTS_ENV_VAR, raising=False)
     assert default_calibrated_costs_path(settings) == (
         settings.data_dir / "cache" / "ibkr_calibrated_costs.json"
     )

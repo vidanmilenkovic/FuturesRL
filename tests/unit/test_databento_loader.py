@@ -509,6 +509,41 @@ def metadata_client(metadata: FakeMetadata | None = None, *, periods: int = 3) -
     return client
 
 
+def test_historical_client_supports_new_key_and_legacy_api_key(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+    calls: list[dict[str, object]] = []
+
+    class KeyOnly:
+        def __init__(self, *, key: str) -> None:
+            calls.append({"key": key})
+
+    class LegacyOnly:
+        def __init__(self, *, api_key: str) -> None:
+            calls.append({"api_key": api_key})
+
+    loader._import_sdk = lambda: type("SDK", (), {"Historical": KeyOnly})()  # type: ignore[method-assign]
+    loader._client()
+    loader._import_sdk = lambda: type("SDK", (), {"Historical": LegacyOnly})()  # type: ignore[method-assign]
+    loader._client()
+    assert calls == [{"key": "fake"}, {"api_key": "fake"}]
+
+
+def test_estimate_cost_supports_metadata_without_unit_keyword(settings: Settings) -> None:
+    loader = make_loader(settings, api_key="fake")
+
+    class ModernMetadata(FakeMetadata):
+        def get_cost(self, **kwargs: Any) -> float:
+            if "unit" in kwargs:
+                raise TypeError("Historical.metadata.get_cost() got an unexpected keyword 'unit'")
+            return super().get_cost(**kwargs)
+
+    metadata = ModernMetadata(cost=0.31)
+    client = metadata_client(metadata)
+    estimate = loader.estimate_cost_usd(["ES"], START, END, client=client)
+    assert estimate.estimated_cost_usd == pytest.approx(0.31)
+    assert "unit" not in metadata.cost_calls[0]
+
+
 def test_estimate_cost_uses_metadata_before_any_download(settings: Settings) -> None:
     loader = make_loader(settings, api_key="fake")
     metadata = FakeMetadata(cost=0.72, billable_size=2_500_000)

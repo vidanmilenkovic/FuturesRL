@@ -49,9 +49,16 @@ def _settings(tmp_path: Path) -> Settings:
 class FakeIBKRManager:
     """Minimal connection-manager surface for whatIf calibration tests."""
 
-    def __init__(self, *, connected: bool = True, failures: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        connected: bool = True,
+        failures: set[str] | None = None,
+        commission: float | None = 2.25,
+    ) -> None:
         self._connected = connected
         self._failures = failures or set()
+        self._commission = commission
         self.what_if_calls: list[str] = []
         self.place_order_calls = 0
         self.last_error: str | None = None
@@ -86,7 +93,7 @@ class FakeIBKRManager:
             maintenance_margin_change=1_000.0,
             initial_margin_after=11_234.5,
             maintenance_margin_after=10_000.0,
-            commission=2.25,
+            commission=self._commission,
             commission_currency="USD",
         )
 
@@ -163,6 +170,35 @@ def test_calibration_service_read_only_persists_exact_contract(tmp_path: Path) -
     assert set(payload["roots"]) == {"ES"}
     assert payload["warnings"]
     assert payload["roots"]["ES"]["initial_margin"] == pytest.approx(1_234.5)
+
+
+def test_calibration_preserves_yaml_fees_when_ibkr_omits_commission(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    manager = FakeIBKRManager(commission=None)
+    master = settings.instruments
+    manager.set_master(master)
+    market = fixtures.build_offline_market(master, clock=lambda: FIXED)
+    service = IBKRExecutionService(
+        settings=settings,
+        market=market,
+        clock=lambda: FIXED,
+        connection_manager=manager,  # type: ignore[arg-type]
+    )
+
+    import asyncio
+
+    result = asyncio.run(service.calibrate_costs(["ES"]))
+    entry = result["roots"]["ES"]
+    spec = master.get("ES")
+    assert entry["commission_source"] == "yaml_default"
+    assert entry["broker_commission_per_contract"] == pytest.approx(
+        spec.broker_commission_per_contract
+    )
+    assert entry["exchange_and_reg_fee_per_contract"] == pytest.approx(
+        spec.exchange_and_reg_fee_per_contract
+    )
+    assert entry["initial_margin"] == pytest.approx(1_234.5)
+    assert any("kept YAML" in warning for warning in result["warnings"])
 
 
 def test_calibrated_costs_get_and_route_success(tmp_path: Path) -> None:

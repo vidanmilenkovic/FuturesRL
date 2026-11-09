@@ -38,7 +38,9 @@ Settings.model_config["env_file"] = None
 
 
 @pytest.fixture(autouse=True)
-def isolate_futuresrl_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def isolate_futuresrl_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[None]:
     """Hermetic tests: the developer's shell must never configure the suite.
 
     Exported ``FUTURESRL_*`` variables (e.g. ``FUTURESRL_ENVIRONMENT=paper``
@@ -59,6 +61,12 @@ def isolate_futuresrl_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[N
     # Ignore the developer's committed/untracked ``.env`` file too, unless a
     # test deliberately opts back in (none currently do).
     monkeypatch.setitem(Settings.model_config, "env_file", None)
+    # Ignore a developer's runtime IBKR fee calibration cache so fee/margin tests
+    # always exercise the committed YAML defaults (calibration tests opt in with
+    # an explicit path).
+    monkeypatch.setenv(
+        "FUTURESRL_IBKR_CALIBRATED_COSTS_PATH", str(tmp_path / "no-calibration.json")
+    )
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

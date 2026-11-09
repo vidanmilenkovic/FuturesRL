@@ -137,6 +137,8 @@ class ContractRequest:
     multiplier: float
     expiration: date | None = None
     currency: str = "USD"
+    #: IBKR futures symbol when it differs from the project root (FX currency aliases).
+    symbol: str | None = None
 
     def __post_init__(self) -> None:
         if not self.root:
@@ -1150,7 +1152,8 @@ class IBKRConnectionManager:
         except KeyError as exc:
             raise IBKRDataError(str(exc)) from exc
         expiration_date, month_string = normalize_expiration(expiration)
-        if month_string is None or expiration_date is None:
+        auto_front = month_string is None or expiration_date is None
+        if expiration_date is None or month_string is None:
             expiration_date = active_contract_expiration(spec, self._local_date())
             month_string = contract_month_string(expiration_date)
         cache_key = (spec.root, month_string)
@@ -1158,17 +1161,52 @@ class IBKRConnectionManager:
         if cached is not None:
             return cached
         client = self._require_client()
-        request = ContractRequest(
-            root=spec.root,
-            last_trade_date_or_contract_month=month_string,
-            exchange=spec.ibkr_exchange,
-            multiplier=spec.multiplier,
-            expiration=expiration_date,
-            currency=spec.currency,
-        )
-        qualified = await client.qualify_contract(request)
-        self._contract_cache[cache_key] = qualified
-        return qualified
+        # When resolving the automatic front month, a listed month can already be
+        # expired at IBKR (e.g. physically delivered CL/NG/RB/HO contracts expire in
+        # the prior month). Roll forward through the declared calendar until IBKR
+        # resolves a live contract instead of skipping the root.
+        candidates: list[date] = [expiration_date]
+        if auto_front:
+            candidates.extend(
+                upcoming_contract_expirations(spec, expiration_date + timedelta(days=1), count=3)
+            )
+        last_error: IBKRDataError | None = None
+        seen: set[date] = set()
+        attempted: list[str] = []
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidate_month = contract_month_string(candidate)
+            attempted.append(candidate_month)
+            cached = self._contract_cache.get((spec.root, candidate_month))
+            if cached is not None:
+                return cached
+            request = ContractRequest(
+                root=spec.root,
+                last_trade_date_or_contract_month=candidate_month,
+                exchange=spec.ibkr_exchange,
+                multiplier=spec.multiplier,
+                expiration=candidate,
+                currency=spec.currency,
+                symbol=spec.ibkr_future_symbol,
+            )
+            try:
+                qualified = await client.qualify_contract(request)
+            except IBKRDataError as exc:
+                last_error = exc
+                continue
+            self._contract_cache[(spec.root, candidate_month)] = qualified
+            return qualified
+        if last_error is not None:
+            raise IBKRDataError(
+                f"IBKR returned no security definition for {spec.root} "
+                f"({spec.ibkr_future_symbol}) on {spec.ibkr_exchange}; tried contract "
+                f"months {attempted}. Check the product code/exchange and that the "
+                f"account has futures trading permissions for it. Last IBKR error: "
+                f"{last_error}"
+            ) from last_error
+        raise IBKRDataError(f"could not resolve a contract for {spec.root}")
 
     # -- margin simulation / order primitives ----------------------------------
 
@@ -1463,11 +1501,13 @@ class _IbAsyncIBClient:
     def _build_contract(self, request: ContractRequest) -> Any:
         from ib_async import Future
 
+        # IBKR rejects ``qualifyContractsAsync`` when a multiplier is supplied on a
+        # futures contract request (Error 200: no security definition). Let IBKR
+        # infer the multiplier from the resolved contract instead.
         return Future(
-            symbol=request.root,
+            symbol=request.symbol or request.root,
             lastTradeDateOrContractMonth=request.last_trade_date_or_contract_month,
             exchange=request.exchange,
-            multiplier=_format_multiplier(request.multiplier),
             currency=request.currency,
         )
 

@@ -110,7 +110,7 @@ def detail(con_id: int, *, symbol: str = "ES") -> SimpleNamespace:
         ("CL", "202401"),
         ("GC", "202402"),
         ("ZC", "202403"),
-        ("SR3", "202401"),
+        ("SR3", "202403"),
         ("MBT", "202401"),
     ],
 )

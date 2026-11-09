@@ -548,7 +548,9 @@ def test_calibration_endpoint_success_persists_exact_contract(tmp_path: Path) ->
         assert simulator.calibrated_margins["ES"].initial_margin == pytest.approx(1_234.5)
 
 
-def test_calibration_endpoint_partial_and_unavailable(tmp_path: Path) -> None:
+def test_calibration_endpoint_partial_and_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = _settings(tmp_path / "partial")
     manager = _FakeWhatIfManager(failures={"NQ"})
     service = _calibration_service(settings, manager)
@@ -561,6 +563,9 @@ def test_calibration_endpoint_partial_and_unavailable(tmp_path: Path) -> None:
         assert any("NQ" in warning for warning in body["warnings"])
         assert calibrated_costs_path(settings).is_file()
 
+    from src.backtest.cost_model import CALIBRATED_COSTS_ENV_VAR
+
+    monkeypatch.delenv(CALIBRATED_COSTS_ENV_VAR, raising=False)
     all_failed = _settings(tmp_path / "unavailable")
     failing = _FakeWhatIfManager(failures={"ES", "NQ"})
     failed_service = _calibration_service(all_failed, failing)

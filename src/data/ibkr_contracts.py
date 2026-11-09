@@ -203,8 +203,9 @@ def build_front_contract(
         ) from exc
     exchange = spec.ibkr_exchange if spec is not None else _DEFAULT_EXCHANGE
     currency = spec.currency if spec is not None else _DEFAULT_CURRENCY
+    ibkr_symbol = spec.ibkr_future_symbol if spec is not None else root
     contract = ib_async.Future(
-        symbol=root,
+        symbol=ibkr_symbol,
         lastTradeDateOrContractMonth=contract_month,
         exchange=exchange,
         currency=currency,

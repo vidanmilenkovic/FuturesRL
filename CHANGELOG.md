@@ -31,6 +31,12 @@ the public release history starts with the current line.
 
 ### Fixed
 
+- IBKR cost calibration resolves contracts correctly: qualification no longer sends a futures
+  multiplier, FX roots use IBKR currency symbols (`6E`→`EUR`, etc.), expired front months roll
+  forward, and SR3 uses its quarterly cycle. Missing IBKR commissions retain the YAML fee split
+  instead of silently calibrating fees to zero.
+- Databento 0.89+ works again: `Historical(key=...)` and unit-less `metadata.get_cost` are used,
+  with backwards-compatible fallbacks for older SDK versions.
 - System drawer and Market Data Cache no longer lose input focus or close native select dropdowns
   on telemetry/health polling ticks.
 - Deterministic quantitative risk thresholds are now the primary Risk workspace, with the LLM

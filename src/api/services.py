@@ -1205,18 +1205,29 @@ class IBKRExecutionService:
                     f"{root}: whatIfOrder reported neither commission nor margin; skipped"
                 )
                 continue
+            commission_source = "ibkr_whatif"
             if commission_total is None:
-                warnings.append(f"{root}: whatIfOrder reported no commission; using 0.0")
-                commission_total = 0.0
-            broker, exchange, split_warning = self._split_commission(root, commission_total)
-            if split_warning:
-                warnings.append(f"{root}: {split_warning}")
+                # Do not calibrate commission to zero when IBKR omits it (some
+                # paper accounts do): keep the committed YAML fee split so the
+                # cost model never under-charges, while retaining calibrated margins.
+                spec = master.get(root)
+                broker = float(spec.broker_commission_per_contract)
+                exchange = float(spec.exchange_and_reg_fee_per_contract)
+                commission_source = "yaml_default"
+                warnings.append(
+                    f"{root}: whatIfOrder reported no commission; kept YAML broker/"
+                    "exchange fee split"
+                )
+            else:
+                broker, exchange, split_warning = self._split_commission(root, commission_total)
+                if split_warning:
+                    warnings.append(f"{root}: {split_warning}")
             calibrated[root] = {
                 "broker_commission_per_contract": round(float(broker), 6),
                 "exchange_and_reg_fee_per_contract": round(float(exchange), 6),
                 "initial_margin": round(float(initial or 0.0), 6),
                 "maintenance_margin": round(float(maintenance or 0.0), 6),
-                "commission_source": "ibkr_whatif",
+                "commission_source": commission_source,
                 "margin_source": "ibkr_whatif",
             }
         if not calibrated:

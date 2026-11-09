@@ -148,6 +148,7 @@ class FakeIBClient:
         self.place_raises: BaseException | None = None
         self.next_con_id = 100
         self._con_ids: dict[tuple[str, str], int] = {}
+        self.fail_contracts: set[tuple[str, str]] = set()
 
     # -- protocol -----------------------------------------------------------------
 
@@ -175,6 +176,10 @@ class FakeIBClient:
     async def qualify_contract(self, request: Any) -> VenueContract:
         self.qualify_requests.append(request)
         key = (request.root, request.last_trade_date_or_contract_month)
+        if key in self.fail_contracts:
+            raise IBKRDataError(
+                f"IBKR could not qualify {request.root} {request.last_trade_date_or_contract_month}"
+            )
         con_id = self._con_ids.get(key)
         if con_id is None:
             con_id = self.next_con_id
@@ -685,6 +690,26 @@ async def test_resolve_contract_unknown_root_raises(
         await manager.resolve_contract("NOPE")
 
 
+async def test_resolve_contract_falls_forward_and_uses_fx_symbol(
+    settings: Settings, fake_client: FakeIBClient, clock: FakeClock
+) -> None:
+    manager = make_manager(settings, fake_client, clock)
+    await manager.connect()
+    fake_client.fail_contracts.add(("CL", "202401"))
+    contract = await manager.resolve_contract("CL")
+    assert contract.last_trade_date_or_contract_month == "202402"
+    assert [
+        request.last_trade_date_or_contract_month for request in fake_client.qualify_requests
+    ] == [
+        "202401",
+        "202402",
+    ]
+
+    fx = await manager.resolve_contract("6E")
+    assert fx.last_trade_date_or_contract_month == "202403"
+    assert fake_client.qualify_requests[-1].symbol == "EUR"
+
+
 # ---------------------------------------------------------------------------
 # whatIfOrder margin simulation
 # ---------------------------------------------------------------------------
@@ -947,7 +972,18 @@ def test_ib_async_adapter_maps_contract_and_orders() -> None:
     assert future.symbol == "ES"
     assert future.lastTradeDateOrContractMonth == "202403"
     assert future.exchange == "CME"
-    assert future.multiplier == "50"
+    # IBKR rejects qualification requests that carry a multiplier; let the
+    # resolved contract supply it instead.
+    assert future.multiplier in ("", None)
+
+    fx_request = ContractRequest(
+        root="6E",
+        last_trade_date_or_contract_month="202612",
+        exchange="CME",
+        multiplier=125000.0,
+        symbol="EUR",
+    )
+    assert adapter._build_contract(fx_request).symbol == "EUR"
 
     order = adapter._to_ib_order(
         IBOrderRequest(

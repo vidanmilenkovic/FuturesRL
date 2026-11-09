@@ -85,6 +85,9 @@ class InstrumentSpec(BaseModel):
     price_precision: int = Field(default=2, ge=0, le=8)
     databento_symbol: str
     ibkr_exchange: str
+    #: IBKR futures symbol when it differs from the project root/ticker
+    #: (FX futures use currency codes: 6E -> EUR, 6J -> JPY, ...).
+    ibkr_symbol: str | None = None
     micro_root: str | None = None
     standard_root: str | None = None
     #: IBKR one-way broker commission per contract for this exact root
@@ -97,6 +100,19 @@ class InstrumentSpec(BaseModel):
     default_slippage_ticks: float = Field(default=0.75, ge=0.0)
     margins: MarginSpec
     roll: RollSpec
+
+    @field_validator("ibkr_symbol")
+    @classmethod
+    def _upper_ibkr_symbol(cls, symbol: str | None) -> str | None:
+        if symbol is None:
+            return None
+        normalised = symbol.strip().upper()
+        return normalised or None
+
+    @property
+    def ibkr_future_symbol(self) -> str:
+        """Symbol passed to ``ib_async.Future`` (root unless overridden)."""
+        return self.ibkr_symbol or self.root
 
     @field_validator("root")
     @classmethod

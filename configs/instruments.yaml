@@ -311,6 +311,7 @@ instruments:
     tick_size: 0.00005
     price_precision: 5
     databento_symbol: 6E.FUT
+    ibkr_symbol: EUR
     ibkr_exchange: CME
     broker_commission_per_contract: 0.85
     exchange_and_reg_fee_per_contract: 1.05
@@ -506,7 +507,7 @@ instruments:
       trigger: calendar_days_before_fnd
       days_before_fnd: 5
       use_volume_crossover: true
-      contract_months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      contract_months: [3, 6, 9, 12]
       physical_delivery: false
 
   NG:
@@ -752,6 +753,7 @@ instruments:
     tick_size: 5e-07
     price_precision: 7
     databento_symbol: 6J.FUT
+    ibkr_symbol: JPY
     ibkr_exchange: CME
     broker_commission_per_contract: 0.85
     exchange_and_reg_fee_per_contract: 1.05
@@ -775,6 +777,7 @@ instruments:
     tick_size: 0.0001
     price_precision: 4
     databento_symbol: 6B.FUT
+    ibkr_symbol: GBP
     ibkr_exchange: CME
     broker_commission_per_contract: 0.85
     exchange_and_reg_fee_per_contract: 1.05
@@ -798,6 +801,7 @@ instruments:
     tick_size: 0.0001
     price_precision: 4
     databento_symbol: 6A.FUT
+    ibkr_symbol: AUD
     ibkr_exchange: CME
     broker_commission_per_contract: 0.85
     exchange_and_reg_fee_per_contract: 1.05
@@ -821,6 +825,7 @@ instruments:
     tick_size: 5e-05
     price_precision: 5
     databento_symbol: 6C.FUT
+    ibkr_symbol: CAD
     ibkr_exchange: CME
     broker_commission_per_contract: 0.85
     exchange_and_reg_fee_per_contract: 1.05
@@ -844,6 +849,7 @@ instruments:
     tick_size: 0.0001
     price_precision: 4
     databento_symbol: 6S.FUT
+    ibkr_symbol: CHF
     ibkr_exchange: CME
     broker_commission_per_contract: 0.85
     exchange_and_reg_fee_per_contract: 1.05
